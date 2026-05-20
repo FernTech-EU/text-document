@@ -982,24 +982,21 @@ impl TextDocument {
     pub fn set_syntax_highlighter(&self, highlighter: Option<Arc<dyn crate::SyntaxHighlighter>>) {
         let queued = {
             let mut inner = self.inner.lock();
+            let prev_kind = inner.highlight_kind;
             match highlighter {
                 Some(hl) => {
                     inner.highlight = Some(crate::highlight::HighlightData {
                         highlighter: hl,
                         blocks: std::collections::HashMap::new(),
                     });
-                    inner.rehighlight_all();
+                    inner.rehighlight_all(); // recomputes highlight_kind
                 }
                 None => {
                     inner.highlight = None;
+                    inner.recompute_highlight_kind(); // -> None
                 }
             }
-            // Highlighting overlays the layout snapshot without touching stored
-            // formatting, so it emits no edit event on its own. Notify
-            // subscribers (e.g. live editors) so they re-snapshot and repaint.
-            // `FormatChanged` triggers a full relayout while preserving
-            // caret / scroll / selection.
-            Self::queue_highlight_changed(&mut inner);
+            Self::queue_highlight_changed(&mut inner, 0, 0, prev_kind);
             inner.take_queued_events()
         };
         crate::inner::dispatch_queued_events(queued);
@@ -1012,8 +1009,9 @@ impl TextDocument {
     pub fn rehighlight(&self) {
         let queued = {
             let mut inner = self.inner.lock();
+            let prev_kind = inner.highlight_kind;
             inner.rehighlight_all();
-            Self::queue_highlight_changed(&mut inner);
+            Self::queue_highlight_changed(&mut inner, 0, 0, prev_kind);
             inner.take_queued_events()
         };
         crate::inner::dispatch_queued_events(queued);
@@ -1024,20 +1022,60 @@ impl TextDocument {
     pub fn rehighlight_block(&self, block_id: usize) {
         let queued = {
             let mut inner = self.inner.lock();
+            let prev_kind = inner.highlight_kind;
             inner.rehighlight_from_block(block_id);
-            Self::queue_highlight_changed(&mut inner);
+            Self::queue_highlight_changed(&mut inner, 0, 0, prev_kind);
             inner.take_queued_events()
         };
         crate::inner::dispatch_queued_events(queued);
     }
 
     /// Queue the relayout/repaint notification for a highlight-only change.
-    fn queue_highlight_changed(inner: &mut TextDocumentInner) {
-        inner.queue_event(DocumentEvent::FormatChanged {
-            position: 0,
-            length: 0,
-            kind: crate::flow::FormatChangeKind::Character,
-        });
+    ///
+    /// Highlighting overlays the layout without touching stored formatting,
+    /// so it emits no edit event on its own — subscribers (live editors)
+    /// must be told to re-snapshot. The event kind depends on whether the
+    /// shaping input (`fragments`) changed:
+    ///
+    /// - A change that leaves `fragments` BASE on both sides (paint-only ↔
+    ///   paint-only / none) emits [`DocumentEvent::HighlightPaintChanged`],
+    ///   which the editor handles by recoloring the cached layout without
+    ///   reshaping.
+    /// - Any transition involving a metric-affecting highlighter changes
+    ///   `fragments` (highlights are merged in / removed), so it emits
+    ///   [`DocumentEvent::FormatChanged`] (full relayout, caret/scroll
+    ///   preserved).
+    ///
+    /// `position` / `length` are advisory: the editor's recolor path
+    /// re-derives the whole snapshot, so callers pass `0, 0` (whole-document)
+    /// today.
+    fn queue_highlight_changed(
+        inner: &mut TextDocumentInner,
+        position: usize,
+        length: usize,
+        prev_kind: crate::highlight::HighlighterKind,
+    ) {
+        use crate::highlight::HighlighterKind::{Metric, None as KNone, PaintOnly};
+        let new_kind = inner.highlight_kind;
+        let event = match (prev_kind, new_kind) {
+            // No highlighter before or after — nothing changed.
+            (KNone, KNone) => return,
+            // Fragments are BASE on both sides: recolor-only.
+            (PaintOnly, PaintOnly) | (KNone, PaintOnly) | (PaintOnly, KNone) => {
+                DocumentEvent::HighlightPaintChanged { position, length }
+            }
+            // A metric highlighter is involved on one side: fragments change.
+            (KNone, Metric)
+            | (Metric, Metric)
+            | (Metric, PaintOnly)
+            | (Metric, KNone)
+            | (PaintOnly, Metric) => DocumentEvent::FormatChanged {
+                position,
+                length,
+                kind: crate::flow::FormatChangeKind::Character,
+            },
+        };
+        inner.queue_event(event);
     }
 }
 

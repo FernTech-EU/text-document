@@ -35,6 +35,16 @@ pub enum DocumentEvent {
         kind: crate::flow::FormatChangeKind,
     },
 
+    /// Only paint-level highlight attributes changed (colors, underline
+    /// decorations) on a paint-only highlighter. The shaping input
+    /// (`fragments`) is unchanged, so the layout engine can recolor the
+    /// cached layout without reshaping or reflowing.
+    ///
+    /// `position` / `length` are document-absolute character offsets. For
+    /// whole-document rehighlights both are 0; for single-block
+    /// rehighlights they bound the affected block.
+    HighlightPaintChanged { position: usize, length: usize },
+
     /// Block count changed. Carries the new count.
     BlockCountChanged(usize),
 

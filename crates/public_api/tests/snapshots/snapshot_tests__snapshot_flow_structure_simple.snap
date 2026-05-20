@@ -64,6 +64,7 @@ expression: "&snap.elements"
                 2,
             ),
             table_cell: None,
+            paint_highlights: [],
         },
     ),
     Block(
@@ -127,6 +128,7 @@ expression: "&snap.elements"
                 2,
             ),
             table_cell: None,
+            paint_highlights: [],
         },
     ),
 ]

@@ -115,6 +115,34 @@ pub struct BlockSnapshot {
     /// Needed so the typesetter can propagate height changes to the
     /// enclosing table row.
     pub table_cell: Option<TableCellContext>,
+    /// Paint-only highlight overlay for this block.
+    ///
+    /// Non-empty **only** when the active syntax highlighter is paint-only
+    /// (colors / underline decorations, no metric changes). In that case
+    /// `fragments` carry the *base* formatting (no highlight merge) and the
+    /// layout engine applies these spans as a post-shape recolor — no
+    /// reshaping. When a metric-affecting highlighter is active, highlights
+    /// are merged into `fragments` as usual and this is empty.
+    pub paint_highlights: Vec<PaintHighlightSpan>,
+}
+
+/// A resolved paint-only highlight span for one character range of a block.
+///
+/// Char offsets are block-relative, matching [`HighlightSpan`](crate::HighlightSpan).
+/// Each color field is `None` when the highlight does not override it. This is
+/// the post-shape overlay counterpart of the merged-into-`fragments` path —
+/// it carries only attributes that do not change glyph metrics.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PaintHighlightSpan {
+    pub start: usize,
+    pub length: usize,
+    pub foreground_color: Option<crate::Color>,
+    pub background_color: Option<crate::Color>,
+    pub underline_color: Option<crate::Color>,
+    pub underline_style: Option<crate::UnderlineStyle>,
+    pub font_underline: Option<bool>,
+    pub font_overline: Option<bool>,
+    pub font_strikeout: Option<bool>,
 }
 
 /// Snapshot-friendly reference to a table cell (plain IDs, no live handles).

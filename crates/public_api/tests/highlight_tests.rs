@@ -4,8 +4,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use text_document::{
-    Color, FlowElement, FlowElementSnapshot, FragmentContent, HighlightContext, HighlightFormat,
-    MoveMode, SyntaxHighlighter, TextDocument, TextFormat, UnderlineStyle,
+    Color, DocumentEvent, FlowElement, FlowElementSnapshot, FragmentContent, HighlightContext,
+    HighlightFormat, MoveMode, SyntaxHighlighter, TextDocument, TextFormat, UnderlineStyle,
 };
 
 // ── Helpers ──────────────────────────────────────────────────────
@@ -16,9 +16,20 @@ fn new_doc(text: &str) -> TextDocument {
     doc
 }
 
+// Fully-merged display fragments (base + all highlights). Paint-only
+// highlights now live in `BlockSnapshot::paint_highlights` rather than in
+// `fragments()` (the shaping input), so these merge-result assertions go
+// through `display_fragments()`, which reproduces the merged visual.
 fn first_block_fragments(doc: &TextDocument) -> Vec<FragmentContent> {
     match &doc.flow()[0] {
-        FlowElement::Block(b) => b.fragments(),
+        FlowElement::Block(b) => b.display_fragments(),
+        _ => panic!("expected block"),
+    }
+}
+
+fn first_block_paint_spans(doc: &TextDocument) -> Vec<text_document::PaintHighlightSpan> {
+    match &doc.flow()[0] {
+        FlowElement::Block(b) => b.snapshot().paint_highlights,
         _ => panic!("expected block"),
     }
 }
@@ -664,13 +675,12 @@ fn highlight_visible_in_snapshot() {
         _ => panic!("expected block"),
     };
     let snap = block.snapshot();
-    assert!(!snap.fragments.is_empty());
-    match &snap.fragments[0] {
-        FragmentContent::Text { format, .. } => {
-            assert_eq!(format.foreground_color, Some(red));
-        }
-        _ => panic!("expected text fragment"),
-    }
+    // Paint-only highlighter: colors ride in `paint_highlights`, not merged
+    // into `fragments` (which stay base for stable shaping).
+    assert_eq!(snap.paint_highlights.len(), 1);
+    assert_eq!(snap.paint_highlights[0].start, 0);
+    assert_eq!(snap.paint_highlights[0].length, 5);
+    assert_eq!(snap.paint_highlights[0].foreground_color, Some(red));
 }
 
 #[test]
@@ -681,12 +691,10 @@ fn highlight_visible_in_flow_snapshot() {
 
     let snap = doc.snapshot_flow();
     match &snap.elements[0] {
-        FlowElementSnapshot::Block(bs) => match &bs.fragments[0] {
-            FragmentContent::Text { format, .. } => {
-                assert_eq!(format.foreground_color, Some(red));
-            }
-            _ => panic!("expected text"),
-        },
+        FlowElementSnapshot::Block(bs) => {
+            assert_eq!(bs.paint_highlights.len(), 1);
+            assert_eq!(bs.paint_highlights[0].foreground_color, Some(red));
+        }
         _ => panic!("expected block snapshot"),
     }
 }
@@ -945,7 +953,7 @@ fn state_change_cascades_to_next_block() {
 
     // Block 0: "/* start" — fully green
     if let FlowElement::Block(b) = &flow[0] {
-        let frags = b.fragments();
+        let frags = b.display_fragments();
         assert!(frags.iter().all(|f| match f {
             FragmentContent::Text { format, .. } => format.foreground_color == Some(green),
             _ => true,
@@ -954,7 +962,7 @@ fn state_change_cascades_to_next_block() {
 
     // Block 1: "middle" — fully green (inside comment)
     if let FlowElement::Block(b) = &flow[1] {
-        let frags = b.fragments();
+        let frags = b.display_fragments();
         assert!(frags.iter().all(|f| match f {
             FragmentContent::Text { format, .. } => format.foreground_color == Some(green),
             _ => true,
@@ -963,7 +971,7 @@ fn state_change_cascades_to_next_block() {
 
     // Block 3: "normal" — not green
     if let FlowElement::Block(b) = &flow[3] {
-        let frags = b.fragments();
+        let frags = b.display_fragments();
         assert!(frags.iter().all(|f| match f {
             FragmentContent::Text { format, .. } => format.foreground_color != Some(green),
             _ => true,
@@ -1019,7 +1027,7 @@ fn cascade_through_multiple_blocks() {
 
     for (i, element) in flow.iter().enumerate() {
         if let FlowElement::Block(b) = element {
-            let frags = b.fragments();
+            let frags = b.display_fragments();
             let all_green = frags.iter().all(|f| match f {
                 FragmentContent::Text { format, .. } => format.foreground_color == Some(green),
                 _ => true,
@@ -1040,7 +1048,7 @@ fn cascade_terminates_at_document_end() {
 
     for element in &flow {
         if let FlowElement::Block(b) = element {
-            let frags = b.fragments();
+            let frags = b.display_fragments();
             assert!(frags.iter().all(|f| match f {
                 FragmentContent::Text { format, .. } => format.foreground_color == Some(green),
                 _ => true,
@@ -1107,7 +1115,7 @@ fn multiline_comment_full_integration() {
 
     // Block 0: "int x;" — no highlight
     if let FlowElement::Block(b) = &flow[0] {
-        let frags = b.fragments();
+        let frags = b.display_fragments();
         assert!(
             frags.iter().all(|f| match f {
                 FragmentContent::Text { format, .. } => format.foreground_color != Some(green),
@@ -1119,7 +1127,7 @@ fn multiline_comment_full_integration() {
 
     // Block 1: "/* comment" — green
     if let FlowElement::Block(b) = &flow[1] {
-        let frags = b.fragments();
+        let frags = b.display_fragments();
         assert!(
             frags.iter().all(|f| match f {
                 FragmentContent::Text { format, .. } => format.foreground_color == Some(green),
@@ -1131,7 +1139,7 @@ fn multiline_comment_full_integration() {
 
     // Block 2: "still comment */" — green (closes at end)
     if let FlowElement::Block(b) = &flow[2] {
-        let frags = b.fragments();
+        let frags = b.display_fragments();
         assert!(
             frags.iter().all(|f| match f {
                 FragmentContent::Text { format, .. } => format.foreground_color == Some(green),
@@ -1143,7 +1151,7 @@ fn multiline_comment_full_integration() {
 
     // Block 3: "int y;" — no highlight
     if let FlowElement::Block(b) = &flow[3] {
-        let frags = b.fragments();
+        let frags = b.display_fragments();
         assert!(
             frags.iter().all(|f| match f {
                 FragmentContent::Text { format, .. } => format.foreground_color != Some(green),
@@ -1168,7 +1176,7 @@ fn multiline_comment_full_integration() {
     // Now block 3 should be green (comment cascaded)
     let flow = doc.flow();
     if let FlowElement::Block(b) = &flow[3] {
-        let frags = b.fragments();
+        let frags = b.display_fragments();
         assert!(
             frags.iter().all(|f| match f {
                 FragmentContent::Text { format, .. } => format.foreground_color == Some(green),
@@ -1224,4 +1232,224 @@ fn spellcheck_underline_highlight() {
         assert_eq!(text, "wrold");
         assert_eq!(format.underline_color, Some(Color::rgb(255, 0, 0)));
     }
+}
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// Paint-only fast path: classification, snapshot split, events
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+/// A metric-affecting highlighter (bolds the whole block).
+struct BoldAllHighlighter;
+impl SyntaxHighlighter for BoldAllHighlighter {
+    fn highlight_block(&self, text: &str, ctx: &mut HighlightContext) {
+        let len = text.chars().count();
+        if len > 0 {
+            ctx.set_format(
+                0,
+                len,
+                HighlightFormat {
+                    font_bold: Some(true),
+                    ..Default::default()
+                },
+            );
+        }
+    }
+}
+
+/// Base (shaping-input) fragments of the first block.
+fn first_block_base_fragments(doc: &TextDocument) -> Vec<FragmentContent> {
+    match &doc.flow()[0] {
+        FlowElement::Block(b) => b.fragments(),
+        _ => panic!("expected block"),
+    }
+}
+
+/// Drain pending events, returning only highlight-relevant ones.
+fn drain_highlight_events(doc: &TextDocument) -> Vec<DocumentEvent> {
+    doc.poll_events()
+        .into_iter()
+        .filter(|e| {
+            matches!(
+                e,
+                DocumentEvent::HighlightPaintChanged { .. } | DocumentEvent::FormatChanged { .. }
+            )
+        })
+        .collect()
+}
+
+#[test]
+fn paint_only_keeps_fragments_base_and_fills_paint_spans() {
+    let doc = new_doc("Hello");
+    let red = Color::rgb(255, 0, 0);
+    doc.set_syntax_highlighter(Some(Arc::new(ColorAllHighlighter { color: red })));
+
+    // Shaping input stays base — no color merged.
+    let base = first_block_base_fragments(&doc);
+    assert_eq!(base.len(), 1);
+    match &base[0] {
+        FragmentContent::Text { format, .. } => assert_eq!(format.foreground_color, None),
+        _ => panic!("expected text"),
+    }
+    // The color lives in the paint overlay.
+    let spans = first_block_paint_spans(&doc);
+    assert_eq!(spans.len(), 1);
+    assert_eq!(spans[0].start, 0);
+    assert_eq!(spans[0].length, 5);
+    assert_eq!(spans[0].foreground_color, Some(red));
+}
+
+#[test]
+fn metric_highlighter_merges_fragments_and_has_no_paint_spans() {
+    let doc = new_doc("Hello");
+    doc.set_syntax_highlighter(Some(Arc::new(BoldAllHighlighter)));
+
+    // Bold IS metric: merged into the shaping input.
+    let base = first_block_base_fragments(&doc);
+    match &base[0] {
+        FragmentContent::Text { format, .. } => assert_eq!(format.font_bold, Some(true)),
+        _ => panic!("expected text"),
+    }
+    // No separate paint overlay for a metric highlighter.
+    assert!(first_block_paint_spans(&doc).is_empty());
+}
+
+#[test]
+fn no_highlighter_has_empty_paint_spans() {
+    let doc = new_doc("Hello");
+    assert!(first_block_paint_spans(&doc).is_empty());
+}
+
+#[test]
+fn paint_only_overlapping_last_wins_in_paint_spans() {
+    let doc = new_doc("Hello");
+    struct OverlapHighlighter;
+    impl SyntaxHighlighter for OverlapHighlighter {
+        fn highlight_block(&self, _text: &str, ctx: &mut HighlightContext) {
+            ctx.set_format(
+                0,
+                5,
+                HighlightFormat {
+                    foreground_color: Some(Color::rgb(255, 0, 0)),
+                    ..Default::default()
+                },
+            );
+            ctx.set_format(
+                0,
+                5,
+                HighlightFormat {
+                    foreground_color: Some(Color::rgb(0, 0, 255)),
+                    ..Default::default()
+                },
+            );
+        }
+    }
+    doc.set_syntax_highlighter(Some(Arc::new(OverlapHighlighter)));
+    let spans = first_block_paint_spans(&doc);
+    assert_eq!(spans.len(), 1);
+    assert_eq!(spans[0].foreground_color, Some(Color::rgb(0, 0, 255)));
+}
+
+#[test]
+fn paint_highlight_invisible_to_char_format() {
+    let doc = new_doc("Hello");
+    doc.set_syntax_highlighter(Some(Arc::new(ColorAllHighlighter {
+        color: Color::rgb(255, 0, 0),
+    })));
+    // char_format reads stored formatting, never the highlight overlay.
+    let fmt = doc.cursor_at(0).char_format().unwrap();
+    assert_eq!(fmt.foreground_color, None);
+}
+
+#[test]
+fn set_paint_only_emits_highlight_paint_changed() {
+    let doc = new_doc("Hello");
+    let _ = doc.poll_events(); // drain construction events
+    doc.set_syntax_highlighter(Some(Arc::new(ColorAllHighlighter {
+        color: Color::rgb(255, 0, 0),
+    })));
+    let events = drain_highlight_events(&doc);
+    assert_eq!(events.len(), 1);
+    assert!(matches!(
+        events[0],
+        DocumentEvent::HighlightPaintChanged { .. }
+    ));
+}
+
+#[test]
+fn set_metric_emits_format_changed() {
+    let doc = new_doc("Hello");
+    let _ = doc.poll_events();
+    doc.set_syntax_highlighter(Some(Arc::new(BoldAllHighlighter)));
+    let events = drain_highlight_events(&doc);
+    assert_eq!(events.len(), 1);
+    assert!(matches!(events[0], DocumentEvent::FormatChanged { .. }));
+}
+
+#[test]
+fn remove_paint_only_emits_highlight_paint_changed() {
+    let doc = new_doc("Hello");
+    doc.set_syntax_highlighter(Some(Arc::new(ColorAllHighlighter {
+        color: Color::rgb(255, 0, 0),
+    })));
+    let _ = doc.poll_events();
+    doc.set_syntax_highlighter(None);
+    let events = drain_highlight_events(&doc);
+    assert_eq!(events.len(), 1);
+    assert!(matches!(
+        events[0],
+        DocumentEvent::HighlightPaintChanged { .. }
+    ));
+}
+
+#[test]
+fn remove_metric_emits_format_changed() {
+    let doc = new_doc("Hello");
+    doc.set_syntax_highlighter(Some(Arc::new(BoldAllHighlighter)));
+    let _ = doc.poll_events();
+    doc.set_syntax_highlighter(None);
+    let events = drain_highlight_events(&doc);
+    assert_eq!(events.len(), 1);
+    assert!(matches!(events[0], DocumentEvent::FormatChanged { .. }));
+}
+
+#[test]
+fn paint_to_metric_emits_format_changed() {
+    let doc = new_doc("Hello");
+    doc.set_syntax_highlighter(Some(Arc::new(ColorAllHighlighter {
+        color: Color::rgb(255, 0, 0),
+    })));
+    let _ = doc.poll_events();
+    doc.set_syntax_highlighter(Some(Arc::new(BoldAllHighlighter)));
+    let events = drain_highlight_events(&doc);
+    assert_eq!(events.len(), 1);
+    assert!(matches!(events[0], DocumentEvent::FormatChanged { .. }));
+}
+
+#[test]
+fn metric_to_paint_emits_format_changed() {
+    let doc = new_doc("Hello");
+    doc.set_syntax_highlighter(Some(Arc::new(BoldAllHighlighter)));
+    let _ = doc.poll_events();
+    doc.set_syntax_highlighter(Some(Arc::new(ColorAllHighlighter {
+        color: Color::rgb(255, 0, 0),
+    })));
+    let events = drain_highlight_events(&doc);
+    assert_eq!(events.len(), 1);
+    assert!(matches!(events[0], DocumentEvent::FormatChanged { .. }));
+}
+
+#[test]
+fn rehighlight_paint_only_emits_highlight_paint_changed() {
+    let doc = new_doc("Hello");
+    doc.set_syntax_highlighter(Some(Arc::new(ColorAllHighlighter {
+        color: Color::rgb(255, 0, 0),
+    })));
+    let _ = doc.poll_events();
+    doc.rehighlight();
+    let events = drain_highlight_events(&doc);
+    assert_eq!(events.len(), 1);
+    assert!(matches!(
+        events[0],
+        DocumentEvent::HighlightPaintChanged { .. }
+    ));
 }

@@ -284,11 +284,38 @@ impl TextBlock {
 
     // ── Fragments ───────────────────────────────────────────
 
-    /// All formatting runs in one call. O(k) where k = format runs +
-    /// image anchors in this block.
+    /// Shaping-input fragments: base formatting plus any *metric-affecting*
+    /// syntax highlights (bold / italic / size / family / spacing). This is
+    /// what the layout engine shapes. **Paint-only highlights (colors,
+    /// underline decorations) are NOT merged here** — they are kept separate
+    /// in [`BlockSnapshot::paint_highlights`](crate::BlockSnapshot::paint_highlights)
+    /// as a post-shape recolor overlay, so the shaping input stays stable
+    /// across paint-only highlight changes. For the fully-merged *visual*
+    /// fragments, use [`display_fragments`](Self::display_fragments).
+    ///
+    /// O(k) where k = format runs + image anchors in this block.
     pub fn fragments(&self) -> Vec<FragmentContent> {
         let inner = self.doc.lock();
         build_fragments(&inner, self.block_id as u64)
+    }
+
+    /// Fragments as they should be *displayed*: base formatting with **all**
+    /// active syntax highlights merged in, including paint-only ones. This is
+    /// the "what it looks like" view — useful for a non-optimized renderer,
+    /// for accessibility, or for tests. The optimized layout path instead uses
+    /// [`fragments`](Self::fragments) (shaping input) plus the separate
+    /// [`BlockSnapshot::paint_highlights`](crate::BlockSnapshot::paint_highlights)
+    /// overlay. Equivalent to the pre-overlay behaviour of `fragments()`.
+    pub fn display_fragments(&self) -> Vec<FragmentContent> {
+        let inner = self.doc.lock();
+        let fragments = build_raw_fragments(&inner, self.block_id as u64, None);
+        if let Some(ref hl) = inner.highlight
+            && let Some(block_hl) = hl.blocks.get(&(self.block_id as usize))
+            && !block_hl.spans.is_empty()
+        {
+            return crate::highlight::merge_highlight_spans(fragments, &block_hl.spans);
+        }
+        fragments
     }
 
     // ── List Membership ─────────────────────────────────────
@@ -335,6 +362,7 @@ impl TextBlock {
             list_info: None,
             parent_frame_id: None,
             table_cell: None,
+            paint_highlights: Vec::new(),
         })
     }
 }
@@ -458,7 +486,13 @@ pub(crate) fn build_fragments_with_text(
 ) -> Vec<FragmentContent> {
     let fragments = build_raw_fragments(inner, block_id, prefetched_text);
 
-    if let Some(ref hl) = inner.highlight
+    // Only merge highlights into the shaping input when the active
+    // highlighter is metric-affecting. Paint-only highlighters keep
+    // fragments as BASE and carry their spans separately in
+    // `BlockSnapshot::paint_highlights`, so the engine can recolor without
+    // reshaping. See `HighlighterKind`.
+    if inner.highlight_kind == crate::highlight::HighlighterKind::Metric
+        && let Some(ref hl) = inner.highlight
         && let Some(block_hl) = hl.blocks.get(&(block_id as usize))
         && !block_hl.spans.is_empty()
     {
@@ -919,6 +953,20 @@ pub(crate) fn build_block_snapshot_with_position_and_parent(
     ));
     let fragments = build_fragments_with_text(inner, block_id, Some(&text));
 
+    // Paint-only highlighter: emit the spans as a separate overlay (fragments
+    // stayed base above). Metric / none: empty (highlights merged into
+    // fragments, or none).
+    let paint_highlights = if inner.highlight_kind == crate::highlight::HighlighterKind::PaintOnly {
+        inner
+            .highlight
+            .as_ref()
+            .and_then(|hl| hl.blocks.get(&(block_id as usize)))
+            .map(|bd| crate::highlight::extract_paint_spans(&bd.spans, length))
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+
     Some(BlockSnapshot {
         block_id: block_id as usize,
         position,
@@ -929,6 +977,7 @@ pub(crate) fn build_block_snapshot_with_position_and_parent(
         list_info,
         parent_frame_id,
         table_cell,
+        paint_highlights,
     })
 }
 

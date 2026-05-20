@@ -173,6 +173,43 @@ pub(crate) struct HighlightData {
     pub blocks: HashMap<usize, BlockHighlightData>,
 }
 
+/// Classification of the active highlighter's output.
+///
+/// Drives whether highlights are merged into the shaping input
+/// (`fragments`) or kept as a separate post-shape recolor overlay.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HighlighterKind {
+    /// No highlighter attached.
+    None,
+    /// Every span touches only paint attributes (colors, underline
+    /// style, underline/overline/strikeout, tooltip). Glyph metrics are
+    /// unchanged, so the layout engine can recolor without reshaping —
+    /// `fragments` stay base and the spans ride as a paint overlay.
+    PaintOnly,
+    /// At least one span touches a metric-affecting field. Highlights
+    /// are merged into `fragments` (reshape required on change).
+    Metric,
+}
+
+/// Returns `true` if any span sets a metric-affecting field, i.e. one
+/// that changes glyph advances or line height: font family / size /
+/// weight / bold / italic, letter / word spacing, or vertical
+/// alignment (sub/superscript). The color and underline-decoration
+/// fields are paint-only and never trigger `true`.
+pub(crate) fn spans_touch_metrics(spans: &[HighlightSpan]) -> bool {
+    spans.iter().any(|s| {
+        let f = &s.format;
+        f.font_family.is_some()
+            || f.font_point_size.is_some()
+            || f.font_weight.is_some()
+            || f.font_bold.is_some()
+            || f.font_italic.is_some()
+            || f.letter_spacing.is_some()
+            || f.word_spacing.is_some()
+            || f.vertical_alignment.is_some()
+    })
+}
+
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 // Merge algorithm
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -265,6 +302,77 @@ fn merge_overlapping_highlights(spans: &[&HighlightSpan]) -> HighlightFormat {
         }
     }
     merged
+}
+
+/// Flatten a block's stored highlight spans into a list of
+/// [`PaintHighlightSpan`](crate::flow::PaintHighlightSpan)s for the
+/// paint-overlay path.
+///
+/// Only called when the active highlighter is [`HighlighterKind::PaintOnly`],
+/// so metric fields are guaranteed absent and ignored here. Overlapping
+/// spans are resolved exactly like `merge_highlight_spans` (split at every
+/// boundary, last-wins per field) so the overlay matches what the merged
+/// path would have produced. `block_len` is the block's character length.
+/// Sub-ranges with no paint field set are skipped.
+pub(crate) fn extract_paint_spans(
+    spans: &[HighlightSpan],
+    block_len: usize,
+) -> Vec<crate::flow::PaintHighlightSpan> {
+    if spans.is_empty() || block_len == 0 {
+        return Vec::new();
+    }
+
+    // Collect and dedupe all span boundaries within (0, block_len).
+    let mut boundaries = vec![0usize, block_len];
+    for s in spans {
+        let end = s.start.saturating_add(s.length);
+        if s.start > 0 && s.start < block_len {
+            boundaries.push(s.start);
+        }
+        if end > 0 && end < block_len {
+            boundaries.push(end);
+        }
+    }
+    boundaries.sort_unstable();
+    boundaries.dedup();
+
+    let mut result = Vec::new();
+    for w in boundaries.windows(2) {
+        let (sub_start, sub_end) = (w[0], w[1]);
+        if sub_end <= sub_start {
+            continue;
+        }
+        let active: Vec<&HighlightSpan> = spans
+            .iter()
+            .filter(|s| s.start < sub_end && s.start + s.length > sub_start)
+            .collect();
+        if active.is_empty() {
+            continue;
+        }
+        let merged = merge_overlapping_highlights(&active);
+        if merged.foreground_color.is_none()
+            && merged.background_color.is_none()
+            && merged.underline_color.is_none()
+            && merged.underline_style.is_none()
+            && merged.font_underline.is_none()
+            && merged.font_overline.is_none()
+            && merged.font_strikeout.is_none()
+        {
+            continue;
+        }
+        result.push(crate::flow::PaintHighlightSpan {
+            start: sub_start,
+            length: sub_end - sub_start,
+            foreground_color: merged.foreground_color,
+            background_color: merged.background_color,
+            underline_color: merged.underline_color,
+            underline_style: merged.underline_style,
+            font_underline: merged.font_underline,
+            font_overline: merged.font_overline,
+            font_strikeout: merged.font_strikeout,
+        });
+    }
+    result
 }
 
 /// Merge highlight spans into a list of fragments.
@@ -489,6 +597,24 @@ impl TextDocumentInner {
                 },
             );
         }
+
+        self.recompute_highlight_kind();
+    }
+
+    /// Recompute [`highlight_kind`](TextDocumentInner::highlight_kind) from the
+    /// currently stored spans. Paint-only iff a highlighter is attached and no
+    /// stored span touches a metric field.
+    pub(crate) fn recompute_highlight_kind(&mut self) {
+        self.highlight_kind = match &self.highlight {
+            None => HighlighterKind::None,
+            Some(hl) => {
+                if hl.blocks.values().any(|bd| spans_touch_metrics(&bd.spans)) {
+                    HighlighterKind::Metric
+                } else {
+                    HighlighterKind::PaintOnly
+                }
+            }
+        };
     }
 
     /// Re-highlight starting from a specific block, cascading until the
@@ -562,6 +688,8 @@ impl TextDocumentInner {
                 break;
             }
         }
+
+        self.recompute_highlight_kind();
     }
 
     /// Re-highlight blocks affected by a content change at the given

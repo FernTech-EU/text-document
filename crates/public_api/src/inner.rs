@@ -97,6 +97,11 @@ pub(crate) struct TextDocumentInner {
     // Syntax highlighting state (shadow formatting layer).
     pub highlight: Option<HighlightData>,
 
+    // Classification of the active highlighter, recomputed after every
+    // rehighlight pass. Drives whether highlights are merged into the
+    // shaping input or kept as a separate paint overlay.
+    pub highlight_kind: crate::highlight::HighlighterKind,
+
     // Holds SubscriptionTokens for LongOperation event bridges. Dropping a
     // token unsubscribes the callback, so these must outlive the document.
     pub long_op_subscriptions: Vec<SubscriptionToken>,
@@ -391,6 +396,7 @@ impl TextDocumentInner {
             last_block_count: 1, // new document starts with one block
             last_child_order: vec![block.id as i64],
             highlight: None,
+            highlight_kind: crate::highlight::HighlighterKind::None,
             long_op_subscriptions: Vec::new(),
         })
     }
