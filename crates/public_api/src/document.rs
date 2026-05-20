@@ -980,19 +980,29 @@ impl TextDocument {
     /// previously attached highlighter. Pass `None` to remove the
     /// highlighter and clear all highlight formatting.
     pub fn set_syntax_highlighter(&self, highlighter: Option<Arc<dyn crate::SyntaxHighlighter>>) {
-        let mut inner = self.inner.lock();
-        match highlighter {
-            Some(hl) => {
-                inner.highlight = Some(crate::highlight::HighlightData {
-                    highlighter: hl,
-                    blocks: std::collections::HashMap::new(),
-                });
-                inner.rehighlight_all();
+        let queued = {
+            let mut inner = self.inner.lock();
+            match highlighter {
+                Some(hl) => {
+                    inner.highlight = Some(crate::highlight::HighlightData {
+                        highlighter: hl,
+                        blocks: std::collections::HashMap::new(),
+                    });
+                    inner.rehighlight_all();
+                }
+                None => {
+                    inner.highlight = None;
+                }
             }
-            None => {
-                inner.highlight = None;
-            }
-        }
+            // Highlighting overlays the layout snapshot without touching stored
+            // formatting, so it emits no edit event on its own. Notify
+            // subscribers (e.g. live editors) so they re-snapshot and repaint.
+            // `FormatChanged` triggers a full relayout while preserving
+            // caret / scroll / selection.
+            Self::queue_highlight_changed(&mut inner);
+            inner.take_queued_events()
+        };
+        crate::inner::dispatch_queued_events(queued);
     }
 
     /// Re-highlight the entire document.
@@ -1000,15 +1010,34 @@ impl TextDocument {
     /// Call this when the highlighter's rules change (e.g., new keywords
     /// were added, spellcheck dictionary updated).
     pub fn rehighlight(&self) {
-        let mut inner = self.inner.lock();
-        inner.rehighlight_all();
+        let queued = {
+            let mut inner = self.inner.lock();
+            inner.rehighlight_all();
+            Self::queue_highlight_changed(&mut inner);
+            inner.take_queued_events()
+        };
+        crate::inner::dispatch_queued_events(queued);
     }
 
     /// Re-highlight a single block and cascade to subsequent blocks if
     /// the block state changes.
     pub fn rehighlight_block(&self, block_id: usize) {
-        let mut inner = self.inner.lock();
-        inner.rehighlight_from_block(block_id);
+        let queued = {
+            let mut inner = self.inner.lock();
+            inner.rehighlight_from_block(block_id);
+            Self::queue_highlight_changed(&mut inner);
+            inner.take_queued_events()
+        };
+        crate::inner::dispatch_queued_events(queued);
+    }
+
+    /// Queue the relayout/repaint notification for a highlight-only change.
+    fn queue_highlight_changed(inner: &mut TextDocumentInner) {
+        inner.queue_event(DocumentEvent::FormatChanged {
+            position: 0,
+            length: 0,
+            kind: crate::flow::FormatChangeKind::Character,
+        });
     }
 }
 
