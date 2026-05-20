@@ -518,7 +518,31 @@ impl TextDocument {
         &self,
         position: usize,
     ) -> Option<crate::flow::BlockSnapshot> {
+        self.snapshot_block_at_position_impl(position, true)
+    }
+
+    /// Like [`snapshot_block_at_position`](Self::snapshot_block_at_position)
+    /// but with **no highlights applied** — base fragments and empty
+    /// `paint_highlights`, regardless of the active highlighter. Used by the
+    /// incremental relayout path of a view that has opted out of highlights.
+    pub fn snapshot_block_at_position_without_highlights(
+        &self,
+        position: usize,
+    ) -> Option<crate::flow::BlockSnapshot> {
+        self.snapshot_block_at_position_impl(position, false)
+    }
+
+    fn snapshot_block_at_position_impl(
+        &self,
+        position: usize,
+        apply_highlights: bool,
+    ) -> Option<crate::flow::BlockSnapshot> {
         let inner = self.inner.lock();
+        let effective_kind = if apply_highlights {
+            inner.highlight_kind
+        } else {
+            crate::highlight::HighlighterKind::None
+        };
         let main_frame_id = get_main_frame_id(&inner);
 
         // Collect all block IDs in document order, traversing into nested frames
@@ -540,6 +564,7 @@ impl TextDocument {
                     &inner,
                     block_id,
                     Some(running_pos as usize),
+                    effective_kind,
                 );
             }
             running_pos = block_end + 1;
@@ -547,7 +572,7 @@ impl TextDocument {
 
         // Fallback to last block
         if let Some(&last_id) = ordered_block_ids.last() {
-            return crate::text_block::build_block_snapshot(&inner, last_id);
+            return crate::text_block::build_block_snapshot(&inner, last_id, effective_kind);
         }
         None
     }
@@ -663,7 +688,28 @@ impl TextDocument {
     pub fn snapshot_flow(&self) -> crate::flow::FlowSnapshot {
         let inner = self.inner.lock();
         let main_frame_id = get_main_frame_id(&inner);
-        let elements = crate::text_frame::build_flow_snapshot(&inner, main_frame_id);
+        let elements =
+            crate::text_frame::build_flow_snapshot(&inner, main_frame_id, inner.highlight_kind);
+        crate::flow::FlowSnapshot { elements }
+    }
+
+    /// Snapshot the entire main flow with **no highlights applied** — base
+    /// fragments and empty `paint_highlights` on every block, regardless of
+    /// the active syntax highlighter.
+    ///
+    /// This is the per-view opt-out: a read-only viewer that should stay
+    /// free of search / spell / syntax highlighting pulls *this* snapshot
+    /// instead of [`snapshot_flow`](Self::snapshot_flow). Because suppression
+    /// happens at build time, it works for metric-affecting highlighters too
+    /// (whose highlights are otherwise merged into `fragments` irreversibly).
+    pub fn snapshot_flow_without_highlights(&self) -> crate::flow::FlowSnapshot {
+        let inner = self.inner.lock();
+        let main_frame_id = get_main_frame_id(&inner);
+        let elements = crate::text_frame::build_flow_snapshot(
+            &inner,
+            main_frame_id,
+            crate::highlight::HighlighterKind::None,
+        );
         crate::flow::FlowSnapshot { elements }
     }
 

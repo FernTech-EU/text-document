@@ -94,16 +94,15 @@ impl TextTable {
     /// All cells with block snapshots. O(c·k).
     pub fn snapshot(&self) -> TableSnapshot {
         let inner = self.doc.lock();
-        crate::text_frame::build_table_snapshot(&inner, self.table_id as u64).unwrap_or_else(|| {
-            TableSnapshot {
+        crate::text_frame::build_table_snapshot(&inner, self.table_id as u64, inner.highlight_kind)
+            .unwrap_or_else(|| TableSnapshot {
                 table_id: self.table_id,
                 rows: 0,
                 columns: 0,
                 column_widths: Vec::new(),
                 format: TableFormat::default(),
                 cells: Vec::new(),
-            }
-        })
+            })
     }
 }
 
@@ -229,7 +228,11 @@ impl TextTableCell {
         };
 
         match cell_dto.cell_frame {
-            Some(frame_id) => crate::text_block::build_blocks_snapshot_for_frame(&inner, frame_id),
+            Some(frame_id) => crate::text_block::build_blocks_snapshot_for_frame(
+                &inner,
+                frame_id,
+                inner.highlight_kind,
+            ),
             None => Vec::new(),
         }
     }

@@ -699,6 +699,79 @@ fn highlight_visible_in_flow_snapshot() {
     }
 }
 
+// ── "without highlights" snapshots (per-view opt-out) ────────────
+
+fn has_bold_fragment(frags: &[FragmentContent]) -> bool {
+    frags.iter().any(
+        |f| matches!(f, FragmentContent::Text { format, .. } if format.font_bold == Some(true)),
+    )
+}
+
+#[test]
+fn clean_flow_snapshot_drops_paint_only_spans() {
+    let doc = new_doc("Hello");
+    let red = Color::rgb(255, 0, 0);
+    doc.set_syntax_highlighter(Some(Arc::new(ColorAllHighlighter { color: red })));
+
+    // Full snapshot carries the paint overlay…
+    match &doc.snapshot_flow().elements[0] {
+        FlowElementSnapshot::Block(bs) => assert_eq!(bs.paint_highlights.len(), 1),
+        _ => panic!("expected block snapshot"),
+    }
+    // …the clean snapshot does not.
+    match &doc.snapshot_flow_without_highlights().elements[0] {
+        FlowElementSnapshot::Block(bs) => assert!(bs.paint_highlights.is_empty()),
+        _ => panic!("expected block snapshot"),
+    }
+}
+
+#[test]
+fn clean_flow_snapshot_keeps_base_fragments_under_metric_highlighter() {
+    let doc = new_doc("Hello");
+    doc.set_syntax_highlighter(Some(Arc::new(WordBoldHighlighter {
+        word: "Hello".into(),
+    })));
+
+    // Full snapshot merges bold into the shaping input…
+    match &doc.snapshot_flow().elements[0] {
+        FlowElementSnapshot::Block(bs) => assert!(
+            has_bold_fragment(&bs.fragments),
+            "metric highlighter should merge bold into full-snapshot fragments"
+        ),
+        _ => panic!("expected block snapshot"),
+    }
+    // …the clean snapshot has BASE fragments (no bold). For a metric
+    // highlighter this only works because suppression happens at build
+    // time — the merged fragments are otherwise irreversible.
+    match &doc.snapshot_flow_without_highlights().elements[0] {
+        FlowElementSnapshot::Block(bs) => {
+            assert!(
+                !has_bold_fragment(&bs.fragments),
+                "clean snapshot must not carry the metric highlight"
+            );
+            assert!(bs.paint_highlights.is_empty());
+        }
+        _ => panic!("expected block snapshot"),
+    }
+}
+
+#[test]
+fn clean_block_at_position_without_highlights_is_clean() {
+    let doc = new_doc("Hello");
+    doc.set_syntax_highlighter(Some(Arc::new(WordBoldHighlighter {
+        word: "Hello".into(),
+    })));
+
+    let full = doc.snapshot_block_at_position(0).expect("block at 0");
+    assert!(has_bold_fragment(&full.fragments));
+
+    let clean = doc
+        .snapshot_block_at_position_without_highlights(0)
+        .expect("block at 0");
+    assert!(!has_bold_fragment(&clean.fragments));
+    assert!(clean.paint_highlights.is_empty());
+}
+
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 // set_syntax_highlighter / rehighlight tests
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
