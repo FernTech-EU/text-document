@@ -87,7 +87,11 @@ fn assert_backspace_lands_in(md: &str, needle: &str, expected_after_fragment: &s
 #[test]
 fn backspace_in_depth2_blockquote() {
     // "Nested" + caret@5 → delete index 4 ('e') → "Nestd".
-    assert_backspace_lands_in(MD, "Nested blockquote at depth 2", "Nestd blockquote at depth 2");
+    assert_backspace_lands_in(
+        MD,
+        "Nested blockquote at depth 2",
+        "Nestd blockquote at depth 2",
+    );
 }
 
 #[test]
@@ -106,10 +110,18 @@ fn backspace_after_table_with_blockquotes_present() {
     // "Trailing paragraph" sits AFTER the table; its flow position is past the
     // table's inline cells + the anchor sentinel. The edit must still land in
     // it. "Trailing" + caret@5 → delete index 4 ('l') → "Traiing".
-    assert_backspace_lands_in(MD_WITH_TABLE, "Trailing paragraph at the end", "Traiing paragraph at the end");
+    assert_backspace_lands_in(
+        MD_WITH_TABLE,
+        "Trailing paragraph at the end",
+        "Traiing paragraph at the end",
+    );
 }
 
 #[test]
 fn backspace_in_trailing_paragraph_no_table() {
-    assert_backspace_lands_in(MD, "Trailing paragraph at the end", "Traiing paragraph at the end");
+    assert_backspace_lands_in(
+        MD,
+        "Trailing paragraph at the end",
+        "Traiing paragraph at the end",
+    );
 }

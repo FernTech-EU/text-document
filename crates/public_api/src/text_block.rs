@@ -310,7 +310,7 @@ impl TextBlock {
         let inner = self.doc.lock();
         let fragments = build_raw_fragments(&inner, self.block_id as u64, None);
         if let Some(ref hl) = inner.highlight
-            && let Some(block_hl) = hl.blocks.get(&(self.block_id as usize))
+            && let Some(block_hl) = hl.blocks.get(&{ self.block_id })
             && !block_hl.spans.is_empty()
         {
             return crate::highlight::merge_highlight_spans(fragments, &block_hl.spans);

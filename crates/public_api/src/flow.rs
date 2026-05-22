@@ -330,6 +330,10 @@ pub struct FlowSnapshot {
 }
 
 /// Snapshot of one flow element.
+// `Block` is by far the most common variant in a document flow, so boxing it
+// to shrink the enum would add a heap allocation on the hot path for no real
+// gain — the large-variant cost only bites the rare `Table`/`Frame` elements.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq)]
 pub enum FlowElementSnapshot {
     Block(BlockSnapshot),

@@ -480,16 +480,17 @@ fn execute_insert_table(
             .block_offsets
             .read()
             .unwrap()
-            .range_of(common::database::block_offset_index::OffsetMarker::TableAnchor(
-                created_table.id,
-            ))
+            .range_of(
+                common::database::block_offset_index::OffsetMarker::TableAnchor(created_table.id),
+            )
             .map(|(start, _)| start);
         if let Some(anchor_start) = anchor_start {
             const SENTINEL_BYTES: u32 = 3; // U+FFFC
-            let mut byte_pos = anchor_start + SENTINEL_BYTES;
-            for cell_block in cell_blocks.iter() {
+            // byte_pos advances by 1 per cell: one `\n` boundary; empty cell
+            // content adds 0.
+            for (byte_pos, cell_block) in (anchor_start + SENTINEL_BYTES..).zip(cell_blocks.iter())
+            {
                 rope_insert_block_at(&store, byte_pos, cell_block.id, "");
-                byte_pos += 1; // one `\n` boundary; empty cell content adds 0
             }
         }
     }

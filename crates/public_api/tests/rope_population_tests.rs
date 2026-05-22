@@ -242,7 +242,10 @@ fn insert_table_inserts_sentinel_and_cells_inline_in_rope() {
     assert_eq!(offsets.entries.len(), 8);
     // Index order is now flow order: alpha, TableAnchor, [4 cells], beta, gamma
     assert!(offsets.entries[0].0.is_block(), "alpha");
-    assert!(offsets.entries[1].0.as_table_anchor().is_some(), "table anchor");
+    assert!(
+        offsets.entries[1].0.as_table_anchor().is_some(),
+        "table anchor"
+    );
     assert!(offsets.entries[2].0.is_block(), "cell (0,0)");
     assert!(offsets.entries[3].0.is_block(), "cell (0,1)");
     assert!(offsets.entries[4].0.is_block(), "cell (1,0)");
