@@ -544,6 +544,21 @@ impl TextDocument {
             crate::highlight::HighlighterKind::None
         };
         let main_frame_id = get_main_frame_id(&inner);
+        let store = inner.ctx.db_context.get_store();
+
+        // Rope-authoritative fast path. When every block is mirrored to the
+        // rope (now true with tables — see `rope_positions_match_flow`), the
+        // rope IS the position space the snapshot reports in, so we must also
+        // *locate* the block via the rope. Walking a hand-rolled `running_pos`
+        // here instead would search in the old cells-inline-no-sentinel space
+        // and then report the rope position — an off-by-the-sentinel mismatch
+        // for any block after a table.
+        if common::database::rope_helpers::rope_positions_match_flow(store)
+            && let Some((block_id, _, _)) =
+                common::database::rope_helpers::find_block_at_char_position(store, position as i64)
+        {
+            return crate::text_block::build_block_snapshot(&inner, block_id, effective_kind);
+        }
 
         // Collect all block IDs in document order, traversing into nested frames
         let ordered_block_ids = collect_frame_block_ids(&inner, main_frame_id)?;
@@ -551,7 +566,6 @@ impl TextDocument {
         // Walk blocks computing positions on the fly
         let pos = position as i64;
         let mut running_pos: i64 = 0;
-        let store = inner.ctx.db_context.get_store();
         for &block_id in &ordered_block_ids {
             let block_dto = block_commands::get_block(&inner.ctx, &block_id)
                 .ok()

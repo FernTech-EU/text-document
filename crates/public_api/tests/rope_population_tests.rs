@@ -214,7 +214,7 @@ fn cross_block_delete_merges_in_rope() {
 }
 
 #[test]
-fn insert_table_inserts_sentinel_and_appends_cells_in_rope() {
+fn insert_table_inserts_sentinel_and_cells_inline_in_rope() {
     // Three-block doc; insert a 2x2 table between block 1 and block 2.
     let doc = TextDocument::new();
     doc.set_plain_text("alpha\nbeta\ngamma").unwrap();
@@ -227,34 +227,38 @@ fn insert_table_inserts_sentinel_and_appends_cells_in_rope() {
 
     let store = doc.rope_store_for_test();
     let rope = store.rope.read().unwrap();
-    // Expected: main flow "alpha\n\u{FFFC}\nbeta\ngamma" (20 bytes)
-    //           + 4 empty cells each preceded by a `\n` boundary
-    //           → "alpha\n\u{FFFC}\nbeta\ngamma\n\n\n\n" (24 bytes)
-    assert_eq!(rope.to_string(), "alpha\n\u{FFFC}\nbeta\ngamma\n\n\n\n");
+    // The table anchor sentinel AND its 4 empty cells are spliced INLINE,
+    // right where the table sits in the flow (before "beta"), NOT appended
+    // at the end of the rope. This keeps the rope's char order identical to
+    // the document/flow order, so the editor's caret space and the editing
+    // path agree (and cursor navigation can move through the table).
+    //   "alpha\n" + U+FFFC + sentinel-`\n` + 4×(cell-boundary `\n` + empty)
+    //   + "beta\ngamma"
+    //   = "alpha\n\u{FFFC}\n\n\n\n\nbeta\ngamma" (24 bytes)
+    assert_eq!(rope.to_string(), "alpha\n\u{FFFC}\n\n\n\n\nbeta\ngamma");
 
     let offsets = store.block_offsets.read().unwrap();
     // 3 main blocks + 1 TableAnchor + 4 cell blocks = 8 entries
     assert_eq!(offsets.entries.len(), 8);
-    // Main flow: alpha, TableAnchor, beta, gamma
-    assert!(offsets.entries[0].0.is_block());
-    assert!(offsets.entries[1].0.as_table_anchor().is_some());
-    assert!(offsets.entries[2].0.is_block());
-    assert!(offsets.entries[3].0.is_block());
-    // Cell area: 4 empty cell blocks in row-major order
-    assert!(offsets.entries[4].0.is_block());
-    assert!(offsets.entries[5].0.is_block());
-    assert!(offsets.entries[6].0.is_block());
-    assert!(offsets.entries[7].0.is_block());
-    // Byte starts for main flow: 0, 6, 10, 15
+    // Index order is now flow order: alpha, TableAnchor, [4 cells], beta, gamma
+    assert!(offsets.entries[0].0.is_block(), "alpha");
+    assert!(offsets.entries[1].0.as_table_anchor().is_some(), "table anchor");
+    assert!(offsets.entries[2].0.is_block(), "cell (0,0)");
+    assert!(offsets.entries[3].0.is_block(), "cell (0,1)");
+    assert!(offsets.entries[4].0.is_block(), "cell (1,0)");
+    assert!(offsets.entries[5].0.is_block(), "cell (1,1)");
+    assert!(offsets.entries[6].0.is_block(), "beta");
+    assert!(offsets.entries[7].0.is_block(), "gamma");
+    // Byte starts: alpha=0, anchor=6 (U+FFFC), cells inline at 10..=13,
+    // then beta=14, gamma=19.
     assert_eq!(offsets.entries[0].1, 0);
     assert_eq!(offsets.entries[1].1, 6);
     assert_eq!(offsets.entries[2].1, 10);
-    assert_eq!(offsets.entries[3].1, 15);
-    // Cells: 21, 22, 23, 24 (each preceded by a 1-byte boundary)
-    assert_eq!(offsets.entries[4].1, 21);
-    assert_eq!(offsets.entries[5].1, 22);
-    assert_eq!(offsets.entries[6].1, 23);
-    assert_eq!(offsets.entries[7].1, 24);
+    assert_eq!(offsets.entries[3].1, 11);
+    assert_eq!(offsets.entries[4].1, 12);
+    assert_eq!(offsets.entries[5].1, 13);
+    assert_eq!(offsets.entries[6].1, 14);
+    assert_eq!(offsets.entries[7].1, 19);
     assert_eq!(offsets.total_bytes(), 24);
 }
 

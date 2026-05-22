@@ -3,7 +3,7 @@ use crate::InsertTableResultDto;
 use anyhow::{Result, anyhow};
 use common::database::CommandUnitOfWork;
 use common::database::rope_helpers::{
-    block_char_length, rope_insert_block_at, rope_insert_table_anchor, top_level_frame_end_byte,
+    block_char_length, rope_insert_block_at, rope_insert_table_anchor,
 };
 use common::direct_access::document::document_repository::DocumentRelationshipField;
 use common::direct_access::frame::frame_repository::FrameRelationshipField;
@@ -456,36 +456,50 @@ fn execute_insert_table(
         uow.update_block_multi(&blocks_to_update)?;
     }
 
-    // Mirror cell-block creation into the global rope. Per plan §1.6
-    // cells of a table live AT THE END of the containing top-level
-    // frame's rope range — ideally BEFORE any following top-level
-    // frame's content. Each cell is preceded by a `\n` boundary.
+    // Mirror cell-block creation into the global rope INLINE, immediately
+    // after the table-anchor sentinel — matching the markdown importer's
+    // layout. This keeps the rope's char order identical to the document
+    // (flow) order: `… host content, U+FFFC table sentinel, cellA, cellB, …,
+    // following content`. Flow positions are derived from this same rope
+    // (see `text_block::build_block_snapshot_with_position_and_parent`), so
+    // the editor's caret space and the editing path's resolution agree —
+    // including cursor navigation INTO the table, which a frame-end cell
+    // layout (cells parked after all following content in rope order) would
+    // break.
     //
-    // The anchor sentinel was just inserted, so the top-level frame's
-    // current end byte (computed fresh from block_offsets, not from
-    // the stale Frame.byte_range) already includes that sentinel.
+    // The sentinel is `U+FFFC` (3 bytes) starting at the TableAnchor marker's
+    // byte; we splice the cells in just past it. `rope_insert_block_at`
+    // prepends a `\n` boundary per cell and shifts following entries, so
+    // advancing `byte_pos` by `1 + content_len` per cell lays them out
+    // contiguously. Newly-created cells are empty (`content_len == 0`).
     //
-    // LIMITATION (deferred): when a following top-level frame's content
-    // coincides with frame 1's end byte (typical when the following
-    // frame's first block is empty), `rope_insert_block_at`'s shift
-    // semantics leave the following entry at the colliding byte and
-    // place the cell at byte_pos+1 — so cells end up AFTER the
-    // following frame in the rope. Real public-API workloads do not
-    // currently produce multi-top-level-frame docs, so this layout
-    // anomaly is invisible to users.
-    //
-    // No-op under default backend.
+    // No-op under a backend that doesn't register the anchor.
     {
         let store = uow.store();
-        let start_byte = top_level_frame_end_byte(&store, parent_frame_id);
-        for (next_byte, cell_block) in (start_byte..).zip(cell_blocks.iter()) {
-            // Newly-created cells via `create_cell_frame` are empty,
-            // so we know the content is "" — no need to read from the
-            // store/entity (the block hasn't been registered in the
-            // rope yet anyway).
-            rope_insert_block_at(&store, next_byte, cell_block.id, "");
+        let anchor_start = store
+            .block_offsets
+            .read()
+            .unwrap()
+            .range_of(common::database::block_offset_index::OffsetMarker::TableAnchor(
+                created_table.id,
+            ))
+            .map(|(start, _)| start);
+        if let Some(anchor_start) = anchor_start {
+            const SENTINEL_BYTES: u32 = 3; // U+FFFC
+            let mut byte_pos = anchor_start + SENTINEL_BYTES;
+            for cell_block in cell_blocks.iter() {
+                rope_insert_block_at(&store, byte_pos, cell_block.id, "");
+                byte_pos += 1; // one `\n` boundary; empty cell content adds 0
+            }
         }
     }
+    // NB: the stored `document_position` written for the cells (step 4) and
+    // for the shifted following blocks (step 5) is now in the OLD running-
+    // counter space, which omits the sentinel. That is harmless: with the
+    // cells mirrored inline the rope is authoritative, so every read path
+    // (`build_block_snapshot…` and `find_block_at_char_position`) re-derives
+    // positions from the rope and ignores the stale stored field. The stored
+    // writes still matter for the rope-unavailable backend, so they stay.
 
     // 5. Shift document_position for all blocks that end up positioned
     // at or past the new table's first cell. Use `cell_start_pos` (not

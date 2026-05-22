@@ -94,12 +94,14 @@ pub fn block_document_position(block: &Block, store: &Store) -> i64 {
 /// stored field, and the loops are required to keep it correct.
 pub fn rope_positions_match_flow(store: &Store) -> bool {
     let offsets = store.block_offsets.read().unwrap();
-    if offsets.table_anchor_count() > 0 {
-        return false;
-    }
-    // With no table anchors, every entry is a Block marker, so
-    // `entries.len()` equals the indexed block count.
-    let indexed_block_count = offsets.entries.len();
+    // The rope is authoritative as long as EVERY block is mirrored into it.
+    // Tables no longer disqualify it: cell content is mirrored inline, in
+    // document order, and the table itself occupies a 1-char anchor sentinel
+    // — so the rope's char space matches the user-visible flow order. (The
+    // flow snapshot derives its block positions from this same rope space,
+    // so the two agree by construction.) Only count Block markers; the
+    // TableAnchor sentinel entries are not blocks.
+    let indexed_block_count = offsets.entries.iter().filter(|(m, _)| m.is_block()).count();
     drop(offsets);
     let total_block_count = store.blocks.read().unwrap().len();
     indexed_block_count == total_block_count
@@ -138,13 +140,13 @@ pub fn find_block_at_char_position(store: &Store, position: i64) -> Option<(Enti
     //    counts: if the rope index has fewer Block markers than the
     //    store has Block entities, some are unmirrored.
     let offsets = store.block_offsets.read().unwrap();
-    if offsets.table_anchor_count() > 0 {
-        return None;
-    }
-    // No table anchors → every entry is a Block marker, so the indexed
-    // block count is simply `entries.len()`. O(1) instead of an O(N)
-    // filter-count on every keystroke.
-    let indexed_block_count = offsets.entries.len();
+    // Valid as long as every block is mirrored to the rope. Tables are fine:
+    // cell content is mirrored inline in document order and the table is a
+    // 1-char anchor sentinel, so byte→block lookup resolves correctly for any
+    // non-sentinel position. A position that lands exactly on the sentinel
+    // resolves to a TableAnchor marker, where `as_block()` returns None and
+    // the caller falls back to the slow walk. Only count Block markers.
+    let indexed_block_count = offsets.entries.iter().filter(|(m, _)| m.is_block()).count();
     let total_block_count = store.blocks.read().unwrap().len();
     if indexed_block_count != total_block_count {
         return None;

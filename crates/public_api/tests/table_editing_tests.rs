@@ -355,13 +355,15 @@ fn inserted_3x3_with_surrounding_text() -> TextDocument {
     doc.set_plain_text("Before").unwrap();
     let cursor = doc.cursor_at(6);
     cursor.insert_table(3, 3).unwrap();
-    // Position immediately past the table's last cell in the
-    // snapshot's position space (one separator + 9 empty cells, each
-    // 1 position). `cursor_at(character_count())` would still report
-    // 6 because empty cells do not contribute to character_count;
-    // walk past the table explicitly so the "After" block lands
-    // *after* the table, matching what a user would intuit.
-    let after_table = 6 + 1 + 9;
+    // Position immediately past the table's last cell, derived from the
+    // snapshot's actual position space rather than hard-coded arithmetic.
+    // (The rope-canonical model represents the table itself as a 1-char
+    // U+FFFC anchor sentinel, so "6 + 1 separator + 9 cells" no longer
+    // names the spot just past the table — the last cell's reported
+    // position + 1 does, independent of the sentinel footprint.)
+    let (last_cell_pos, last_cell_len) =
+        cell_block_position(&doc, 2, 2).expect("3x3 has a (2,2) cell");
+    let after_table = last_cell_pos + last_cell_len + 1;
     let cursor2 = doc.cursor_at(after_table);
     cursor2.insert_block().unwrap();
     cursor2.insert_text("After").unwrap();
@@ -497,11 +499,16 @@ fn inserted_2x2_at_start_of_block_lands_before_it() {
         4,
         "2x2 table should yield 4 empty cell blocks; got {cell_positions:?}"
     );
-    // Cells should occupy a contiguous run starting at 0 (the
-    // cursor's position), each one boundary past the previous.
+    // The table sits at the document start: its cells are the earliest
+    // content (only the table's own 1-char anchor sentinel precedes them),
+    // contiguous, each one boundary past the previous. We assert "earliest
+    // content" via the minimum block position rather than a literal 0,
+    // because in the rope-canonical model the sentinel occupies position 0
+    // and the cells follow it.
+    let min_pos = positions.iter().map(|(p, _, _)| *p).min().unwrap();
     assert_eq!(
-        cell_positions[0], 0,
-        "first cell of insert_table at offset 0 should sit at the cursor's position (0)"
+        cell_positions[0], min_pos,
+        "the table (cells) should be the first content in the document; positions={positions:?}"
     );
     for w in cell_positions.windows(2) {
         assert_eq!(
@@ -534,10 +541,12 @@ fn inserted_2x2_at_start_of_block_lands_before_it() {
 
 #[test]
 fn inserted_2x2_in_empty_document_starts_at_zero() {
-    // Empty doc still has an implicit empty block at position 0
-    // (TextDocument::new() creates it). insert_table at offset 0 of
-    // that empty block produces cells at positions 0..3 in row-major
-    // order, with the implicit empty block displaced past the table.
+    // Empty doc still has an implicit empty block (TextDocument::new()
+    // creates it). insert_table at offset 0 produces a contiguous run of
+    // cells at the document start, with the implicit empty block displaced
+    // past the table. In the rope-canonical model the table's 1-char anchor
+    // sentinel occupies the very first position, so the cells start just
+    // past it (not at a literal 0) — assert ordering/contiguity instead.
     let doc = TextDocument::new();
     let cursor = doc.cursor_at(0);
     cursor.insert_table(2, 2).unwrap();
@@ -548,9 +557,10 @@ fn inserted_2x2_in_empty_document_starts_at_zero() {
         .take(4) // first four entries are the cells in row-major order
         .map(|(p, _, _)| *p)
         .collect();
+    let min_pos = positions.iter().map(|(p, _, _)| *p).min().unwrap();
     assert_eq!(
-        cell_positions[0], 0,
-        "first cell of insert_table in empty doc should sit at 0; positions: {positions:?}"
+        cell_positions[0], min_pos,
+        "the table's cells should be the first content in the empty doc; positions: {positions:?}"
     );
     for w in cell_positions.windows(2) {
         assert_eq!(
@@ -559,6 +569,11 @@ fn inserted_2x2_in_empty_document_starts_at_zero() {
             "cells should be contiguous; positions: {positions:?}"
         );
     }
+    // The implicit empty block is displaced to after the table's cells.
+    assert!(
+        positions.len() >= 5 && positions[4].0 > cell_positions[3],
+        "the implicit empty block should sit after the table; positions: {positions:?}"
+    );
     // Typing in cell (0,0) should land in cell (0,0).
     let (p00, l00) = cell_block_position(&doc, 0, 0).expect("cell (0,0)");
     let c = doc.cursor_at(p00 + l00);
@@ -849,13 +864,18 @@ fn inserted_2x2_deep_in_long_block_lands_after_block() {
         .filter_map(|(p, _, t)| if t.is_empty() { Some(*p) } else { None })
         .collect();
     assert_eq!(cell_positions.len(), 4, "2x2 → 4 cells");
-    assert_eq!(
-        cell_positions[0],
-        host_pos + host_len + 1,
-        "cells should start one boundary past the host block's end \
-         (host_pos={host_pos}, host_len={host_len}, cell_positions={cell_positions:?}) — \
-         this is the regression where the cursor's offset within the host caused cells \
-         to land at `insert_pos + 1` instead of `host_end + 1`"
+    // Cells must start strictly PAST the host block's end, not at the
+    // cursor's offset inside it. The original regression placed cells at
+    // `insert_pos + 1` (= 6, well inside the 26-char host), so asserting
+    // `cell_positions[0] > host_pos + host_len` catches it independently of
+    // the cursor offset. (We no longer assert the exact `host_end + 1`: the
+    // rope-canonical model inserts the table's 1-char anchor sentinel
+    // between the host and its cells, a constant footprint that does not
+    // depend on the cursor offset — which is what this test actually guards.)
+    assert!(
+        cell_positions[0] > host_pos + host_len,
+        "cells should start past the host block's end, not inside it \
+         (host_pos={host_pos}, host_len={host_len}, cell_positions={cell_positions:?})"
     );
     for w in cell_positions.windows(2) {
         assert_eq!(w[1], w[0] + 1, "cells contiguous: {cell_positions:?}");

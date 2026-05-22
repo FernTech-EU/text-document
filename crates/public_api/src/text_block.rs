@@ -954,7 +954,21 @@ pub(crate) fn build_block_snapshot_with_position_and_parent(
         .map(|id| id as usize);
     let table_cell = find_table_cell_context(inner, block_id);
 
-    let position = computed_position.unwrap_or_else(|| to_usize(block_dto.document_position));
+    // The flow-snapshot position MUST agree with the space the editing path
+    // resolves cursor positions against. When the rope mirrors every block
+    // (now true even with tables, since cell content is mirrored inline), the
+    // rope is the single source of truth: its char order — including the
+    // 1-char table-anchor sentinel — is what `find_block_at_char_position`
+    // uses. So derive `position` from the rope-refreshed `document_position`
+    // (set above) rather than the caller's running counter, which omits the
+    // sentinel and would drift past every table. Only when the rope is NOT
+    // authoritative (programmatically-inserted sub-frames whose blocks aren't
+    // mirrored) do we fall back to the caller's computed running position.
+    let position = if common::database::rope_helpers::rope_positions_match_flow(store_for_pos) {
+        to_usize(block_dto.document_position)
+    } else {
+        computed_position.unwrap_or_else(|| to_usize(block_dto.document_position))
+    };
 
     // Materialize the block text once and pass it to build_fragments
     // and into the snapshot's `text` field — saves one redundant rope
