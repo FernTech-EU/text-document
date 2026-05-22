@@ -1632,7 +1632,7 @@ dependencies = [
 
 [[package]]
 name = "text-document"
-version = "1.5.4"
+version = "1.5.5"
 dependencies = [
  "anyhow",
  "base64",
@@ -1649,7 +1649,7 @@ dependencies = [
 
 [[package]]
 name = "text-document-cli"
-version = "1.5.4"
+version = "1.5.5"
 dependencies = [
  "anyhow",
  "clap",
@@ -1658,7 +1658,7 @@ dependencies = [
 
 [[package]]
 name = "text-document-common"
-version = "1.5.4"
+version = "1.5.5"
 dependencies = [
  "anyhow",
  "chrono",
@@ -1678,7 +1678,7 @@ dependencies = [
 
 [[package]]
 name = "text-document-direct-access"
-version = "1.5.4"
+version = "1.5.5"
 dependencies = [
  "anyhow",
  "chrono",
@@ -1691,7 +1691,7 @@ dependencies = [
 
 [[package]]
 name = "text-document-editing"
-version = "1.5.4"
+version = "1.5.5"
 dependencies = [
  "anyhow",
  "chrono",
@@ -1705,7 +1705,7 @@ dependencies = [
 
 [[package]]
 name = "text-document-formatting"
-version = "1.5.4"
+version = "1.5.5"
 dependencies = [
  "anyhow",
  "chrono",
@@ -1719,7 +1719,7 @@ dependencies = [
 
 [[package]]
 name = "text-document-frontend"
-version = "1.5.4"
+version = "1.5.5"
 dependencies = [
  "anyhow",
  "chrono",
@@ -1736,7 +1736,7 @@ dependencies = [
 
 [[package]]
 name = "text-document-inspection"
-version = "1.5.4"
+version = "1.5.5"
 dependencies = [
  "anyhow",
  "chrono",
@@ -1752,7 +1752,7 @@ dependencies = [
 
 [[package]]
 name = "text-document-io"
-version = "1.5.4"
+version = "1.5.5"
 dependencies = [
  "anyhow",
  "chrono",
@@ -1768,7 +1768,7 @@ dependencies = [
 
 [[package]]
 name = "text-document-macros"
-version = "1.5.4"
+version = "1.5.5"
 dependencies = [
  "heck",
  "proc-macro2",
@@ -1778,7 +1778,7 @@ dependencies = [
 
 [[package]]
 name = "text-document-search"
-version = "1.5.4"
+version = "1.5.5"
 dependencies = [
  "anyhow",
  "chrono",
@@ -1794,7 +1794,7 @@ dependencies = [
 
 [[package]]
 name = "text-document-test-harness"
-version = "1.5.4"
+version = "1.5.5"
 dependencies = [
  "anyhow",
  "text-document-common",
