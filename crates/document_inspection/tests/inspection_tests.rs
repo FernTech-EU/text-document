@@ -288,52 +288,66 @@ fn test_get_block_at_position_in_table_cells() -> Result<()> {
         },
     )?;
 
-    // Document layout after insert (running positions):
-    //   "Hi" block            : start=0, len=2
-    //   cell(0,0) block       : start=3, len=0
-    //   cell(0,1) block       : start=4, len=0
-    //   cell(1,0) block       : start=5, len=0
-    //   cell(1,1) block       : start=6, len=0
+    // Document layout after insert (rope-canonical positions). The table
+    // occupies a 1-char U+FFFC anchor sentinel between "Hi" and its cells, so
+    // the cells start past that sentinel rather than immediately after "Hi":
+    //   "Hi" block      : start=0, len=2  (block_number 0)
+    //   (table anchor sentinel gap)
+    //   cell(0,0) block : start=5, len=0  (block_number 1)
+    //   cell(0,1) block : start=6, len=0  (block_number 2)
+    //   cell(1,0) block : start=7, len=0  (block_number 3)
+    //   cell(1,1) block : start=8, len=0  (block_number 4)
 
-    // Separator after "Hi" folds into cell(0,0).
-    let at_sep = document_inspection_controller::get_block_at_position(
+    // The position at the end of "Hi" (its trailing boundary) resolves to "Hi"
+    // itself — the table sentinel now sits between "Hi" and the first cell.
+    let at_hi_end = document_inspection_controller::get_block_at_position(
         &db_context,
         &event_hub,
         &GetBlockAtPositionDto { position: 2 },
     )?;
-    assert_eq!(at_sep.block_number, 1);
-    assert_eq!(at_sep.block_start, 3);
-    assert_eq!(at_sep.block_length, 0);
+    assert_eq!(at_hi_end.block_number, 0);
+    assert_eq!(at_hi_end.block_start, 0);
+    assert_eq!(at_hi_end.block_length, 2);
+
+    // Exact cell(0,0) position.
+    let at_cell_00 = document_inspection_controller::get_block_at_position(
+        &db_context,
+        &event_hub,
+        &GetBlockAtPositionDto { position: 5 },
+    )?;
+    assert_eq!(at_cell_00.block_number, 1);
+    assert_eq!(at_cell_00.block_start, 5);
+    assert_eq!(at_cell_00.block_length, 0);
 
     // Exact cell(0,1) position.
     let at_cell_01 = document_inspection_controller::get_block_at_position(
         &db_context,
         &event_hub,
-        &GetBlockAtPositionDto { position: 4 },
+        &GetBlockAtPositionDto { position: 6 },
     )?;
     assert_eq!(at_cell_01.block_number, 2);
-    assert_eq!(at_cell_01.block_start, 4);
+    assert_eq!(at_cell_01.block_start, 6);
 
-    // Exact cell(1,1) position — confirms row-major traversal.
+    // Exact cell(1,1) position — confirms row-major traversal (block_number is
+    // the document block-order index, excluding the table-anchor sentinel).
     let at_cell_11 = document_inspection_controller::get_block_at_position(
         &db_context,
         &event_hub,
-        &GetBlockAtPositionDto { position: 6 },
+        &GetBlockAtPositionDto { position: 8 },
     )?;
     assert_eq!(at_cell_11.block_number, 4);
-    assert_eq!(at_cell_11.block_start, 6);
+    assert_eq!(at_cell_11.block_start, 8);
 
-    // Cells are visited in a different order than block IDs were assigned,
-    // so the four block_ids must still be distinct.
+    // The four cells are distinct blocks.
+    let at_cell_10 = document_inspection_controller::get_block_at_position(
+        &db_context,
+        &event_hub,
+        &GetBlockAtPositionDto { position: 7 },
+    )?;
     let mut cell_ids = vec![
-        at_sep.block_id,
-        document_inspection_controller::get_block_at_position(
-            &db_context,
-            &event_hub,
-            &GetBlockAtPositionDto { position: 5 },
-        )?
-        .block_id,
+        at_cell_00.block_id,
         at_cell_01.block_id,
+        at_cell_10.block_id,
         at_cell_11.block_id,
     ];
     cell_ids.sort();

@@ -82,12 +82,22 @@ impl GetBlockAtPositionUseCase {
                 }
             }
 
-            let block_number = store
-                .block_offsets
-                .read()
-                .unwrap()
-                .position_of(OffsetMarker::Block(block_id))
-                .unwrap_or(0) as i64;
+            // Document block-order index = number of Block markers preceding
+            // this one. Must exclude TableAnchor sentinel entries: the raw
+            // entry index counts them, which would inflate every block_number
+            // after a table (and run past the real block count).
+            let block_number = {
+                let offsets = store.block_offsets.read().unwrap();
+                offsets
+                    .position_of(OffsetMarker::Block(block_id))
+                    .map(|idx| {
+                        offsets.entries[..idx]
+                            .iter()
+                            .filter(|(m, _)| m.is_block())
+                            .count()
+                    })
+                    .unwrap_or(0) as i64
+            };
             uow.end_transaction()?;
             return Ok(BlockInfoDto {
                 block_id: block_id as i64,
