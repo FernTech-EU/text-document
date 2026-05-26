@@ -21,3 +21,6 @@ pub(crate) mod remove_table_column_uow;
 pub(crate) mod remove_table_row_uow;
 pub(crate) mod remove_table_uow;
 pub(crate) mod split_table_cell_uow;
+pub(crate) mod unwrap_block_from_frame_uow;
+pub(crate) mod unwrap_frame_uow;
+pub(crate) mod wrap_blocks_in_frame_uow;

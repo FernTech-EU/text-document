@@ -61,7 +61,8 @@ pub use operation::{DocxExportResult, HtmlImportResult, MarkdownImportResult, Op
 pub use flow::{
     BlockSnapshot, CellFormat, CellRange, CellSnapshot, CellVerticalAlignment, FlowElement,
     FlowElementSnapshot, FlowSnapshot, FormatChangeKind, FragmentContent, FrameSnapshot, ListInfo,
-    PaintHighlightSpan, SelectionKind, TableCellContext, TableCellRef, TableFormat, TableSnapshot,
+    FrameRef, PaintHighlightSpan, SelectionKind, TableCellContext, TableCellRef, TableFormat,
+    TableSnapshot,
 };
 pub use text_block::TextBlock;
 pub use text_frame::TextFrame;

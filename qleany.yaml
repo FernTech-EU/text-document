@@ -488,6 +488,81 @@ features:
             - name: frame_id
               type: integer
 
+      - name: wrap_blocks_in_frame
+        undoable: true
+        entities: [Document, Frame, Block]
+        dto_in:
+          name: WrapBlocksInFrameDto
+          fields:
+            - name: start_block_id
+              type: integer
+            - name: end_block_id
+              type: integer
+            - name: position
+              type: enum
+              enum_name: FramePosition
+              enum_values:
+                - InFlow
+                - FloatLeft
+                - FloatRight
+              optional: true
+            - name: top_margin
+              type: integer
+              optional: true
+            - name: bottom_margin
+              type: integer
+              optional: true
+            - name: left_margin
+              type: integer
+              optional: true
+            - name: right_margin
+              type: integer
+              optional: true
+            - name: padding
+              type: integer
+              optional: true
+            - name: border
+              type: integer
+              optional: true
+            - name: is_blockquote
+              type: boolean
+              optional: true
+        dto_out:
+          name: WrapBlocksInFrameResultDto
+          fields:
+            - name: new_frame_id
+              type: integer
+            - name: new_position
+              type: integer
+
+      - name: unwrap_frame
+        undoable: true
+        entities: [Document, Frame, Block]
+        dto_in:
+          name: UnwrapFrameDto
+          fields:
+            - name: frame_id
+              type: integer
+        dto_out:
+          name: UnwrapFrameResultDto
+          fields:
+            - name: new_position
+              type: integer
+
+      - name: unwrap_block_from_frame
+        undoable: true
+        entities: [Document, Frame, Block]
+        dto_in:
+          name: UnwrapBlockFromFrameDto
+          fields:
+            - name: block_id
+              type: integer
+        dto_out:
+          name: UnwrapBlockFromFrameResultDto
+          fields:
+            - name: new_position
+              type: integer
+
       - name: insert_formatted_text
         undoable: true
         entities: [Document, Frame, Block]

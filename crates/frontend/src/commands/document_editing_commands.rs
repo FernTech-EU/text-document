@@ -15,7 +15,8 @@ use document_editing::{
     InsertTextDto, InsertTextResultDto, MergeTableCellsDto, MergeTableCellsResultDto,
     RemoveBlockFromListDto, RemoveTableColumnDto, RemoveTableColumnResultDto, RemoveTableDto,
     RemoveTableRowDto, RemoveTableRowResultDto, SplitTableCellDto, SplitTableCellResultDto,
-    document_editing_controller,
+    UnwrapBlockFromFrameDto, UnwrapBlockFromFrameResultDto, UnwrapFrameDto, UnwrapFrameResultDto,
+    WrapBlocksInFrameDto, WrapBlocksInFrameResultDto, document_editing_controller,
 };
 
 pub fn insert_text(
@@ -348,4 +349,52 @@ pub fn remove_block_from_list(
         dto,
     )
     .context("remove_block_from_list")
+}
+
+pub fn wrap_blocks_in_frame(
+    ctx: &AppContext,
+    stack_id: Option<u64>,
+    dto: &WrapBlocksInFrameDto,
+) -> Result<WrapBlocksInFrameResultDto> {
+    let mut undo_redo_manager = ctx.undo_redo_manager.lock().unwrap();
+    document_editing_controller::wrap_blocks_in_frame(
+        &ctx.db_context,
+        &ctx.event_hub,
+        &mut undo_redo_manager,
+        stack_id,
+        dto,
+    )
+    .context("wrap_blocks_in_frame")
+}
+
+pub fn unwrap_frame(
+    ctx: &AppContext,
+    stack_id: Option<u64>,
+    dto: &UnwrapFrameDto,
+) -> Result<UnwrapFrameResultDto> {
+    let mut undo_redo_manager = ctx.undo_redo_manager.lock().unwrap();
+    document_editing_controller::unwrap_frame(
+        &ctx.db_context,
+        &ctx.event_hub,
+        &mut undo_redo_manager,
+        stack_id,
+        dto,
+    )
+    .context("unwrap_frame")
+}
+
+pub fn unwrap_block_from_frame(
+    ctx: &AppContext,
+    stack_id: Option<u64>,
+    dto: &UnwrapBlockFromFrameDto,
+) -> Result<UnwrapBlockFromFrameResultDto> {
+    let mut undo_redo_manager = ctx.undo_redo_manager.lock().unwrap();
+    document_editing_controller::unwrap_block_from_frame(
+        &ctx.db_context,
+        &ctx.event_hub,
+        &mut undo_redo_manager,
+        stack_id,
+        dto,
+    )
+    .context("unwrap_block_from_frame")
 }

@@ -75,6 +75,9 @@ pub enum DocumentEditingEvent {
     RemoveTableColumn,
     MergeTableCells,
     SplitTableCell,
+    WrapBlocksInFrame,
+    UnwrapFrame,
+    UnwrapBlockFromFrame,
 }
 
 #[derive(Debug, Clone, Hash, PartialEq, Eq, Serialize)]

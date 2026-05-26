@@ -69,6 +69,9 @@ pub enum FlatEventKind {
     DocumentEditingRemoveTableColumn,
     DocumentEditingMergeTableCells,
     DocumentEditingSplitTableCell,
+    DocumentEditingWrapBlocksInFrame,
+    DocumentEditingUnwrapFrame,
+    DocumentEditingUnwrapBlockFromFrame,
 
     DocumentFormattingSetTextFormat,
     DocumentFormattingMergeTextFormat,
@@ -217,6 +220,15 @@ impl From<Event> for FlatEvent {
                 }
                 DocumentEditingEvent::SplitTableCell => {
                     FlatEventKind::DocumentEditingSplitTableCell
+                }
+                DocumentEditingEvent::WrapBlocksInFrame => {
+                    FlatEventKind::DocumentEditingWrapBlocksInFrame
+                }
+                DocumentEditingEvent::UnwrapFrame => {
+                    FlatEventKind::DocumentEditingUnwrapFrame
+                }
+                DocumentEditingEvent::UnwrapBlockFromFrame => {
+                    FlatEventKind::DocumentEditingUnwrapBlockFromFrame
                 }
             },
             Origin::DocumentFormatting(fe) => match fe {

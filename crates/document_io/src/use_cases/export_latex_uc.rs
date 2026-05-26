@@ -87,6 +87,14 @@ impl ExportLatexUseCase {
             if cell_frame_ids.contains(frame_id) {
                 continue;
             }
+            // Skip sub-frames (parent_frame != None) — recursively rendered
+            // by their parent's render_frame_latex walk; rendering at the
+            // top level again would duplicate their content.
+            if let Some(f) = uow.get_frame(frame_id)?
+                && f.parent_frame.is_some()
+            {
+                continue;
+            }
 
             let frame_latex = self.render_frame_latex(&*uow, frame_id, &cell_frame_ids)?;
             if !frame_latex.is_empty() {

@@ -374,7 +374,7 @@ impl TextBlock {
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 /// Find the parent frame of a block by scanning all frames.
-fn find_parent_frame(inner: &TextDocumentInner, block_id: u64) -> Option<EntityId> {
+pub(crate) fn find_parent_frame(inner: &TextDocumentInner, block_id: u64) -> Option<EntityId> {
     let all_frames = frame_commands::get_all_frame(&inner.ctx).ok()?;
     let block_entity_id = block_id as EntityId;
     for frame in &all_frames {

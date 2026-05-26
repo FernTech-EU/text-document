@@ -39,6 +39,12 @@ use crate::RemoveTableRowDto;
 use crate::RemoveTableRowResultDto;
 use crate::SplitTableCellDto;
 use crate::SplitTableCellResultDto;
+use crate::UnwrapBlockFromFrameDto;
+use crate::UnwrapBlockFromFrameResultDto;
+use crate::UnwrapFrameDto;
+use crate::UnwrapFrameResultDto;
+use crate::WrapBlocksInFrameDto;
+use crate::WrapBlocksInFrameResultDto;
 use crate::units_of_work::add_block_to_list_uow::AddBlockToListUnitOfWorkFactory;
 use crate::units_of_work::create_list_uow::CreateListUnitOfWorkFactory;
 use crate::units_of_work::delete_text_uow::DeleteTextUnitOfWorkFactory;
@@ -60,6 +66,9 @@ use crate::units_of_work::remove_table_column_uow::RemoveTableColumnUnitOfWorkFa
 use crate::units_of_work::remove_table_row_uow::RemoveTableRowUnitOfWorkFactory;
 use crate::units_of_work::remove_table_uow::RemoveTableUnitOfWorkFactory;
 use crate::units_of_work::split_table_cell_uow::SplitTableCellUnitOfWorkFactory;
+use crate::units_of_work::unwrap_block_from_frame_uow::UnwrapBlockFromFrameUnitOfWorkFactory;
+use crate::units_of_work::unwrap_frame_uow::UnwrapFrameUnitOfWorkFactory;
+use crate::units_of_work::wrap_blocks_in_frame_uow::WrapBlocksInFrameUnitOfWorkFactory;
 use crate::use_cases::add_block_to_list_uc::AddBlockToListUseCase;
 use crate::use_cases::create_list_uc::CreateListUseCase;
 use crate::use_cases::delete_text_uc::DeleteTextUseCase;
@@ -81,6 +90,9 @@ use crate::use_cases::remove_table_column_uc::RemoveTableColumnUseCase;
 use crate::use_cases::remove_table_row_uc::RemoveTableRowUseCase;
 use crate::use_cases::remove_table_uc::RemoveTableUseCase;
 use crate::use_cases::split_table_cell_uc::SplitTableCellUseCase;
+use crate::use_cases::unwrap_block_from_frame_uc::UnwrapBlockFromFrameUseCase;
+use crate::use_cases::unwrap_frame_uc::UnwrapFrameUseCase;
+use crate::use_cases::wrap_blocks_in_frame_uc::WrapBlocksInFrameUseCase;
 use anyhow::Result;
 use common::event::{Event, Origin};
 
@@ -105,6 +117,9 @@ use common::event::DocumentEditingEvent::RemoveTable;
 use common::event::DocumentEditingEvent::RemoveTableColumn;
 use common::event::DocumentEditingEvent::RemoveTableRow;
 use common::event::DocumentEditingEvent::SplitTableCell;
+use common::event::DocumentEditingEvent::UnwrapBlockFromFrame;
+use common::event::DocumentEditingEvent::UnwrapFrame;
+use common::event::DocumentEditingEvent::WrapBlocksInFrame;
 
 use common::undo_redo::UndoRedoManager;
 use common::{database::db_context::DbContext, event::EventHub};
@@ -526,4 +541,61 @@ pub fn remove_block_from_list(
         data: None,
     });
     Ok(())
+}
+
+pub fn wrap_blocks_in_frame(
+    db_context: &DbContext,
+    event_hub: &Arc<EventHub>,
+    undo_redo_manager: &mut UndoRedoManager,
+    stack_id: Option<u64>,
+    dto: &WrapBlocksInFrameDto,
+) -> Result<WrapBlocksInFrameResultDto> {
+    let uow_context = WrapBlocksInFrameUnitOfWorkFactory::new(db_context, event_hub);
+    let mut uc = WrapBlocksInFrameUseCase::new(Box::new(uow_context));
+    let return_dto = uc.execute(dto)?;
+    undo_redo_manager.add_command_to_stack(Box::new(uc), stack_id)?;
+    event_hub.send_event(Event {
+        origin: Origin::DocumentEditing(WrapBlocksInFrame),
+        ids: vec![],
+        data: None,
+    });
+    Ok(return_dto)
+}
+
+pub fn unwrap_frame(
+    db_context: &DbContext,
+    event_hub: &Arc<EventHub>,
+    undo_redo_manager: &mut UndoRedoManager,
+    stack_id: Option<u64>,
+    dto: &UnwrapFrameDto,
+) -> Result<UnwrapFrameResultDto> {
+    let uow_context = UnwrapFrameUnitOfWorkFactory::new(db_context, event_hub);
+    let mut uc = UnwrapFrameUseCase::new(Box::new(uow_context));
+    let return_dto = uc.execute(dto)?;
+    undo_redo_manager.add_command_to_stack(Box::new(uc), stack_id)?;
+    event_hub.send_event(Event {
+        origin: Origin::DocumentEditing(UnwrapFrame),
+        ids: vec![],
+        data: None,
+    });
+    Ok(return_dto)
+}
+
+pub fn unwrap_block_from_frame(
+    db_context: &DbContext,
+    event_hub: &Arc<EventHub>,
+    undo_redo_manager: &mut UndoRedoManager,
+    stack_id: Option<u64>,
+    dto: &UnwrapBlockFromFrameDto,
+) -> Result<UnwrapBlockFromFrameResultDto> {
+    let uow_context = UnwrapBlockFromFrameUnitOfWorkFactory::new(db_context, event_hub);
+    let mut uc = UnwrapBlockFromFrameUseCase::new(Box::new(uow_context));
+    let return_dto = uc.execute(dto)?;
+    undo_redo_manager.add_command_to_stack(Box::new(uc), stack_id)?;
+    event_hub.send_event(Event {
+        origin: Origin::DocumentEditing(UnwrapBlockFromFrame),
+        ids: vec![],
+        data: None,
+    });
+    Ok(return_dto)
 }

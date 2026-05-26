@@ -2,8 +2,11 @@ use crate::InsertFrameDto;
 use crate::InsertFrameResultDto;
 use anyhow::{Result, anyhow};
 use common::database::CommandUnitOfWork;
+use common::database::block_offset_index::OffsetMarker;
 use common::database::rope_helpers::block_char_length;
-use common::database::rope_helpers::rope_append_empty_block;
+use common::database::rope_helpers::{
+    find_block_at_char_position, rope_append_empty_block, rope_insert_block_at,
+};
 use common::direct_access::document::document_repository::DocumentRelationshipField;
 use common::direct_access::frame::frame_repository::FrameRelationshipField;
 use common::direct_access::root::root_repository::RootRelationshipField;
@@ -185,18 +188,47 @@ fn execute_insert_frame(
     updated_doc.updated_at = now;
     uow.update_document(&updated_doc)?;
 
-    // Plan §1.6: mirror to rope. Top-level (parent=None) frames
-    // append at rope end with a `\n` boundary; the new empty block is
-    // registered in block_offsets so subsequent edits can find it.
+    // Mirror to rope so every block stays indexed and
+    // `find_block_at_char_position` keeps using its O(log n) fast path.
     // Frame.byte_range is recomputed centrally in Transaction::commit.
     //
-    // Nested (parent=Some) frames are NOT mirrored here — their
-    // position depends on parent.child_order interleaving with sibling
-    // blocks/tables/frames. Sub-frame insertion within a populated
-    // parent is currently a follow-up; this matches the pre-existing
-    // behavior where insert_frame_uc only populated the entity tree.
-    // No-op under default backend.
-    if parent_frame_id.is_none() {
+    // - Top-level (parent = None) frame: append at the rope end with a
+    //   `\n` boundary.
+    // - Nested (parent = Some) frame: insert the new empty block right
+    //   after the current block at `dto.position`. The byte position
+    //   chosen is the end of the current block's content (= the byte
+    //   index of its trailing `\n`, or the rope end if it has no
+    //   successor). The new sub-frame's negative entry in parent's
+    //   `child_order` is placed at `block_idx + 1` (above), so the
+    //   rope order matches the entity order. If the rope is currently
+    //   inconsistent (an older unmirrored sub-frame already disabled
+    //   the fast path), fall back to `rope_append_empty_block` to at
+    //   least register the new block in the index — that closes the
+    //   gap going forward without trying to retrofit the past.
+    if let Some(_parent_id) = parent_frame_id {
+        let store = uow.store();
+        let inserted = {
+            let block_at_pos = find_block_at_char_position(&store, dto.position);
+            if let Some((current_block_id, _, _)) = block_at_pos {
+                let range = {
+                    let offsets = store.block_offsets.read().unwrap();
+                    offsets.range_with_successor(OffsetMarker::Block(current_block_id))
+                };
+                if let Some((bs, be, has_successor)) = range {
+                    let content_end = if has_successor && be > bs { be - 1 } else { be };
+                    rope_insert_block_at(&store, content_end, created_block.id, "");
+                    true
+                } else {
+                    false
+                }
+            } else {
+                false
+            }
+        };
+        if !inserted {
+            rope_append_empty_block(&store, created_block.id);
+        }
+    } else {
         rope_append_empty_block(&uow.store(), created_block.id);
     }
 

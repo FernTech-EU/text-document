@@ -88,6 +88,15 @@ impl ExportMarkdownUseCase {
 
             // Check if this is a table anchor frame
             let frame = uow.get_frame(frame_id)?;
+            // Only render top-level frames (parent_frame == None). Sub-frames
+            // (e.g. blockquotes) are recursively rendered from their parent's
+            // `render_frame_content` walk; rendering them at the top level
+            // again would duplicate their content.
+            if let Some(ref f) = frame
+                && f.parent_frame.is_some()
+            {
+                continue;
+            }
             if let Some(ref f) = frame
                 && let Some(table_id) = f.table
             {
@@ -100,12 +109,12 @@ impl ExportMarkdownUseCase {
             }
 
             if let Some(ref f) = frame {
-                let frame_lines = self.render_frame_content(&*uow, f, &cell_frame_ids, "")?;
-                for line in frame_lines {
+                let frame_text = self.render_frame_content(&*uow, f, &cell_frame_ids, "")?;
+                if !frame_text.is_empty() {
                     if !output_parts.is_empty() {
                         output_parts.push("\n\n".to_string());
                     }
-                    output_parts.push(line);
+                    output_parts.push(frame_text);
                 }
             }
         }
@@ -118,17 +127,22 @@ impl ExportMarkdownUseCase {
     }
 
     /// Render the content of a frame by walking its `child_order`.
-    /// Positive entries are block IDs, negative entries are negated sub-frame IDs.
-    /// `quote_prefix` is prepended to every output line (e.g. "> " for blockquotes).
-    /// Returns a vec of block-level strings (each is one rendered block or sub-frame output).
+    /// Positive entries are block IDs, negative entries are negated
+    /// sub-frame IDs. `quote_prefix` is prepended to every output line
+    /// (e.g. "> " for blockquotes). Returns a single fully-joined
+    /// String — inter-block / inter-frame separators are already baked
+    /// in. Callers (both `execute` and this function's own recursion
+    /// into sub-frames) must NOT add further "\n\n" around the result;
+    /// doing so previously produced exponentially many extra blank
+    /// lines for nested frames.
     fn render_frame_content(
         &self,
         uow: &dyn ExportMarkdownUnitOfWorkTrait,
         frame: &Frame,
         cell_frame_ids: &HashSet<EntityId>,
         quote_prefix: &str,
-    ) -> Result<Vec<String>> {
-        let mut result: Vec<String> = Vec::new();
+    ) -> Result<String> {
+        let mut result = String::new();
         let mut prev_was_list = false;
         let mut ordered_list_counter: i64 = 0;
         let mut current_list_id: Option<EntityId> = None;
@@ -152,12 +166,12 @@ impl ExportMarkdownUseCase {
                         )?;
                         if !result.is_empty() {
                             if is_list_item && prev_was_list {
-                                result.push("\n".to_string());
+                                result.push('\n');
                             } else {
-                                result.push("\n\n".to_string());
+                                result.push_str("\n\n");
                             }
                         }
-                        result.push(line);
+                        result.push_str(&line);
                         prev_was_list = is_list_item;
                     }
                 } else {
@@ -177,9 +191,9 @@ impl ExportMarkdownUseCase {
                                 table_md
                             };
                             if !result.is_empty() {
-                                result.push("\n\n".to_string());
+                                result.push_str("\n\n");
                             }
-                            result.push(prefixed);
+                            result.push_str(&prefixed);
                             prev_was_list = false;
                             current_list_id = None;
                             ordered_list_counter = 0;
@@ -193,13 +207,13 @@ impl ExportMarkdownUseCase {
                             quote_prefix.to_string()
                         };
 
-                        let sub_lines =
+                        let sub_text =
                             self.render_frame_content(uow, sf, cell_frame_ids, &sub_prefix)?;
-                        for sub_line in sub_lines {
+                        if !sub_text.is_empty() {
                             if !result.is_empty() {
-                                result.push("\n\n".to_string());
+                                result.push_str("\n\n");
                             }
-                            result.push(sub_line);
+                            result.push_str(&sub_text);
                         }
                         prev_was_list = false;
                         current_list_id = None;
@@ -232,12 +246,12 @@ impl ExportMarkdownUseCase {
                 )?;
                 if !result.is_empty() {
                     if is_list_item && prev_was_list {
-                        result.push("\n".to_string());
+                        result.push('\n');
                     } else {
-                        result.push("\n\n".to_string());
+                        result.push_str("\n\n");
                     }
                 }
-                result.push(line);
+                result.push_str(&line);
                 prev_was_list = is_list_item;
             }
         }

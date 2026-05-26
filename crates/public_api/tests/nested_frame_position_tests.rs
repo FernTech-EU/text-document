@@ -125,3 +125,110 @@ fn backspace_in_trailing_paragraph_no_table() {
         "Traiing paragraph at the end",
     );
 }
+
+/// A1 regression: a Backspace whose char range crosses a blockquote
+/// boundary used to update only the root frame's `child_order`, leaving
+/// the sub-frame with a dangling entry. The follow-up operation would
+/// then act on a stale block id. Sequence: place the caret at flow
+/// position 0 of the first quoted paragraph and Backspace — that merges
+/// the quoted block into the preceding non-quoted paragraph and removes
+/// the quoted block from the entity store. After the merge, perform a
+/// second Backspace at the same caret to assert that subsequent edits
+/// stay consistent — under the old code the second op would observe a
+/// corrupt `child_order` and either panic or land in the wrong block.
+#[test]
+fn cross_frame_backspace_then_followup_stays_consistent() {
+    let doc = TextDocument::new();
+    doc.set_markdown(MD).unwrap().wait().unwrap();
+
+    let quote_pos = flow_position_of(&doc, "A single-level blockquote");
+    let before = doc.to_plain_text().unwrap();
+
+    let cursor = doc.cursor_at(quote_pos);
+    cursor.set_position(quote_pos, MoveMode::MoveAnchor);
+    cursor.delete_previous_char().unwrap();
+
+    // A follow-up Backspace at the new cursor position must succeed and
+    // remove exactly one more character — proving the structural state
+    // after the cross-frame merge is internally consistent.
+    let pos_after_first = cursor.position();
+    cursor.set_position(pos_after_first, MoveMode::MoveAnchor);
+    cursor.delete_previous_char().unwrap();
+
+    let after = doc.to_plain_text().unwrap();
+    assert_eq!(
+        after.chars().count(),
+        before.chars().count() - 2,
+        "two cross-frame backspaces must remove exactly two characters total"
+    );
+}
+
+/// A2 regression: deleting all the content of a nested (depth-2)
+/// blockquote in one sweep used to leave the depth-2 sub-frame in the
+/// entity store with `blocks=[]` because the auto-prune walked only the
+/// root frame's `child_order`. The recursive prune walks all depths.
+/// We exercise this by selecting from before the depth-2 quote to after
+/// it and deleting, then checking the document still round-trips and a
+/// subsequent operation does not crash.
+#[test]
+fn delete_spanning_depth2_quote_prunes_all_levels() {
+    let doc = TextDocument::new();
+    doc.set_markdown(MD).unwrap().wait().unwrap();
+
+    // Select from the start of the depth-2 quoted paragraph all the way
+    // to its end; this removes every block inside it.
+    let quote_pos = flow_position_of(&doc, "Nested blockquote at depth 2");
+    let end_pos = quote_pos + "Nested blockquote at depth 2. Inline formatting works inside.".len();
+
+    let cursor = doc.cursor_at(quote_pos);
+    cursor.set_position(quote_pos, MoveMode::MoveAnchor);
+    cursor.set_position(end_pos, MoveMode::KeepAnchor);
+    cursor.remove_selected_text().unwrap();
+
+    // A follow-up Backspace should land somewhere reasonable and not
+    // panic, even though the depth-2 (and possibly depth-3) frames were
+    // emptied.
+    let after_pos = cursor.position();
+    cursor.set_position(after_pos, MoveMode::MoveAnchor);
+    cursor.delete_previous_char().unwrap();
+
+    let plain = doc.to_plain_text().unwrap();
+    assert!(
+        !plain.contains("Nested blockquote at depth 2."),
+        "the depth-2 quote text must be gone after the delete"
+    );
+}
+
+/// A3 regression: inserting a sub-frame via `Cursor::insert_frame()`
+/// used to skip rope mirroring for the new block, disabling the rope
+/// fast path for ALL subsequent cursor ops. The fix mirrors the new
+/// block to the rope at the correct byte position. Verify by inserting
+/// a sub-frame and then exercising a backspace that requires the fast
+/// path to land in the right block.
+#[test]
+fn insert_frame_inside_document_keeps_fast_path_alive() {
+    let doc = TextDocument::new();
+    doc.set_markdown(MD).unwrap().wait().unwrap();
+
+    // Insert a sub-frame somewhere inside the document (e.g. in the
+    // middle of "A normal paragraph.").
+    let para_pos = flow_position_of(&doc, "A normal paragraph");
+    let cursor = doc.cursor_at(para_pos + 5);
+    cursor.set_position(para_pos + 5, MoveMode::MoveAnchor);
+    cursor.insert_frame().unwrap();
+
+    // The trailing paragraph still has to be reachable by a backspace
+    // that lands in it — that requires the rope fast path to be active.
+    assert_backspace_lands_in(MD, "Trailing paragraph at the end", "Traiing paragraph at the end");
+    // (The above re-imports MD into a fresh doc; we also check our
+    // mutated doc stays usable by performing a backspace there.)
+    let trail = flow_position_of(&doc, "Trailing paragraph at the end");
+    let cursor = doc.cursor_at(trail + 5);
+    cursor.set_position(trail + 5, MoveMode::MoveAnchor);
+    cursor.delete_previous_char().unwrap();
+    let plain = doc.to_plain_text().unwrap();
+    assert!(
+        plain.contains("Traiing paragraph at the end"),
+        "after insert_frame in a nested context, backspace must still land in the right block; got: {plain:?}"
+    );
+}

@@ -55,6 +55,41 @@ pub struct InsertFrameDto {
 pub struct InsertFrameResultDto {
     pub frame_id: i64,
 }
+pub use common::entities::FramePosition;
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+pub struct WrapBlocksInFrameDto {
+    pub start_block_id: i64,
+    pub end_block_id: i64,
+    pub position: Option<FramePosition>,
+    pub top_margin: Option<i64>,
+    pub bottom_margin: Option<i64>,
+    pub left_margin: Option<i64>,
+    pub right_margin: Option<i64>,
+    pub padding: Option<i64>,
+    pub border: Option<i64>,
+    pub is_blockquote: Option<bool>,
+}
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+pub struct WrapBlocksInFrameResultDto {
+    pub new_frame_id: i64,
+    pub new_position: i64,
+}
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+pub struct UnwrapFrameDto {
+    pub frame_id: i64,
+}
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+pub struct UnwrapFrameResultDto {
+    pub new_position: i64,
+}
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+pub struct UnwrapBlockFromFrameDto {
+    pub block_id: i64,
+}
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+pub struct UnwrapBlockFromFrameResultDto {
+    pub new_position: i64,
+}
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct InsertFormattedTextDto {
     pub position: i64,

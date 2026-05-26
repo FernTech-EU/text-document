@@ -118,6 +118,103 @@ fn drop_block_runs_and_images(uow: &dyn DeleteTextUnitOfWorkTrait, block_id: Ent
     store.block_images.write().unwrap().remove(&block_id);
 }
 
+/// Recursive walk of the frame tree rooted at `root_id` to find which
+/// frame's `child_order` contains the positive entry `target`. Used by
+/// the cross-block merge to correctly resolve sub-frame ownership when
+/// the deletion crosses a frame boundary — the cell-only
+/// `block_to_cell_frame` map cannot answer this for blockquote frames.
+fn find_block_owner_frame(
+    uow: &dyn DeleteTextUnitOfWorkTrait,
+    root_id: EntityId,
+    target: EntityId,
+) -> Result<Option<EntityId>> {
+    let f = uow
+        .get_frame(&root_id)?
+        .ok_or_else(|| anyhow!("Frame not found"))?;
+    for &entry in &f.child_order {
+        if entry > 0 && entry as EntityId == target {
+            return Ok(Some(root_id));
+        }
+        if entry < 0 {
+            let sub = (-entry) as EntityId;
+            if let Some(o) = find_block_owner_frame(uow, sub, target)? {
+                return Ok(Some(o));
+            }
+        }
+    }
+    Ok(None)
+}
+
+/// Recursively prune empty non-table sub-frames under `frame_id` (post-order).
+/// A frame is removed iff its direct block list is empty AND its `child_order`
+/// has no surviving sub-frame entries. Table-anchor frames (`table.is_some()`)
+/// are never pruned — the table's cell frames carry the blocks separately and
+/// the anchor must persist for as long as the table does.
+fn prune_empty_subframes_recursive(
+    uow: &mut Box<dyn DeleteTextUnitOfWorkTrait>,
+    frame_id: EntityId,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<()> {
+    let frame = match uow.get_frame(&frame_id)? {
+        Some(f) => f,
+        None => return Ok(()),
+    };
+
+    let sub_frame_ids: Vec<EntityId> = frame
+        .child_order
+        .iter()
+        .filter_map(|&e| if e < 0 { Some((-e) as EntityId) } else { None })
+        .collect();
+
+    for sf_id in &sub_frame_ids {
+        prune_empty_subframes_recursive(uow, *sf_id, now)?;
+    }
+
+    let frame = match uow.get_frame(&frame_id)? {
+        Some(f) => f,
+        None => return Ok(()),
+    };
+
+    let mut sub_frames_to_remove: Vec<EntityId> = Vec::new();
+    for &entry in &frame.child_order {
+        if entry < 0 {
+            let sf_id = (-entry) as EntityId;
+            if let Some(sf) = uow.get_frame(&sf_id)? {
+                if sf.table.is_some() {
+                    continue;
+                }
+                let blk_ids =
+                    uow.get_frame_relationship(&sf_id, &FrameRelationshipField::Blocks)?;
+                let has_surviving_subframes = sf.child_order.iter().any(|&e| e < 0);
+                if blk_ids.is_empty() && !has_surviving_subframes {
+                    sub_frames_to_remove.push(sf_id);
+                }
+            }
+        }
+    }
+
+    if !sub_frames_to_remove.is_empty() {
+        for &sf_id in &sub_frames_to_remove {
+            uow.remove_frame(&sf_id)?;
+        }
+        let mut updated = uow
+            .get_frame(&frame_id)?
+            .ok_or_else(|| anyhow!("Frame not found"))?;
+        updated.child_order.retain(|entry| {
+            if *entry < 0 {
+                let sf_id = (-entry) as EntityId;
+                !sub_frames_to_remove.contains(&sf_id)
+            } else {
+                true
+            }
+        });
+        updated.updated_at = now;
+        uow.update_frame(&updated)?;
+    }
+
+    Ok(())
+}
+
 fn execute_delete(
     uow: &mut Box<dyn DeleteTextUnitOfWorkTrait>,
     dto: &DeleteTextDto,
@@ -454,45 +551,11 @@ fn execute_delete(
             }
         }
 
-        {
-            let root_frame = uow
-                .get_frame(&frame_id)?
-                .ok_or_else(|| anyhow!("Root frame not found"))?;
-            let mut sub_frames_to_remove: Vec<EntityId> = Vec::new();
-            for &entry in &root_frame.child_order {
-                if entry < 0 {
-                    let sf_id = (-entry) as EntityId;
-                    if let Some(sf) = uow.get_frame(&sf_id)? {
-                        if sf.table.is_some() {
-                            continue;
-                        }
-                        let blk_ids =
-                            uow.get_frame_relationship(&sf_id, &FrameRelationshipField::Blocks)?;
-                        if blk_ids.is_empty() {
-                            sub_frames_to_remove.push(sf_id);
-                        }
-                    }
-                }
-            }
-            if !sub_frames_to_remove.is_empty() {
-                for &sf_id in &sub_frames_to_remove {
-                    uow.remove_frame(&sf_id)?;
-                }
-                let mut updated_root = uow
-                    .get_frame(&frame_id)?
-                    .ok_or_else(|| anyhow!("Root frame not found"))?;
-                updated_root.child_order.retain(|entry| {
-                    if *entry < 0 {
-                        let sf_id = (-entry) as EntityId;
-                        !sub_frames_to_remove.contains(&sf_id)
-                    } else {
-                        true
-                    }
-                });
-                updated_root.updated_at = now;
-                uow.update_frame(&updated_root)?;
-            }
-        }
+        // Recursive prune: walk the whole frame tree and remove every
+        // non-table sub-frame that lost all its blocks and sub-frames.
+        // The previous root-only walk left nested blockquotes (depth >= 2)
+        // orphaned in the entity store when their content was deleted.
+        prune_empty_subframes_recursive(uow, frame_id, now)?;
 
         {
             let list_ids =
@@ -800,19 +863,40 @@ fn execute_delete(
             uow.remove_block(block_id)?;
         }
 
-        let owning_frame_id = block_to_cell_frame
-            .get(&start_block.id)
-            .copied()
-            .unwrap_or(frame_id);
-        let frame = uow
-            .get_frame(&owning_frame_id)?
-            .ok_or_else(|| anyhow!("Frame not found"))?;
-        let mut updated_frame = frame.clone();
-        updated_frame
-            .child_order
-            .retain(|id| !blocks_to_remove.contains(&(*id as EntityId)));
-        updated_frame.updated_at = chrono::Utc::now();
-        uow.update_frame(&updated_frame)?;
+        // Group removed blocks by their owning frame, then update each
+        // affected frame's child_order. Without this, sub-frame (e.g.
+        // blockquote) child_order can be left with dangling entries when
+        // the cross-block merge crosses a frame boundary — the cell-only
+        // `block_to_cell_frame` map silently falls back to the root.
+        let now = chrono::Utc::now();
+        let mut blocks_by_frame: std::collections::HashMap<EntityId, Vec<EntityId>> =
+            std::collections::HashMap::new();
+        for &bid in &blocks_to_remove {
+            let owning = if let Some(&cf) = block_to_cell_frame.get(&bid) {
+                cf
+            } else {
+                find_block_owner_frame(uow.as_ref(), frame_id, bid)?.unwrap_or(frame_id)
+            };
+            blocks_by_frame.entry(owning).or_default().push(bid);
+        }
+        for (owning_frame_id, removed_in_frame) in blocks_by_frame {
+            let frame = uow
+                .get_frame(&owning_frame_id)?
+                .ok_or_else(|| anyhow!("Frame not found"))?;
+            let mut updated_frame = frame.clone();
+            updated_frame.child_order.retain(|entry| {
+                !(*entry > 0 && removed_in_frame.contains(&(*entry as EntityId)))
+            });
+            updated_frame.blocks = uow
+                .get_frame_relationship(&owning_frame_id, &FrameRelationshipField::Blocks)?;
+            updated_frame.updated_at = now;
+            uow.update_frame(&updated_frame)?;
+        }
+
+        // A cross-block merge can empty a sub-frame (the user deleted all
+        // its blocks in one sweep). Prune empty non-table frames at every
+        // depth so the entity store never carries orphans.
+        prune_empty_subframes_recursive(uow, frame_id, now)?;
 
         // Use the pre-mutation texts captured at line 653 — by now the
         // rope merge has run and `block_char_length(start_block)` reflects

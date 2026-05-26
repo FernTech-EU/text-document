@@ -184,6 +184,21 @@ pub struct TableCellRef {
 }
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// FrameRef
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+/// Reference to the frame that immediately encloses the cursor's block.
+/// `depth` is the nesting level (1 for a direct child of the root).
+/// `is_blockquote` is true iff `fmt_is_blockquote` is `Some(true)`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FrameRef {
+    pub frame_id: usize,
+    pub parent_frame_id: Option<usize>,
+    pub is_blockquote: bool,
+    pub depth: usize,
+}
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 // CellRange / SelectionKind
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 

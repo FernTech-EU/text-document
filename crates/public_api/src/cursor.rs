@@ -16,7 +16,7 @@ use unicode_segmentation::UnicodeSegmentation;
 
 use crate::convert::{to_i64, to_usize};
 use crate::events::DocumentEvent;
-use crate::flow::{CellRange, FlowElement, SelectionKind, TableCellRef};
+use crate::flow::{CellRange, FlowElement, FrameRef, SelectionKind, TableCellRef};
 use crate::fragment::DocumentFragment;
 use crate::inner::{CursorData, QueuedEvents, TextDocumentInner};
 use crate::text_table::TextTable;
@@ -853,6 +853,331 @@ impl TextCursor {
         // Release inner lock before calling table_cell() which also locks
         drop(inner);
         block.table_cell()
+    }
+
+    // ── Frame / blockquote queries ──────────
+
+    /// The innermost frame enclosing the cursor's current block, or `None`
+    /// if the cursor sits directly in the root frame (no enclosing
+    /// sub-frame). The returned `depth` is the nesting level from the root
+    /// (1 for a direct child of root, 2 for a grandchild, etc.).
+    pub fn current_frame(&self) -> Option<FrameRef> {
+        let pos = self.position();
+        let inner = self.doc.lock();
+        let dto = frontend::document_inspection::GetBlockAtPositionDto {
+            position: to_i64(pos),
+        };
+        let block_info =
+            document_inspection_commands::get_block_at_position(&inner.ctx, &dto).ok()?;
+        let block_id = block_info.block_id as u64;
+        cursor_frame_ref(&inner, block_id)
+    }
+
+    /// True if the cursor's block lives inside any blockquote frame
+    /// (at any nesting level).
+    pub fn is_in_blockquote(&self) -> bool {
+        self.current_blockquote_frame_id().is_some()
+    }
+
+    /// Id of the innermost blockquote frame enclosing the cursor's block,
+    /// or `None` if not in a blockquote.
+    pub fn current_blockquote_frame_id(&self) -> Option<usize> {
+        let pos = self.position();
+        let inner = self.doc.lock();
+        let dto = frontend::document_inspection::GetBlockAtPositionDto {
+            position: to_i64(pos),
+        };
+        let block_info =
+            document_inspection_commands::get_block_at_position(&inner.ctx, &dto).ok()?;
+        innermost_blockquote_frame_id(&inner, block_info.block_id as u64)
+    }
+
+    /// Nesting depth of the cursor inside blockquote frames: 0 = not in
+    /// any quote, 1 = top-level quote, 2 = quote inside a quote, …
+    pub fn blockquote_depth_at_cursor(&self) -> usize {
+        let pos = self.position();
+        let inner = self.doc.lock();
+        let dto = frontend::document_inspection::GetBlockAtPositionDto {
+            position: to_i64(pos),
+        };
+        let Some(block_info) =
+            document_inspection_commands::get_block_at_position(&inner.ctx, &dto).ok()
+        else {
+            return 0;
+        };
+        blockquote_depth_for_block(&inner, block_info.block_id as u64)
+    }
+
+    /// True iff the cursor's block is the first positive entry in its
+    /// owning frame's `child_order`. Used by the keyboard handler to
+    /// decide whether Backspace should unwrap the enclosing frame.
+    /// A single-block frame returns true for both `is_first_*` and
+    /// `is_last_*`.
+    pub fn is_first_block_in_current_frame(&self) -> bool {
+        matches!(
+            block_position_in_current_frame(self),
+            Some(BlockEdge::First) | Some(BlockEdge::OnlyOne)
+        )
+    }
+
+    /// True iff the cursor's block is the last positive entry in its
+    /// owning frame's `child_order`. Used by the keyboard handler to
+    /// decide whether forward Delete should unwrap the enclosing frame.
+    pub fn is_last_block_in_current_frame(&self) -> bool {
+        matches!(
+            block_position_in_current_frame(self),
+            Some(BlockEdge::Last) | Some(BlockEdge::OnlyOne)
+        )
+    }
+
+    /// True iff the block at the cursor has no characters of content.
+    /// Used by the Enter handler to decide whether to exit a blockquote.
+    pub fn current_block_is_empty(&self) -> bool {
+        let pos = self.position();
+        let inner = self.doc.lock();
+        let dto = frontend::document_inspection::GetBlockAtPositionDto {
+            position: to_i64(pos),
+        };
+        let Some(block_info) =
+            document_inspection_commands::get_block_at_position(&inner.ctx, &dto).ok()
+        else {
+            return false;
+        };
+        let store = inner.ctx.db_context.get_store();
+        let block_entity = store
+            .blocks
+            .read()
+            .unwrap()
+            .get(&(block_info.block_id as common::types::EntityId))
+            .cloned();
+        match block_entity {
+            Some(b) => {
+                let len = common::database::rope_helpers::block_char_length(&b, &store);
+                len == 0
+            }
+            None => false,
+        }
+    }
+
+    /// True iff the cursor's anchor and head sit in different frames.
+    /// Used by the toolbar to disable the "toggle blockquote" button on
+    /// selections that cross frame boundaries.
+    pub fn selection_spans_multiple_frames(&self) -> bool {
+        let (pos, anchor) = self.read_cursor();
+        if pos == anchor {
+            return false;
+        }
+        let inner = self.doc.lock();
+        let pos_dto = frontend::document_inspection::GetBlockAtPositionDto {
+            position: to_i64(pos),
+        };
+        let anchor_dto = frontend::document_inspection::GetBlockAtPositionDto {
+            position: to_i64(anchor),
+        };
+        let Some(pos_block) =
+            document_inspection_commands::get_block_at_position(&inner.ctx, &pos_dto).ok()
+        else {
+            return false;
+        };
+        let Some(anchor_block) =
+            document_inspection_commands::get_block_at_position(&inner.ctx, &anchor_dto).ok()
+        else {
+            return false;
+        };
+        let pos_owner =
+            crate::text_block::find_parent_frame(&inner, pos_block.block_id as u64);
+        let anchor_owner =
+            crate::text_block::find_parent_frame(&inner, anchor_block.block_id as u64);
+        pos_owner != anchor_owner
+    }
+
+    // ── Blockquote mutations ──────────
+
+    /// Wrap the current block (or the blocks in the current selection)
+    /// in a new blockquote frame nested inside the cursor's current
+    /// parent frame. Returns an error if the selection spans multiple
+    /// frames.
+    pub fn wrap_selection_in_blockquote(&self) -> Result<()> {
+        if self.selection_spans_multiple_frames() {
+            return Err(anyhow::anyhow!(
+                "Cannot wrap selection in blockquote: selection spans multiple frames"
+            ));
+        }
+        let (start_block_id, end_block_id) = self.resolve_selection_block_range()?;
+        let dto = frontend::document_editing::WrapBlocksInFrameDto {
+            start_block_id: start_block_id as i64,
+            end_block_id: end_block_id as i64,
+            position: Some(frontend::document_editing::FramePosition::InFlow),
+            top_margin: None,
+            bottom_margin: None,
+            left_margin: None,
+            right_margin: None,
+            padding: None,
+            border: None,
+            is_blockquote: Some(true),
+        };
+        let queued = {
+            let mut inner = self.doc.lock();
+            let _result = document_editing_commands::wrap_blocks_in_frame(
+                &inner.ctx,
+                Some(inner.stack_id),
+                &dto,
+            )?;
+            inner.modified = true;
+            // Frame-structure change: blocks didn't move and no text
+            // changed, but block left-margins shift visually. Fire
+            // FormatChanged (kind = Block) so the widget triggers a
+            // paragraph relayout — same pattern as list operations
+            // ([`add_block_to_list`] et al.). `ContentsChanged` with
+            // chars_added/removed = 0 was misleading and caused the
+            // incremental relayout to no-op until the next full repaint.
+            inner.queue_event(DocumentEvent::FormatChanged {
+                position: 0,
+                length: 0,
+                kind: crate::flow::FormatChangeKind::Block,
+            });
+            self.queue_undo_redo_event(&mut inner)
+        };
+        crate::inner::dispatch_queued_events(queued);
+        Ok(())
+    }
+
+    /// Wrap the current block in a new blockquote frame at the current
+    /// nesting level. Equivalent to `wrap_selection_in_blockquote()`
+    /// when there is no selection.
+    pub fn insert_blockquote(&self) -> Result<()> {
+        self.wrap_selection_in_blockquote()
+    }
+
+    /// If the cursor is inside any blockquote, unwrap the innermost one
+    /// (lift its blocks into the parent frame and delete the frame).
+    /// Otherwise, wrap the current block / selection in a new
+    /// blockquote. Mirrors the toggle behaviour of a toolbar button.
+    pub fn toggle_blockquote(&self) -> Result<()> {
+        if let Some(frame_id) = self.current_blockquote_frame_id() {
+            self.unwrap_frame_by_id(frame_id)
+        } else {
+            self.wrap_selection_in_blockquote()
+        }
+    }
+
+    /// Unwrap the innermost frame enclosing the cursor (any frame, not
+    /// just blockquotes). Errors if the cursor's block sits in the root
+    /// frame.
+    pub fn unwrap_current_frame(&self) -> Result<()> {
+        let frame_ref = self
+            .current_frame()
+            .ok_or_else(|| anyhow::anyhow!("Cursor is not inside any sub-frame"))?;
+        self.unwrap_frame_by_id(frame_ref.frame_id)
+    }
+
+    /// Extract the cursor's current block from its innermost enclosing
+    /// blockquote frame, lifting it one nesting level. If the cursor is
+    /// not in a blockquote, errors.
+    pub fn unwrap_current_block_from_blockquote(&self) -> Result<()> {
+        if self.current_blockquote_frame_id().is_none() {
+            return Err(anyhow::anyhow!("Cursor is not inside a blockquote"));
+        }
+        let block_id = self.current_block_id_for_mutation()?;
+        let dto = frontend::document_editing::UnwrapBlockFromFrameDto {
+            block_id: block_id as i64,
+        };
+        let queued = {
+            let mut inner = self.doc.lock();
+            let _result = document_editing_commands::unwrap_block_from_frame(
+                &inner.ctx,
+                Some(inner.stack_id),
+                &dto,
+            )?;
+            inner.modified = true;
+            // See note in `wrap_selection_in_blockquote` — frame-structure
+            // change without text mutation; fire FormatChanged so the
+            // widget relayouts paragraph margins.
+            inner.queue_event(DocumentEvent::FormatChanged {
+                position: 0,
+                length: 0,
+                kind: crate::flow::FormatChangeKind::Block,
+            });
+            self.queue_undo_redo_event(&mut inner)
+        };
+        crate::inner::dispatch_queued_events(queued);
+        Ok(())
+    }
+
+    /// Wrap the current block in a new blockquote frame. If the cursor
+    /// is already inside a blockquote, this creates a deeper nested
+    /// quote (depth + 1). If outside, this creates a top-level quote.
+    pub fn increase_blockquote_depth(&self) -> Result<()> {
+        self.wrap_selection_in_blockquote()
+    }
+
+    /// Pop the cursor out of one nesting level of blockquotes. If the
+    /// cursor is in a depth-N quote with multiple blocks, the current
+    /// block is extracted (splitting the quote if needed). If the
+    /// current block is the only one in the quote, the whole quote is
+    /// unwrapped.
+    pub fn decrease_blockquote_depth(&self) -> Result<()> {
+        if self.current_blockquote_frame_id().is_none() {
+            return Err(anyhow::anyhow!(
+                "Cursor is not inside a blockquote to decrease depth"
+            ));
+        }
+        self.unwrap_current_block_from_blockquote()
+    }
+
+    fn unwrap_frame_by_id(&self, frame_id: usize) -> Result<()> {
+        let dto = frontend::document_editing::UnwrapFrameDto {
+            frame_id: frame_id as i64,
+        };
+        let queued = {
+            let mut inner = self.doc.lock();
+            let _result = document_editing_commands::unwrap_frame(
+                &inner.ctx,
+                Some(inner.stack_id),
+                &dto,
+            )?;
+            inner.modified = true;
+            // See note in `wrap_selection_in_blockquote` — frame-structure
+            // change without text mutation; fire FormatChanged so the
+            // widget relayouts paragraph margins.
+            inner.queue_event(DocumentEvent::FormatChanged {
+                position: 0,
+                length: 0,
+                kind: crate::flow::FormatChangeKind::Block,
+            });
+            self.queue_undo_redo_event(&mut inner)
+        };
+        crate::inner::dispatch_queued_events(queued);
+        Ok(())
+    }
+
+    fn current_block_id_for_mutation(&self) -> Result<usize> {
+        let pos = self.position();
+        let inner = self.doc.lock();
+        let dto = frontend::document_inspection::GetBlockAtPositionDto {
+            position: to_i64(pos),
+        };
+        let block_info = document_inspection_commands::get_block_at_position(&inner.ctx, &dto)
+            .map_err(|e| anyhow::anyhow!("get_block_at_position: {}", e))?;
+        Ok(block_info.block_id as usize)
+    }
+
+    fn resolve_selection_block_range(&self) -> Result<(usize, usize)> {
+        let (pos, anchor) = self.read_cursor();
+        let lo = pos.min(anchor);
+        let hi = pos.max(anchor);
+        let inner = self.doc.lock();
+        let lo_dto = frontend::document_inspection::GetBlockAtPositionDto {
+            position: to_i64(lo),
+        };
+        let hi_dto = frontend::document_inspection::GetBlockAtPositionDto {
+            position: to_i64(hi),
+        };
+        let lo_block = document_inspection_commands::get_block_at_position(&inner.ctx, &lo_dto)
+            .map_err(|e| anyhow::anyhow!("get_block_at_position(start): {}", e))?;
+        let hi_block = document_inspection_commands::get_block_at_position(&inner.ctx, &hi_dto)
+            .map_err(|e| anyhow::anyhow!("get_block_at_position(end): {}", e))?;
+        Ok((lo_block.block_id as usize, hi_block.block_id as usize))
     }
 
     // ── Table structure mutations (explicit-ID) ──────────
@@ -2452,4 +2777,138 @@ impl TextCursor {
 
         (pos, pos)
     }
+}
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// Frame-awareness helpers used by the public Cursor methods above.
+// Each takes the locked TextDocumentInner so callers can reuse one
+// store snapshot.
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BlockEdge {
+    First,
+    Middle,
+    Last,
+    OnlyOne,
+}
+
+/// Build a `FrameRef` for the innermost non-root frame containing
+/// `block_id`. Returns `None` if the block sits directly in the root
+/// frame (i.e. the only enclosing frame is the root).
+fn cursor_frame_ref(inner: &TextDocumentInner, block_id: u64) -> Option<FrameRef> {
+    let parent = crate::text_block::find_parent_frame(inner, block_id)?;
+    let store = inner.ctx.db_context.get_store();
+    let frames = store.frames.read().unwrap();
+    let frame = frames.get(&parent)?.clone();
+    if frame.parent_frame.is_none() {
+        // The cursor's block lives in the root frame — no sub-frame.
+        return None;
+    }
+    let is_blockquote = frame.fmt_is_blockquote.unwrap_or(false);
+
+    let mut depth = 0;
+    let mut current = Some(parent);
+    while let Some(id) = current {
+        let Some(f) = frames.get(&id) else {
+            break;
+        };
+        if f.parent_frame.is_none() {
+            break;
+        }
+        depth += 1;
+        current = f.parent_frame;
+    }
+
+    Some(FrameRef {
+        frame_id: frame.id as usize,
+        parent_frame_id: frame.parent_frame.map(|id| id as usize),
+        is_blockquote,
+        depth,
+    })
+}
+
+/// Walk up the parent_frame chain from the block's immediate parent and
+/// return the first blockquote frame found (innermost). `None` if no
+/// enclosing frame is a blockquote.
+fn innermost_blockquote_frame_id(
+    inner: &TextDocumentInner,
+    block_id: u64,
+) -> Option<usize> {
+    let mut current = crate::text_block::find_parent_frame(inner, block_id);
+    let store = inner.ctx.db_context.get_store();
+    let frames = store.frames.read().unwrap();
+    while let Some(id) = current {
+        let f = frames.get(&id)?;
+        if f.fmt_is_blockquote == Some(true) {
+            return Some(f.id as usize);
+        }
+        current = f.parent_frame;
+    }
+    None
+}
+
+/// Count how many blockquote frames sit on the parent_frame chain above
+/// `block_id`. 0 if no enclosing frame is a blockquote.
+fn blockquote_depth_for_block(inner: &TextDocumentInner, block_id: u64) -> usize {
+    let mut current = crate::text_block::find_parent_frame(inner, block_id);
+    let store = inner.ctx.db_context.get_store();
+    let frames = store.frames.read().unwrap();
+    let mut count = 0;
+    while let Some(id) = current {
+        let Some(f) = frames.get(&id) else {
+            break;
+        };
+        if f.fmt_is_blockquote == Some(true) {
+            count += 1;
+        }
+        current = f.parent_frame;
+    }
+    count
+}
+
+/// Resolve the cursor's block, find its immediate parent frame, and
+/// determine the block's edge position within that frame's `child_order`
+/// (counting only positive entries — sub-frames are skipped because they
+/// are structurally different elements). Returns `None` if the cursor's
+/// block has no entry in any frame's `child_order`.
+fn block_position_in_current_frame(cursor: &TextCursor) -> Option<BlockEdge> {
+    let pos = cursor.position();
+    let inner = cursor.doc.lock();
+    let dto = frontend::document_inspection::GetBlockAtPositionDto {
+        position: to_i64(pos),
+    };
+    let block_info =
+        document_inspection_commands::get_block_at_position(&inner.ctx, &dto).ok()?;
+    let block_id = block_info.block_id as common::types::EntityId;
+    let parent_id = crate::text_block::find_parent_frame(&inner, block_info.block_id as u64)?;
+    let store = inner.ctx.db_context.get_store();
+    let frames = store.frames.read().unwrap();
+    let frame = frames.get(&parent_id)?;
+    let block_positions: Vec<usize> = frame
+        .child_order
+        .iter()
+        .enumerate()
+        .filter_map(|(i, &e)| if e > 0 { Some((i, e as common::types::EntityId)) } else { None })
+        .filter(|(_, id)| *id == block_id)
+        .map(|(i, _)| i)
+        .collect();
+    let block_idx = *block_positions.first()?;
+    let positive_entries: Vec<usize> = frame
+        .child_order
+        .iter()
+        .enumerate()
+        .filter_map(|(i, &e)| if e > 0 { Some(i) } else { None })
+        .collect();
+    let first_pos = *positive_entries.first()?;
+    let last_pos = *positive_entries.last()?;
+    let is_first = block_idx == first_pos;
+    let is_last = block_idx == last_pos;
+    let edge = match (is_first, is_last, positive_entries.len()) {
+        (_, _, 1) => BlockEdge::OnlyOne,
+        (true, _, _) => BlockEdge::First,
+        (_, true, _) => BlockEdge::Last,
+        _ => BlockEdge::Middle,
+    };
+    Some(edge)
 }
