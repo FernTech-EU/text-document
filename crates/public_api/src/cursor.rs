@@ -952,7 +952,7 @@ impl TextCursor {
             .cloned();
         match block_entity {
             Some(b) => {
-                let len = common::database::rope_helpers::block_char_length(&b, &store);
+                let len = common::database::rope_helpers::block_char_length(&b, store);
                 len == 0
             }
             None => false,
@@ -984,8 +984,7 @@ impl TextCursor {
         else {
             return false;
         };
-        let pos_owner =
-            crate::text_block::find_parent_frame(&inner, pos_block.block_id as u64);
+        let pos_owner = crate::text_block::find_parent_frame(&inner, pos_block.block_id as u64);
         let anchor_owner =
             crate::text_block::find_parent_frame(&inner, anchor_block.block_id as u64);
         pos_owner != anchor_owner
@@ -1131,11 +1130,8 @@ impl TextCursor {
         };
         let queued = {
             let mut inner = self.doc.lock();
-            let _result = document_editing_commands::unwrap_frame(
-                &inner.ctx,
-                Some(inner.stack_id),
-                &dto,
-            )?;
+            let _result =
+                document_editing_commands::unwrap_frame(&inner.ctx, Some(inner.stack_id), &dto)?;
             inner.modified = true;
             // See note in `wrap_selection_in_blockquote` — frame-structure
             // change without text mutation; fire FormatChanged so the
@@ -2801,10 +2797,7 @@ fn cursor_frame_ref(inner: &TextDocumentInner, block_id: u64) -> Option<FrameRef
     let store = inner.ctx.db_context.get_store();
     let frames = store.frames.read().unwrap();
     let frame = frames.get(&parent)?.clone();
-    if frame.parent_frame.is_none() {
-        // The cursor's block lives in the root frame — no sub-frame.
-        return None;
-    }
+    frame.parent_frame?;
     let is_blockquote = frame.fmt_is_blockquote.unwrap_or(false);
 
     let mut depth = 0;
@@ -2831,10 +2824,7 @@ fn cursor_frame_ref(inner: &TextDocumentInner, block_id: u64) -> Option<FrameRef
 /// Walk up the parent_frame chain from the block's immediate parent and
 /// return the first blockquote frame found (innermost). `None` if no
 /// enclosing frame is a blockquote.
-fn innermost_blockquote_frame_id(
-    inner: &TextDocumentInner,
-    block_id: u64,
-) -> Option<usize> {
+fn innermost_blockquote_frame_id(inner: &TextDocumentInner, block_id: u64) -> Option<usize> {
     let mut current = crate::text_block::find_parent_frame(inner, block_id);
     let store = inner.ctx.db_context.get_store();
     let frames = store.frames.read().unwrap();
@@ -2878,8 +2868,7 @@ fn block_position_in_current_frame(cursor: &TextCursor) -> Option<BlockEdge> {
     let dto = frontend::document_inspection::GetBlockAtPositionDto {
         position: to_i64(pos),
     };
-    let block_info =
-        document_inspection_commands::get_block_at_position(&inner.ctx, &dto).ok()?;
+    let block_info = document_inspection_commands::get_block_at_position(&inner.ctx, &dto).ok()?;
     let block_id = block_info.block_id as common::types::EntityId;
     let parent_id = crate::text_block::find_parent_frame(&inner, block_info.block_id as u64)?;
     let store = inner.ctx.db_context.get_store();
@@ -2889,7 +2878,13 @@ fn block_position_in_current_frame(cursor: &TextCursor) -> Option<BlockEdge> {
         .child_order
         .iter()
         .enumerate()
-        .filter_map(|(i, &e)| if e > 0 { Some((i, e as common::types::EntityId)) } else { None })
+        .filter_map(|(i, &e)| {
+            if e > 0 {
+                Some((i, e as common::types::EntityId))
+            } else {
+                None
+            }
+        })
         .filter(|(_, id)| *id == block_id)
         .map(|(i, _)| i)
         .collect();

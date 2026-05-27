@@ -884,11 +884,11 @@ fn execute_delete(
                 .get_frame(&owning_frame_id)?
                 .ok_or_else(|| anyhow!("Frame not found"))?;
             let mut updated_frame = frame.clone();
-            updated_frame.child_order.retain(|entry| {
-                !(*entry > 0 && removed_in_frame.contains(&(*entry as EntityId)))
-            });
-            updated_frame.blocks = uow
-                .get_frame_relationship(&owning_frame_id, &FrameRelationshipField::Blocks)?;
+            updated_frame
+                .child_order
+                .retain(|entry| !(*entry > 0 && removed_in_frame.contains(&(*entry as EntityId))));
+            updated_frame.blocks =
+                uow.get_frame_relationship(&owning_frame_id, &FrameRelationshipField::Blocks)?;
             updated_frame.updated_at = now;
             uow.update_frame(&updated_frame)?;
         }

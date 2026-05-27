@@ -32,7 +32,8 @@ fn wrap_current_block_in_blockquote_then_export_has_quote_prefix() {
         "exported markdown must carry the `>` prefix; got: {md:?}"
     );
     assert!(
-        !md.replace("> ", "").contains("A plain paragraph\\.\n\nA plain paragraph"),
+        !md.replace("> ", "")
+            .contains("A plain paragraph\\.\n\nA plain paragraph"),
         "block must not appear twice; got: {md:?}"
     );
 }
@@ -48,10 +49,7 @@ fn toggle_blockquote_round_trips() {
     assert!(cursor.is_in_blockquote(), "toggle on a plain block wraps");
 
     cursor.toggle_blockquote().unwrap();
-    assert!(
-        !cursor.is_in_blockquote(),
-        "toggle inside a quote unwraps"
-    );
+    assert!(!cursor.is_in_blockquote(), "toggle inside a quote unwraps");
 
     let md = doc.to_markdown().unwrap();
     assert!(
@@ -203,7 +201,7 @@ fn insert_block_inside_quote_produces_clean_markdown() {
 /// must end up AFTER C in document order (lift one level but keep
 /// document position), NOT before C.
 #[test]
-fn enter_enter_at_end_of_depth3_quote_keeps_C_above_the_new_empty() {
+fn enter_enter_at_end_of_depth3_quote_keeps_c_above_the_new_empty() {
     let doc = TextDocument::new();
     doc.set_markdown("> block A\n> > block B\n> > > block C\n")
         .unwrap()
@@ -249,11 +247,7 @@ fn enter_enter_at_end_of_depth3_quote_keeps_C_above_the_new_empty() {
     // new empty block. The data layer is the source of truth for the
     // widget's rendering; any GUI ordering bug must originate here.
     use text_document::FlowElementSnapshot;
-    fn flatten(
-        els: &[FlowElementSnapshot],
-        depth: usize,
-        out: &mut Vec<(usize, String)>,
-    ) {
+    fn flatten(els: &[FlowElementSnapshot], depth: usize, out: &mut Vec<(usize, String)>) {
         for el in els {
             match el {
                 FlowElementSnapshot::Block(b) => out.push((depth, b.text.clone())),

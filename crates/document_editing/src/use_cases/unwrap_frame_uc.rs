@@ -2,8 +2,6 @@ use crate::UnwrapFrameDto;
 use crate::UnwrapFrameResultDto;
 use anyhow::{Result, anyhow};
 use common::database::CommandUnitOfWork;
-use common::direct_access::document::document_repository::DocumentRelationshipField;
-use common::direct_access::frame::frame_repository::FrameRelationshipField;
 use common::direct_access::root::root_repository::RootRelationshipField;
 #[allow(unused_imports)]
 use common::entities::{Block, Document, Frame, Root};
@@ -103,7 +101,7 @@ fn execute_unwrap_frame(
     let mut updated_parent = parent.clone();
     updated_parent
         .child_order
-        .splice(neg_idx..=neg_idx, moved_slice.into_iter());
+        .splice(neg_idx..=neg_idx, moved_slice);
     let mut new_parent_blocks = updated_parent.blocks.clone();
     for b in &moved_block_ids {
         if !new_parent_blocks.contains(b) {

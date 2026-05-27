@@ -3,7 +3,6 @@ use crate::WrapBlocksInFrameResultDto;
 use anyhow::{Result, anyhow};
 use common::database::CommandUnitOfWork;
 use common::direct_access::document::document_repository::DocumentRelationshipField;
-use common::direct_access::frame::frame_repository::FrameRelationshipField;
 use common::direct_access::root::root_repository::RootRelationshipField;
 #[allow(unused_imports)]
 use common::entities::{Block, Document, Frame, Root};
@@ -175,10 +174,9 @@ fn execute_wrap_blocks_in_frame(
     // sub-frame's negative entry at the original start position.
     let mut updated_owner = owner.clone();
     let new_negative_entry = -(created_frame.id as i64);
-    updated_owner.child_order.splice(
-        start_idx..=end_idx,
-        std::iter::once(new_negative_entry),
-    );
+    updated_owner
+        .child_order
+        .splice(start_idx..=end_idx, std::iter::once(new_negative_entry));
     // Refresh the owning frame's `blocks` from the relationship store
     // (mirrors insert_block_uc:236-238). Removing blocks from a frame
     // doesn't delete the Block entity, but the relationship vec on the

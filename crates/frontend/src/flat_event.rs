@@ -224,9 +224,7 @@ impl From<Event> for FlatEvent {
                 DocumentEditingEvent::WrapBlocksInFrame => {
                     FlatEventKind::DocumentEditingWrapBlocksInFrame
                 }
-                DocumentEditingEvent::UnwrapFrame => {
-                    FlatEventKind::DocumentEditingUnwrapFrame
-                }
+                DocumentEditingEvent::UnwrapFrame => FlatEventKind::DocumentEditingUnwrapFrame,
                 DocumentEditingEvent::UnwrapBlockFromFrame => {
                     FlatEventKind::DocumentEditingUnwrapBlockFromFrame
                 }

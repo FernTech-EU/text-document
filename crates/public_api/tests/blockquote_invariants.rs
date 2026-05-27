@@ -80,7 +80,7 @@ fn apply_op(doc: &TextDocument, op: Op) {
         let c = doc.cursor_at(0);
         c.position()
     };
-    let len = doc.character_count() as usize;
+    let len = doc.character_count();
     let cursor = doc.cursor_at(pos.min(len));
     match op {
         Op::WrapSelection => {
@@ -150,12 +150,8 @@ fn check_invariants(doc: &TextDocument, step: usize, op: Op, seed: u64) {
          blockquote_depth_at_cursor ({depth})"
     );
 
-    // (5) character count must be non-negative; basic sanity
-    let cc = doc.character_count();
-    assert!(
-        cc >= 0,
-        "seed={seed} step={step} op={op:?}: character_count returned negative ({cc})"
-    );
+    // (5) character_count must not panic; basic sanity
+    let _cc = doc.character_count();
 
     // (6) the plain text export must be reproducible — calling it
     // twice in a row must yield the same value (catches operations

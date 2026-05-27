@@ -219,7 +219,11 @@ fn insert_frame_inside_document_keeps_fast_path_alive() {
 
     // The trailing paragraph still has to be reachable by a backspace
     // that lands in it — that requires the rope fast path to be active.
-    assert_backspace_lands_in(MD, "Trailing paragraph at the end", "Traiing paragraph at the end");
+    assert_backspace_lands_in(
+        MD,
+        "Trailing paragraph at the end",
+        "Traiing paragraph at the end",
+    );
     // (The above re-imports MD into a fresh doc; we also check our
     // mutated doc stays usable by performing a backspace there.)
     let trail = flow_position_of(&doc, "Trailing paragraph at the end");

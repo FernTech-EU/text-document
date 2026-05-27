@@ -60,8 +60,8 @@ pub use operation::{DocxExportResult, HtmlImportResult, MarkdownImportResult, Op
 // ── Layout engine API types ─────────────────────────────────────
 pub use flow::{
     BlockSnapshot, CellFormat, CellRange, CellSnapshot, CellVerticalAlignment, FlowElement,
-    FlowElementSnapshot, FlowSnapshot, FormatChangeKind, FragmentContent, FrameSnapshot, ListInfo,
-    FrameRef, PaintHighlightSpan, SelectionKind, TableCellContext, TableCellRef, TableFormat,
+    FlowElementSnapshot, FlowSnapshot, FormatChangeKind, FragmentContent, FrameRef, FrameSnapshot,
+    ListInfo, PaintHighlightSpan, SelectionKind, TableCellContext, TableCellRef, TableFormat,
     TableSnapshot,
 };
 pub use text_block::TextBlock;
