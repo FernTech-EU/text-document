@@ -191,6 +191,94 @@ fn insert_block_inside_quote_produces_clean_markdown() {
     );
 }
 
+/// Reproduce the user's depth-3 scenario exactly.
+///
+/// Initial:
+///   > block A
+///   > > block B
+///   > > > block C|        (cursor at end of C)
+///
+/// After 1st Enter: cursor on a new empty depth-3 block after C.
+/// After 2nd Enter: cursor on a new empty depth-2 block. The empty
+/// must end up AFTER C in document order (lift one level but keep
+/// document position), NOT before C.
+#[test]
+fn enter_enter_at_end_of_depth3_quote_keeps_C_above_the_new_empty() {
+    let doc = TextDocument::new();
+    doc.set_markdown("> block A\n> > block B\n> > > block C\n")
+        .unwrap()
+        .wait()
+        .unwrap();
+
+    // Walk to end of last block via block-hopping.
+    let cursor = doc.cursor_at(0);
+    cursor.set_position(0, MoveMode::MoveAnchor);
+    for _ in 0..3 {
+        cursor.move_position(
+            text_document::MoveOperation::EndOfBlock,
+            MoveMode::MoveAnchor,
+            1,
+        );
+        cursor.move_position(
+            text_document::MoveOperation::NextBlock,
+            MoveMode::MoveAnchor,
+            1,
+        );
+    }
+    cursor.move_position(
+        text_document::MoveOperation::EndOfBlock,
+        MoveMode::MoveAnchor,
+        1,
+    );
+    assert_eq!(
+        cursor.blockquote_depth_at_cursor(),
+        3,
+        "precondition: cursor must be at depth 3 (end of `block C`)"
+    );
+
+    // 1st Enter: still in quote at depth 3, on a new empty block.
+    cursor.insert_block().unwrap();
+    assert_eq!(cursor.blockquote_depth_at_cursor(), 3);
+    assert!(cursor.current_block_is_empty());
+
+    // 2nd Enter: unwrap one level.
+    cursor.unwrap_current_block_from_blockquote().unwrap();
+    assert_eq!(cursor.blockquote_depth_at_cursor(), 2);
+
+    // Verify document order via the flow snapshot — C must precede the
+    // new empty block. The data layer is the source of truth for the
+    // widget's rendering; any GUI ordering bug must originate here.
+    use text_document::FlowElementSnapshot;
+    fn flatten(
+        els: &[FlowElementSnapshot],
+        depth: usize,
+        out: &mut Vec<(usize, String)>,
+    ) {
+        for el in els {
+            match el {
+                FlowElementSnapshot::Block(b) => out.push((depth, b.text.clone())),
+                FlowElementSnapshot::Frame(f) => flatten(&f.elements, depth + 1, out),
+                FlowElementSnapshot::Table(_) => {}
+            }
+        }
+    }
+    let snap = doc.snapshot_flow();
+    let mut tuples = Vec::new();
+    flatten(&snap.elements, 0, &mut tuples);
+    let c_pos = tuples
+        .iter()
+        .position(|(_, t)| t == "block C")
+        .expect("`block C` must remain in the flow");
+    let empty_pos = tuples
+        .iter()
+        .position(|(_, t)| t.is_empty())
+        .expect("the new empty block must remain in the flow");
+    assert!(
+        c_pos < empty_pos,
+        "`block C` (flow idx {c_pos}) must come before the new empty block (flow idx {empty_pos}); flow: {tuples:?}"
+    );
+}
+
 #[test]
 fn enter_then_enter_at_end_of_quote_exits_after_not_before() {
     let doc = TextDocument::new();
