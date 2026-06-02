@@ -764,15 +764,16 @@ fn build_tail_state(
 
 /// Insert a mixed fragment (both blocks and tables) at the cursor position.
 ///
-/// FOLLOW-UP: the rope mirror for this path is not yet wired. Mixed
-/// fragments (paste with BOTH blocks and tables interleaved — e.g.
-/// copying a section that contains prose AND a table) are rare in
-/// practice; existing tests cover the entity tree but the rope is
-/// not updated by this UC. Adding the mirror requires a new helper
-/// `rope_insert_block_after_anchor` (because the byte position right
-/// after a table-anchor sentinel is not directly addressable via the
-/// existing `rope_split_block` API, which targets `Block` markers
-/// only).
+/// Handles a paste containing BOTH blocks and tables interleaved (e.g.
+/// copying a section that contains prose AND a table). Updates both the
+/// entity tree and the global rope: the head block is replaced in place,
+/// then each subsequent block and each table (a 1-char anchor sentinel
+/// plus its cell content) is mirrored into the rope in document order —
+/// see the "Rope mirror" sections below. Table anchors are placed
+/// relative to the last inserted block via `rope_insert_table_anchor`
+/// (with an `after` flag that handles the still-empty-head case), and
+/// cell blocks at the parent frame's `top_level_frame_end_byte`, so no
+/// "insert after a table anchor" primitive is required.
 fn insert_mixed_fragment(
     uow: &mut Box<dyn InsertFragmentUnitOfWorkTrait>,
     dto: &InsertFragmentDto,
