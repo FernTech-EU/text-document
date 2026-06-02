@@ -24,7 +24,7 @@ pub fn insert_text(
     stack_id: Option<u64>,
     dto: &InsertTextDto,
 ) -> Result<InsertTextResultDto> {
-    let mut undo_redo_manager = ctx.undo_redo_manager.lock().unwrap();
+    let mut undo_redo_manager = ctx.undo_redo_manager.lock();
     document_editing_controller::insert_text(
         &ctx.db_context,
         &ctx.event_hub,
@@ -40,7 +40,7 @@ pub fn delete_text(
     stack_id: Option<u64>,
     dto: &DeleteTextDto,
 ) -> Result<DeleteTextResultDto> {
-    let mut undo_redo_manager = ctx.undo_redo_manager.lock().unwrap();
+    let mut undo_redo_manager = ctx.undo_redo_manager.lock();
     document_editing_controller::delete_text(
         &ctx.db_context,
         &ctx.event_hub,
@@ -56,7 +56,7 @@ pub fn insert_block(
     stack_id: Option<u64>,
     dto: &InsertBlockDto,
 ) -> Result<InsertBlockResultDto> {
-    let mut undo_redo_manager = ctx.undo_redo_manager.lock().unwrap();
+    let mut undo_redo_manager = ctx.undo_redo_manager.lock();
     document_editing_controller::insert_block(
         &ctx.db_context,
         &ctx.event_hub,
@@ -72,7 +72,7 @@ pub fn insert_image(
     stack_id: Option<u64>,
     dto: &InsertImageDto,
 ) -> Result<InsertImageResultDto> {
-    let mut undo_redo_manager = ctx.undo_redo_manager.lock().unwrap();
+    let mut undo_redo_manager = ctx.undo_redo_manager.lock();
     document_editing_controller::insert_image(
         &ctx.db_context,
         &ctx.event_hub,
@@ -88,7 +88,7 @@ pub fn insert_frame(
     stack_id: Option<u64>,
     dto: &InsertFrameDto,
 ) -> Result<InsertFrameResultDto> {
-    let mut undo_redo_manager = ctx.undo_redo_manager.lock().unwrap();
+    let mut undo_redo_manager = ctx.undo_redo_manager.lock();
     document_editing_controller::insert_frame(
         &ctx.db_context,
         &ctx.event_hub,
@@ -104,7 +104,7 @@ pub fn insert_formatted_text(
     stack_id: Option<u64>,
     dto: &InsertFormattedTextDto,
 ) -> Result<InsertFormattedTextResultDto> {
-    let mut undo_redo_manager = ctx.undo_redo_manager.lock().unwrap();
+    let mut undo_redo_manager = ctx.undo_redo_manager.lock();
     document_editing_controller::insert_formatted_text(
         &ctx.db_context,
         &ctx.event_hub,
@@ -120,7 +120,7 @@ pub fn create_list(
     stack_id: Option<u64>,
     dto: &CreateListDto,
 ) -> Result<CreateListResultDto> {
-    let mut undo_redo_manager = ctx.undo_redo_manager.lock().unwrap();
+    let mut undo_redo_manager = ctx.undo_redo_manager.lock();
     document_editing_controller::create_list(
         &ctx.db_context,
         &ctx.event_hub,
@@ -136,7 +136,7 @@ pub fn insert_list(
     stack_id: Option<u64>,
     dto: &InsertListDto,
 ) -> Result<InsertListResultDto> {
-    let mut undo_redo_manager = ctx.undo_redo_manager.lock().unwrap();
+    let mut undo_redo_manager = ctx.undo_redo_manager.lock();
     document_editing_controller::insert_list(
         &ctx.db_context,
         &ctx.event_hub,
@@ -152,7 +152,7 @@ pub fn insert_fragment(
     stack_id: Option<u64>,
     dto: &InsertFragmentDto,
 ) -> Result<InsertFragmentResultDto> {
-    let mut undo_redo_manager = ctx.undo_redo_manager.lock().unwrap();
+    let mut undo_redo_manager = ctx.undo_redo_manager.lock();
     document_editing_controller::insert_fragment(
         &ctx.db_context,
         &ctx.event_hub,
@@ -168,7 +168,7 @@ pub fn insert_html_at_position(
     stack_id: Option<u64>,
     dto: &InsertHtmlAtPositionDto,
 ) -> Result<InsertHtmlAtPositionResultDto> {
-    let mut undo_redo_manager = ctx.undo_redo_manager.lock().unwrap();
+    let mut undo_redo_manager = ctx.undo_redo_manager.lock();
     document_editing_controller::insert_html_at_position(
         &ctx.db_context,
         &ctx.event_hub,
@@ -184,7 +184,7 @@ pub fn insert_markdown_at_position(
     stack_id: Option<u64>,
     dto: &InsertMarkdownAtPositionDto,
 ) -> Result<InsertMarkdownAtPositionResultDto> {
-    let mut undo_redo_manager = ctx.undo_redo_manager.lock().unwrap();
+    let mut undo_redo_manager = ctx.undo_redo_manager.lock();
     document_editing_controller::insert_markdown_at_position(
         &ctx.db_context,
         &ctx.event_hub,
@@ -200,7 +200,7 @@ pub fn insert_table(
     stack_id: Option<u64>,
     dto: &InsertTableDto,
 ) -> Result<InsertTableResultDto> {
-    let mut undo_redo_manager = ctx.undo_redo_manager.lock().unwrap();
+    let mut undo_redo_manager = ctx.undo_redo_manager.lock();
     document_editing_controller::insert_table(
         &ctx.db_context,
         &ctx.event_hub,
@@ -212,7 +212,7 @@ pub fn insert_table(
 }
 
 pub fn remove_table(ctx: &AppContext, stack_id: Option<u64>, dto: &RemoveTableDto) -> Result<()> {
-    let mut undo_redo_manager = ctx.undo_redo_manager.lock().unwrap();
+    let mut undo_redo_manager = ctx.undo_redo_manager.lock();
     document_editing_controller::remove_table(
         &ctx.db_context,
         &ctx.event_hub,
@@ -228,7 +228,7 @@ pub fn insert_table_row(
     stack_id: Option<u64>,
     dto: &InsertTableRowDto,
 ) -> Result<InsertTableRowResultDto> {
-    let mut undo_redo_manager = ctx.undo_redo_manager.lock().unwrap();
+    let mut undo_redo_manager = ctx.undo_redo_manager.lock();
     document_editing_controller::insert_table_row(
         &ctx.db_context,
         &ctx.event_hub,
@@ -244,7 +244,7 @@ pub fn insert_table_column(
     stack_id: Option<u64>,
     dto: &InsertTableColumnDto,
 ) -> Result<InsertTableColumnResultDto> {
-    let mut undo_redo_manager = ctx.undo_redo_manager.lock().unwrap();
+    let mut undo_redo_manager = ctx.undo_redo_manager.lock();
     document_editing_controller::insert_table_column(
         &ctx.db_context,
         &ctx.event_hub,
@@ -260,7 +260,7 @@ pub fn remove_table_row(
     stack_id: Option<u64>,
     dto: &RemoveTableRowDto,
 ) -> Result<RemoveTableRowResultDto> {
-    let mut undo_redo_manager = ctx.undo_redo_manager.lock().unwrap();
+    let mut undo_redo_manager = ctx.undo_redo_manager.lock();
     document_editing_controller::remove_table_row(
         &ctx.db_context,
         &ctx.event_hub,
@@ -276,7 +276,7 @@ pub fn remove_table_column(
     stack_id: Option<u64>,
     dto: &RemoveTableColumnDto,
 ) -> Result<RemoveTableColumnResultDto> {
-    let mut undo_redo_manager = ctx.undo_redo_manager.lock().unwrap();
+    let mut undo_redo_manager = ctx.undo_redo_manager.lock();
     document_editing_controller::remove_table_column(
         &ctx.db_context,
         &ctx.event_hub,
@@ -292,7 +292,7 @@ pub fn merge_table_cells(
     stack_id: Option<u64>,
     dto: &MergeTableCellsDto,
 ) -> Result<MergeTableCellsResultDto> {
-    let mut undo_redo_manager = ctx.undo_redo_manager.lock().unwrap();
+    let mut undo_redo_manager = ctx.undo_redo_manager.lock();
     document_editing_controller::merge_table_cells(
         &ctx.db_context,
         &ctx.event_hub,
@@ -308,7 +308,7 @@ pub fn split_table_cell(
     stack_id: Option<u64>,
     dto: &SplitTableCellDto,
 ) -> Result<SplitTableCellResultDto> {
-    let mut undo_redo_manager = ctx.undo_redo_manager.lock().unwrap();
+    let mut undo_redo_manager = ctx.undo_redo_manager.lock();
     document_editing_controller::split_table_cell(
         &ctx.db_context,
         &ctx.event_hub,
@@ -324,7 +324,7 @@ pub fn add_block_to_list(
     stack_id: Option<u64>,
     dto: &AddBlockToListDto,
 ) -> Result<()> {
-    let mut undo_redo_manager = ctx.undo_redo_manager.lock().unwrap();
+    let mut undo_redo_manager = ctx.undo_redo_manager.lock();
     document_editing_controller::add_block_to_list(
         &ctx.db_context,
         &ctx.event_hub,
@@ -340,7 +340,7 @@ pub fn remove_block_from_list(
     stack_id: Option<u64>,
     dto: &RemoveBlockFromListDto,
 ) -> Result<()> {
-    let mut undo_redo_manager = ctx.undo_redo_manager.lock().unwrap();
+    let mut undo_redo_manager = ctx.undo_redo_manager.lock();
     document_editing_controller::remove_block_from_list(
         &ctx.db_context,
         &ctx.event_hub,
@@ -356,7 +356,7 @@ pub fn wrap_blocks_in_frame(
     stack_id: Option<u64>,
     dto: &WrapBlocksInFrameDto,
 ) -> Result<WrapBlocksInFrameResultDto> {
-    let mut undo_redo_manager = ctx.undo_redo_manager.lock().unwrap();
+    let mut undo_redo_manager = ctx.undo_redo_manager.lock();
     document_editing_controller::wrap_blocks_in_frame(
         &ctx.db_context,
         &ctx.event_hub,
@@ -372,7 +372,7 @@ pub fn unwrap_frame(
     stack_id: Option<u64>,
     dto: &UnwrapFrameDto,
 ) -> Result<UnwrapFrameResultDto> {
-    let mut undo_redo_manager = ctx.undo_redo_manager.lock().unwrap();
+    let mut undo_redo_manager = ctx.undo_redo_manager.lock();
     document_editing_controller::unwrap_frame(
         &ctx.db_context,
         &ctx.event_hub,
@@ -388,7 +388,7 @@ pub fn unwrap_block_from_frame(
     stack_id: Option<u64>,
     dto: &UnwrapBlockFromFrameDto,
 ) -> Result<UnwrapBlockFromFrameResultDto> {
-    let mut undo_redo_manager = ctx.undo_redo_manager.lock().unwrap();
+    let mut undo_redo_manager = ctx.undo_redo_manager.lock();
     document_editing_controller::unwrap_block_from_frame(
         &ctx.db_context,
         &ctx.event_hub,

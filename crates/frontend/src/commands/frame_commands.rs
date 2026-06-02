@@ -16,7 +16,7 @@ pub fn create_orphan_frame(
     stack_id: Option<u64>,
     dto: &CreateFrameDto,
 ) -> Result<FrameDto> {
-    let mut undo_redo_manager = ctx.undo_redo_manager.lock().unwrap();
+    let mut undo_redo_manager = ctx.undo_redo_manager.lock();
     frame_controller::create_orphan(
         &ctx.db_context,
         &ctx.event_hub,
@@ -34,7 +34,7 @@ pub fn create_frame(
     owner_id: EntityId,
     index: i32,
 ) -> Result<FrameDto> {
-    let mut undo_redo_manager = ctx.undo_redo_manager.lock().unwrap();
+    let mut undo_redo_manager = ctx.undo_redo_manager.lock();
     frame_controller::create(
         &ctx.db_context,
         &ctx.event_hub,
@@ -52,7 +52,7 @@ pub fn create_orphan_frame_multi(
     stack_id: Option<u64>,
     dtos: &[CreateFrameDto],
 ) -> Result<Vec<FrameDto>> {
-    let mut undo_redo_manager = ctx.undo_redo_manager.lock().unwrap();
+    let mut undo_redo_manager = ctx.undo_redo_manager.lock();
     frame_controller::create_orphan_multi(
         &ctx.db_context,
         &ctx.event_hub,
@@ -70,7 +70,7 @@ pub fn create_frame_multi(
     owner_id: EntityId,
     index: i32,
 ) -> Result<Vec<FrameDto>> {
-    let mut undo_redo_manager = ctx.undo_redo_manager.lock().unwrap();
+    let mut undo_redo_manager = ctx.undo_redo_manager.lock();
     frame_controller::create_multi(
         &ctx.db_context,
         &ctx.event_hub,
@@ -106,7 +106,7 @@ pub fn update_frame(
     stack_id: Option<u64>,
     dto: &UpdateFrameDto,
 ) -> Result<FrameDto> {
-    let mut undo_redo_manager = ctx.undo_redo_manager.lock().unwrap();
+    let mut undo_redo_manager = ctx.undo_redo_manager.lock();
     frame_controller::update(
         &ctx.db_context,
         &ctx.event_hub,
@@ -123,7 +123,7 @@ pub fn update_frame_multi(
     stack_id: Option<u64>,
     dtos: &[UpdateFrameDto],
 ) -> Result<Vec<FrameDto>> {
-    let mut undo_redo_manager = ctx.undo_redo_manager.lock().unwrap();
+    let mut undo_redo_manager = ctx.undo_redo_manager.lock();
     frame_controller::update_multi(
         &ctx.db_context,
         &ctx.event_hub,
@@ -140,7 +140,7 @@ pub fn update_frame_with_relationships(
     stack_id: Option<u64>,
     dto: &FrameDto,
 ) -> Result<FrameDto> {
-    let mut undo_redo_manager = ctx.undo_redo_manager.lock().unwrap();
+    let mut undo_redo_manager = ctx.undo_redo_manager.lock();
     frame_controller::update_with_relationships(
         &ctx.db_context,
         &ctx.event_hub,
@@ -157,7 +157,7 @@ pub fn update_frame_with_relationships_multi(
     stack_id: Option<u64>,
     dtos: &[FrameDto],
 ) -> Result<Vec<FrameDto>> {
-    let mut undo_redo_manager = ctx.undo_redo_manager.lock().unwrap();
+    let mut undo_redo_manager = ctx.undo_redo_manager.lock();
     frame_controller::update_with_relationships_multi(
         &ctx.db_context,
         &ctx.event_hub,
@@ -170,7 +170,7 @@ pub fn update_frame_with_relationships_multi(
 
 /// Remove a frame entity by ID
 pub fn remove_frame(ctx: &AppContext, stack_id: Option<u64>, id: &EntityId) -> Result<()> {
-    let mut undo_redo_manager = ctx.undo_redo_manager.lock().unwrap();
+    let mut undo_redo_manager = ctx.undo_redo_manager.lock();
     frame_controller::remove(
         &ctx.db_context,
         &ctx.event_hub,
@@ -183,7 +183,7 @@ pub fn remove_frame(ctx: &AppContext, stack_id: Option<u64>, id: &EntityId) -> R
 
 /// Remove multiple frame entities by IDs
 pub fn remove_frame_multi(ctx: &AppContext, stack_id: Option<u64>, ids: &[EntityId]) -> Result<()> {
-    let mut undo_redo_manager = ctx.undo_redo_manager.lock().unwrap();
+    let mut undo_redo_manager = ctx.undo_redo_manager.lock();
     frame_controller::remove_multi(
         &ctx.db_context,
         &ctx.event_hub,
@@ -242,7 +242,7 @@ pub fn set_frame_relationship(
     stack_id: Option<u64>,
     dto: &FrameRelationshipDto,
 ) -> Result<()> {
-    let mut undo_redo_manager = ctx.undo_redo_manager.lock().unwrap();
+    let mut undo_redo_manager = ctx.undo_redo_manager.lock();
     frame_controller::set_relationship(
         &ctx.db_context,
         &ctx.event_hub,
@@ -262,7 +262,7 @@ pub fn move_frame_relationship(
     ids_to_move: &[EntityId],
     new_index: i32,
 ) -> Result<Vec<EntityId>> {
-    let mut undo_redo_manager = ctx.undo_redo_manager.lock().unwrap();
+    let mut undo_redo_manager = ctx.undo_redo_manager.lock();
     frame_controller::move_relationship(
         &ctx.db_context,
         &ctx.event_hub,

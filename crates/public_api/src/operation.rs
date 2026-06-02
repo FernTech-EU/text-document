@@ -53,19 +53,7 @@ impl<T> Operation<T> {
     /// Get the current progress, if available.
     /// Returns `(percent, message)` where percent is 0.0–100.0.
     pub fn progress(&self) -> Option<(f64, String)> {
-        let mgr = self
-            .state
-            .ctx
-            .long_operation_manager
-            .lock()
-            .ok()
-            .or_else(|| {
-                // Mutex poisoned — recover by re-locking through the poison.
-                match self.state.ctx.long_operation_manager.lock() {
-                    Ok(g) => Some(g),
-                    Err(e) => Some(e.into_inner()),
-                }
-            })?;
+        let mgr = self.state.ctx.long_operation_manager.lock();
         mgr.get_operation_progress(&self.id)
             .map(|p| (p.percentage as f64, p.message.unwrap_or_default()))
     }
@@ -77,9 +65,11 @@ impl<T> Operation<T> {
 
     /// Cancel the operation. No-op if already finished.
     pub fn cancel(&self) {
-        if let Ok(mgr) = self.state.ctx.long_operation_manager.lock() {
-            mgr.cancel_operation(&self.id);
-        }
+        self.state
+            .ctx
+            .long_operation_manager
+            .lock()
+            .cancel_operation(&self.id);
     }
 
     /// Block the calling thread until the operation completes and return

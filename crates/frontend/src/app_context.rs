@@ -5,7 +5,8 @@ use common::event::EventHub;
 use common::long_operation::LongOperationManager;
 use common::undo_redo::UndoRedoManager;
 use flume::{Receiver, Sender};
-use std::sync::{Arc, Mutex};
+use parking_lot::Mutex;
+use std::sync::Arc;
 
 /// Application context that holds all shared state.
 ///
@@ -48,7 +49,7 @@ impl AppContext {
 
         // Inject event hub into long_operation_manager
         {
-            let mut lom = long_operation_manager.lock().unwrap();
+            let mut lom = long_operation_manager.lock();
             lom.set_event_hub(&event_hub);
         }
 
@@ -66,7 +67,7 @@ impl AppContext {
     /// second call is a no-op because the sender has already been
     /// taken.
     pub fn shutdown(&self) {
-        let _ = self.shutdown_tx.lock().unwrap().take();
+        let _ = self.shutdown_tx.lock().take();
     }
 }
 

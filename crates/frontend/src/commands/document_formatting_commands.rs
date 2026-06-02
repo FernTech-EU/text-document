@@ -14,7 +14,7 @@ pub fn set_text_format(
     stack_id: Option<u64>,
     dto: &SetTextFormatDto,
 ) -> Result<()> {
-    let mut undo_redo_manager = ctx.undo_redo_manager.lock().unwrap();
+    let mut undo_redo_manager = ctx.undo_redo_manager.lock();
     document_formatting_controller::set_text_format(
         &ctx.db_context,
         &ctx.event_hub,
@@ -30,7 +30,7 @@ pub fn merge_text_format(
     stack_id: Option<u64>,
     dto: &MergeTextFormatDto,
 ) -> Result<()> {
-    let mut undo_redo_manager = ctx.undo_redo_manager.lock().unwrap();
+    let mut undo_redo_manager = ctx.undo_redo_manager.lock();
     document_formatting_controller::merge_text_format(
         &ctx.db_context,
         &ctx.event_hub,
@@ -46,7 +46,7 @@ pub fn set_block_format(
     stack_id: Option<u64>,
     dto: &SetBlockFormatDto,
 ) -> Result<()> {
-    let mut undo_redo_manager = ctx.undo_redo_manager.lock().unwrap();
+    let mut undo_redo_manager = ctx.undo_redo_manager.lock();
     document_formatting_controller::set_block_format(
         &ctx.db_context,
         &ctx.event_hub,
@@ -62,7 +62,7 @@ pub fn set_frame_format(
     stack_id: Option<u64>,
     dto: &SetFrameFormatDto,
 ) -> Result<()> {
-    let mut undo_redo_manager = ctx.undo_redo_manager.lock().unwrap();
+    let mut undo_redo_manager = ctx.undo_redo_manager.lock();
     document_formatting_controller::set_frame_format(
         &ctx.db_context,
         &ctx.event_hub,
@@ -78,7 +78,7 @@ pub fn set_table_format(
     stack_id: Option<u64>,
     dto: &SetTableFormatDto,
 ) -> Result<()> {
-    let mut undo_redo_manager = ctx.undo_redo_manager.lock().unwrap();
+    let mut undo_redo_manager = ctx.undo_redo_manager.lock();
     document_formatting_controller::set_table_format(
         &ctx.db_context,
         &ctx.event_hub,
@@ -94,7 +94,7 @@ pub fn set_table_cell_format(
     stack_id: Option<u64>,
     dto: &SetTableCellFormatDto,
 ) -> Result<()> {
-    let mut undo_redo_manager = ctx.undo_redo_manager.lock().unwrap();
+    let mut undo_redo_manager = ctx.undo_redo_manager.lock();
     document_formatting_controller::set_table_cell_format(
         &ctx.db_context,
         &ctx.event_hub,
@@ -110,7 +110,7 @@ pub fn set_list_format(
     stack_id: Option<u64>,
     dto: &SetListFormatDto,
 ) -> Result<()> {
-    let mut undo_redo_manager = ctx.undo_redo_manager.lock().unwrap();
+    let mut undo_redo_manager = ctx.undo_redo_manager.lock();
     document_formatting_controller::set_list_format(
         &ctx.db_context,
         &ctx.event_hub,

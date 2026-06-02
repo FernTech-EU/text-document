@@ -14,7 +14,7 @@ pub fn create_orphan_resource(
     stack_id: Option<u64>,
     dto: &CreateResourceDto,
 ) -> Result<ResourceDto> {
-    let mut undo_redo_manager = ctx.undo_redo_manager.lock().unwrap();
+    let mut undo_redo_manager = ctx.undo_redo_manager.lock();
     resource_controller::create_orphan(
         &ctx.db_context,
         &ctx.event_hub,
@@ -32,7 +32,7 @@ pub fn create_resource(
     owner_id: EntityId,
     index: i32,
 ) -> Result<ResourceDto> {
-    let mut undo_redo_manager = ctx.undo_redo_manager.lock().unwrap();
+    let mut undo_redo_manager = ctx.undo_redo_manager.lock();
     resource_controller::create(
         &ctx.db_context,
         &ctx.event_hub,
@@ -50,7 +50,7 @@ pub fn create_orphan_resource_multi(
     stack_id: Option<u64>,
     dtos: &[CreateResourceDto],
 ) -> Result<Vec<ResourceDto>> {
-    let mut undo_redo_manager = ctx.undo_redo_manager.lock().unwrap();
+    let mut undo_redo_manager = ctx.undo_redo_manager.lock();
     resource_controller::create_orphan_multi(
         &ctx.db_context,
         &ctx.event_hub,
@@ -68,7 +68,7 @@ pub fn create_resource_multi(
     owner_id: EntityId,
     index: i32,
 ) -> Result<Vec<ResourceDto>> {
-    let mut undo_redo_manager = ctx.undo_redo_manager.lock().unwrap();
+    let mut undo_redo_manager = ctx.undo_redo_manager.lock();
     resource_controller::create_multi(
         &ctx.db_context,
         &ctx.event_hub,
@@ -104,7 +104,7 @@ pub fn update_resource(
     stack_id: Option<u64>,
     dto: &UpdateResourceDto,
 ) -> Result<ResourceDto> {
-    let mut undo_redo_manager = ctx.undo_redo_manager.lock().unwrap();
+    let mut undo_redo_manager = ctx.undo_redo_manager.lock();
     resource_controller::update(
         &ctx.db_context,
         &ctx.event_hub,
@@ -121,7 +121,7 @@ pub fn update_resource_multi(
     stack_id: Option<u64>,
     dtos: &[UpdateResourceDto],
 ) -> Result<Vec<ResourceDto>> {
-    let mut undo_redo_manager = ctx.undo_redo_manager.lock().unwrap();
+    let mut undo_redo_manager = ctx.undo_redo_manager.lock();
     resource_controller::update_multi(
         &ctx.db_context,
         &ctx.event_hub,
@@ -138,7 +138,7 @@ pub fn update_resource_with_relationships(
     stack_id: Option<u64>,
     dto: &ResourceDto,
 ) -> Result<ResourceDto> {
-    let mut undo_redo_manager = ctx.undo_redo_manager.lock().unwrap();
+    let mut undo_redo_manager = ctx.undo_redo_manager.lock();
     resource_controller::update_with_relationships(
         &ctx.db_context,
         &ctx.event_hub,
@@ -155,7 +155,7 @@ pub fn update_resource_with_relationships_multi(
     stack_id: Option<u64>,
     dtos: &[ResourceDto],
 ) -> Result<Vec<ResourceDto>> {
-    let mut undo_redo_manager = ctx.undo_redo_manager.lock().unwrap();
+    let mut undo_redo_manager = ctx.undo_redo_manager.lock();
     resource_controller::update_with_relationships_multi(
         &ctx.db_context,
         &ctx.event_hub,
@@ -168,7 +168,7 @@ pub fn update_resource_with_relationships_multi(
 
 /// Remove a resource entity by ID
 pub fn remove_resource(ctx: &AppContext, stack_id: Option<u64>, id: &EntityId) -> Result<()> {
-    let mut undo_redo_manager = ctx.undo_redo_manager.lock().unwrap();
+    let mut undo_redo_manager = ctx.undo_redo_manager.lock();
     resource_controller::remove(
         &ctx.db_context,
         &ctx.event_hub,
@@ -185,7 +185,7 @@ pub fn remove_resource_multi(
     stack_id: Option<u64>,
     ids: &[EntityId],
 ) -> Result<()> {
-    let mut undo_redo_manager = ctx.undo_redo_manager.lock().unwrap();
+    let mut undo_redo_manager = ctx.undo_redo_manager.lock();
     resource_controller::remove_multi(
         &ctx.db_context,
         &ctx.event_hub,

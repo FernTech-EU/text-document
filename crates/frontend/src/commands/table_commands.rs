@@ -16,7 +16,7 @@ pub fn create_orphan_table(
     stack_id: Option<u64>,
     dto: &CreateTableDto,
 ) -> Result<TableDto> {
-    let mut undo_redo_manager = ctx.undo_redo_manager.lock().unwrap();
+    let mut undo_redo_manager = ctx.undo_redo_manager.lock();
     table_controller::create_orphan(
         &ctx.db_context,
         &ctx.event_hub,
@@ -34,7 +34,7 @@ pub fn create_table(
     owner_id: EntityId,
     index: i32,
 ) -> Result<TableDto> {
-    let mut undo_redo_manager = ctx.undo_redo_manager.lock().unwrap();
+    let mut undo_redo_manager = ctx.undo_redo_manager.lock();
     table_controller::create(
         &ctx.db_context,
         &ctx.event_hub,
@@ -52,7 +52,7 @@ pub fn create_orphan_table_multi(
     stack_id: Option<u64>,
     dtos: &[CreateTableDto],
 ) -> Result<Vec<TableDto>> {
-    let mut undo_redo_manager = ctx.undo_redo_manager.lock().unwrap();
+    let mut undo_redo_manager = ctx.undo_redo_manager.lock();
     table_controller::create_orphan_multi(
         &ctx.db_context,
         &ctx.event_hub,
@@ -70,7 +70,7 @@ pub fn create_table_multi(
     owner_id: EntityId,
     index: i32,
 ) -> Result<Vec<TableDto>> {
-    let mut undo_redo_manager = ctx.undo_redo_manager.lock().unwrap();
+    let mut undo_redo_manager = ctx.undo_redo_manager.lock();
     table_controller::create_multi(
         &ctx.db_context,
         &ctx.event_hub,
@@ -106,7 +106,7 @@ pub fn update_table(
     stack_id: Option<u64>,
     dto: &UpdateTableDto,
 ) -> Result<TableDto> {
-    let mut undo_redo_manager = ctx.undo_redo_manager.lock().unwrap();
+    let mut undo_redo_manager = ctx.undo_redo_manager.lock();
     table_controller::update(
         &ctx.db_context,
         &ctx.event_hub,
@@ -123,7 +123,7 @@ pub fn update_table_multi(
     stack_id: Option<u64>,
     dtos: &[UpdateTableDto],
 ) -> Result<Vec<TableDto>> {
-    let mut undo_redo_manager = ctx.undo_redo_manager.lock().unwrap();
+    let mut undo_redo_manager = ctx.undo_redo_manager.lock();
     table_controller::update_multi(
         &ctx.db_context,
         &ctx.event_hub,
@@ -140,7 +140,7 @@ pub fn update_table_with_relationships(
     stack_id: Option<u64>,
     dto: &TableDto,
 ) -> Result<TableDto> {
-    let mut undo_redo_manager = ctx.undo_redo_manager.lock().unwrap();
+    let mut undo_redo_manager = ctx.undo_redo_manager.lock();
     table_controller::update_with_relationships(
         &ctx.db_context,
         &ctx.event_hub,
@@ -157,7 +157,7 @@ pub fn update_table_with_relationships_multi(
     stack_id: Option<u64>,
     dtos: &[TableDto],
 ) -> Result<Vec<TableDto>> {
-    let mut undo_redo_manager = ctx.undo_redo_manager.lock().unwrap();
+    let mut undo_redo_manager = ctx.undo_redo_manager.lock();
     table_controller::update_with_relationships_multi(
         &ctx.db_context,
         &ctx.event_hub,
@@ -170,7 +170,7 @@ pub fn update_table_with_relationships_multi(
 
 /// Remove a table entity by ID
 pub fn remove_table(ctx: &AppContext, stack_id: Option<u64>, id: &EntityId) -> Result<()> {
-    let mut undo_redo_manager = ctx.undo_redo_manager.lock().unwrap();
+    let mut undo_redo_manager = ctx.undo_redo_manager.lock();
     table_controller::remove(
         &ctx.db_context,
         &ctx.event_hub,
@@ -183,7 +183,7 @@ pub fn remove_table(ctx: &AppContext, stack_id: Option<u64>, id: &EntityId) -> R
 
 /// Remove multiple table entities by IDs
 pub fn remove_table_multi(ctx: &AppContext, stack_id: Option<u64>, ids: &[EntityId]) -> Result<()> {
-    let mut undo_redo_manager = ctx.undo_redo_manager.lock().unwrap();
+    let mut undo_redo_manager = ctx.undo_redo_manager.lock();
     table_controller::remove_multi(
         &ctx.db_context,
         &ctx.event_hub,
@@ -242,7 +242,7 @@ pub fn set_table_relationship(
     stack_id: Option<u64>,
     dto: &TableRelationshipDto,
 ) -> Result<()> {
-    let mut undo_redo_manager = ctx.undo_redo_manager.lock().unwrap();
+    let mut undo_redo_manager = ctx.undo_redo_manager.lock();
     table_controller::set_relationship(
         &ctx.db_context,
         &ctx.event_hub,
@@ -262,7 +262,7 @@ pub fn move_table_relationship(
     ids_to_move: &[EntityId],
     new_index: i32,
 ) -> Result<Vec<EntityId>> {
-    let mut undo_redo_manager = ctx.undo_redo_manager.lock().unwrap();
+    let mut undo_redo_manager = ctx.undo_redo_manager.lock();
     table_controller::move_relationship(
         &ctx.db_context,
         &ctx.event_hub,

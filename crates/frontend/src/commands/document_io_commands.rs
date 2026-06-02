@@ -27,7 +27,7 @@ pub fn import_markdown(ctx: &AppContext, dto: &ImportMarkdownDto) -> Result<Stri
     document_io_controller::import_markdown(
         &ctx.db_context,
         &ctx.event_hub,
-        &mut ctx.long_operation_manager.lock().unwrap(),
+        &mut ctx.long_operation_manager.lock(),
         dto,
     )
     .context("import_markdown")
@@ -39,7 +39,7 @@ pub fn get_import_markdown_progress(
     operation_id: &str,
 ) -> Option<OperationProgress> {
     document_io_controller::get_import_markdown_progress(
-        &ctx.long_operation_manager.lock().unwrap(),
+        &ctx.long_operation_manager.lock(),
         operation_id,
     )
 }
@@ -50,7 +50,7 @@ pub fn get_import_markdown_result(
     operation_id: &str,
 ) -> Result<Option<ImportMarkdownResultDto>> {
     document_io_controller::get_import_markdown_result(
-        &ctx.long_operation_manager.lock().unwrap(),
+        &ctx.long_operation_manager.lock(),
         operation_id,
     )
     .context("getting import_markdown result")
@@ -66,7 +66,7 @@ pub fn import_html(ctx: &AppContext, dto: &ImportHtmlDto) -> Result<String> {
     document_io_controller::import_html(
         &ctx.db_context,
         &ctx.event_hub,
-        &mut ctx.long_operation_manager.lock().unwrap(),
+        &mut ctx.long_operation_manager.lock(),
         dto,
     )
     .context("import_html")
@@ -75,7 +75,7 @@ pub fn import_html(ctx: &AppContext, dto: &ImportHtmlDto) -> Result<String> {
 /// Get the progress of a import_html operation
 pub fn get_import_html_progress(ctx: &AppContext, operation_id: &str) -> Option<OperationProgress> {
     document_io_controller::get_import_html_progress(
-        &ctx.long_operation_manager.lock().unwrap(),
+        &ctx.long_operation_manager.lock(),
         operation_id,
     )
 }
@@ -85,11 +85,8 @@ pub fn get_import_html_result(
     ctx: &AppContext,
     operation_id: &str,
 ) -> Result<Option<ImportHtmlResultDto>> {
-    document_io_controller::get_import_html_result(
-        &ctx.long_operation_manager.lock().unwrap(),
-        operation_id,
-    )
-    .context("getting import_html result")
+    document_io_controller::get_import_html_result(&ctx.long_operation_manager.lock(), operation_id)
+        .context("getting import_html result")
 }
 
 pub fn export_html(ctx: &AppContext) -> Result<ExportHtmlDto> {
@@ -106,7 +103,7 @@ pub fn export_docx(ctx: &AppContext, dto: &ExportDocxDto) -> Result<String> {
     document_io_controller::export_docx(
         &ctx.db_context,
         &ctx.event_hub,
-        &mut ctx.long_operation_manager.lock().unwrap(),
+        &mut ctx.long_operation_manager.lock(),
         dto,
     )
     .context("export_docx")
@@ -115,7 +112,7 @@ pub fn export_docx(ctx: &AppContext, dto: &ExportDocxDto) -> Result<String> {
 /// Get the progress of a export_docx operation
 pub fn get_export_docx_progress(ctx: &AppContext, operation_id: &str) -> Option<OperationProgress> {
     document_io_controller::get_export_docx_progress(
-        &ctx.long_operation_manager.lock().unwrap(),
+        &ctx.long_operation_manager.lock(),
         operation_id,
     )
 }
@@ -125,9 +122,6 @@ pub fn get_export_docx_result(
     ctx: &AppContext,
     operation_id: &str,
 ) -> Result<Option<ExportDocxResultDto>> {
-    document_io_controller::get_export_docx_result(
-        &ctx.long_operation_manager.lock().unwrap(),
-        operation_id,
-    )
-    .context("getting export_docx result")
+    document_io_controller::get_export_docx_result(&ctx.long_operation_manager.lock(), operation_id)
+        .context("getting export_docx result")
 }

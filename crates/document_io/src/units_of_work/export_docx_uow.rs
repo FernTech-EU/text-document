@@ -12,7 +12,7 @@ use common::entities::{Block, Document, Frame, List, Resource, Root, Table, Tabl
 use common::types;
 #[allow(unused_imports)]
 use common::types::EntityId;
-use std::sync::Mutex;
+use parking_lot::Mutex;
 
 pub struct ExportDocxUnitOfWork {
     context: DbContext,
@@ -30,13 +30,13 @@ impl ExportDocxUnitOfWork {
 
 impl QueryUnitOfWork for ExportDocxUnitOfWork {
     fn begin_transaction(&self) -> Result<()> {
-        let mut transaction = self.transaction.lock().unwrap();
+        let mut transaction = self.transaction.lock();
         *transaction = Some(Transaction::begin_read_transaction(&self.context)?);
         Ok(())
     }
 
     fn end_transaction(&self) -> Result<()> {
-        let mut transaction = self.transaction.lock().unwrap();
+        let mut transaction = self.transaction.lock();
         transaction.take().unwrap().end_read_transaction()?;
         Ok(())
     }

@@ -14,7 +14,7 @@ pub fn create_orphan_list(
     stack_id: Option<u64>,
     dto: &CreateListDto,
 ) -> Result<ListDto> {
-    let mut undo_redo_manager = ctx.undo_redo_manager.lock().unwrap();
+    let mut undo_redo_manager = ctx.undo_redo_manager.lock();
     list_controller::create_orphan(
         &ctx.db_context,
         &ctx.event_hub,
@@ -32,7 +32,7 @@ pub fn create_list(
     owner_id: EntityId,
     index: i32,
 ) -> Result<ListDto> {
-    let mut undo_redo_manager = ctx.undo_redo_manager.lock().unwrap();
+    let mut undo_redo_manager = ctx.undo_redo_manager.lock();
     list_controller::create(
         &ctx.db_context,
         &ctx.event_hub,
@@ -50,7 +50,7 @@ pub fn create_orphan_list_multi(
     stack_id: Option<u64>,
     dtos: &[CreateListDto],
 ) -> Result<Vec<ListDto>> {
-    let mut undo_redo_manager = ctx.undo_redo_manager.lock().unwrap();
+    let mut undo_redo_manager = ctx.undo_redo_manager.lock();
     list_controller::create_orphan_multi(
         &ctx.db_context,
         &ctx.event_hub,
@@ -68,7 +68,7 @@ pub fn create_list_multi(
     owner_id: EntityId,
     index: i32,
 ) -> Result<Vec<ListDto>> {
-    let mut undo_redo_manager = ctx.undo_redo_manager.lock().unwrap();
+    let mut undo_redo_manager = ctx.undo_redo_manager.lock();
     list_controller::create_multi(
         &ctx.db_context,
         &ctx.event_hub,
@@ -104,7 +104,7 @@ pub fn update_list(
     stack_id: Option<u64>,
     dto: &UpdateListDto,
 ) -> Result<ListDto> {
-    let mut undo_redo_manager = ctx.undo_redo_manager.lock().unwrap();
+    let mut undo_redo_manager = ctx.undo_redo_manager.lock();
     list_controller::update(
         &ctx.db_context,
         &ctx.event_hub,
@@ -121,7 +121,7 @@ pub fn update_list_multi(
     stack_id: Option<u64>,
     dtos: &[UpdateListDto],
 ) -> Result<Vec<ListDto>> {
-    let mut undo_redo_manager = ctx.undo_redo_manager.lock().unwrap();
+    let mut undo_redo_manager = ctx.undo_redo_manager.lock();
     list_controller::update_multi(
         &ctx.db_context,
         &ctx.event_hub,
@@ -138,7 +138,7 @@ pub fn update_list_with_relationships(
     stack_id: Option<u64>,
     dto: &ListDto,
 ) -> Result<ListDto> {
-    let mut undo_redo_manager = ctx.undo_redo_manager.lock().unwrap();
+    let mut undo_redo_manager = ctx.undo_redo_manager.lock();
     list_controller::update_with_relationships(
         &ctx.db_context,
         &ctx.event_hub,
@@ -155,7 +155,7 @@ pub fn update_list_with_relationships_multi(
     stack_id: Option<u64>,
     dtos: &[ListDto],
 ) -> Result<Vec<ListDto>> {
-    let mut undo_redo_manager = ctx.undo_redo_manager.lock().unwrap();
+    let mut undo_redo_manager = ctx.undo_redo_manager.lock();
     list_controller::update_with_relationships_multi(
         &ctx.db_context,
         &ctx.event_hub,
@@ -168,7 +168,7 @@ pub fn update_list_with_relationships_multi(
 
 /// Remove a list entity by ID
 pub fn remove_list(ctx: &AppContext, stack_id: Option<u64>, id: &EntityId) -> Result<()> {
-    let mut undo_redo_manager = ctx.undo_redo_manager.lock().unwrap();
+    let mut undo_redo_manager = ctx.undo_redo_manager.lock();
     list_controller::remove(
         &ctx.db_context,
         &ctx.event_hub,
@@ -181,7 +181,7 @@ pub fn remove_list(ctx: &AppContext, stack_id: Option<u64>, id: &EntityId) -> Re
 
 /// Remove multiple list entities by IDs
 pub fn remove_list_multi(ctx: &AppContext, stack_id: Option<u64>, ids: &[EntityId]) -> Result<()> {
-    let mut undo_redo_manager = ctx.undo_redo_manager.lock().unwrap();
+    let mut undo_redo_manager = ctx.undo_redo_manager.lock();
     list_controller::remove_multi(
         &ctx.db_context,
         &ctx.event_hub,

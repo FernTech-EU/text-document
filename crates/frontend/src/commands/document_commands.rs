@@ -16,7 +16,7 @@ pub fn create_orphan_document(
     stack_id: Option<u64>,
     dto: &CreateDocumentDto,
 ) -> Result<DocumentDto> {
-    let mut undo_redo_manager = ctx.undo_redo_manager.lock().unwrap();
+    let mut undo_redo_manager = ctx.undo_redo_manager.lock();
     document_controller::create_orphan(
         &ctx.db_context,
         &ctx.event_hub,
@@ -34,7 +34,7 @@ pub fn create_document(
     owner_id: EntityId,
     index: i32,
 ) -> Result<DocumentDto> {
-    let mut undo_redo_manager = ctx.undo_redo_manager.lock().unwrap();
+    let mut undo_redo_manager = ctx.undo_redo_manager.lock();
     document_controller::create(
         &ctx.db_context,
         &ctx.event_hub,
@@ -52,7 +52,7 @@ pub fn create_orphan_document_multi(
     stack_id: Option<u64>,
     dtos: &[CreateDocumentDto],
 ) -> Result<Vec<DocumentDto>> {
-    let mut undo_redo_manager = ctx.undo_redo_manager.lock().unwrap();
+    let mut undo_redo_manager = ctx.undo_redo_manager.lock();
     document_controller::create_orphan_multi(
         &ctx.db_context,
         &ctx.event_hub,
@@ -70,7 +70,7 @@ pub fn create_document_multi(
     owner_id: EntityId,
     index: i32,
 ) -> Result<Vec<DocumentDto>> {
-    let mut undo_redo_manager = ctx.undo_redo_manager.lock().unwrap();
+    let mut undo_redo_manager = ctx.undo_redo_manager.lock();
     document_controller::create_multi(
         &ctx.db_context,
         &ctx.event_hub,
@@ -106,7 +106,7 @@ pub fn update_document(
     stack_id: Option<u64>,
     dto: &UpdateDocumentDto,
 ) -> Result<DocumentDto> {
-    let mut undo_redo_manager = ctx.undo_redo_manager.lock().unwrap();
+    let mut undo_redo_manager = ctx.undo_redo_manager.lock();
     document_controller::update(
         &ctx.db_context,
         &ctx.event_hub,
@@ -123,7 +123,7 @@ pub fn update_document_multi(
     stack_id: Option<u64>,
     dtos: &[UpdateDocumentDto],
 ) -> Result<Vec<DocumentDto>> {
-    let mut undo_redo_manager = ctx.undo_redo_manager.lock().unwrap();
+    let mut undo_redo_manager = ctx.undo_redo_manager.lock();
     document_controller::update_multi(
         &ctx.db_context,
         &ctx.event_hub,
@@ -140,7 +140,7 @@ pub fn update_document_with_relationships(
     stack_id: Option<u64>,
     dto: &DocumentDto,
 ) -> Result<DocumentDto> {
-    let mut undo_redo_manager = ctx.undo_redo_manager.lock().unwrap();
+    let mut undo_redo_manager = ctx.undo_redo_manager.lock();
     document_controller::update_with_relationships(
         &ctx.db_context,
         &ctx.event_hub,
@@ -157,7 +157,7 @@ pub fn update_document_with_relationships_multi(
     stack_id: Option<u64>,
     dtos: &[DocumentDto],
 ) -> Result<Vec<DocumentDto>> {
-    let mut undo_redo_manager = ctx.undo_redo_manager.lock().unwrap();
+    let mut undo_redo_manager = ctx.undo_redo_manager.lock();
     document_controller::update_with_relationships_multi(
         &ctx.db_context,
         &ctx.event_hub,
@@ -170,7 +170,7 @@ pub fn update_document_with_relationships_multi(
 
 /// Remove a document entity by ID
 pub fn remove_document(ctx: &AppContext, stack_id: Option<u64>, id: &EntityId) -> Result<()> {
-    let mut undo_redo_manager = ctx.undo_redo_manager.lock().unwrap();
+    let mut undo_redo_manager = ctx.undo_redo_manager.lock();
     document_controller::remove(
         &ctx.db_context,
         &ctx.event_hub,
@@ -187,7 +187,7 @@ pub fn remove_document_multi(
     stack_id: Option<u64>,
     ids: &[EntityId],
 ) -> Result<()> {
-    let mut undo_redo_manager = ctx.undo_redo_manager.lock().unwrap();
+    let mut undo_redo_manager = ctx.undo_redo_manager.lock();
     document_controller::remove_multi(
         &ctx.db_context,
         &ctx.event_hub,
@@ -246,7 +246,7 @@ pub fn set_document_relationship(
     stack_id: Option<u64>,
     dto: &DocumentRelationshipDto,
 ) -> Result<()> {
-    let mut undo_redo_manager = ctx.undo_redo_manager.lock().unwrap();
+    let mut undo_redo_manager = ctx.undo_redo_manager.lock();
     document_controller::set_relationship(
         &ctx.db_context,
         &ctx.event_hub,
@@ -266,7 +266,7 @@ pub fn move_document_relationship(
     ids_to_move: &[EntityId],
     new_index: i32,
 ) -> Result<Vec<EntityId>> {
-    let mut undo_redo_manager = ctx.undo_redo_manager.lock().unwrap();
+    let mut undo_redo_manager = ctx.undo_redo_manager.lock();
     document_controller::move_relationship(
         &ctx.db_context,
         &ctx.event_hub,

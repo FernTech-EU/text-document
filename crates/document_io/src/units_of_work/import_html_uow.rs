@@ -13,8 +13,8 @@ use common::event::{AllEvent, DirectAccessEntity, Event, EventBuffer, EventHub, 
 use common::types;
 #[allow(unused_imports)]
 use common::types::EntityId;
+use parking_lot::Mutex;
 use std::sync::Arc;
-use std::sync::Mutex;
 
 pub struct ImportHtmlUnitOfWork {
     context: DbContext,
@@ -36,42 +36,42 @@ impl ImportHtmlUnitOfWork {
 
 impl CommandUnitOfWork for ImportHtmlUnitOfWork {
     fn begin_transaction(&mut self) -> Result<()> {
-        let mut transaction = self.transaction.lock().unwrap();
+        let mut transaction = self.transaction.lock();
         *transaction = Some(Transaction::begin_write_transaction(&self.context)?);
-        self.event_buffer.lock().unwrap().begin_buffering();
+        self.event_buffer.lock().begin_buffering();
         Ok(())
     }
 
     fn commit(&mut self) -> Result<()> {
-        let mut transaction = self.transaction.lock().unwrap();
+        let mut transaction = self.transaction.lock();
         transaction.take().unwrap().commit()?;
         drop(transaction); // release lock before flushing events
-        for event in self.event_buffer.lock().unwrap().flush() {
+        for event in self.event_buffer.lock().flush() {
             self.event_hub.send_event(event);
         }
         Ok(())
     }
 
     fn rollback(&mut self) -> Result<()> {
-        let mut transaction = self.transaction.lock().unwrap();
+        let mut transaction = self.transaction.lock();
         transaction.take().unwrap().rollback()?;
         drop(transaction);
-        self.event_buffer.lock().unwrap().discard();
+        self.event_buffer.lock().discard();
         Ok(())
     }
 
     fn create_savepoint(&self) -> Result<types::Savepoint> {
-        let transaction = self.transaction.lock().unwrap();
+        let transaction = self.transaction.lock();
         transaction.as_ref().unwrap().create_savepoint()
     }
 
     fn restore_to_savepoint(&mut self, savepoint: types::Savepoint) -> Result<()> {
-        let mut transaction_guard = self.transaction.lock().unwrap();
+        let mut transaction_guard = self.transaction.lock();
         let mut transaction = transaction_guard.take().unwrap();
         transaction.restore_to_savepoint(savepoint)?;
 
         // Discard buffered events — savepoint restore invalidated them
-        self.event_buffer.lock().unwrap().discard();
+        self.event_buffer.lock().discard();
 
         // Send Reset immediately (not buffered — UI must refresh now)
         self.event_hub.send_event(Event {

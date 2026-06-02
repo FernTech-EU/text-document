@@ -22,7 +22,7 @@ pub fn replace_text(
     stack_id: Option<u64>,
     dto: &ReplaceTextDto,
 ) -> Result<ReplaceResultDto> {
-    let mut undo_redo_manager = ctx.undo_redo_manager.lock().unwrap();
+    let mut undo_redo_manager = ctx.undo_redo_manager.lock();
     document_search_controller::replace_text(
         &ctx.db_context,
         &ctx.event_hub,
