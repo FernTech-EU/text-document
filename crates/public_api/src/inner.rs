@@ -445,8 +445,8 @@ pub(crate) fn refresh_block_positions(
     if !frontend::common::database::rope_helpers::rope_positions_match_flow(store) {
         return;
     }
-    let offsets = store.block_offsets.read().unwrap();
-    let rope = store.rope.read().unwrap();
+    let offsets = store.block_offsets.read();
+    let rope = store.rope.read();
     for dto in dtos.iter_mut() {
         if let Some((byte_start, _)) = offsets.range_of_block(dto.id) {
             dto.document_position = rope.byte_to_char(byte_start as usize) as i64;
@@ -462,9 +462,9 @@ pub(crate) fn refresh_block_position(
     if !frontend::common::database::rope_helpers::rope_positions_match_flow(store) {
         return;
     }
-    let offsets = store.block_offsets.read().unwrap();
+    let offsets = store.block_offsets.read();
     if let Some((byte_start, _)) = offsets.range_of_block(dto.id) {
-        let rope = store.rope.read().unwrap();
+        let rope = store.rope.read();
         dto.document_position = rope.byte_to_char(byte_start as usize) as i64;
     }
 }

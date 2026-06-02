@@ -2,11 +2,9 @@
 
 use crate::types::EntityId;
 use flume::{Receiver, Sender, unbounded};
+use parking_lot::Mutex;
 use serde::Serialize;
-use std::{
-    sync::{Arc, Mutex},
-    thread,
-};
+use std::{sync::Arc, thread};
 
 #[derive(Debug, Clone, Hash, PartialEq, Eq, Serialize)]
 pub enum EntityEvent {
@@ -277,7 +275,7 @@ impl EventHub {
                     .wait();
                 match outcome {
                     Ok(Some(event)) => {
-                        let mut queue = queue.lock().unwrap();
+                        let mut queue = queue.lock();
                         queue.push(event);
                     }
                     Ok(None) | Err(()) => break,
@@ -329,7 +327,7 @@ mod tests {
         thread::sleep(std::time::Duration::from_millis(100));
 
         let queue = event_hub.get_queue();
-        let queue = queue.lock().unwrap();
+        let queue = queue.lock();
         assert_eq!(queue.len(), 1);
         assert_eq!(queue[0], event);
 

@@ -1666,6 +1666,7 @@ dependencies = [
  "flume",
  "im",
  "log",
+ "parking_lot",
  "proptest",
  "pulldown-cmark",
  "ropey",

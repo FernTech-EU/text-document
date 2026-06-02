@@ -362,7 +362,7 @@ impl<'a> ListRepository<'a> {
         };
 
         // Emit Created events for this entity
-        let list_ids: Vec<_> = store.lists.read().unwrap().keys().copied().collect();
+        let list_ids: Vec<_> = store.lists.read().keys().copied().collect();
         emit(
             DirectAccessEntity::List(EntityEvent::Created),
             list_ids.clone(),

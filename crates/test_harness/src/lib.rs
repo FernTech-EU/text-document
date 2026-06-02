@@ -649,7 +649,6 @@ pub fn insert_image(
     let images_at_block = store
         .block_images
         .read()
-        .unwrap()
         .get(&target_block.id)
         .cloned()
         .unwrap_or_default();
@@ -662,7 +661,7 @@ pub fn insert_image(
     // image goes AFTER any anchors at the same byte position to match
     // insert_image_uc's convention).
     {
-        let mut images_map = store.block_images.write().unwrap();
+        let mut images_map = store.block_images.write();
         let images = images_map.entry(target_block.id).or_default();
         let insert_idx = images
             .iter()

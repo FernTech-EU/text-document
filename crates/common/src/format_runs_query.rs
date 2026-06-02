@@ -14,7 +14,6 @@ pub fn get_format_runs(store: &Store, block_id: EntityId) -> Vec<FormatRun> {
     store
         .format_runs
         .read()
-        .unwrap()
         .get(&block_id)
         .cloned()
         .unwrap_or_default()
@@ -25,7 +24,6 @@ pub fn get_block_images(store: &Store, block_id: EntityId) -> Vec<ImageAnchor> {
     store
         .block_images
         .read()
-        .unwrap()
         .get(&block_id)
         .cloned()
         .unwrap_or_default()

@@ -14,12 +14,12 @@ fn set_markdown_populates_rope() {
 
     // Inspect the rope via the document's internal store.
     let store = doc.rope_store_for_test();
-    let rope = store.rope.read().unwrap();
+    let rope = store.rope.read();
     let rope_text = rope.to_string();
     // Two blocks joined by an inter-block `\n`.
     assert_eq!(rope_text, "first paragraph\nsecond paragraph");
 
-    let offsets = store.block_offsets.read().unwrap();
+    let offsets = store.block_offsets.read();
     assert_eq!(offsets.entries.len(), 2);
     assert_eq!(offsets.entries[0].1, 0);
     assert_eq!(offsets.entries[1].1, 16); // "first paragraph\n".len()
@@ -35,10 +35,10 @@ fn set_html_populates_rope() {
         .expect("wait");
 
     let store = doc.rope_store_for_test();
-    let rope = store.rope.read().unwrap();
+    let rope = store.rope.read();
     assert_eq!(rope.to_string(), "alpha\nbeta\ngamma");
 
-    let offsets = store.block_offsets.read().unwrap();
+    let offsets = store.block_offsets.read();
     assert_eq!(offsets.entries.len(), 3);
     assert_eq!(offsets.entries[0].1, 0);
     assert_eq!(offsets.entries[1].1, 6); // "alpha\n".len()
@@ -55,7 +55,7 @@ fn insert_text_at_position_mirrors_to_rope() {
     cursor.insert_text(",").unwrap();
 
     let store = doc.rope_store_for_test();
-    let rope = store.rope.read().unwrap();
+    let rope = store.rope.read();
     assert_eq!(rope.to_string(), "hello, world");
 }
 
@@ -68,7 +68,7 @@ fn insert_text_at_end_mirrors_to_rope() {
     cursor.insert_text(" world").unwrap();
 
     let store = doc.rope_store_for_test();
-    let rope = store.rope.read().unwrap();
+    let rope = store.rope.read();
     assert_eq!(rope.to_string(), "hello world");
 }
 
@@ -85,10 +85,10 @@ fn insert_text_into_block_other_than_first_shifts_offsets() {
     cursor.insert_text("XX").unwrap();
 
     let store = doc.rope_store_for_test();
-    let rope = store.rope.read().unwrap();
+    let rope = store.rope.read();
     assert_eq!(rope.to_string(), "aaa\nbXXbb\nccc");
 
-    let offsets = store.block_offsets.read().unwrap();
+    let offsets = store.block_offsets.read();
     assert_eq!(offsets.entries.len(), 3);
     assert_eq!(offsets.entries[0].1, 0);
     assert_eq!(offsets.entries[1].1, 4);
@@ -107,7 +107,7 @@ fn delete_within_block_mirrors_to_rope() {
     cursor.remove_selected_text().unwrap();
 
     let store = doc.rope_store_for_test();
-    let rope = store.rope.read().unwrap();
+    let rope = store.rope.read();
     assert_eq!(rope.to_string(), "helloworld");
 }
 
@@ -123,10 +123,10 @@ fn delete_within_middle_block_shifts_subsequent_offsets() {
     cursor.remove_selected_text().unwrap();
 
     let store = doc.rope_store_for_test();
-    let rope = store.rope.read().unwrap();
+    let rope = store.rope.read();
     assert_eq!(rope.to_string(), "aaa\nbbb\nccc");
 
-    let offsets = store.block_offsets.read().unwrap();
+    let offsets = store.block_offsets.read();
     assert_eq!(offsets.entries[0].1, 0);
     assert_eq!(offsets.entries[1].1, 4);
     assert_eq!(offsets.entries[2].1, 8); // was 10, shifted by -2
@@ -141,12 +141,12 @@ fn insert_image_inserts_object_replacement_sentinel() {
     cursor.insert_image("img1", 100, 100).unwrap();
 
     let store = doc.rope_store_for_test();
-    let rope = store.rope.read().unwrap();
+    let rope = store.rope.read();
     // U+FFFC is 3 bytes in UTF-8. Original "ab" plus sentinel = 5 bytes.
     assert_eq!(rope.to_string(), "a\u{FFFC}b");
     assert_eq!(rope.len_bytes(), 5);
 
-    let offsets = store.block_offsets.read().unwrap();
+    let offsets = store.block_offsets.read();
     assert_eq!(offsets.total_bytes(), 5);
 }
 
@@ -164,7 +164,7 @@ fn insert_formatted_text_at_position_mirrors_to_rope() {
     cursor.insert_formatted_text(",", &fmt).unwrap();
 
     let store = doc.rope_store_for_test();
-    let rope = store.rope.read().unwrap();
+    let rope = store.rope.read();
     assert_eq!(rope.to_string(), "hello, world");
 }
 
@@ -178,10 +178,10 @@ fn insert_block_splits_existing_block_in_rope() {
     cursor.insert_block().unwrap();
 
     let store = doc.rope_store_for_test();
-    let rope = store.rope.read().unwrap();
+    let rope = store.rope.read();
     assert_eq!(rope.to_string(), "hello\n world");
 
-    let offsets = store.block_offsets.read().unwrap();
+    let offsets = store.block_offsets.read();
     assert_eq!(offsets.entries.len(), 2);
     assert_eq!(offsets.entries[0].1, 0);
     assert_eq!(offsets.entries[1].1, 6); // after "hello\n"
@@ -202,10 +202,10 @@ fn cross_block_delete_merges_in_rope() {
     cursor.remove_selected_text().unwrap();
 
     let store = doc.rope_store_for_test();
-    let rope = store.rope.read().unwrap();
+    let rope = store.rope.read();
     assert_eq!(rope.to_string(), "aacc");
 
-    let offsets = store.block_offsets.read().unwrap();
+    let offsets = store.block_offsets.read();
     // Two intermediate blocks (block 1 and block 2) removed from
     // index; only the merged block remains.
     assert_eq!(offsets.entries.len(), 1);
@@ -226,7 +226,7 @@ fn insert_table_inserts_sentinel_and_cells_inline_in_rope() {
     cursor.insert_table(2, 2).unwrap();
 
     let store = doc.rope_store_for_test();
-    let rope = store.rope.read().unwrap();
+    let rope = store.rope.read();
     // The table anchor sentinel AND its 4 empty cells are spliced INLINE,
     // right where the table sits in the flow (before "beta"), NOT appended
     // at the end of the rope. This keeps the rope's char order identical to
@@ -237,7 +237,7 @@ fn insert_table_inserts_sentinel_and_cells_inline_in_rope() {
     //   = "alpha\n\u{FFFC}\n\n\n\n\nbeta\ngamma" (24 bytes)
     assert_eq!(rope.to_string(), "alpha\n\u{FFFC}\n\n\n\n\nbeta\ngamma");
 
-    let offsets = store.block_offsets.read().unwrap();
+    let offsets = store.block_offsets.read();
     // 3 main blocks + 1 TableAnchor + 4 cell blocks = 8 entries
     assert_eq!(offsets.entries.len(), 8);
     // Index order is now flow order: alpha, TableAnchor, [4 cells], beta, gamma
@@ -278,7 +278,7 @@ fn cell_text_edits_mirror_to_rope() {
     // its block id is one of the entries[4..].
     let store = doc.rope_store_for_test();
     let registered_block_ids: Vec<u64> = {
-        let offsets = store.block_offsets.read().unwrap();
+        let offsets = store.block_offsets.read();
         offsets
             .entries
             .iter()
@@ -313,7 +313,7 @@ fn cell_text_edits_mirror_to_rope() {
 
     // The rope's cell area should now contain "hi" for that cell.
     let store = doc.rope_store_for_test();
-    let rope = store.rope.read().unwrap();
+    let rope = store.rope.read();
     assert!(
         rope.to_string().contains("hi"),
         "rope should contain edited cell text, got {:?}",
@@ -332,7 +332,7 @@ fn remove_table_strips_sentinel_from_rope() {
     // Verify the sentinel landed.
     {
         let store = doc.rope_store_for_test();
-        let rope = store.rope.read().unwrap();
+        let rope = store.rope.read();
         assert!(rope.to_string().contains('\u{FFFC}'));
     }
 
@@ -342,9 +342,9 @@ fn remove_table_strips_sentinel_from_rope() {
 
     // Rope should be back to "alpha\nbeta".
     let store = doc.rope_store_for_test();
-    let rope = store.rope.read().unwrap();
+    let rope = store.rope.read();
     assert_eq!(rope.to_string(), "alpha\nbeta");
-    let offsets = store.block_offsets.read().unwrap();
+    let offsets = store.block_offsets.read();
     assert_eq!(offsets.entries.len(), 2);
     assert!(offsets.entries.iter().all(|(m, _)| m.is_block()));
 }
@@ -360,7 +360,7 @@ fn set_html_table_cells_in_main_rope() {
         .expect("wait");
 
     let store = doc.rope_store_for_test();
-    let rope = store.rope.read().unwrap();
+    let rope = store.rope.read();
     // Layout: paragraph "before", boundary, U+FFFC anchor, boundary,
     // cell "cell", boundary, paragraph "after".
     assert_eq!(rope.to_string(), "before\n\u{FFFC}\ncell\nafter");
@@ -389,7 +389,7 @@ fn paste_inline_fragment_mirrors_to_rope() {
 
     // Expected: "world" prepended to original → "worldhello world".
     let store = doc.rope_store_for_test();
-    let rope = store.rope.read().unwrap();
+    let rope = store.rope.read();
     assert_eq!(rope.to_string(), "worldhello world");
 }
 
@@ -418,7 +418,7 @@ fn paste_multi_block_fragment_mirrors_to_rope() {
     paste.insert_fragment(&frag).unwrap();
 
     let store = doc.rope_store_for_test();
-    let rope = store.rope.read().unwrap();
+    let rope = store.rope.read();
     let rope_text = rope.to_string();
 
     // Expected: "B2" prepended to the original. Single inline-only
@@ -463,7 +463,7 @@ fn paste_table_fragment_mirrors_to_rope() {
     // U+FFFC table-anchor sentinel and the cell contents A, B, C, D
     // somewhere in the cell area.
     let store = dst.rope_store_for_test();
-    let rope = store.rope.read().unwrap();
+    let rope = store.rope.read();
     let rope_text = rope.to_string();
     assert!(
         rope_text.contains('\u{FFFC}'),
@@ -505,7 +505,7 @@ fn paste_cross_block_fragment_mirrors_to_rope() {
     paste.insert_fragment(&frag).unwrap();
 
     let store = doc.rope_store_for_test();
-    let rope = store.rope.read().unwrap();
+    let rope = store.rope.read();
     let rope_text = rope.to_string();
     // Doc after paste should contain the original "A1\nB2\nC3" PLUS the
     // pasted "1\nB2\nC" content appended at the end.

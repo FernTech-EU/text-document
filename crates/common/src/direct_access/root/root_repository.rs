@@ -480,7 +480,7 @@ impl<'a> RootRepository<'a> {
         };
 
         // Emit Created events for this entity
-        let root_ids: Vec<_> = store.roots.read().unwrap().keys().copied().collect();
+        let root_ids: Vec<_> = store.roots.read().keys().copied().collect();
         emit(
             DirectAccessEntity::Root(EntityEvent::Created),
             root_ids.clone(),
@@ -490,7 +490,7 @@ impl<'a> RootRepository<'a> {
         // Emit Created events for strong children
 
         {
-            let child_ids: Vec<_> = store.documents.read().unwrap().keys().copied().collect();
+            let child_ids: Vec<_> = store.documents.read().keys().copied().collect();
             emit(
                 DirectAccessEntity::Document(EntityEvent::Created),
                 child_ids.clone(),

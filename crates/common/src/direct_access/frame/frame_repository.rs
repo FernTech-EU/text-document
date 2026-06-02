@@ -685,7 +685,7 @@ impl<'a> FrameRepository<'a> {
         };
 
         // Emit Created events for this entity
-        let frame_ids: Vec<_> = store.frames.read().unwrap().keys().copied().collect();
+        let frame_ids: Vec<_> = store.frames.read().keys().copied().collect();
         emit(
             DirectAccessEntity::Frame(EntityEvent::Created),
             frame_ids.clone(),
@@ -695,7 +695,7 @@ impl<'a> FrameRepository<'a> {
         // Emit Created events for strong children
 
         {
-            let child_ids: Vec<_> = store.blocks.read().unwrap().keys().copied().collect();
+            let child_ids: Vec<_> = store.blocks.read().keys().copied().collect();
             emit(
                 DirectAccessEntity::Block(EntityEvent::Created),
                 child_ids.clone(),

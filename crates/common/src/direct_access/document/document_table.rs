@@ -52,7 +52,7 @@ impl<'a> DocumentTable for DocumentHashMapTable<'a> {
 
     fn create_multi(&mut self, entities: &[Document]) -> Result<Vec<Document>, RepositoryError> {
         let mut created = Vec::with_capacity(entities.len());
-        let mut document_map = self.store.documents.write().unwrap();
+        let mut document_map = self.store.documents.write();
 
         for entity in entities {
             let new_entity = if entity.id == EntityId::default() {
@@ -78,23 +78,16 @@ impl<'a> DocumentTable for DocumentHashMapTable<'a> {
     }
 
     fn get(&self, id: &EntityId) -> Result<Option<Document>, RepositoryError> {
-        Ok(self.store.documents.read().unwrap().get(id).cloned())
+        Ok(self.store.documents.read().get(id).cloned())
     }
 
     fn get_multi(&self, ids: &[EntityId]) -> Result<Vec<Option<Document>>, RepositoryError> {
-        let map = self.store.documents.read().unwrap();
+        let map = self.store.documents.read();
         Ok(ids.iter().map(|id| map.get(id).cloned()).collect())
     }
 
     fn get_all(&self) -> Result<Vec<Document>, RepositoryError> {
-        Ok(self
-            .store
-            .documents
-            .read()
-            .unwrap()
-            .values()
-            .cloned()
-            .collect())
+        Ok(self.store.documents.read().values().cloned().collect())
     }
 
     fn update(&mut self, entity: &Document) -> Result<Document, RepositoryError> {
@@ -109,7 +102,7 @@ impl<'a> DocumentTable for DocumentHashMapTable<'a> {
     /// (e.g. fetched before a sibling create_table call) won't
     /// accidentally revert the relationship state.
     fn update_multi(&mut self, entities: &[Document]) -> Result<Vec<Document>, RepositoryError> {
-        let mut document_map = self.store.documents.write().unwrap();
+        let mut document_map = self.store.documents.write();
         let mut result = Vec::with_capacity(entities.len());
         for entity in entities {
             let mut to_write = entity.clone();
@@ -140,7 +133,7 @@ impl<'a> DocumentTable for DocumentHashMapTable<'a> {
         &mut self,
         entities: &[Document],
     ) -> Result<Vec<Document>, RepositoryError> {
-        let mut document_map = self.store.documents.write().unwrap();
+        let mut document_map = self.store.documents.write();
         let mut result = Vec::with_capacity(entities.len());
         for entity in entities {
             document_map.insert(entity.id, entity.clone());
@@ -154,7 +147,7 @@ impl<'a> DocumentTable for DocumentHashMapTable<'a> {
     }
 
     fn remove_multi(&mut self, ids: &[EntityId]) -> Result<(), RepositoryError> {
-        let mut document_map = self.store.documents.write().unwrap();
+        let mut document_map = self.store.documents.write();
         for id in ids {
             document_map.remove(id);
         }
@@ -163,7 +156,7 @@ impl<'a> DocumentTable for DocumentHashMapTable<'a> {
         // Backward-junction cleanup: Document was referenced by
         // Root.document (one-to-one). Clear any Root that pointed at a
         // removed Document.
-        let mut roots = self.store.roots.write().unwrap();
+        let mut roots = self.store.roots.write();
         let to_clear: Vec<EntityId> = roots
             .iter()
             .filter_map(|(rid, r)| ids.contains(&r.document).then_some(*rid))
@@ -185,7 +178,6 @@ impl<'a> DocumentTable for DocumentHashMapTable<'a> {
             .store
             .documents
             .read()
-            .unwrap()
             .get(id)
             .map(|d| read_field(d, field))
             .unwrap_or_default())
@@ -196,7 +188,7 @@ impl<'a> DocumentTable for DocumentHashMapTable<'a> {
         ids: &[EntityId],
         field: &DocumentRelationshipField,
     ) -> Result<StdHashMap<EntityId, Vec<EntityId>>, RepositoryError> {
-        let map = self.store.documents.read().unwrap();
+        let map = self.store.documents.read();
         let mut out = StdHashMap::new();
         for id in ids {
             out.insert(
@@ -218,7 +210,6 @@ impl<'a> DocumentTable for DocumentHashMapTable<'a> {
             .store
             .documents
             .read()
-            .unwrap()
             .get(id)
             .map(|d| read_field(d, field).len())
             .unwrap_or(0))
@@ -235,7 +226,6 @@ impl<'a> DocumentTable for DocumentHashMapTable<'a> {
             .store
             .documents
             .read()
-            .unwrap()
             .get(id)
             .map(|d| {
                 read_field(d, field)
@@ -255,7 +245,7 @@ impl<'a> DocumentTable for DocumentHashMapTable<'a> {
         // Scan all Documents and return those whose inline list for
         // `field` contains any of `right_ids`. Always O(N_docs) — but
         // there's typically only one Document per Root.
-        let map = self.store.documents.read().unwrap();
+        let map = self.store.documents.read();
         let mut out = Vec::new();
         for (id, doc) in map.iter() {
             let list = read_field(doc, field);
@@ -271,7 +261,7 @@ impl<'a> DocumentTable for DocumentHashMapTable<'a> {
         field: &DocumentRelationshipField,
         relationships: Vec<(EntityId, Vec<EntityId>)>,
     ) -> Result<(), RepositoryError> {
-        let mut map = self.store.documents.write().unwrap();
+        let mut map = self.store.documents.write();
         for (id, ids) in relationships {
             if let Some(doc) = map.get_mut(&id) {
                 write_field(doc, field, ids);
@@ -286,7 +276,7 @@ impl<'a> DocumentTable for DocumentHashMapTable<'a> {
         field: &DocumentRelationshipField,
         right_ids: &[EntityId],
     ) -> Result<(), RepositoryError> {
-        let mut map = self.store.documents.write().unwrap();
+        let mut map = self.store.documents.write();
         if let Some(doc) = map.get_mut(id) {
             write_field(doc, field, right_ids.to_vec());
         }
@@ -300,7 +290,7 @@ impl<'a> DocumentTable for DocumentHashMapTable<'a> {
         ids_to_move: &[EntityId],
         new_index: i32,
     ) -> Result<Vec<EntityId>, RepositoryError> {
-        let mut map = self.store.documents.write().unwrap();
+        let mut map = self.store.documents.write();
         let Some(doc) = map.get_mut(id) else {
             return Ok(Vec::new());
         };
@@ -323,23 +313,16 @@ impl<'a> DocumentHashMapTableRO<'a> {
 
 impl<'a> DocumentTableRO for DocumentHashMapTableRO<'a> {
     fn get(&self, id: &EntityId) -> Result<Option<Document>, RepositoryError> {
-        Ok(self.store.documents.read().unwrap().get(id).cloned())
+        Ok(self.store.documents.read().get(id).cloned())
     }
 
     fn get_multi(&self, ids: &[EntityId]) -> Result<Vec<Option<Document>>, RepositoryError> {
-        let map = self.store.documents.read().unwrap();
+        let map = self.store.documents.read();
         Ok(ids.iter().map(|id| map.get(id).cloned()).collect())
     }
 
     fn get_all(&self) -> Result<Vec<Document>, RepositoryError> {
-        Ok(self
-            .store
-            .documents
-            .read()
-            .unwrap()
-            .values()
-            .cloned()
-            .collect())
+        Ok(self.store.documents.read().values().cloned().collect())
     }
 
     fn get_relationship(
@@ -351,7 +334,6 @@ impl<'a> DocumentTableRO for DocumentHashMapTableRO<'a> {
             .store
             .documents
             .read()
-            .unwrap()
             .get(id)
             .map(|d| read_field(d, field))
             .unwrap_or_default())
@@ -362,7 +344,7 @@ impl<'a> DocumentTableRO for DocumentHashMapTableRO<'a> {
         ids: &[EntityId],
         field: &DocumentRelationshipField,
     ) -> Result<StdHashMap<EntityId, Vec<EntityId>>, RepositoryError> {
-        let map = self.store.documents.read().unwrap();
+        let map = self.store.documents.read();
         let mut out = StdHashMap::new();
         for id in ids {
             out.insert(
@@ -384,7 +366,6 @@ impl<'a> DocumentTableRO for DocumentHashMapTableRO<'a> {
             .store
             .documents
             .read()
-            .unwrap()
             .get(id)
             .map(|d| read_field(d, field).len())
             .unwrap_or(0))
@@ -401,7 +382,6 @@ impl<'a> DocumentTableRO for DocumentHashMapTableRO<'a> {
             .store
             .documents
             .read()
-            .unwrap()
             .get(id)
             .map(|d| {
                 read_field(d, field)
@@ -418,7 +398,7 @@ impl<'a> DocumentTableRO for DocumentHashMapTableRO<'a> {
         field: &DocumentRelationshipField,
         right_ids: &[EntityId],
     ) -> Result<Vec<(EntityId, Vec<EntityId>)>, RepositoryError> {
-        let map = self.store.documents.read().unwrap();
+        let map = self.store.documents.read();
         let mut out = Vec::new();
         for (id, doc) in map.iter() {
             let list = read_field(doc, field);

@@ -18,8 +18,8 @@ fn insert_frame_past_end_appends_top_level_frame_to_rope() -> Result<()> {
     let (db_context, event_hub, mut urm) = setup_with_imported_text("Hello")?;
 
     let store = db_context.get_store();
-    assert_eq!(store.rope.read().unwrap().to_string(), "Hello");
-    assert_eq!(store.block_offsets.read().unwrap().entries.len(), 1);
+    assert_eq!(store.rope.read().to_string(), "Hello");
+    assert_eq!(store.block_offsets.read().entries.len(), 1);
 
     // Position 999 falls outside any existing frame → top-level path.
     document_editing_controller::insert_frame(
@@ -34,10 +34,10 @@ fn insert_frame_past_end_appends_top_level_frame_to_rope() -> Result<()> {
     )?;
 
     // Rope: "Hello\n" — original 5 bytes + `\n` boundary.
-    assert_eq!(store.rope.read().unwrap().to_string(), "Hello\n");
+    assert_eq!(store.rope.read().to_string(), "Hello\n");
 
     // Offsets: original block at byte 0, new empty block at byte 6.
-    let offsets = store.block_offsets.read().unwrap();
+    let offsets = store.block_offsets.read();
     assert_eq!(offsets.entries.len(), 2);
     assert_eq!(offsets.entries[0].1, 0);
     assert_eq!(offsets.entries[1].1, 6);
@@ -48,7 +48,7 @@ fn insert_frame_past_end_appends_top_level_frame_to_rope() -> Result<()> {
     // convention BlockOffsetIndex.range_of follows for any adjacent
     // entries). In half-open [start, end) terms the ranges [0, 6) and
     // [6, 6) are adjacent, not overlapping.
-    let frames = store.frames.read().unwrap();
+    let frames = store.frames.read();
     let mut top_ranges: Vec<(u32, u32)> = frames
         .values()
         .filter(|f| f.parent_frame.is_none())
@@ -82,8 +82,8 @@ fn insert_table_in_first_top_level_frame_places_cells_before_second_frame() -> R
 
     let store = db_context.get_store();
     // Sanity: rope is "ab\n" (3 bytes), 2 entries.
-    assert_eq!(store.rope.read().unwrap().to_string(), "ab\n");
-    assert_eq!(store.block_offsets.read().unwrap().entries.len(), 2);
+    assert_eq!(store.rope.read().to_string(), "ab\n");
+    assert_eq!(store.block_offsets.read().entries.len(), 2);
 
     // Insert a 1x1 table inside frame 1 at position 0 (which falls
     // inside frame 1's block "ab"). Position 0 → table goes BEFORE the
@@ -101,8 +101,8 @@ fn insert_table_in_first_top_level_frame_places_cells_before_second_frame() -> R
         },
     )?;
 
-    let rope_text = store.rope.read().unwrap().to_string();
-    let offsets = store.block_offsets.read().unwrap();
+    let rope_text = store.rope.read().to_string();
+    let offsets = store.block_offsets.read();
 
     // The current implementation places cells at `top_level_frame_end_byte`
     // computed from current block_offsets. For the multi-top-level-frame
@@ -175,8 +175,8 @@ fn root_frame_byte_range_covers_rope_after_edits() -> Result<()> {
     )?;
 
     let store = db_context.get_store();
-    let frames = store.frames.read().unwrap();
-    let table_cells = store.table_cells.read().unwrap();
+    let frames = store.frames.read();
+    let table_cells = store.table_cells.read();
     let cell_frame_ids: std::collections::HashSet<u64> =
         table_cells.values().filter_map(|c| c.cell_frame).collect();
 
@@ -187,7 +187,7 @@ fn root_frame_byte_range_covers_rope_after_edits() -> Result<()> {
         .collect();
     assert_eq!(top_level.len(), 1);
 
-    let total = store.rope.read().unwrap().len_bytes() as u32;
+    let total = store.rope.read().len_bytes() as u32;
     assert_eq!(
         top_level[0].byte_range,
         (0, total),

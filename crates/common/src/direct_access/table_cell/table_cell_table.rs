@@ -43,7 +43,7 @@ impl<'a> TableCellTable for TableCellHashMapTable<'a> {
 
     fn create_multi(&mut self, entities: &[TableCell]) -> Result<Vec<TableCell>, RepositoryError> {
         let mut created = Vec::with_capacity(entities.len());
-        let mut map = self.store.table_cells.write().unwrap();
+        let mut map = self.store.table_cells.write();
 
         for entity in entities {
             let new_entity = if entity.id == EntityId::default() {
@@ -69,23 +69,16 @@ impl<'a> TableCellTable for TableCellHashMapTable<'a> {
     }
 
     fn get(&self, id: &EntityId) -> Result<Option<TableCell>, RepositoryError> {
-        Ok(self.store.table_cells.read().unwrap().get(id).cloned())
+        Ok(self.store.table_cells.read().get(id).cloned())
     }
 
     fn get_multi(&self, ids: &[EntityId]) -> Result<Vec<Option<TableCell>>, RepositoryError> {
-        let map = self.store.table_cells.read().unwrap();
+        let map = self.store.table_cells.read();
         Ok(ids.iter().map(|id| map.get(id).cloned()).collect())
     }
 
     fn get_all(&self) -> Result<Vec<TableCell>, RepositoryError> {
-        Ok(self
-            .store
-            .table_cells
-            .read()
-            .unwrap()
-            .values()
-            .cloned()
-            .collect())
+        Ok(self.store.table_cells.read().values().cloned().collect())
     }
 
     fn update(&mut self, entity: &TableCell) -> Result<TableCell, RepositoryError> {
@@ -94,7 +87,7 @@ impl<'a> TableCellTable for TableCellHashMapTable<'a> {
     }
 
     fn update_multi(&mut self, entities: &[TableCell]) -> Result<Vec<TableCell>, RepositoryError> {
-        let mut map = self.store.table_cells.write().unwrap();
+        let mut map = self.store.table_cells.write();
         let mut result = Vec::with_capacity(entities.len());
         for entity in entities {
             let mut to_write = entity.clone();
@@ -119,7 +112,7 @@ impl<'a> TableCellTable for TableCellHashMapTable<'a> {
         &mut self,
         entities: &[TableCell],
     ) -> Result<Vec<TableCell>, RepositoryError> {
-        let mut map = self.store.table_cells.write().unwrap();
+        let mut map = self.store.table_cells.write();
         let mut result = Vec::with_capacity(entities.len());
         for entity in entities {
             map.insert(entity.id, entity.clone());
@@ -136,7 +129,7 @@ impl<'a> TableCellTable for TableCellHashMapTable<'a> {
         let removed: std::collections::HashSet<EntityId> = ids.iter().copied().collect();
 
         {
-            let mut map = self.store.table_cells.write().unwrap();
+            let mut map = self.store.table_cells.write();
             for id in ids {
                 map.remove(id);
             }
@@ -145,7 +138,7 @@ impl<'a> TableCellTable for TableCellHashMapTable<'a> {
         // Backward cleanup: Tables whose `cells` Vec listed any
         // removed TableCell must strip those ids.
         {
-            let mut table_map = self.store.tables.write().unwrap();
+            let mut table_map = self.store.tables.write();
             let updates: Vec<(EntityId, crate::entities::Table)> = table_map
                 .iter()
                 .filter_map(|(tid, t)| {
@@ -175,7 +168,6 @@ impl<'a> TableCellTable for TableCellHashMapTable<'a> {
             .store
             .table_cells
             .read()
-            .unwrap()
             .get(id)
             .map(|c| read_field(c, field))
             .unwrap_or_default())
@@ -186,7 +178,7 @@ impl<'a> TableCellTable for TableCellHashMapTable<'a> {
         ids: &[EntityId],
         field: &TableCellRelationshipField,
     ) -> Result<StdHashMap<EntityId, Vec<EntityId>>, RepositoryError> {
-        let map = self.store.table_cells.read().unwrap();
+        let map = self.store.table_cells.read();
         let mut out = StdHashMap::new();
         for id in ids {
             out.insert(
@@ -208,7 +200,6 @@ impl<'a> TableCellTable for TableCellHashMapTable<'a> {
             .store
             .table_cells
             .read()
-            .unwrap()
             .get(id)
             .map(|c| read_field(c, field).len())
             .unwrap_or(0))
@@ -225,7 +216,6 @@ impl<'a> TableCellTable for TableCellHashMapTable<'a> {
             .store
             .table_cells
             .read()
-            .unwrap()
             .get(id)
             .map(|c| {
                 read_field(c, field)
@@ -242,7 +232,7 @@ impl<'a> TableCellTable for TableCellHashMapTable<'a> {
         field: &TableCellRelationshipField,
         right_ids: &[EntityId],
     ) -> Result<Vec<(EntityId, Vec<EntityId>)>, RepositoryError> {
-        let map = self.store.table_cells.read().unwrap();
+        let map = self.store.table_cells.read();
         let mut out = Vec::new();
         for (id, cell) in map.iter() {
             let list = read_field(cell, field);
@@ -258,7 +248,7 @@ impl<'a> TableCellTable for TableCellHashMapTable<'a> {
         field: &TableCellRelationshipField,
         relationships: Vec<(EntityId, Vec<EntityId>)>,
     ) -> Result<(), RepositoryError> {
-        let mut map = self.store.table_cells.write().unwrap();
+        let mut map = self.store.table_cells.write();
         for (id, ids) in relationships {
             if let Some(cell) = map.get_mut(&id) {
                 write_field(cell, field, ids);
@@ -273,7 +263,7 @@ impl<'a> TableCellTable for TableCellHashMapTable<'a> {
         field: &TableCellRelationshipField,
         right_ids: &[EntityId],
     ) -> Result<(), RepositoryError> {
-        let mut map = self.store.table_cells.write().unwrap();
+        let mut map = self.store.table_cells.write();
         if let Some(cell) = map.get_mut(id) {
             write_field(cell, field, right_ids.to_vec());
         }
@@ -287,7 +277,7 @@ impl<'a> TableCellTable for TableCellHashMapTable<'a> {
         ids_to_move: &[EntityId],
         new_index: i32,
     ) -> Result<Vec<EntityId>, RepositoryError> {
-        let mut map = self.store.table_cells.write().unwrap();
+        let mut map = self.store.table_cells.write();
         let Some(cell) = map.get_mut(id) else {
             return Ok(Vec::new());
         };
@@ -310,23 +300,16 @@ impl<'a> TableCellHashMapTableRO<'a> {
 
 impl<'a> TableCellTableRO for TableCellHashMapTableRO<'a> {
     fn get(&self, id: &EntityId) -> Result<Option<TableCell>, RepositoryError> {
-        Ok(self.store.table_cells.read().unwrap().get(id).cloned())
+        Ok(self.store.table_cells.read().get(id).cloned())
     }
 
     fn get_multi(&self, ids: &[EntityId]) -> Result<Vec<Option<TableCell>>, RepositoryError> {
-        let map = self.store.table_cells.read().unwrap();
+        let map = self.store.table_cells.read();
         Ok(ids.iter().map(|id| map.get(id).cloned()).collect())
     }
 
     fn get_all(&self) -> Result<Vec<TableCell>, RepositoryError> {
-        Ok(self
-            .store
-            .table_cells
-            .read()
-            .unwrap()
-            .values()
-            .cloned()
-            .collect())
+        Ok(self.store.table_cells.read().values().cloned().collect())
     }
 
     fn get_relationship(
@@ -338,7 +321,6 @@ impl<'a> TableCellTableRO for TableCellHashMapTableRO<'a> {
             .store
             .table_cells
             .read()
-            .unwrap()
             .get(id)
             .map(|c| read_field(c, field))
             .unwrap_or_default())
@@ -349,7 +331,7 @@ impl<'a> TableCellTableRO for TableCellHashMapTableRO<'a> {
         ids: &[EntityId],
         field: &TableCellRelationshipField,
     ) -> Result<StdHashMap<EntityId, Vec<EntityId>>, RepositoryError> {
-        let map = self.store.table_cells.read().unwrap();
+        let map = self.store.table_cells.read();
         let mut out = StdHashMap::new();
         for id in ids {
             out.insert(
@@ -371,7 +353,6 @@ impl<'a> TableCellTableRO for TableCellHashMapTableRO<'a> {
             .store
             .table_cells
             .read()
-            .unwrap()
             .get(id)
             .map(|c| read_field(c, field).len())
             .unwrap_or(0))
@@ -388,7 +369,6 @@ impl<'a> TableCellTableRO for TableCellHashMapTableRO<'a> {
             .store
             .table_cells
             .read()
-            .unwrap()
             .get(id)
             .map(|c| {
                 read_field(c, field)
@@ -405,7 +385,7 @@ impl<'a> TableCellTableRO for TableCellHashMapTableRO<'a> {
         field: &TableCellRelationshipField,
         right_ids: &[EntityId],
     ) -> Result<Vec<(EntityId, Vec<EntityId>)>, RepositoryError> {
-        let map = self.store.table_cells.read().unwrap();
+        let map = self.store.table_cells.read();
         let mut out = Vec::new();
         for (id, cell) in map.iter() {
             let list = read_field(cell, field);

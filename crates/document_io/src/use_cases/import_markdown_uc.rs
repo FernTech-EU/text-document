@@ -209,7 +209,7 @@ fn import_parsed_elements(
 
                 {
                     let store = uow.store();
-                    let mut runs_map = store.format_runs.write().unwrap();
+                    let mut runs_map = store.format_runs.write();
                     if !format_runs.is_empty() {
                         runs_map.insert(created_block.id, format_runs);
                     } else {
@@ -307,7 +307,7 @@ fn import_parsed_elements(
 
                         {
                             let store = uow.store();
-                            let mut runs_map = store.format_runs.write().unwrap();
+                            let mut runs_map = store.format_runs.write();
                             if !format_runs.is_empty() {
                                 runs_map.insert(created_block.id, format_runs);
                             } else {

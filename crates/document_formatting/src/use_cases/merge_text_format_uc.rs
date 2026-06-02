@@ -163,14 +163,14 @@ fn execute_merge_text_format(
 
         // Capture prior state before mutation.
         let prior_runs = {
-            let runs_map = store.format_runs.read().unwrap();
+            let runs_map = store.format_runs.read();
             runs_map
                 .get(&block.id)
                 .map(|runs| capture_runs_in_range(runs, byte_start, byte_end))
                 .unwrap_or_default()
         };
         let prior_image_formats = {
-            let images_map = store.block_images.read().unwrap();
+            let images_map = store.block_images.read();
             images_map
                 .get(&block.id)
                 .map(|images| capture_image_formats_in_range(images, byte_start, byte_end))
@@ -178,7 +178,7 @@ fn execute_merge_text_format(
         };
 
         {
-            let mut runs_map = store.format_runs.write().unwrap();
+            let mut runs_map = store.format_runs.write();
             let runs = runs_map.entry(block.id).or_default();
             let replacement = build_replacement_runs(runs, byte_start, byte_end, dto);
             splice_range(runs, byte_start..byte_end, replacement);
@@ -187,7 +187,7 @@ fn execute_merge_text_format(
 
         // Update image anchor formats inside the selected byte range.
         {
-            let mut images_map = store.block_images.write().unwrap();
+            let mut images_map = store.block_images.write();
             if let Some(images) = images_map.get_mut(&block.id) {
                 for img in images.iter_mut() {
                     if img.byte_offset >= byte_start && img.byte_offset < byte_end {
@@ -217,7 +217,7 @@ fn apply_inverse(
     let store = uow.store();
     for entry in inverse {
         {
-            let mut runs_map = store.format_runs.write().unwrap();
+            let mut runs_map = store.format_runs.write();
             let runs = runs_map.entry(entry.block_id).or_default();
             splice_range(
                 runs,
@@ -226,7 +226,7 @@ fn apply_inverse(
             );
         }
         {
-            let mut images_map = store.block_images.write().unwrap();
+            let mut images_map = store.block_images.write();
             if let Some(images) = images_map.get_mut(&entry.block_id) {
                 for (byte_offset, format) in &entry.prior_image_formats {
                     if let Some(img) = images.iter_mut().find(|i| i.byte_offset == *byte_offset) {

@@ -947,7 +947,6 @@ impl TextCursor {
         let block_entity = store
             .blocks
             .read()
-            .unwrap()
             .get(&(block_info.block_id as common::types::EntityId))
             .cloned();
         match block_entity {
@@ -2186,7 +2185,6 @@ impl TextCursor {
         let images = store
             .block_images
             .read()
-            .unwrap()
             .get(&block_id)
             .cloned()
             .unwrap_or_default();
@@ -2198,7 +2196,6 @@ impl TextCursor {
         let runs = store
             .format_runs
             .read()
-            .unwrap()
             .get(&block_id)
             .cloned()
             .unwrap_or_default();
@@ -2795,7 +2792,7 @@ enum BlockEdge {
 fn cursor_frame_ref(inner: &TextDocumentInner, block_id: u64) -> Option<FrameRef> {
     let parent = crate::text_block::find_parent_frame(inner, block_id)?;
     let store = inner.ctx.db_context.get_store();
-    let frames = store.frames.read().unwrap();
+    let frames = store.frames.read();
     let frame = frames.get(&parent)?.clone();
     frame.parent_frame?;
     let is_blockquote = frame.fmt_is_blockquote.unwrap_or(false);
@@ -2827,7 +2824,7 @@ fn cursor_frame_ref(inner: &TextDocumentInner, block_id: u64) -> Option<FrameRef
 fn innermost_blockquote_frame_id(inner: &TextDocumentInner, block_id: u64) -> Option<usize> {
     let mut current = crate::text_block::find_parent_frame(inner, block_id);
     let store = inner.ctx.db_context.get_store();
-    let frames = store.frames.read().unwrap();
+    let frames = store.frames.read();
     while let Some(id) = current {
         let f = frames.get(&id)?;
         if f.fmt_is_blockquote == Some(true) {
@@ -2843,7 +2840,7 @@ fn innermost_blockquote_frame_id(inner: &TextDocumentInner, block_id: u64) -> Op
 fn blockquote_depth_for_block(inner: &TextDocumentInner, block_id: u64) -> usize {
     let mut current = crate::text_block::find_parent_frame(inner, block_id);
     let store = inner.ctx.db_context.get_store();
-    let frames = store.frames.read().unwrap();
+    let frames = store.frames.read();
     let mut count = 0;
     while let Some(id) = current {
         let Some(f) = frames.get(&id) else {
@@ -2872,7 +2869,7 @@ fn block_position_in_current_frame(cursor: &TextCursor) -> Option<BlockEdge> {
     let block_id = block_info.block_id as common::types::EntityId;
     let parent_id = crate::text_block::find_parent_frame(&inner, block_info.block_id as u64)?;
     let store = inner.ctx.db_context.get_store();
-    let frames = store.frames.read().unwrap();
+    let frames = store.frames.read();
     let frame = frames.get(&parent_id)?;
     let block_positions: Vec<usize> = frame
         .child_order

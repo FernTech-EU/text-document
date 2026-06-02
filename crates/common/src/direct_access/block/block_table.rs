@@ -43,7 +43,7 @@ impl<'a> BlockTable for BlockHashMapTable<'a> {
 
     fn create_multi(&mut self, entities: &[Block]) -> Result<Vec<Block>, RepositoryError> {
         let mut created = Vec::with_capacity(entities.len());
-        let mut block_map = self.store.blocks.write().unwrap();
+        let mut block_map = self.store.blocks.write();
 
         for entity in entities {
             let new_entity = if entity.id == EntityId::default() {
@@ -69,23 +69,16 @@ impl<'a> BlockTable for BlockHashMapTable<'a> {
     }
 
     fn get(&self, id: &EntityId) -> Result<Option<Block>, RepositoryError> {
-        Ok(self.store.blocks.read().unwrap().get(id).cloned())
+        Ok(self.store.blocks.read().get(id).cloned())
     }
 
     fn get_multi(&self, ids: &[EntityId]) -> Result<Vec<Option<Block>>, RepositoryError> {
-        let map = self.store.blocks.read().unwrap();
+        let map = self.store.blocks.read();
         Ok(ids.iter().map(|id| map.get(id).cloned()).collect())
     }
 
     fn get_all(&self) -> Result<Vec<Block>, RepositoryError> {
-        Ok(self
-            .store
-            .blocks
-            .read()
-            .unwrap()
-            .values()
-            .cloned()
-            .collect())
+        Ok(self.store.blocks.read().values().cloned().collect())
     }
 
     fn update(&mut self, entity: &Block) -> Result<Block, RepositoryError> {
@@ -96,7 +89,7 @@ impl<'a> BlockTable for BlockHashMapTable<'a> {
     /// Scalar-only: preserve in-store `list` so a stale Block doesn't
     /// revert the relationship state.
     fn update_multi(&mut self, entities: &[Block]) -> Result<Vec<Block>, RepositoryError> {
-        let mut block_map = self.store.blocks.write().unwrap();
+        let mut block_map = self.store.blocks.write();
         let mut result = Vec::with_capacity(entities.len());
         for entity in entities {
             let mut to_write = entity.clone();
@@ -118,7 +111,7 @@ impl<'a> BlockTable for BlockHashMapTable<'a> {
         &mut self,
         entities: &[Block],
     ) -> Result<Vec<Block>, RepositoryError> {
-        let mut block_map = self.store.blocks.write().unwrap();
+        let mut block_map = self.store.blocks.write();
         let mut result = Vec::with_capacity(entities.len());
         for entity in entities {
             block_map.insert(entity.id, entity.clone());
@@ -135,7 +128,7 @@ impl<'a> BlockTable for BlockHashMapTable<'a> {
         let removed: std::collections::HashSet<EntityId> = ids.iter().copied().collect();
 
         {
-            let mut block_map = self.store.blocks.write().unwrap();
+            let mut block_map = self.store.blocks.write();
             for id in ids {
                 block_map.remove(id);
             }
@@ -145,7 +138,7 @@ impl<'a> BlockTable for BlockHashMapTable<'a> {
         // removed Block must have those ids stripped (this also
         // affects `child_order`, which encodes block positions).
         {
-            let mut frame_map = self.store.frames.write().unwrap();
+            let mut frame_map = self.store.frames.write();
             let updates: Vec<(EntityId, crate::entities::Frame)> = frame_map
                 .iter()
                 .filter_map(|(fid, f)| {
@@ -174,13 +167,13 @@ impl<'a> BlockTable for BlockHashMapTable<'a> {
 
         // Also clean up per-block format_runs and block_images.
         {
-            let mut runs = self.store.format_runs.write().unwrap();
+            let mut runs = self.store.format_runs.write();
             for id in ids {
                 runs.remove(id);
             }
         }
         {
-            let mut images = self.store.block_images.write().unwrap();
+            let mut images = self.store.block_images.write();
             for id in ids {
                 images.remove(id);
             }
@@ -198,7 +191,6 @@ impl<'a> BlockTable for BlockHashMapTable<'a> {
             .store
             .blocks
             .read()
-            .unwrap()
             .get(id)
             .map(|b| read_field(b, field))
             .unwrap_or_default())
@@ -209,7 +201,7 @@ impl<'a> BlockTable for BlockHashMapTable<'a> {
         ids: &[EntityId],
         field: &BlockRelationshipField,
     ) -> Result<StdHashMap<EntityId, Vec<EntityId>>, RepositoryError> {
-        let map = self.store.blocks.read().unwrap();
+        let map = self.store.blocks.read();
         let mut out = StdHashMap::new();
         for id in ids {
             out.insert(
@@ -231,7 +223,6 @@ impl<'a> BlockTable for BlockHashMapTable<'a> {
             .store
             .blocks
             .read()
-            .unwrap()
             .get(id)
             .map(|b| read_field(b, field).len())
             .unwrap_or(0))
@@ -248,7 +239,6 @@ impl<'a> BlockTable for BlockHashMapTable<'a> {
             .store
             .blocks
             .read()
-            .unwrap()
             .get(id)
             .map(|b| {
                 read_field(b, field)
@@ -265,7 +255,7 @@ impl<'a> BlockTable for BlockHashMapTable<'a> {
         field: &BlockRelationshipField,
         right_ids: &[EntityId],
     ) -> Result<Vec<(EntityId, Vec<EntityId>)>, RepositoryError> {
-        let map = self.store.blocks.read().unwrap();
+        let map = self.store.blocks.read();
         let mut out = Vec::new();
         for (id, block) in map.iter() {
             let list = read_field(block, field);
@@ -281,7 +271,7 @@ impl<'a> BlockTable for BlockHashMapTable<'a> {
         field: &BlockRelationshipField,
         relationships: Vec<(EntityId, Vec<EntityId>)>,
     ) -> Result<(), RepositoryError> {
-        let mut map = self.store.blocks.write().unwrap();
+        let mut map = self.store.blocks.write();
         for (id, ids) in relationships {
             if let Some(block) = map.get_mut(&id) {
                 write_field(block, field, ids);
@@ -296,7 +286,7 @@ impl<'a> BlockTable for BlockHashMapTable<'a> {
         field: &BlockRelationshipField,
         right_ids: &[EntityId],
     ) -> Result<(), RepositoryError> {
-        let mut map = self.store.blocks.write().unwrap();
+        let mut map = self.store.blocks.write();
         if let Some(block) = map.get_mut(id) {
             write_field(block, field, right_ids.to_vec());
         }
@@ -310,7 +300,7 @@ impl<'a> BlockTable for BlockHashMapTable<'a> {
         ids_to_move: &[EntityId],
         new_index: i32,
     ) -> Result<Vec<EntityId>, RepositoryError> {
-        let mut map = self.store.blocks.write().unwrap();
+        let mut map = self.store.blocks.write();
         let Some(block) = map.get_mut(id) else {
             return Ok(Vec::new());
         };
@@ -333,23 +323,16 @@ impl<'a> BlockHashMapTableRO<'a> {
 
 impl<'a> BlockTableRO for BlockHashMapTableRO<'a> {
     fn get(&self, id: &EntityId) -> Result<Option<Block>, RepositoryError> {
-        Ok(self.store.blocks.read().unwrap().get(id).cloned())
+        Ok(self.store.blocks.read().get(id).cloned())
     }
 
     fn get_multi(&self, ids: &[EntityId]) -> Result<Vec<Option<Block>>, RepositoryError> {
-        let map = self.store.blocks.read().unwrap();
+        let map = self.store.blocks.read();
         Ok(ids.iter().map(|id| map.get(id).cloned()).collect())
     }
 
     fn get_all(&self) -> Result<Vec<Block>, RepositoryError> {
-        Ok(self
-            .store
-            .blocks
-            .read()
-            .unwrap()
-            .values()
-            .cloned()
-            .collect())
+        Ok(self.store.blocks.read().values().cloned().collect())
     }
 
     fn get_relationship(
@@ -361,7 +344,6 @@ impl<'a> BlockTableRO for BlockHashMapTableRO<'a> {
             .store
             .blocks
             .read()
-            .unwrap()
             .get(id)
             .map(|b| read_field(b, field))
             .unwrap_or_default())
@@ -372,7 +354,7 @@ impl<'a> BlockTableRO for BlockHashMapTableRO<'a> {
         ids: &[EntityId],
         field: &BlockRelationshipField,
     ) -> Result<StdHashMap<EntityId, Vec<EntityId>>, RepositoryError> {
-        let map = self.store.blocks.read().unwrap();
+        let map = self.store.blocks.read();
         let mut out = StdHashMap::new();
         for id in ids {
             out.insert(
@@ -394,7 +376,6 @@ impl<'a> BlockTableRO for BlockHashMapTableRO<'a> {
             .store
             .blocks
             .read()
-            .unwrap()
             .get(id)
             .map(|b| read_field(b, field).len())
             .unwrap_or(0))
@@ -411,7 +392,6 @@ impl<'a> BlockTableRO for BlockHashMapTableRO<'a> {
             .store
             .blocks
             .read()
-            .unwrap()
             .get(id)
             .map(|b| {
                 read_field(b, field)
@@ -428,7 +408,7 @@ impl<'a> BlockTableRO for BlockHashMapTableRO<'a> {
         field: &BlockRelationshipField,
         right_ids: &[EntityId],
     ) -> Result<Vec<(EntityId, Vec<EntityId>)>, RepositoryError> {
-        let map = self.store.blocks.read().unwrap();
+        let map = self.store.blocks.read();
         let mut out = Vec::new();
         for (id, block) in map.iter() {
             let list = read_field(block, field);

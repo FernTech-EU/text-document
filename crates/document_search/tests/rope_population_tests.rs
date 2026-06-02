@@ -15,7 +15,7 @@ fn replace_text_mirrors_to_rope() -> Result<()> {
     let (db_context, event_hub, mut urm) = setup_with_imported_text("hello world hello")?;
 
     let store = db_context.get_store();
-    assert_eq!(store.rope.read().unwrap().to_string(), "hello world hello");
+    assert_eq!(store.rope.read().to_string(), "hello world hello");
 
     document_search_controller::replace_text(
         &db_context,
@@ -33,7 +33,7 @@ fn replace_text_mirrors_to_rope() -> Result<()> {
     )?;
 
     // Rope reflects both replacements.
-    assert_eq!(store.rope.read().unwrap().to_string(), "HEY world HEY");
+    assert_eq!(store.rope.read().to_string(), "HEY world HEY");
 
     Ok(())
 }
@@ -45,10 +45,7 @@ fn replace_text_in_one_block_of_many_preserves_other_blocks() -> Result<()> {
     let (db_context, event_hub, mut urm) = setup_with_imported_text("first\nfind me\nthird")?;
 
     let store = db_context.get_store();
-    assert_eq!(
-        store.rope.read().unwrap().to_string(),
-        "first\nfind me\nthird"
-    );
+    assert_eq!(store.rope.read().to_string(), "first\nfind me\nthird");
 
     document_search_controller::replace_text(
         &db_context,
@@ -65,10 +62,7 @@ fn replace_text_in_one_block_of_many_preserves_other_blocks() -> Result<()> {
         },
     )?;
 
-    assert_eq!(
-        store.rope.read().unwrap().to_string(),
-        "first\nFOUND\nthird"
-    );
+    assert_eq!(store.rope.read().to_string(), "first\nFOUND\nthird");
 
     Ok(())
 }

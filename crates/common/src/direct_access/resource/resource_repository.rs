@@ -363,7 +363,7 @@ impl<'a> ResourceRepository<'a> {
         };
 
         // Emit Created events for this entity
-        let resource_ids: Vec<_> = store.resources.read().unwrap().keys().copied().collect();
+        let resource_ids: Vec<_> = store.resources.read().keys().copied().collect();
         emit(
             DirectAccessEntity::Resource(EntityEvent::Created),
             resource_ids.clone(),

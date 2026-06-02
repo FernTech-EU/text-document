@@ -49,7 +49,7 @@ impl<'a> FrameTable for FrameHashMapTable<'a> {
 
     fn create_multi(&mut self, entities: &[Frame]) -> Result<Vec<Frame>, RepositoryError> {
         let mut created = Vec::with_capacity(entities.len());
-        let mut frame_map = self.store.frames.write().unwrap();
+        let mut frame_map = self.store.frames.write();
 
         for entity in entities {
             let new_entity = if entity.id == EntityId::default() {
@@ -75,23 +75,16 @@ impl<'a> FrameTable for FrameHashMapTable<'a> {
     }
 
     fn get(&self, id: &EntityId) -> Result<Option<Frame>, RepositoryError> {
-        Ok(self.store.frames.read().unwrap().get(id).cloned())
+        Ok(self.store.frames.read().get(id).cloned())
     }
 
     fn get_multi(&self, ids: &[EntityId]) -> Result<Vec<Option<Frame>>, RepositoryError> {
-        let map = self.store.frames.read().unwrap();
+        let map = self.store.frames.read();
         Ok(ids.iter().map(|id| map.get(id).cloned()).collect())
     }
 
     fn get_all(&self) -> Result<Vec<Frame>, RepositoryError> {
-        Ok(self
-            .store
-            .frames
-            .read()
-            .unwrap()
-            .values()
-            .cloned()
-            .collect())
+        Ok(self.store.frames.read().values().cloned().collect())
     }
 
     fn update(&mut self, entity: &Frame) -> Result<Frame, RepositoryError> {
@@ -102,7 +95,7 @@ impl<'a> FrameTable for FrameHashMapTable<'a> {
     /// Scalar-only: preserve in-store relationship lists so a stale
     /// Frame passed in doesn't revert the relationship state.
     fn update_multi(&mut self, entities: &[Frame]) -> Result<Vec<Frame>, RepositoryError> {
-        let mut frame_map = self.store.frames.write().unwrap();
+        let mut frame_map = self.store.frames.write();
         let mut result = Vec::with_capacity(entities.len());
         for entity in entities {
             let mut to_write = entity.clone();
@@ -126,7 +119,7 @@ impl<'a> FrameTable for FrameHashMapTable<'a> {
         &mut self,
         entities: &[Frame],
     ) -> Result<Vec<Frame>, RepositoryError> {
-        let mut frame_map = self.store.frames.write().unwrap();
+        let mut frame_map = self.store.frames.write();
         let mut result = Vec::with_capacity(entities.len());
         for entity in entities {
             frame_map.insert(entity.id, entity.clone());
@@ -144,7 +137,7 @@ impl<'a> FrameTable for FrameHashMapTable<'a> {
 
         // Drop the removed frames themselves.
         {
-            let mut frame_map = self.store.frames.write().unwrap();
+            let mut frame_map = self.store.frames.write();
             for id in ids {
                 frame_map.remove(id);
             }
@@ -157,7 +150,7 @@ impl<'a> FrameTable for FrameHashMapTable<'a> {
         // 1. Self-referential: child frames whose parent_frame pointed
         //    at one of the removed ids must be detached.
         {
-            let mut frame_map = self.store.frames.write().unwrap();
+            let mut frame_map = self.store.frames.write();
             let updates: Vec<(EntityId, Frame)> = frame_map
                 .iter()
                 .filter_map(|(fid, f)| {
@@ -176,7 +169,7 @@ impl<'a> FrameTable for FrameHashMapTable<'a> {
         // 2. Documents that listed any removed frame in `frames` must
         //    have those ids stripped.
         {
-            let mut doc_map = self.store.documents.write().unwrap();
+            let mut doc_map = self.store.documents.write();
             let updates: Vec<(EntityId, crate::entities::Document)> = doc_map
                 .iter()
                 .filter_map(|(did, d)| {
@@ -197,7 +190,7 @@ impl<'a> FrameTable for FrameHashMapTable<'a> {
         // 3. TableCells whose `cell_frame` pointed at one of the
         //    removed ids must be detached.
         {
-            let mut cell_map = self.store.table_cells.write().unwrap();
+            let mut cell_map = self.store.table_cells.write();
             let updates: Vec<(EntityId, crate::entities::TableCell)> = cell_map
                 .iter()
                 .filter_map(|(cid, c)| {
@@ -225,7 +218,6 @@ impl<'a> FrameTable for FrameHashMapTable<'a> {
             .store
             .frames
             .read()
-            .unwrap()
             .get(id)
             .map(|f| read_field(f, field))
             .unwrap_or_default())
@@ -236,7 +228,7 @@ impl<'a> FrameTable for FrameHashMapTable<'a> {
         ids: &[EntityId],
         field: &FrameRelationshipField,
     ) -> Result<StdHashMap<EntityId, Vec<EntityId>>, RepositoryError> {
-        let map = self.store.frames.read().unwrap();
+        let map = self.store.frames.read();
         let mut out = StdHashMap::new();
         for id in ids {
             out.insert(
@@ -258,7 +250,6 @@ impl<'a> FrameTable for FrameHashMapTable<'a> {
             .store
             .frames
             .read()
-            .unwrap()
             .get(id)
             .map(|f| read_field(f, field).len())
             .unwrap_or(0))
@@ -275,7 +266,6 @@ impl<'a> FrameTable for FrameHashMapTable<'a> {
             .store
             .frames
             .read()
-            .unwrap()
             .get(id)
             .map(|f| {
                 read_field(f, field)
@@ -292,7 +282,7 @@ impl<'a> FrameTable for FrameHashMapTable<'a> {
         field: &FrameRelationshipField,
         right_ids: &[EntityId],
     ) -> Result<Vec<(EntityId, Vec<EntityId>)>, RepositoryError> {
-        let map = self.store.frames.read().unwrap();
+        let map = self.store.frames.read();
         let mut out = Vec::new();
         for (id, frame) in map.iter() {
             let list = read_field(frame, field);
@@ -308,7 +298,7 @@ impl<'a> FrameTable for FrameHashMapTable<'a> {
         field: &FrameRelationshipField,
         relationships: Vec<(EntityId, Vec<EntityId>)>,
     ) -> Result<(), RepositoryError> {
-        let mut map = self.store.frames.write().unwrap();
+        let mut map = self.store.frames.write();
         for (id, ids) in relationships {
             if let Some(frame) = map.get_mut(&id) {
                 write_field(frame, field, ids);
@@ -323,7 +313,7 @@ impl<'a> FrameTable for FrameHashMapTable<'a> {
         field: &FrameRelationshipField,
         right_ids: &[EntityId],
     ) -> Result<(), RepositoryError> {
-        let mut map = self.store.frames.write().unwrap();
+        let mut map = self.store.frames.write();
         if let Some(frame) = map.get_mut(id) {
             write_field(frame, field, right_ids.to_vec());
         }
@@ -337,7 +327,7 @@ impl<'a> FrameTable for FrameHashMapTable<'a> {
         ids_to_move: &[EntityId],
         new_index: i32,
     ) -> Result<Vec<EntityId>, RepositoryError> {
-        let mut map = self.store.frames.write().unwrap();
+        let mut map = self.store.frames.write();
         let Some(frame) = map.get_mut(id) else {
             return Ok(Vec::new());
         };
@@ -360,23 +350,16 @@ impl<'a> FrameHashMapTableRO<'a> {
 
 impl<'a> FrameTableRO for FrameHashMapTableRO<'a> {
     fn get(&self, id: &EntityId) -> Result<Option<Frame>, RepositoryError> {
-        Ok(self.store.frames.read().unwrap().get(id).cloned())
+        Ok(self.store.frames.read().get(id).cloned())
     }
 
     fn get_multi(&self, ids: &[EntityId]) -> Result<Vec<Option<Frame>>, RepositoryError> {
-        let map = self.store.frames.read().unwrap();
+        let map = self.store.frames.read();
         Ok(ids.iter().map(|id| map.get(id).cloned()).collect())
     }
 
     fn get_all(&self) -> Result<Vec<Frame>, RepositoryError> {
-        Ok(self
-            .store
-            .frames
-            .read()
-            .unwrap()
-            .values()
-            .cloned()
-            .collect())
+        Ok(self.store.frames.read().values().cloned().collect())
     }
 
     fn get_relationship(
@@ -388,7 +371,6 @@ impl<'a> FrameTableRO for FrameHashMapTableRO<'a> {
             .store
             .frames
             .read()
-            .unwrap()
             .get(id)
             .map(|f| read_field(f, field))
             .unwrap_or_default())
@@ -399,7 +381,7 @@ impl<'a> FrameTableRO for FrameHashMapTableRO<'a> {
         ids: &[EntityId],
         field: &FrameRelationshipField,
     ) -> Result<StdHashMap<EntityId, Vec<EntityId>>, RepositoryError> {
-        let map = self.store.frames.read().unwrap();
+        let map = self.store.frames.read();
         let mut out = StdHashMap::new();
         for id in ids {
             out.insert(
@@ -421,7 +403,6 @@ impl<'a> FrameTableRO for FrameHashMapTableRO<'a> {
             .store
             .frames
             .read()
-            .unwrap()
             .get(id)
             .map(|f| read_field(f, field).len())
             .unwrap_or(0))
@@ -438,7 +419,6 @@ impl<'a> FrameTableRO for FrameHashMapTableRO<'a> {
             .store
             .frames
             .read()
-            .unwrap()
             .get(id)
             .map(|f| {
                 read_field(f, field)
@@ -455,7 +435,7 @@ impl<'a> FrameTableRO for FrameHashMapTableRO<'a> {
         field: &FrameRelationshipField,
         right_ids: &[EntityId],
     ) -> Result<Vec<(EntityId, Vec<EntityId>)>, RepositoryError> {
-        let map = self.store.frames.read().unwrap();
+        let map = self.store.frames.read();
         let mut out = Vec::new();
         for (id, frame) in map.iter() {
             let list = read_field(frame, field);
