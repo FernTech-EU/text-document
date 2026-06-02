@@ -1644,6 +1644,7 @@ dependencies = [
  "serde_json",
  "text-document-common",
  "text-document-frontend",
+ "thiserror",
  "unicode-segmentation",
 ]
 

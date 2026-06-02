@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use parking_lot::Mutex;
 
-use anyhow::Result;
+use crate::{DocumentError, Result};
 
 use crate::ListStyle;
 use frontend::commands::{
@@ -435,7 +435,7 @@ impl TextCursor {
                     undo_redo_commands::end_composite(&inner.ctx);
                     ins_result
                 }
-                Err(e) => return Err(e),
+                Err(e) => return Err(e.into()),
             };
 
             let edit_pos = pos.min(anchor);
@@ -501,7 +501,7 @@ impl TextCursor {
                     undo_redo_commands::end_composite(&inner.ctx);
                     ins_result
                 }
-                Err(e) => return Err(e),
+                Err(e) => return Err(e.into()),
             };
 
             let edit_pos = pos.min(anchor);
@@ -997,8 +997,8 @@ impl TextCursor {
     /// frames.
     pub fn wrap_selection_in_blockquote(&self) -> Result<()> {
         if self.selection_spans_multiple_frames() {
-            return Err(anyhow::anyhow!(
-                "Cannot wrap selection in blockquote: selection spans multiple frames"
+            return Err(DocumentError::InvalidArgument(
+                "Cannot wrap selection in blockquote: selection spans multiple frames".into(),
             ));
         }
         let (start_block_id, end_block_id) = self.resolve_selection_block_range()?;
@@ -1063,9 +1063,9 @@ impl TextCursor {
     /// just blockquotes). Errors if the cursor's block sits in the root
     /// frame.
     pub fn unwrap_current_frame(&self) -> Result<()> {
-        let frame_ref = self
-            .current_frame()
-            .ok_or_else(|| anyhow::anyhow!("Cursor is not inside any sub-frame"))?;
+        let frame_ref = self.current_frame().ok_or_else(|| {
+            DocumentError::InvalidCursorContext("Cursor is not inside any sub-frame".into())
+        })?;
         self.unwrap_frame_by_id(frame_ref.frame_id)
     }
 
@@ -1074,7 +1074,9 @@ impl TextCursor {
     /// not in a blockquote, errors.
     pub fn unwrap_current_block_from_blockquote(&self) -> Result<()> {
         if self.current_blockquote_frame_id().is_none() {
-            return Err(anyhow::anyhow!("Cursor is not inside a blockquote"));
+            return Err(DocumentError::InvalidCursorContext(
+                "Cursor is not inside a blockquote".into(),
+            ));
         }
         let block_id = self.current_block_id_for_mutation()?;
         let dto = frontend::document_editing::UnwrapBlockFromFrameDto {
@@ -1116,8 +1118,8 @@ impl TextCursor {
     /// unwrapped.
     pub fn decrease_blockquote_depth(&self) -> Result<()> {
         if self.current_blockquote_frame_id().is_none() {
-            return Err(anyhow::anyhow!(
-                "Cursor is not inside a blockquote to decrease depth"
+            return Err(DocumentError::InvalidCursorContext(
+                "Cursor is not inside a blockquote to decrease depth".into(),
             ));
         }
         self.unwrap_current_block_from_blockquote()
@@ -1381,63 +1383,63 @@ impl TextCursor {
     /// Remove the table the cursor is currently inside.
     /// Returns an error if the cursor is not inside a table.
     pub fn remove_current_table(&self) -> Result<()> {
-        let table = self
-            .current_table()
-            .ok_or_else(|| anyhow::anyhow!("cursor is not inside a table"))?;
+        let table = self.current_table().ok_or_else(|| {
+            DocumentError::InvalidCursorContext("cursor is not inside a table".into())
+        })?;
         self.remove_table(table.id())
     }
 
     /// Insert a row above the cursor's current row.
     /// Returns an error if the cursor is not inside a table.
     pub fn insert_row_above(&self) -> Result<()> {
-        let cell_ref = self
-            .current_table_cell()
-            .ok_or_else(|| anyhow::anyhow!("cursor is not inside a table"))?;
+        let cell_ref = self.current_table_cell().ok_or_else(|| {
+            DocumentError::InvalidCursorContext("cursor is not inside a table".into())
+        })?;
         self.insert_table_row(cell_ref.table.id(), cell_ref.row)
     }
 
     /// Insert a row below the cursor's current row.
     /// Returns an error if the cursor is not inside a table.
     pub fn insert_row_below(&self) -> Result<()> {
-        let cell_ref = self
-            .current_table_cell()
-            .ok_or_else(|| anyhow::anyhow!("cursor is not inside a table"))?;
+        let cell_ref = self.current_table_cell().ok_or_else(|| {
+            DocumentError::InvalidCursorContext("cursor is not inside a table".into())
+        })?;
         self.insert_table_row(cell_ref.table.id(), cell_ref.row + 1)
     }
 
     /// Insert a column before the cursor's current column.
     /// Returns an error if the cursor is not inside a table.
     pub fn insert_column_before(&self) -> Result<()> {
-        let cell_ref = self
-            .current_table_cell()
-            .ok_or_else(|| anyhow::anyhow!("cursor is not inside a table"))?;
+        let cell_ref = self.current_table_cell().ok_or_else(|| {
+            DocumentError::InvalidCursorContext("cursor is not inside a table".into())
+        })?;
         self.insert_table_column(cell_ref.table.id(), cell_ref.column)
     }
 
     /// Insert a column after the cursor's current column.
     /// Returns an error if the cursor is not inside a table.
     pub fn insert_column_after(&self) -> Result<()> {
-        let cell_ref = self
-            .current_table_cell()
-            .ok_or_else(|| anyhow::anyhow!("cursor is not inside a table"))?;
+        let cell_ref = self.current_table_cell().ok_or_else(|| {
+            DocumentError::InvalidCursorContext("cursor is not inside a table".into())
+        })?;
         self.insert_table_column(cell_ref.table.id(), cell_ref.column + 1)
     }
 
     /// Remove the row at the cursor's current position.
     /// Returns an error if the cursor is not inside a table.
     pub fn remove_current_row(&self) -> Result<()> {
-        let cell_ref = self
-            .current_table_cell()
-            .ok_or_else(|| anyhow::anyhow!("cursor is not inside a table"))?;
+        let cell_ref = self.current_table_cell().ok_or_else(|| {
+            DocumentError::InvalidCursorContext("cursor is not inside a table".into())
+        })?;
         self.remove_table_row(cell_ref.table.id(), cell_ref.row)
     }
 
     /// Remove the column at the cursor's current position.
     /// Returns an error if the cursor is not inside a table.
     pub fn remove_current_column(&self) -> Result<()> {
-        let cell_ref = self
-            .current_table_cell()
-            .ok_or_else(|| anyhow::anyhow!("cursor is not inside a table"))?;
+        let cell_ref = self.current_table_cell().ok_or_else(|| {
+            DocumentError::InvalidCursorContext("cursor is not inside a table".into())
+        })?;
         self.remove_table_column(cell_ref.table.id(), cell_ref.column)
     }
 
@@ -1448,9 +1450,9 @@ impl TextCursor {
     /// Returns an error if the cursor is not inside a table or position
     /// and anchor are in different tables.
     pub fn merge_selected_cells(&self) -> Result<()> {
-        let pos_cell = self
-            .current_table_cell()
-            .ok_or_else(|| anyhow::anyhow!("cursor position is not inside a table"))?;
+        let pos_cell = self.current_table_cell().ok_or_else(|| {
+            DocumentError::InvalidCursorContext("cursor position is not inside a table".into())
+        })?;
 
         // Get anchor cell
         let (_pos, anchor) = self.read_cursor();
@@ -1461,20 +1463,24 @@ impl TextCursor {
                 position: to_i64(anchor),
             };
             let block_info = document_inspection_commands::get_block_at_position(&inner.ctx, &dto)
-                .map_err(|_| anyhow::anyhow!("cursor anchor is not inside a table"))?;
+                .map_err(|_| {
+                    DocumentError::InvalidCursorContext(
+                        "cursor anchor is not inside a table".into(),
+                    )
+                })?;
             let block = crate::text_block::TextBlock {
                 doc: self.doc.clone(),
                 block_id: block_info.block_id as usize,
             };
             drop(inner);
-            block
-                .table_cell()
-                .ok_or_else(|| anyhow::anyhow!("cursor anchor is not inside a table"))?
+            block.table_cell().ok_or_else(|| {
+                DocumentError::InvalidCursorContext("cursor anchor is not inside a table".into())
+            })?
         };
 
         if pos_cell.table.id() != anchor_cell.table.id() {
-            return Err(anyhow::anyhow!(
-                "position and anchor are in different tables"
+            return Err(DocumentError::InvalidArgument(
+                "position and anchor are in different tables".into(),
             ));
         }
 
@@ -1489,14 +1495,14 @@ impl TextCursor {
     /// Split the cell at the cursor's current position.
     /// Returns an error if the cursor is not inside a table.
     pub fn split_current_cell(&self, split_rows: usize, split_columns: usize) -> Result<()> {
-        let cell_ref = self
-            .current_table_cell()
-            .ok_or_else(|| anyhow::anyhow!("cursor is not inside a table"))?;
+        let cell_ref = self.current_table_cell().ok_or_else(|| {
+            DocumentError::InvalidCursorContext("cursor is not inside a table".into())
+        })?;
         // Get the cell entity ID from the table handle
         let cell = cell_ref
             .table
             .cell(cell_ref.row, cell_ref.column)
-            .ok_or_else(|| anyhow::anyhow!("cell not found"))?;
+            .ok_or_else(|| DocumentError::NotFound("cell not found".into()))?;
         // TextTableCell stores cell_id
         self.split_table_cell(cell.id(), split_rows, split_columns)
     }
@@ -1504,22 +1510,22 @@ impl TextCursor {
     /// Set formatting on the table the cursor is currently inside.
     /// Returns an error if the cursor is not inside a table.
     pub fn set_current_table_format(&self, format: &crate::flow::TableFormat) -> Result<()> {
-        let table = self
-            .current_table()
-            .ok_or_else(|| anyhow::anyhow!("cursor is not inside a table"))?;
+        let table = self.current_table().ok_or_else(|| {
+            DocumentError::InvalidCursorContext("cursor is not inside a table".into())
+        })?;
         self.set_table_format(table.id(), format)
     }
 
     /// Set formatting on the cell the cursor is currently inside.
     /// Returns an error if the cursor is not inside a table.
     pub fn set_current_cell_format(&self, format: &crate::flow::CellFormat) -> Result<()> {
-        let cell_ref = self
-            .current_table_cell()
-            .ok_or_else(|| anyhow::anyhow!("cursor is not inside a table"))?;
+        let cell_ref = self.current_table_cell().ok_or_else(|| {
+            DocumentError::InvalidCursorContext("cursor is not inside a table".into())
+        })?;
         let cell = cell_ref
             .table
             .cell(cell_ref.row, cell_ref.column)
-            .ok_or_else(|| anyhow::anyhow!("cell not found"))?;
+            .ok_or_else(|| DocumentError::NotFound("cell not found".into()))?;
         self.set_table_cell_format(cell.id(), format)
     }
 
@@ -2052,9 +2058,9 @@ impl TextCursor {
     /// Set formatting on the list that the current block belongs to.
     /// Returns an error if the cursor is not inside a list item.
     pub fn set_current_list_format(&self, format: &crate::ListFormat) -> Result<()> {
-        let list = self
-            .current_list()
-            .ok_or_else(|| anyhow::anyhow!("cursor is not inside a list"))?;
+        let list = self.current_list().ok_or_else(|| {
+            DocumentError::InvalidCursorContext("cursor is not inside a list".into())
+        })?;
         self.set_list_format(list.id(), format)
     }
 
@@ -2143,9 +2149,9 @@ impl TextCursor {
             doc: self.doc.clone(),
             list_id,
         };
-        let block = list
-            .item(index)
-            .ok_or_else(|| anyhow::anyhow!("list item index {index} out of range"))?;
+        let block = list.item(index).ok_or_else(|| {
+            DocumentError::OutOfRange(format!("list item index {index} out of range"))
+        })?;
         self.remove_block_from_list(block.id())
     }
 
@@ -2163,8 +2169,9 @@ impl TextCursor {
         };
         let block_info = document_inspection_commands::get_block_at_position(&inner.ctx, &dto)?;
         let block_id = block_info.block_id as u64;
-        let mut block_dto = frontend::commands::block_commands::get_block(&inner.ctx, &block_id)?
-            .ok_or_else(|| anyhow::anyhow!("block not found at position"))?;
+        let mut block_dto =
+            frontend::commands::block_commands::get_block(&inner.ctx, &block_id)?
+                .ok_or_else(|| DocumentError::NotFound("block not found at position".into()))?;
         let store = inner.ctx.db_context.get_store();
         crate::inner::refresh_block_position(&mut block_dto, store);
 
@@ -2217,7 +2224,7 @@ impl TextCursor {
         let block_info = document_inspection_commands::get_block_at_position(&inner.ctx, &dto)?;
         let block_id = block_info.block_id as u64;
         let block = frontend::commands::block_commands::get_block(&inner.ctx, &block_id)?
-            .ok_or_else(|| anyhow::anyhow!("block not found"))?;
+            .ok_or_else(|| DocumentError::NotFound("block not found".into()))?;
         Ok(BlockFormat::from(&block))
     }
 

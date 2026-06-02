@@ -24,7 +24,7 @@ pub(crate) type QueuedEvents = Vec<(
     Vec<Arc<dyn Fn(crate::events::DocumentEvent) + Send + Sync>>,
 )>;
 
-use anyhow::Result;
+use crate::Result;
 use frontend::AppContext;
 use frontend::EventHubClient;
 use frontend::common::types::EntityId;
