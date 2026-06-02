@@ -121,7 +121,6 @@ fn replace_in_block(
     let images_before = store
         .block_images
         .read()
-        .unwrap()
         .get(&block.id)
         .cloned()
         .unwrap_or_default();
@@ -148,7 +147,7 @@ fn replace_in_block(
     // insertion (no run carries formatting — replacement inherits
     // surrounding format via shift_runs_for_insert).
     {
-        let mut runs_map = store.format_runs.write().unwrap();
+        let mut runs_map = store.format_runs.write();
         let runs = runs_map.entry(block.id).or_default();
         shift_runs_for_delete(runs, byte_start, byte_end);
         // After delete, the trailing runs sit at the (byte_start) cursor.
@@ -158,7 +157,7 @@ fn replace_in_block(
         debug_assert_well_formed(runs, new_plain.len());
     }
     let _images_removed = {
-        let mut images_map = store.block_images.write().unwrap();
+        let mut images_map = store.block_images.write();
         let images = images_map.entry(block.id).or_default();
         let removed = shift_images_for_delete(images, byte_start, byte_end);
         shift_images_for_insert(images, byte_start, inserted_byte_len);

@@ -615,7 +615,7 @@ impl<'a> TableRepository<'a> {
         };
 
         // Emit Created events for this entity
-        let table_ids: Vec<_> = store.tables.read().unwrap().keys().copied().collect();
+        let table_ids: Vec<_> = store.tables.read().keys().copied().collect();
         emit(
             DirectAccessEntity::Table(EntityEvent::Created),
             table_ids.clone(),
@@ -625,7 +625,7 @@ impl<'a> TableRepository<'a> {
         // Emit Created events for strong children
 
         {
-            let child_ids: Vec<_> = store.table_cells.read().unwrap().keys().copied().collect();
+            let child_ids: Vec<_> = store.table_cells.read().keys().copied().collect();
             emit(
                 DirectAccessEntity::TableCell(EntityEvent::Created),
                 child_ids.clone(),

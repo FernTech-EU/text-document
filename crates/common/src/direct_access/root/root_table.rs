@@ -56,7 +56,7 @@ fn check_one_to_one(
     if document_id == EntityId::default() {
         return Ok(());
     }
-    let roots = store.roots.read().unwrap();
+    let roots = store.roots.read();
     for (existing_id, existing) in roots.iter() {
         if *existing_id != self_id && existing.document == document_id {
             return Err(RepositoryError::ConstraintViolation(format!(
@@ -86,7 +86,7 @@ impl<'a> RootTable for RootHashMapTable<'a> {
 
     fn create_multi(&mut self, entities: &[Root]) -> Result<Vec<Root>, RepositoryError> {
         let mut created = Vec::with_capacity(entities.len());
-        let mut root_map = self.store.roots.write().unwrap();
+        let mut root_map = self.store.roots.write();
 
         for entity in entities {
             let new_entity = if entity.id == EntityId::default() {
@@ -124,16 +124,16 @@ impl<'a> RootTable for RootHashMapTable<'a> {
     }
 
     fn get(&self, id: &EntityId) -> Result<Option<Root>, RepositoryError> {
-        Ok(self.store.roots.read().unwrap().get(id).cloned())
+        Ok(self.store.roots.read().get(id).cloned())
     }
 
     fn get_multi(&self, ids: &[EntityId]) -> Result<Vec<Option<Root>>, RepositoryError> {
-        let map = self.store.roots.read().unwrap();
+        let map = self.store.roots.read();
         Ok(ids.iter().map(|id| map.get(id).cloned()).collect())
     }
 
     fn get_all(&self) -> Result<Vec<Root>, RepositoryError> {
-        Ok(self.store.roots.read().unwrap().values().cloned().collect())
+        Ok(self.store.roots.read().values().cloned().collect())
     }
 
     fn update(&mut self, entity: &Root) -> Result<Root, RepositoryError> {
@@ -144,7 +144,7 @@ impl<'a> RootTable for RootHashMapTable<'a> {
     /// Scalar-only: preserve in-store `document` so a stale Root
     /// passed in doesn't accidentally revert the relationship.
     fn update_multi(&mut self, entities: &[Root]) -> Result<Vec<Root>, RepositoryError> {
-        let mut root_map = self.store.roots.write().unwrap();
+        let mut root_map = self.store.roots.write();
         let mut result = Vec::with_capacity(entities.len());
         for entity in entities {
             let mut to_write = entity.clone();
@@ -170,7 +170,7 @@ impl<'a> RootTable for RootHashMapTable<'a> {
         for entity in entities {
             check_one_to_one(self.store, entity.id, entity.document)?;
         }
-        let mut root_map = self.store.roots.write().unwrap();
+        let mut root_map = self.store.roots.write();
         let mut result = Vec::with_capacity(entities.len());
         for entity in entities {
             root_map.insert(entity.id, entity.clone());
@@ -184,7 +184,7 @@ impl<'a> RootTable for RootHashMapTable<'a> {
     }
 
     fn remove_multi(&mut self, ids: &[EntityId]) -> Result<(), RepositoryError> {
-        let mut root_map = self.store.roots.write().unwrap();
+        let mut root_map = self.store.roots.write();
         for id in ids {
             root_map.remove(id);
         }
@@ -202,7 +202,6 @@ impl<'a> RootTable for RootHashMapTable<'a> {
             .store
             .roots
             .read()
-            .unwrap()
             .get(id)
             .map(|r| read_field(r, field))
             .unwrap_or_default())
@@ -213,7 +212,7 @@ impl<'a> RootTable for RootHashMapTable<'a> {
         ids: &[EntityId],
         field: &RootRelationshipField,
     ) -> Result<StdHashMap<EntityId, Vec<EntityId>>, RepositoryError> {
-        let map = self.store.roots.read().unwrap();
+        let map = self.store.roots.read();
         let mut out = StdHashMap::new();
         for id in ids {
             out.insert(
@@ -235,7 +234,6 @@ impl<'a> RootTable for RootHashMapTable<'a> {
             .store
             .roots
             .read()
-            .unwrap()
             .get(id)
             .map(|r| read_field(r, field).len())
             .unwrap_or(0))
@@ -252,7 +250,6 @@ impl<'a> RootTable for RootHashMapTable<'a> {
             .store
             .roots
             .read()
-            .unwrap()
             .get(id)
             .map(|r| {
                 read_field(r, field)
@@ -269,7 +266,7 @@ impl<'a> RootTable for RootHashMapTable<'a> {
         field: &RootRelationshipField,
         right_ids: &[EntityId],
     ) -> Result<Vec<(EntityId, Vec<EntityId>)>, RepositoryError> {
-        let map = self.store.roots.read().unwrap();
+        let map = self.store.roots.read();
         let mut out = Vec::new();
         for (id, root) in map.iter() {
             let list = read_field(root, field);
@@ -293,7 +290,7 @@ impl<'a> RootTable for RootHashMapTable<'a> {
                 check_one_to_one(self.store, *id, doc_id)?;
             }
         }
-        let mut map = self.store.roots.write().unwrap();
+        let mut map = self.store.roots.write();
         for (id, ids) in relationships {
             if let Some(root) = map.get_mut(&id) {
                 write_field(root, field, ids);
@@ -313,7 +310,7 @@ impl<'a> RootTable for RootHashMapTable<'a> {
         {
             check_one_to_one(self.store, *id, doc_id)?;
         }
-        let mut map = self.store.roots.write().unwrap();
+        let mut map = self.store.roots.write();
         if let Some(root) = map.get_mut(id) {
             write_field(root, field, right_ids.to_vec());
         }
@@ -328,7 +325,7 @@ impl<'a> RootTable for RootHashMapTable<'a> {
         new_index: i32,
     ) -> Result<Vec<EntityId>, RepositoryError> {
         // Root.document is single-valued; "move" is essentially "set".
-        let mut map = self.store.roots.write().unwrap();
+        let mut map = self.store.roots.write();
         let Some(root) = map.get_mut(id) else {
             return Ok(Vec::new());
         };
@@ -351,16 +348,16 @@ impl<'a> RootHashMapTableRO<'a> {
 
 impl<'a> RootTableRO for RootHashMapTableRO<'a> {
     fn get(&self, id: &EntityId) -> Result<Option<Root>, RepositoryError> {
-        Ok(self.store.roots.read().unwrap().get(id).cloned())
+        Ok(self.store.roots.read().get(id).cloned())
     }
 
     fn get_multi(&self, ids: &[EntityId]) -> Result<Vec<Option<Root>>, RepositoryError> {
-        let map = self.store.roots.read().unwrap();
+        let map = self.store.roots.read();
         Ok(ids.iter().map(|id| map.get(id).cloned()).collect())
     }
 
     fn get_all(&self) -> Result<Vec<Root>, RepositoryError> {
-        Ok(self.store.roots.read().unwrap().values().cloned().collect())
+        Ok(self.store.roots.read().values().cloned().collect())
     }
 
     fn get_relationship(
@@ -372,7 +369,6 @@ impl<'a> RootTableRO for RootHashMapTableRO<'a> {
             .store
             .roots
             .read()
-            .unwrap()
             .get(id)
             .map(|r| read_field(r, field))
             .unwrap_or_default())
@@ -383,7 +379,7 @@ impl<'a> RootTableRO for RootHashMapTableRO<'a> {
         ids: &[EntityId],
         field: &RootRelationshipField,
     ) -> Result<StdHashMap<EntityId, Vec<EntityId>>, RepositoryError> {
-        let map = self.store.roots.read().unwrap();
+        let map = self.store.roots.read();
         let mut out = StdHashMap::new();
         for id in ids {
             out.insert(
@@ -405,7 +401,6 @@ impl<'a> RootTableRO for RootHashMapTableRO<'a> {
             .store
             .roots
             .read()
-            .unwrap()
             .get(id)
             .map(|r| read_field(r, field).len())
             .unwrap_or(0))
@@ -422,7 +417,6 @@ impl<'a> RootTableRO for RootHashMapTableRO<'a> {
             .store
             .roots
             .read()
-            .unwrap()
             .get(id)
             .map(|r| {
                 read_field(r, field)
@@ -439,7 +433,7 @@ impl<'a> RootTableRO for RootHashMapTableRO<'a> {
         field: &RootRelationshipField,
         right_ids: &[EntityId],
     ) -> Result<Vec<(EntityId, Vec<EntityId>)>, RepositoryError> {
-        let map = self.store.roots.read().unwrap();
+        let map = self.store.roots.read();
         let mut out = Vec::new();
         for (id, root) in map.iter() {
             let list = read_field(root, field);

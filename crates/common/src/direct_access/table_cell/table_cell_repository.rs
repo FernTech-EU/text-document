@@ -596,7 +596,7 @@ impl<'a> TableCellRepository<'a> {
         };
 
         // Emit Created events for this entity
-        let table_cell_ids: Vec<_> = store.table_cells.read().unwrap().keys().copied().collect();
+        let table_cell_ids: Vec<_> = store.table_cells.read().keys().copied().collect();
         emit(
             DirectAccessEntity::TableCell(EntityEvent::Created),
             table_cell_ids.clone(),

@@ -134,7 +134,7 @@ fn execute_insert_image(
     // the new image goes AFTER any existing anchors at the same byte position).
     {
         let store = uow.store();
-        let mut images_map = store.block_images.write().unwrap();
+        let mut images_map = store.block_images.write();
         let images = images_map.entry(block.id).or_default();
         let insert_idx = images
             .iter()

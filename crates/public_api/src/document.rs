@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use parking_lot::Mutex;
 
-use anyhow::Result;
+use crate::{DocumentError, Result};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
 
@@ -468,7 +468,7 @@ impl TextDocument {
         let block_id = block_info.block_id;
         let block_id = block_id as u64;
         let block_dto = frontend::commands::block_commands::get_block(&inner.ctx, &block_id)?
-            .ok_or_else(|| anyhow::anyhow!("block not found"))?;
+            .ok_or_else(|| DocumentError::NotFound("block not found".into()))?;
         Ok(BlockFormat::from(&block_dto))
     }
 
@@ -830,7 +830,9 @@ impl TextDocument {
         // Fast path: check the name → ID cache.
         if let Some(&id) = inner.resource_cache.get(name) {
             if let Some(r) = resource_commands::get_resource(&inner.ctx, &id)? {
-                let bytes = BASE64.decode(&r.data_base64)?;
+                let bytes = BASE64
+                    .decode(&r.data_base64)
+                    .map_err(|e| DocumentError::Internal(e.into()))?;
                 return Ok(Some(bytes));
             }
             // ID was stale — fall through to full scan.
@@ -842,7 +844,9 @@ impl TextDocument {
         for r in &all {
             if r.name == name {
                 inner.resource_cache.insert(name.to_string(), r.id);
-                let bytes = BASE64.decode(&r.data_base64)?;
+                let bytes = BASE64
+                    .decode(&r.data_base64)
+                    .map_err(|e| DocumentError::Internal(e.into()))?;
                 return Ok(Some(bytes));
             }
         }
@@ -947,7 +951,7 @@ impl TextDocument {
     pub fn set_title(&self, title: &str) -> Result<()> {
         let inner = self.inner.lock();
         let doc = document_commands::get_document(&inner.ctx, &inner.document_id)?
-            .ok_or_else(|| anyhow::anyhow!("document not found"))?;
+            .ok_or_else(|| DocumentError::NotFound("document not found".into()))?;
         let mut update: frontend::document::dtos::UpdateDocumentDto = doc.into();
         update.title = title.into();
         document_commands::update_document(&inner.ctx, Some(inner.stack_id), &update)?;
@@ -968,7 +972,7 @@ impl TextDocument {
     pub fn set_text_direction(&self, direction: TextDirection) -> Result<()> {
         let inner = self.inner.lock();
         let doc = document_commands::get_document(&inner.ctx, &inner.document_id)?
-            .ok_or_else(|| anyhow::anyhow!("document not found"))?;
+            .ok_or_else(|| DocumentError::NotFound("document not found".into()))?;
         let mut update: frontend::document::dtos::UpdateDocumentDto = doc.into();
         update.text_direction = direction;
         document_commands::update_document(&inner.ctx, Some(inner.stack_id), &update)?;
@@ -989,7 +993,7 @@ impl TextDocument {
     pub fn set_default_wrap_mode(&self, mode: WrapMode) -> Result<()> {
         let inner = self.inner.lock();
         let doc = document_commands::get_document(&inner.ctx, &inner.document_id)?
-            .ok_or_else(|| anyhow::anyhow!("document not found"))?;
+            .ok_or_else(|| DocumentError::NotFound("document not found".into()))?;
         let mut update: frontend::document::dtos::UpdateDocumentDto = doc.into();
         update.default_wrap_mode = mode;
         document_commands::update_document(&inner.ctx, Some(inner.stack_id), &update)?;

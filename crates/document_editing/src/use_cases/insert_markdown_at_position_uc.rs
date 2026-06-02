@@ -59,7 +59,7 @@ fn write_block_state(
 ) {
     let store = uow.store();
     {
-        let mut runs_map = store.format_runs.write().unwrap();
+        let mut runs_map = store.format_runs.write();
         if runs.is_empty() {
             runs_map.remove(&block_id);
         } else {
@@ -67,7 +67,7 @@ fn write_block_state(
         }
     }
     {
-        let mut images_map = store.block_images.write().unwrap();
+        let mut images_map = store.block_images.write();
         if images.is_empty() {
             images_map.remove(&block_id);
         } else {
@@ -133,14 +133,12 @@ fn execute_content_insert(
         let runs = store
             .format_runs
             .read()
-            .unwrap()
             .get(&current_block.id)
             .cloned()
             .unwrap_or_default();
         let images = store
             .block_images
             .read()
-            .unwrap()
             .get(&current_block.id)
             .cloned()
             .unwrap_or_default();
@@ -279,7 +277,6 @@ fn execute_content_insert(
         let head_rope_start = store
             .block_offsets
             .read()
-            .unwrap()
             .range_of_block(current_block.id)
             .map(|(s, _)| s);
         let mut next_rope_byte_opt = head_rope_start.map(|s| {
@@ -502,7 +499,6 @@ fn execute_content_insert(
         let head_rope_start = store
             .block_offsets
             .read()
-            .unwrap()
             .range_of_block(current_block.id)
             .map(|(s, _)| s);
         let mut next_rope_byte_opt = head_rope_start.map(|s| {

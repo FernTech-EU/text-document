@@ -1644,6 +1644,7 @@ dependencies = [
  "serde_json",
  "text-document-common",
  "text-document-frontend",
+ "thiserror",
  "unicode-segmentation",
 ]
 
@@ -1666,6 +1667,7 @@ dependencies = [
  "flume",
  "im",
  "log",
+ "parking_lot",
  "proptest",
  "pulldown-cmark",
  "ropey",

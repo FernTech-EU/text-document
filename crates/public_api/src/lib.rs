@@ -27,6 +27,7 @@
 mod convert;
 mod cursor;
 mod document;
+mod error;
 mod events;
 mod flow;
 mod fragment;
@@ -47,7 +48,7 @@ pub use frontend::list::dtos::ListStyle;
 pub use frontend::resource::dtos::ResourceType;
 
 // ── Error type ───────────────────────────────────────────────────
-pub type Result<T> = anyhow::Result<T>;
+pub use error::{DocumentError, Result};
 
 // ── Public API types ─────────────────────────────────────────────
 pub use cursor::TextCursor;

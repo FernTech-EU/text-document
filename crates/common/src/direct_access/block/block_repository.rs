@@ -585,7 +585,7 @@ impl<'a> BlockRepository<'a> {
         };
 
         // Emit Created events for this entity
-        let block_ids: Vec<_> = store.blocks.read().unwrap().keys().copied().collect();
+        let block_ids: Vec<_> = store.blocks.read().keys().copied().collect();
         emit(
             DirectAccessEntity::Block(EntityEvent::Created),
             block_ids.clone(),

@@ -70,14 +70,12 @@ fn read_block_runs_and_images(
     let runs = store
         .format_runs
         .read()
-        .unwrap()
         .get(&block_id)
         .cloned()
         .unwrap_or_default();
     let images = store
         .block_images
         .read()
-        .unwrap()
         .get(&block_id)
         .cloned()
         .unwrap_or_default();
@@ -97,16 +95,8 @@ fn clear_block(
     uow.update_block(&updated)?;
     let store = uow.store();
     common::database::rope_helpers::rope_replace_block_content(&store, block.id, "");
-    store
-        .format_runs
-        .write()
-        .unwrap()
-        .insert(block.id, Vec::new());
-    store
-        .block_images
-        .write()
-        .unwrap()
-        .insert(block.id, Vec::new());
+    store.format_runs.write().insert(block.id, Vec::new());
+    store.block_images.write().insert(block.id, Vec::new());
     Ok(())
 }
 
@@ -114,8 +104,8 @@ fn clear_block(
 /// about to be removed entirely. Idempotent.
 fn drop_block_runs_and_images(uow: &dyn DeleteTextUnitOfWorkTrait, block_id: EntityId) {
     let store = uow.store();
-    store.format_runs.write().unwrap().remove(&block_id);
-    store.block_images.write().unwrap().remove(&block_id);
+    store.format_runs.write().remove(&block_id);
+    store.block_images.write().remove(&block_id);
 }
 
 /// Recursive walk of the frame tree rooted at `root_id` to find which
@@ -674,13 +664,13 @@ fn execute_delete(
         new_plain.push_str(&start_block_text[..byte_so as usize]);
         new_plain.push_str(&start_block_text[byte_eo as usize..]);
         {
-            let mut runs_map = store.format_runs.write().unwrap();
+            let mut runs_map = store.format_runs.write();
             let runs = runs_map.entry(start_block.id).or_default();
             shift_runs_for_delete(runs, byte_so, byte_eo);
             debug_assert_well_formed(runs, new_plain.len());
         }
         let _images_removed = {
-            let mut images_map = store.block_images.write().unwrap();
+            let mut images_map = store.block_images.write();
             let images = images_map.entry(start_block.id).or_default();
             shift_images_for_delete(images, byte_so, byte_eo) as i64
         };
@@ -822,12 +812,10 @@ fn execute_delete(
         store
             .format_runs
             .write()
-            .unwrap()
             .insert(start_block.id, merged_runs);
         store
             .block_images
             .write()
-            .unwrap()
             .insert(start_block.id, merged_images);
 
         // Cross-block merge: delete the rope range from
@@ -956,7 +944,6 @@ fn delete_char_range_in_block(
     let images_before = store
         .block_images
         .read()
-        .unwrap()
         .get(&block.id)
         .cloned()
         .unwrap_or_default();
@@ -974,13 +961,13 @@ fn delete_char_range_in_block(
     new_plain.push_str(&block_text[byte_end as usize..]);
 
     {
-        let mut runs_map = store.format_runs.write().unwrap();
+        let mut runs_map = store.format_runs.write();
         let runs = runs_map.entry(block.id).or_default();
         shift_runs_for_delete(runs, byte_start, byte_end);
         debug_assert_well_formed(runs, new_plain.len());
     }
     let images_removed = {
-        let mut images_map = store.block_images.write().unwrap();
+        let mut images_map = store.block_images.write();
         let images = images_map.entry(block.id).or_default();
         shift_images_for_delete(images, byte_start, byte_end) as i64
     };

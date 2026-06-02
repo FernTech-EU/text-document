@@ -3,7 +3,7 @@
 use std::thread;
 use std::time::Duration;
 
-use anyhow::Result;
+use crate::Result;
 
 use frontend::AppContext;
 

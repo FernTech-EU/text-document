@@ -13,9 +13,9 @@ use crate::format_runs::{FormatRun, ImageAnchor};
 use crate::snapshot::{StoreSnapshot, StoreSnapshotTrait};
 use crate::types::EntityId;
 use im::HashMap;
+use parking_lot::RwLock;
 use ropey::Rope;
 use std::collections::HashMap as StdHashMap;
-use std::sync::RwLock;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // The Store
@@ -62,64 +62,64 @@ impl RopeStore {
     /// `Vec` cloned outright).
     pub fn snapshot(&self) -> RopeStoreSnapshot {
         RopeStoreSnapshot {
-            rope: self.rope.read().unwrap().clone(),
-            roots: self.roots.read().unwrap().clone(),
-            documents: self.documents.read().unwrap().clone(),
-            frames: self.frames.read().unwrap().clone(),
-            blocks: self.blocks.read().unwrap().clone(),
-            lists: self.lists.read().unwrap().clone(),
-            resources: self.resources.read().unwrap().clone(),
-            tables: self.tables.read().unwrap().clone(),
-            table_cells: self.table_cells.read().unwrap().clone(),
-            format_runs: self.format_runs.read().unwrap().clone(),
-            block_images: self.block_images.read().unwrap().clone(),
-            block_offsets: self.block_offsets.read().unwrap().clone(),
-            counters: self.counters.read().unwrap().clone(),
+            rope: self.rope.read().clone(),
+            roots: self.roots.read().clone(),
+            documents: self.documents.read().clone(),
+            frames: self.frames.read().clone(),
+            blocks: self.blocks.read().clone(),
+            lists: self.lists.read().clone(),
+            resources: self.resources.read().clone(),
+            tables: self.tables.read().clone(),
+            table_cells: self.table_cells.read().clone(),
+            format_runs: self.format_runs.read().clone(),
+            block_images: self.block_images.read().clone(),
+            block_offsets: self.block_offsets.read().clone(),
+            counters: self.counters.read().clone(),
         }
     }
 
     /// Restore from a snapshot. Overwrites counters too — used for
     /// transaction rollback (`Drop` of an uncommitted write txn).
     pub fn restore(&self, snap: &RopeStoreSnapshot) {
-        *self.rope.write().unwrap() = snap.rope.clone();
-        *self.roots.write().unwrap() = snap.roots.clone();
-        *self.documents.write().unwrap() = snap.documents.clone();
-        *self.frames.write().unwrap() = snap.frames.clone();
-        *self.blocks.write().unwrap() = snap.blocks.clone();
-        *self.lists.write().unwrap() = snap.lists.clone();
-        *self.resources.write().unwrap() = snap.resources.clone();
-        *self.tables.write().unwrap() = snap.tables.clone();
-        *self.table_cells.write().unwrap() = snap.table_cells.clone();
-        *self.format_runs.write().unwrap() = snap.format_runs.clone();
-        *self.block_images.write().unwrap() = snap.block_images.clone();
-        *self.block_offsets.write().unwrap() = snap.block_offsets.clone();
-        *self.counters.write().unwrap() = snap.counters.clone();
+        *self.rope.write() = snap.rope.clone();
+        *self.roots.write() = snap.roots.clone();
+        *self.documents.write() = snap.documents.clone();
+        *self.frames.write() = snap.frames.clone();
+        *self.blocks.write() = snap.blocks.clone();
+        *self.lists.write() = snap.lists.clone();
+        *self.resources.write() = snap.resources.clone();
+        *self.tables.write() = snap.tables.clone();
+        *self.table_cells.write() = snap.table_cells.clone();
+        *self.format_runs.write() = snap.format_runs.clone();
+        *self.block_images.write() = snap.block_images.clone();
+        *self.block_offsets.write() = snap.block_offsets.clone();
+        *self.counters.write() = snap.counters.clone();
     }
 
     /// Restore everything *except* counters — used for undo, where IDs
     /// must remain monotonically increasing across undo/redo cycles.
     pub fn restore_without_counters(&self, snap: &RopeStoreSnapshot) {
-        *self.rope.write().unwrap() = snap.rope.clone();
-        *self.roots.write().unwrap() = snap.roots.clone();
-        *self.documents.write().unwrap() = snap.documents.clone();
-        *self.frames.write().unwrap() = snap.frames.clone();
-        *self.blocks.write().unwrap() = snap.blocks.clone();
-        *self.lists.write().unwrap() = snap.lists.clone();
-        *self.resources.write().unwrap() = snap.resources.clone();
-        *self.tables.write().unwrap() = snap.tables.clone();
-        *self.table_cells.write().unwrap() = snap.table_cells.clone();
-        *self.format_runs.write().unwrap() = snap.format_runs.clone();
-        *self.block_images.write().unwrap() = snap.block_images.clone();
-        *self.block_offsets.write().unwrap() = snap.block_offsets.clone();
+        *self.rope.write() = snap.rope.clone();
+        *self.roots.write() = snap.roots.clone();
+        *self.documents.write() = snap.documents.clone();
+        *self.frames.write() = snap.frames.clone();
+        *self.blocks.write() = snap.blocks.clone();
+        *self.lists.write() = snap.lists.clone();
+        *self.resources.write() = snap.resources.clone();
+        *self.tables.write() = snap.tables.clone();
+        *self.table_cells.write() = snap.table_cells.clone();
+        *self.format_runs.write() = snap.format_runs.clone();
+        *self.block_images.write() = snap.block_images.clone();
+        *self.block_offsets.write() = snap.block_offsets.clone();
         // counters intentionally not restored
     }
 
     pub fn create_savepoint(&self) -> u64 {
         let snap = self.snapshot();
-        let mut id_counter = self.next_savepoint_id.write().unwrap();
+        let mut id_counter = self.next_savepoint_id.write();
         let id = *id_counter;
         *id_counter += 1;
-        self.savepoints.write().unwrap().insert(id, snap);
+        self.savepoints.write().insert(id, snap);
         id
     }
 
@@ -127,7 +127,6 @@ impl RopeStore {
         let snap = self
             .savepoints
             .read()
-            .unwrap()
             .get(&savepoint_id)
             .expect("savepoint not found")
             .clone();
@@ -135,12 +134,12 @@ impl RopeStore {
     }
 
     pub fn discard_savepoint(&self, savepoint_id: u64) {
-        self.savepoints.write().unwrap().remove(&savepoint_id);
+        self.savepoints.write().remove(&savepoint_id);
     }
 
     /// Get-and-increment counter for an entity type.
     pub(crate) fn next_id(&self, entity_name: &str) -> EntityId {
-        let mut counters = self.counters.write().unwrap();
+        let mut counters = self.counters.write();
         let counter = counters.entry(entity_name.to_string()).or_insert(1);
         let id = *counter;
         *counter += 1;

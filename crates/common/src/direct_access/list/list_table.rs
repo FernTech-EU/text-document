@@ -29,7 +29,7 @@ impl<'a> ListTable for ListHashMapTable<'a> {
 
     fn create_multi(&mut self, entities: &[List]) -> Result<Vec<List>, RepositoryError> {
         let mut created = Vec::with_capacity(entities.len());
-        let mut map = self.store.lists.write().unwrap();
+        let mut map = self.store.lists.write();
         for entity in entities {
             let new_entity = if entity.id == EntityId::default() {
                 let id = self.store.next_id("list");
@@ -53,16 +53,16 @@ impl<'a> ListTable for ListHashMapTable<'a> {
     }
 
     fn get(&self, id: &EntityId) -> Result<Option<List>, RepositoryError> {
-        Ok(self.store.lists.read().unwrap().get(id).cloned())
+        Ok(self.store.lists.read().get(id).cloned())
     }
 
     fn get_multi(&self, ids: &[EntityId]) -> Result<Vec<Option<List>>, RepositoryError> {
-        let map = self.store.lists.read().unwrap();
+        let map = self.store.lists.read();
         Ok(ids.iter().map(|id| map.get(id).cloned()).collect())
     }
 
     fn get_all(&self) -> Result<Vec<List>, RepositoryError> {
-        Ok(self.store.lists.read().unwrap().values().cloned().collect())
+        Ok(self.store.lists.read().values().cloned().collect())
     }
 
     fn update(&mut self, entity: &List) -> Result<List, RepositoryError> {
@@ -71,7 +71,7 @@ impl<'a> ListTable for ListHashMapTable<'a> {
     }
 
     fn update_multi(&mut self, entities: &[List]) -> Result<Vec<List>, RepositoryError> {
-        let mut map = self.store.lists.write().unwrap();
+        let mut map = self.store.lists.write();
         let mut result = Vec::with_capacity(entities.len());
         for entity in entities {
             map.insert(entity.id, entity.clone());
@@ -99,7 +99,7 @@ impl<'a> ListTable for ListHashMapTable<'a> {
         let removed: std::collections::HashSet<EntityId> = ids.iter().copied().collect();
 
         {
-            let mut map = self.store.lists.write().unwrap();
+            let mut map = self.store.lists.write();
             for id in ids {
                 map.remove(id);
             }
@@ -107,7 +107,7 @@ impl<'a> ListTable for ListHashMapTable<'a> {
 
         // Backward cleanup: Blocks whose `list` pointed at a removed List.
         {
-            let mut block_map = self.store.blocks.write().unwrap();
+            let mut block_map = self.store.blocks.write();
             let updates: Vec<(EntityId, crate::entities::Block)> = block_map
                 .iter()
                 .filter_map(|(bid, b)| {
@@ -125,7 +125,7 @@ impl<'a> ListTable for ListHashMapTable<'a> {
 
         // Backward cleanup: Documents whose `lists` Vec listed a removed List.
         {
-            let mut doc_map = self.store.documents.write().unwrap();
+            let mut doc_map = self.store.documents.write();
             let updates: Vec<(EntityId, crate::entities::Document)> = doc_map
                 .iter()
                 .filter_map(|(did, d)| {
@@ -159,15 +159,15 @@ impl<'a> ListHashMapTableRO<'a> {
 
 impl<'a> ListTableRO for ListHashMapTableRO<'a> {
     fn get(&self, id: &EntityId) -> Result<Option<List>, RepositoryError> {
-        Ok(self.store.lists.read().unwrap().get(id).cloned())
+        Ok(self.store.lists.read().get(id).cloned())
     }
 
     fn get_multi(&self, ids: &[EntityId]) -> Result<Vec<Option<List>>, RepositoryError> {
-        let map = self.store.lists.read().unwrap();
+        let map = self.store.lists.read();
         Ok(ids.iter().map(|id| map.get(id).cloned()).collect())
     }
 
     fn get_all(&self) -> Result<Vec<List>, RepositoryError> {
-        Ok(self.store.lists.read().unwrap().values().cloned().collect())
+        Ok(self.store.lists.read().values().cloned().collect())
     }
 }

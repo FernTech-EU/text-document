@@ -12,55 +12,27 @@ use proptest::prelude::*;
 
 fn assert_states_eq(a: &RopeStore, b: &RopeStore) {
     assert_eq!(
-        a.rope.read().unwrap().to_string(),
-        b.rope.read().unwrap().to_string(),
+        a.rope.read().to_string(),
+        b.rope.read().to_string(),
         "rope content"
     );
-    assert_eq!(*a.roots.read().unwrap(), *b.roots.read().unwrap(), "roots");
+    assert_eq!(*a.roots.read(), *b.roots.read(), "roots");
+    assert_eq!(*a.documents.read(), *b.documents.read(), "documents");
+    assert_eq!(*a.frames.read(), *b.frames.read(), "frames");
+    assert_eq!(*a.blocks.read(), *b.blocks.read(), "blocks");
+    assert_eq!(*a.lists.read(), *b.lists.read(), "lists");
+    assert_eq!(*a.resources.read(), *b.resources.read(), "resources");
+    assert_eq!(*a.tables.read(), *b.tables.read(), "tables");
+    assert_eq!(*a.table_cells.read(), *b.table_cells.read(), "table_cells");
+    assert_eq!(*a.format_runs.read(), *b.format_runs.read(), "format_runs");
     assert_eq!(
-        *a.documents.read().unwrap(),
-        *b.documents.read().unwrap(),
-        "documents"
-    );
-    assert_eq!(
-        *a.frames.read().unwrap(),
-        *b.frames.read().unwrap(),
-        "frames"
-    );
-    assert_eq!(
-        *a.blocks.read().unwrap(),
-        *b.blocks.read().unwrap(),
-        "blocks"
-    );
-    assert_eq!(*a.lists.read().unwrap(), *b.lists.read().unwrap(), "lists");
-    assert_eq!(
-        *a.resources.read().unwrap(),
-        *b.resources.read().unwrap(),
-        "resources"
-    );
-    assert_eq!(
-        *a.tables.read().unwrap(),
-        *b.tables.read().unwrap(),
-        "tables"
-    );
-    assert_eq!(
-        *a.table_cells.read().unwrap(),
-        *b.table_cells.read().unwrap(),
-        "table_cells"
-    );
-    assert_eq!(
-        *a.format_runs.read().unwrap(),
-        *b.format_runs.read().unwrap(),
-        "format_runs"
-    );
-    assert_eq!(
-        *a.block_images.read().unwrap(),
-        *b.block_images.read().unwrap(),
+        *a.block_images.read(),
+        *b.block_images.read(),
         "block_images"
     );
     assert_eq!(
-        *a.block_offsets.read().unwrap(),
-        *b.block_offsets.read().unwrap(),
+        *a.block_offsets.read(),
+        *b.block_offsets.read(),
         "block_offsets"
     );
 }
@@ -75,16 +47,15 @@ fn populate_some_state(store: &RopeStore) {
     store
         .rope
         .write()
-        .unwrap()
         .insert(0, "hello world\nsecond paragraph\n");
-    store.roots.write().unwrap().insert(
+    store.roots.write().insert(
         ROOT_ID,
         Root {
             id: ROOT_ID,
             ..Root::default()
         },
     );
-    store.blocks.write().unwrap().insert(
+    store.blocks.write().insert(
         BLOCK_ID,
         Block {
             id: BLOCK_ID,
@@ -92,14 +63,14 @@ fn populate_some_state(store: &RopeStore) {
             ..Block::default()
         },
     );
-    store.frames.write().unwrap().insert(
+    store.frames.write().insert(
         FRAME_ID,
         Frame {
             id: FRAME_ID,
             ..Frame::default()
         },
     );
-    store.format_runs.write().unwrap().insert(
+    store.format_runs.write().insert(
         BLOCK_ID,
         vec![FormatRun {
             byte_start: 0,
@@ -110,12 +81,12 @@ fn populate_some_state(store: &RopeStore) {
             },
         }],
     );
-    store.block_offsets.write().unwrap().push_block(BLOCK_ID, 0);
+    store.block_offsets.write().push_block(BLOCK_ID, 0);
 
     // Pre-set counters so populate is deterministic (would otherwise
     // depend on call order).
     {
-        let mut counters = store.counters.write().unwrap();
+        let mut counters = store.counters.write();
         counters.insert("Root".into(), 2);
         counters.insert("Block".into(), 3);
         counters.insert("Frame".into(), 4);
@@ -127,9 +98,9 @@ fn snapshot_restore_round_trip_empty_store() {
     let store = RopeStore::new();
     let snap = store.snapshot();
     // Mutate aggressively.
-    store.rope.write().unwrap().insert(0, "garbage");
-    store.counters.write().unwrap().insert("Block".into(), 99);
-    store.blocks.write().unwrap().insert(
+    store.rope.write().insert(0, "garbage");
+    store.counters.write().insert("Block".into(), 99);
+    store.blocks.write().insert(
         99,
         Block {
             id: 99,
@@ -149,10 +120,10 @@ fn snapshot_restore_round_trip_populated_store() {
     let snap = store.snapshot();
 
     // Mutate after snapshot.
-    store.rope.write().unwrap().insert(0, "PREFIX");
-    store.blocks.write().unwrap().clear();
-    store.format_runs.write().unwrap().clear();
-    store.block_offsets.write().unwrap().clear();
+    store.rope.write().insert(0, "PREFIX");
+    store.blocks.write().clear();
+    store.format_runs.write().clear();
+    store.block_offsets.write().clear();
 
     // Restore.
     let expected = RopeStore::new();
@@ -170,22 +141,21 @@ fn restore_without_counters_preserves_counters() {
     let store = RopeStore::new();
     populate_some_state(&store);
     let snap = store.snapshot();
-    let counter_at_snap = *store.counters.read().unwrap().get("Block").unwrap();
+    let counter_at_snap = *store.counters.read().get("Block").unwrap();
 
     // Bump counter past the snapshot value and mutate state.
     store
         .counters
         .write()
-        .unwrap()
         .insert("Block".into(), counter_at_snap + 42);
-    store.blocks.write().unwrap().clear();
+    store.blocks.write().clear();
 
     store.restore_without_counters(&snap);
 
     // Entity tables restored.
-    assert!(!store.blocks.read().unwrap().is_empty());
+    assert!(!store.blocks.read().is_empty());
     // Counter NOT rolled back to the snapshot value.
-    let counter_after_restore = *store.counters.read().unwrap().get("Block").unwrap();
+    let counter_after_restore = *store.counters.read().get("Block").unwrap();
     assert_eq!(
         counter_after_restore,
         counter_at_snap + 42,
@@ -200,20 +170,13 @@ fn savepoint_create_restore_discard() {
     let sp = store.create_savepoint();
 
     // Mutate.
-    store.rope.write().unwrap().insert(0, "MUTATION");
-    store.blocks.write().unwrap().clear();
+    store.rope.write().insert(0, "MUTATION");
+    store.blocks.write().clear();
 
     // Restore.
     store.restore_savepoint(sp);
-    assert!(!store.blocks.read().unwrap().is_empty());
-    assert!(
-        !store
-            .rope
-            .read()
-            .unwrap()
-            .to_string()
-            .starts_with("MUTATION")
-    );
+    assert!(!store.blocks.read().is_empty());
+    assert!(!store.rope.read().to_string().starts_with("MUTATION"));
 
     // Discard is just a memory cleanup — restoring after discard panics.
     store.discard_savepoint(sp);
@@ -226,15 +189,15 @@ fn store_snapshot_round_trip_via_type_erased_path() {
     let erased = store.store_snapshot();
 
     // Mutate.
-    store.rope.write().unwrap().insert(0, "X");
-    store.blocks.write().unwrap().clear();
+    store.rope.write().insert(0, "X");
+    store.blocks.write().clear();
 
     store.restore_store_snapshot(&erased);
 
     // Restored: rope content matches what was populated.
-    let rope_text = store.rope.read().unwrap().to_string();
+    let rope_text = store.rope.read().to_string();
     assert!(rope_text.starts_with("hello world"));
-    assert!(!store.blocks.read().unwrap().is_empty());
+    assert!(!store.blocks.read().is_empty());
 }
 
 #[test]
@@ -260,17 +223,17 @@ proptest! {
 
         // Apply identical pre-snapshot history to both stores.
         for text in &rope_inserts {
-            let len = store.rope.read().unwrap().len_chars();
-            store.rope.write().unwrap().insert(len, text);
-            let elen = expected.rope.read().unwrap().len_chars();
-            expected.rope.write().unwrap().insert(elen, text);
+            let len = store.rope.read().len_chars();
+            store.rope.write().insert(len, text);
+            let elen = expected.rope.read().len_chars();
+            expected.rope.write().insert(elen, text);
         }
 
         // Snapshot one, mutate it.
         let snap = store.snapshot();
         for text in &post_snapshot_inserts {
-            let len = store.rope.read().unwrap().len_chars();
-            store.rope.write().unwrap().insert(len, text);
+            let len = store.rope.read().len_chars();
+            store.rope.write().insert(len, text);
         }
 
         // Restoring must return to the pre-snapshot state.

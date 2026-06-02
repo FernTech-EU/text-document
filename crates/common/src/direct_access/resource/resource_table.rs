@@ -29,7 +29,7 @@ impl<'a> ResourceTable for ResourceHashMapTable<'a> {
 
     fn create_multi(&mut self, entities: &[Resource]) -> Result<Vec<Resource>, RepositoryError> {
         let mut created = Vec::with_capacity(entities.len());
-        let mut map = self.store.resources.write().unwrap();
+        let mut map = self.store.resources.write();
         for entity in entities {
             let new_entity = if entity.id == EntityId::default() {
                 let id = self.store.next_id("resource");
@@ -53,23 +53,16 @@ impl<'a> ResourceTable for ResourceHashMapTable<'a> {
     }
 
     fn get(&self, id: &EntityId) -> Result<Option<Resource>, RepositoryError> {
-        Ok(self.store.resources.read().unwrap().get(id).cloned())
+        Ok(self.store.resources.read().get(id).cloned())
     }
 
     fn get_multi(&self, ids: &[EntityId]) -> Result<Vec<Option<Resource>>, RepositoryError> {
-        let map = self.store.resources.read().unwrap();
+        let map = self.store.resources.read();
         Ok(ids.iter().map(|id| map.get(id).cloned()).collect())
     }
 
     fn get_all(&self) -> Result<Vec<Resource>, RepositoryError> {
-        Ok(self
-            .store
-            .resources
-            .read()
-            .unwrap()
-            .values()
-            .cloned()
-            .collect())
+        Ok(self.store.resources.read().values().cloned().collect())
     }
 
     fn update(&mut self, entity: &Resource) -> Result<Resource, RepositoryError> {
@@ -78,7 +71,7 @@ impl<'a> ResourceTable for ResourceHashMapTable<'a> {
     }
 
     fn update_multi(&mut self, entities: &[Resource]) -> Result<Vec<Resource>, RepositoryError> {
-        let mut map = self.store.resources.write().unwrap();
+        let mut map = self.store.resources.write();
         let mut result = Vec::with_capacity(entities.len());
         for entity in entities {
             map.insert(entity.id, entity.clone());
@@ -109,7 +102,7 @@ impl<'a> ResourceTable for ResourceHashMapTable<'a> {
         let removed: std::collections::HashSet<EntityId> = ids.iter().copied().collect();
 
         {
-            let mut map = self.store.resources.write().unwrap();
+            let mut map = self.store.resources.write();
             for id in ids {
                 map.remove(id);
             }
@@ -118,7 +111,7 @@ impl<'a> ResourceTable for ResourceHashMapTable<'a> {
         // Backward cleanup: Documents whose `resources` Vec listed a
         // removed Resource.
         {
-            let mut doc_map = self.store.documents.write().unwrap();
+            let mut doc_map = self.store.documents.write();
             let updates: Vec<(EntityId, crate::entities::Document)> = doc_map
                 .iter()
                 .filter_map(|(did, d)| {
@@ -152,22 +145,15 @@ impl<'a> ResourceHashMapTableRO<'a> {
 
 impl<'a> ResourceTableRO for ResourceHashMapTableRO<'a> {
     fn get(&self, id: &EntityId) -> Result<Option<Resource>, RepositoryError> {
-        Ok(self.store.resources.read().unwrap().get(id).cloned())
+        Ok(self.store.resources.read().get(id).cloned())
     }
 
     fn get_multi(&self, ids: &[EntityId]) -> Result<Vec<Option<Resource>>, RepositoryError> {
-        let map = self.store.resources.read().unwrap();
+        let map = self.store.resources.read();
         Ok(ids.iter().map(|id| map.get(id).cloned()).collect())
     }
 
     fn get_all(&self) -> Result<Vec<Resource>, RepositoryError> {
-        Ok(self
-            .store
-            .resources
-            .read()
-            .unwrap()
-            .values()
-            .cloned()
-            .collect())
+        Ok(self.store.resources.read().values().cloned().collect())
     }
 }

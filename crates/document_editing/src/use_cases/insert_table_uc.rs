@@ -89,8 +89,8 @@ fn execute_insert_table(
         let store = uow.store();
         let catchup: Vec<(common::types::EntityId, i64)> =
             if common::database::rope_helpers::rope_positions_match_flow(&store) {
-                let offsets = store.block_offsets.read().unwrap();
-                let rope = store.rope.read().unwrap();
+                let offsets = store.block_offsets.read();
+                let rope = store.rope.read();
                 offsets
                     .entries
                     .iter()
@@ -479,7 +479,6 @@ fn execute_insert_table(
         let anchor_start = store
             .block_offsets
             .read()
-            .unwrap()
             .range_of(
                 common::database::block_offset_index::OffsetMarker::TableAnchor(created_table.id),
             )

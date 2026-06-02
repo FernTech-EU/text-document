@@ -758,7 +758,7 @@ impl<'a> DocumentRepository<'a> {
         };
 
         // Emit Created events for this entity
-        let document_ids: Vec<_> = store.documents.read().unwrap().keys().copied().collect();
+        let document_ids: Vec<_> = store.documents.read().keys().copied().collect();
         emit(
             DirectAccessEntity::Document(EntityEvent::Created),
             document_ids.clone(),
@@ -771,7 +771,7 @@ impl<'a> DocumentRepository<'a> {
         // Emit Created events for strong children
 
         {
-            let child_ids: Vec<_> = store.frames.read().unwrap().keys().copied().collect();
+            let child_ids: Vec<_> = store.frames.read().keys().copied().collect();
             emit(
                 DirectAccessEntity::Frame(EntityEvent::Created),
                 child_ids.clone(),
@@ -779,21 +779,21 @@ impl<'a> DocumentRepository<'a> {
             emit(DirectAccessEntity::Frame(EntityEvent::Updated), child_ids);
         }
         {
-            let child_ids: Vec<_> = store.resources.read().unwrap().keys().copied().collect();
+            let child_ids: Vec<_> = store.resources.read().keys().copied().collect();
             emit(
                 DirectAccessEntity::Resource(EntityEvent::Created),
                 child_ids.clone(),
             );
         }
         {
-            let child_ids: Vec<_> = store.lists.read().unwrap().keys().copied().collect();
+            let child_ids: Vec<_> = store.lists.read().keys().copied().collect();
             emit(
                 DirectAccessEntity::List(EntityEvent::Created),
                 child_ids.clone(),
             );
         }
         {
-            let child_ids: Vec<_> = store.tables.read().unwrap().keys().copied().collect();
+            let child_ids: Vec<_> = store.tables.read().keys().copied().collect();
             emit(
                 DirectAccessEntity::Table(EntityEvent::Created),
                 child_ids.clone(),

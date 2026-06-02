@@ -64,15 +64,14 @@ impl GetBlockAtPositionUseCase {
             // belong to the NEXT block. Empty blocks stay put.
             if block_length > 0 && init_char_in_block == block_length {
                 let next_block_info: Option<(EntityId, u32)> = {
-                    let offsets = store.block_offsets.read().unwrap();
+                    let offsets = store.block_offsets.read();
                     offsets
                         .position_of(OffsetMarker::Block(block_id))
                         .and_then(|cur_idx| offsets.entries.get(cur_idx + 1).copied())
                         .and_then(|(m, bs)| m.as_block().map(|id| (id, bs)))
                 };
                 if let Some((next_block_id, next_bs)) = next_block_info {
-                    let next_char_start =
-                        store.rope.read().unwrap().byte_to_char(next_bs as usize) as i64;
+                    let next_char_start = store.rope.read().byte_to_char(next_bs as usize) as i64;
                     block_id = next_block_id;
                     block_char_start = next_char_start;
                     block = uow
@@ -87,7 +86,7 @@ impl GetBlockAtPositionUseCase {
             // entry index counts them, which would inflate every block_number
             // after a table (and run past the real block count).
             let block_number = {
-                let offsets = store.block_offsets.read().unwrap();
+                let offsets = store.block_offsets.read();
                 offsets
                     .position_of(OffsetMarker::Block(block_id))
                     .map(|idx| {

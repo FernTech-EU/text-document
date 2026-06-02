@@ -390,14 +390,7 @@ pub(crate) fn find_parent_frame(inner: &TextDocumentInner, block_id: u64) -> Opt
 /// `find_table_cell_context` walks for documents that have no tables
 /// (e.g. typical markdown documents in an editor).
 fn document_has_no_tables(inner: &TextDocumentInner) -> bool {
-    inner
-        .ctx
-        .db_context
-        .get_store()
-        .tables
-        .read()
-        .unwrap()
-        .is_empty()
+    inner.ctx.db_context.get_store().tables.read().is_empty()
 }
 
 /// Find table cell context for a block (snapshot-friendly, no live handles).
@@ -552,14 +545,12 @@ fn build_raw_fragments(
         let runs: Vec<FormatRun> = store
             .format_runs
             .read()
-            .unwrap()
             .get(&block_id)
             .cloned()
             .unwrap_or_default();
         let images: Vec<ImageAnchor> = store
             .block_images
             .read()
-            .unwrap()
             .get(&block_id)
             .cloned()
             .unwrap_or_default();

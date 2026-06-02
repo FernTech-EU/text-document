@@ -7,15 +7,20 @@ use common::entities::Block;
 use regex::RegexBuilder;
 use unicode_segmentation::UnicodeSegmentation;
 
-/// Build the full document text from main-flow blocks by reading
-/// content from the global rope via `block_offsets`. Blocks whose
-/// content isn't in the rope (e.g. table-cell blocks not yet covered
-/// by plan §1.6's `Frame.byte_range` model) contribute the empty
-/// string — see `block_content_via_store`.
+/// Build the full document text from the given blocks by reading content
+/// from the global rope via `block_offsets`.
 ///
-/// The returned string has main-flow blocks joined by single `\n`
-/// separators — matching the position semantics that
-/// `document_position` is computed against.
+/// This is the *fallback* path used only when the rope's char space does
+/// not match document flow (a sub-frame inserted with a parent — its
+/// blocks aren't mirrored to the rope). The primary search path reads the
+/// whole rope directly via `rope_full_text_if_flow_matches`, which already
+/// covers table-cell content (cells are mirrored inline into the rope in
+/// document order). Blocks not registered in the offset index contribute
+/// the empty string — see `block_content_via_store`.
+///
+/// The returned string has blocks joined by single `\n` separators —
+/// matching the position semantics that `document_position` is computed
+/// against.
 ///
 /// Blocks must be sorted by `document_position` (caller's
 /// responsibility).

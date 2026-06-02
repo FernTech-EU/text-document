@@ -105,7 +105,6 @@ fn delete_range_in_block(
     let images_before = store
         .block_images
         .read()
-        .unwrap()
         .get(&block.id)
         .cloned()
         .unwrap_or_default();
@@ -123,13 +122,13 @@ fn delete_range_in_block(
     new_plain.push_str(&block_text[byte_end as usize..]);
 
     {
-        let mut runs_map = store.format_runs.write().unwrap();
+        let mut runs_map = store.format_runs.write();
         let runs = runs_map.entry(block.id).or_default();
         shift_runs_for_delete(runs, byte_start, byte_end);
         debug_assert_well_formed(runs, new_plain.len());
     }
     let images_removed = {
-        let mut images_map = store.block_images.write().unwrap();
+        let mut images_map = store.block_images.write();
         let images = images_map.entry(block.id).or_default();
         shift_images_for_delete(images, byte_start, byte_end) as i64
     };
@@ -156,7 +155,6 @@ fn insert_formatted_at(
     let images_before = store
         .block_images
         .read()
-        .unwrap()
         .get(&block.id)
         .cloned()
         .unwrap_or_default();
@@ -176,7 +174,7 @@ fn insert_formatted_at(
     // the dto's format (this overrides whatever the shift would have
     // inherited from a straddling run).
     {
-        let mut runs_map = store.format_runs.write().unwrap();
+        let mut runs_map = store.format_runs.write();
         let runs = runs_map.entry(block.id).or_default();
         shift_runs_for_insert(runs, byte_offset, inserted_byte_len);
         let new_run = FormatRun {
@@ -192,7 +190,7 @@ fn insert_formatted_at(
         debug_assert_well_formed(runs, new_plain.len());
     }
     {
-        let mut images_map = store.block_images.write().unwrap();
+        let mut images_map = store.block_images.write();
         if let Some(images) = images_map.get_mut(&block.id) {
             shift_images_for_insert(images, byte_offset, inserted_byte_len);
         }
@@ -341,14 +339,12 @@ fn execute_insert_simple(
     let original_format_runs = store
         .format_runs
         .read()
-        .unwrap()
         .get(&block.id)
         .cloned()
         .unwrap_or_default();
     let original_block_images = store
         .block_images
         .read()
-        .unwrap()
         .get(&block.id)
         .cloned()
         .unwrap_or_default();
@@ -477,12 +473,10 @@ impl UndoRedoCommand for InsertFormattedTextUseCase {
                 store
                     .format_runs
                     .write()
-                    .unwrap()
                     .insert(data.block_id, data.original_format_runs.clone());
                 store
                     .block_images
                     .write()
-                    .unwrap()
                     .insert(data.block_id, data.original_block_images.clone());
 
                 let mut doc = uow

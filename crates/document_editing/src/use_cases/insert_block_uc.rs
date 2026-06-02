@@ -98,14 +98,12 @@ fn execute_insert_block(
     let current_runs = store
         .format_runs
         .read()
-        .unwrap()
         .get(&current_block.id)
         .cloned()
         .unwrap_or_default();
     let current_images = store
         .block_images
         .read()
-        .unwrap()
         .get(&current_block.id)
         .cloned()
         .unwrap_or_default();
@@ -133,12 +131,10 @@ fn execute_insert_block(
     store
         .format_runs
         .write()
-        .unwrap()
         .insert(current_block.id, left_runs);
     store
         .block_images
         .write()
-        .unwrap()
         .insert(current_block.id, left_images);
 
     // Create the "after" block. Use `text_before_chars` directly because the
@@ -204,12 +200,10 @@ fn execute_insert_block(
     store
         .format_runs
         .write()
-        .unwrap()
         .insert(created_block.id, right_runs);
     store
         .block_images
         .write()
-        .unwrap()
         .insert(created_block.id, right_images);
 
     // Mirror the split into the rope: insert `\n` boundary at the

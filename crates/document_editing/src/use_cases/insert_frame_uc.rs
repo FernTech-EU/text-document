@@ -211,7 +211,7 @@ fn execute_insert_frame(
             let block_at_pos = find_block_at_char_position(&store, dto.position);
             if let Some((current_block_id, _, _)) = block_at_pos {
                 let range = {
-                    let offsets = store.block_offsets.read().unwrap();
+                    let offsets = store.block_offsets.read();
                     offsets.range_with_successor(OffsetMarker::Block(current_block_id))
                 };
                 if let Some((bs, be, has_successor)) = range {

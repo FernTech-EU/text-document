@@ -20,11 +20,11 @@ fn import_plain_text_single_line_populates_rope() -> Result<()> {
     )?;
 
     let store = db_context.get_store();
-    let rope = store.rope.read().unwrap();
+    let rope = store.rope.read();
     assert_eq!(rope.to_string(), "Hello World");
     assert_eq!(rope.len_bytes(), 11);
 
-    let offsets = store.block_offsets.read().unwrap();
+    let offsets = store.block_offsets.read();
     assert_eq!(offsets.entries.len(), 1);
     assert_eq!(offsets.entries[0].1, 0);
     assert_eq!(offsets.total_bytes(), 11);
@@ -45,11 +45,11 @@ fn import_plain_text_multi_line_inserts_block_boundaries() -> Result<()> {
     )?;
 
     let store = db_context.get_store();
-    let rope = store.rope.read().unwrap();
+    let rope = store.rope.read();
     // Three blocks joined by inter-block newlines.
     assert_eq!(rope.to_string(), "first\nsecond\nthird");
 
-    let offsets = store.block_offsets.read().unwrap();
+    let offsets = store.block_offsets.read();
     assert_eq!(offsets.entries.len(), 3);
     // byte_starts: 0, then after "first\n" = 6, then after "second\n" = 13
     assert_eq!(offsets.entries[0].1, 0);
@@ -92,10 +92,10 @@ fn second_import_resets_rope() -> Result<()> {
     )?;
 
     let store = db_context.get_store();
-    let rope = store.rope.read().unwrap();
+    let rope = store.rope.read();
     assert_eq!(rope.to_string(), "second import");
 
-    let offsets = store.block_offsets.read().unwrap();
+    let offsets = store.block_offsets.read();
     assert_eq!(offsets.entries.len(), 1);
     assert_eq!(offsets.total_bytes(), 13);
 
@@ -116,12 +116,12 @@ fn import_unicode_text_uses_byte_offsets() -> Result<()> {
     )?;
 
     let store = db_context.get_store();
-    let rope = store.rope.read().unwrap();
+    let rope = store.rope.read();
     assert_eq!(rope.to_string(), "café\nbar");
     assert_eq!(rope.len_bytes(), 9); // "café"=5 + "\n"=1 + "bar"=3
     assert_eq!(rope.len_chars(), 8); // 4 + 1 + 3
 
-    let offsets = store.block_offsets.read().unwrap();
+    let offsets = store.block_offsets.read();
     assert_eq!(offsets.entries.len(), 2);
     assert_eq!(offsets.entries[0].1, 0);
     // Second block starts after "café\n" = 5 + 1 = 6 BYTES (not chars).
@@ -146,11 +146,11 @@ fn import_plain_text_sets_root_frame_byte_range() -> Result<()> {
     )?;
 
     let store = db_context.get_store();
-    let total = store.rope.read().unwrap().len_bytes() as u32;
+    let total = store.rope.read().len_bytes() as u32;
     assert_eq!(total, 18);
 
     // Exactly one top-level frame; find it.
-    let frames = store.frames.read().unwrap();
+    let frames = store.frames.read();
     let top_level: Vec<_> = frames
         .values()
         .filter(|f| f.parent_frame.is_none())
@@ -177,8 +177,8 @@ fn import_plain_text_byte_range_matches_total_bytes() -> Result<()> {
     )?;
 
     let store = db_context.get_store();
-    let total = store.rope.read().unwrap().len_bytes() as u32;
-    let frames = store.frames.read().unwrap();
+    let total = store.rope.read().len_bytes() as u32;
+    let frames = store.frames.read();
     let top = frames
         .values()
         .find(|f| f.parent_frame.is_none())
@@ -212,7 +212,7 @@ fn second_import_resets_root_frame_byte_range() -> Result<()> {
     )?;
 
     let store = db_context.get_store();
-    let frames = store.frames.read().unwrap();
+    let frames = store.frames.read();
     let top_level: Vec<_> = frames
         .values()
         .filter(|f| f.parent_frame.is_none())

@@ -152,7 +152,7 @@ fn execute_insert_table_column(
     {
         let store = uow.store();
         let parent_frame_id_opt = {
-            let frames = store.frames.read().unwrap();
+            let frames = store.frames.read();
             let anchor = frames.values().find(|f| f.table == Some(table_id)).cloned();
             anchor.and_then(|f| f.parent_frame)
         };
