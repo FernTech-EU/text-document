@@ -4,7 +4,7 @@ use crate::FindAllDto;
 use crate::FindAllResultDto;
 use anyhow::{Result, anyhow};
 use common::database::QueryUnitOfWork;
-use common::database::rope_helpers::rope_flat_text_if_simple;
+use common::database::rope_helpers::rope_full_text_if_flow_matches;
 use common::direct_access::document::document_repository::DocumentRelationshipField;
 use common::direct_access::frame::frame_repository::FrameRelationshipField;
 use common::direct_access::root::root_repository::RootRelationshipField;
@@ -36,9 +36,12 @@ fn build_full_text(uow: &dyn FindAllUnitOfWorkTrait) -> Result<String> {
 
     let frame_ids = uow.get_document_relationship(&doc_id, &DocumentRelationshipField::Frames)?;
 
-    // Fast path: flat single-frame document — entire searchable text
-    // is already laid out contiguously in the rope.
-    if let Some(text) = rope_flat_text_if_simple(&uow.store(), frame_ids.len()) {
+    // Fast path: whenever the rope's char space matches the document
+    // flow (the common case, including documents with tables — cell
+    // content is mirrored inline), the entire searchable text is the
+    // rope itself. This is also what makes table-cell content reachable
+    // by search.
+    if let Some(text) = rope_full_text_if_flow_matches(&uow.store()) {
         return Ok(text);
     }
 

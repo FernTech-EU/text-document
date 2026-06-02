@@ -62,10 +62,11 @@ pub fn block_char_length(block: &Block, store: &Store) -> i64 {
 ///
 /// O(log n): one `range_of_block` lookup + one `byte_to_char` conversion.
 /// Falls back to `block.document_position` for blocks not registered in
-/// the index — currently table-cell blocks (plan §1.6 deferred) and
-/// blocks under non-top-level frames (`insert_frame_uc` only mirrors
-/// top-level frames). The stored field is set authoritatively by those
-/// non-flow paths and stays correct for them across main-flow edits.
+/// the index — blocks under non-top-level frames (`insert_frame_uc` only
+/// mirrors top-level frames). Table-cell blocks ARE registered: they are
+/// mirrored inline into the rope in document order. The stored field is
+/// set authoritatively by the non-flow paths and stays correct for them
+/// across main-flow edits.
 pub fn block_document_position(block: &Block, store: &Store) -> i64 {
     let offsets = store.block_offsets.read();
     let Some((byte_start, _)) = offsets.range_of_block(block.id) else {
@@ -117,11 +118,12 @@ pub fn rope_positions_match_flow(store: &Store) -> bool {
 /// + called `block_char_length` per block. For an N-block document
 ///   each editor keystroke now costs O(log n) lookups instead of O(N).
 ///
-/// Returns `None` for documents containing tables — table cell content
-/// lives in separate byte ranges later in the rope (plan §1.6), so the
-/// rope's char-position space diverges from the user-visible flow
-/// order. Callers must fall back to the slow per-block walk in that
-/// case.
+/// Returns `None` only when some block is unmirrored (a sub-frame
+/// inserted with a parent — `insert_frame_uc` mirrors only top-level
+/// frames), where the rope's char space diverges from flow order and
+/// callers must fall back to the slow per-block walk. Tables are fine:
+/// cell content is mirrored inline in document order and each table is a
+/// 1-char anchor sentinel, so byte→block lookup resolves correctly.
 ///
 /// `position` past the document end clamps to the last block's
 /// end-of-content.
@@ -257,6 +259,22 @@ pub fn rope_flat_text_if_simple(store: &Store, top_frame_count: usize) -> Option
     }
     drop(offsets);
     Some(store.rope.read().to_string())
+}
+
+/// Whole-document searchable text straight from the rope, valid whenever
+/// the rope's char-position space matches the user-visible flow order
+/// (`rope_positions_match_flow`).
+///
+/// Unlike `rope_flat_text_if_simple` this does NOT bail on tables or
+/// multiple top-level frames: table-cell content is mirrored inline into
+/// the rope in document order and each table occupies a 1-char anchor
+/// sentinel, so the rope already contains all searchable text — including
+/// cell text — at the same char offsets that match positions are reported
+/// in. Returns `None` only when some block is unmirrored (e.g. a sub-frame
+/// inserted with a parent), where the caller must fall back to the
+/// per-frame, per-block traversal.
+pub fn rope_full_text_if_flow_matches(store: &Store) -> Option<String> {
+    rope_positions_match_flow(store).then(|| store.rope.read().to_string())
 }
 
 /// Reset the rope to empty and clear `block_offsets`. Called by
