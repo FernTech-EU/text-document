@@ -61,6 +61,9 @@ entities:
           - WordWrap
           - WrapAnywhere
           - WrapAtWordBoundaryOrAnywhere
+      - name: default_language
+        type: string
+        optional: true
       - name: resources
         type: entity
         entity: Resource

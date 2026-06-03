@@ -31,6 +31,11 @@ pub struct Document {
     pub frames: Vec<EntityId>,
     pub text_direction: TextDirection,
     pub default_wrap_mode: WrapMode,
+    /// Document-wide default natural language as an ISO 639-1 code (e.g.
+    /// "en", "fr"). Used as the fallback hyphenation language for blocks
+    /// that don't set their own `fmt_language`. `None` is treated as "en".
+    #[serde(default)]
+    pub default_language: Option<String>,
     pub resources: Vec<EntityId>,
     pub lists: Vec<EntityId>,
     pub tables: Vec<EntityId>,

@@ -1000,6 +1000,30 @@ impl TextDocument {
         Ok(())
     }
 
+    /// Get the document-wide default language (ISO 639-1 code, e.g. "en").
+    /// This is the fallback hyphenation language for blocks that don't set
+    /// their own `language`. Defaults to `"en"` when never set.
+    pub fn default_language(&self) -> String {
+        let inner = self.inner.lock();
+        document_commands::get_document(&inner.ctx, &inner.document_id)
+            .ok()
+            .flatten()
+            .and_then(|d| d.default_language)
+            .unwrap_or_else(|| "en".to_string())
+    }
+
+    /// Set the document-wide default language (ISO 639-1 code). Blocks
+    /// without an explicit `language` inherit this for hyphenation.
+    pub fn set_default_language(&self, language: &str) -> Result<()> {
+        let inner = self.inner.lock();
+        let doc = document_commands::get_document(&inner.ctx, &inner.document_id)?
+            .ok_or_else(|| DocumentError::NotFound("document not found".into()))?;
+        let mut update: frontend::document::dtos::UpdateDocumentDto = doc.into();
+        update.default_language = Some(language.to_string());
+        document_commands::update_document(&inner.ctx, Some(inner.stack_id), &update)?;
+        Ok(())
+    }
+
     // ── Event subscription ───────────────────────────────────
 
     /// Subscribe to document events via callback.

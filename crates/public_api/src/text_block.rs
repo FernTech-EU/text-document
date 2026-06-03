@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use parking_lot::Mutex;
 
-use frontend::commands::{block_commands, frame_commands, list_commands};
+use frontend::commands::{block_commands, document_commands, frame_commands, list_commands};
 use frontend::common::format_runs::{FormatRun, ImageAnchor, synth_element_id};
 use frontend::common::types::EntityId;
 
@@ -937,7 +937,16 @@ pub(crate) fn build_block_snapshot_with_position_and_parent(
     let store_for_pos = inner.ctx.db_context.get_store();
     crate::inner::refresh_block_position(&mut block_dto, store_for_pos);
 
-    let block_format = BlockFormat::from(&block_dto);
+    let mut block_format = BlockFormat::from(&block_dto);
+    // Inherit the document-wide default language when the block sets none,
+    // so hyphenation has a language for every block. The bridge still
+    // falls back to English if this is also unset.
+    if block_format.language.is_none() {
+        block_format.language = document_commands::get_document(&inner.ctx, &inner.document_id)
+            .ok()
+            .flatten()
+            .and_then(|d| d.default_language);
+    }
     let list_info = build_list_info(inner, &block_dto);
 
     let parent_frame_id = parent_frame_hint
