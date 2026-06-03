@@ -58,6 +58,8 @@ expression: "&snap.elements"
                 background_color: None,
                 is_code_block: None,
                 code_language: None,
+                hyphenate: None,
+                language: None,
             },
             list_info: None,
             parent_frame_id: Some(
@@ -122,6 +124,8 @@ expression: "&snap.elements"
                 background_color: None,
                 is_code_block: None,
                 code_language: None,
+                hyphenate: None,
+                language: None,
             },
             list_info: None,
             parent_frame_id: Some(

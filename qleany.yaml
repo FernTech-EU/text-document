@@ -238,6 +238,12 @@ entities:
       - name: fmt_code_language
         type: string
         optional: true
+      - name: fmt_hyphenate
+        type: bool
+        optional: true
+      - name: fmt_language
+        type: string
+        optional: true
 
   # NOTE: the legacy `InlineElement` entity (one row per text run / image
   # within a block, carrying `content: InlineContent { Empty | Text |
@@ -1015,6 +1021,12 @@ features:
               type: boolean
               optional: true
             - name: code_language
+              type: string
+              optional: true
+            - name: hyphenate
+              type: boolean
+              optional: true
+            - name: language
               type: string
               optional: true
             - name: top_margin

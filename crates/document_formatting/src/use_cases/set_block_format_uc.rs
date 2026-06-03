@@ -132,6 +132,12 @@ fn execute_set_block_format(
             if let Some(ref l) = dto.code_language {
                 updated.fmt_code_language = Some(l.clone());
             }
+            if let Some(v) = dto.hyphenate {
+                updated.fmt_hyphenate = Some(v);
+            }
+            if let Some(ref l) = dto.language {
+                updated.fmt_language = Some(l.clone());
+            }
             if let Some(v) = dto.top_margin {
                 updated.fmt_top_margin = Some(v);
             }

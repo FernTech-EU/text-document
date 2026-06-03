@@ -345,6 +345,8 @@ fn execute_content_insert(
                 fmt_background_color: None,
                 fmt_is_code_block: None,
                 fmt_code_language: None,
+                fmt_hyphenate: None,
+                fmt_language: None,
             };
 
             let insert_index = (block_idx + 1 + new_block_ids.len()) as i32;
@@ -425,6 +427,8 @@ fn execute_content_insert(
             fmt_background_color: current_block.fmt_background_color.clone(),
             fmt_is_code_block: current_block.fmt_is_code_block,
             fmt_code_language: current_block.fmt_code_language.clone(),
+            fmt_hyphenate: current_block.fmt_hyphenate,
+            fmt_language: current_block.fmt_language.clone(),
         };
 
         let tail_insert_index = (block_idx + 1 + new_block_ids.len()) as i32;
@@ -547,6 +551,8 @@ fn execute_content_insert(
             fmt_background_color: None,
             fmt_is_code_block: None,
             fmt_code_language: None,
+            fmt_hyphenate: None,
+            fmt_language: None,
         };
 
         let created_block = uow.create_block(&new_block, frame_id, (block_idx + 1) as i32)?;
@@ -582,6 +588,8 @@ fn execute_content_insert(
             fmt_background_color: current_block.fmt_background_color.clone(),
             fmt_is_code_block: current_block.fmt_is_code_block,
             fmt_code_language: current_block.fmt_code_language.clone(),
+            fmt_hyphenate: current_block.fmt_hyphenate,
+            fmt_language: current_block.fmt_language.clone(),
         };
 
         let created_tail = uow.create_block(&tail_block, frame_id, (block_idx + 2) as i32)?;

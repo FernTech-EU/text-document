@@ -71,6 +71,8 @@ impl DocumentFragment {
                 background_color: None,
                 is_code_block: None,
                 code_language: None,
+                hyphenate: None,
+                language: None,
             })
             .collect();
 
@@ -697,6 +699,8 @@ fn parsed_elements_to_fragment(parsed: Vec<ParsedElement>) -> DocumentFragment {
                     background_color: pb.background_color,
                     is_code_block: None,
                     code_language: None,
+                    hyphenate: None,
+                    language: None,
                 });
             }
             ParsedElement::Table(pt) => {
@@ -737,6 +741,8 @@ fn parsed_elements_to_fragment(parsed: Vec<ParsedElement>) -> DocumentFragment {
                                 background_color: None,
                                 is_code_block: None,
                                 code_language: None,
+                                hyphenate: None,
+                                language: None,
                             }],
                             fmt_padding: None,
                             fmt_border: None,

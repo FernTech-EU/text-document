@@ -34,6 +34,8 @@ pub struct BlockDto {
     pub fmt_background_color: Option<String>,
     pub fmt_is_code_block: Option<bool>,
     pub fmt_code_language: Option<String>,
+    pub fmt_hyphenate: Option<bool>,
+    pub fmt_language: Option<String>,
 }
 
 impl From<BlockDto> for Block {
@@ -60,6 +62,8 @@ impl From<BlockDto> for Block {
             fmt_background_color: dto.fmt_background_color,
             fmt_is_code_block: dto.fmt_is_code_block,
             fmt_code_language: dto.fmt_code_language,
+            fmt_hyphenate: dto.fmt_hyphenate,
+            fmt_language: dto.fmt_language,
         }
     }
 }
@@ -88,6 +92,8 @@ impl From<&BlockDto> for Block {
             fmt_background_color: dto.fmt_background_color.clone(),
             fmt_is_code_block: dto.fmt_is_code_block,
             fmt_code_language: dto.fmt_code_language.clone(),
+            fmt_hyphenate: dto.fmt_hyphenate,
+            fmt_language: dto.fmt_language.clone(),
         }
     }
 }
@@ -116,6 +122,8 @@ impl From<Block> for BlockDto {
             fmt_background_color: entity.fmt_background_color,
             fmt_is_code_block: entity.fmt_is_code_block,
             fmt_code_language: entity.fmt_code_language,
+            fmt_hyphenate: entity.fmt_hyphenate,
+            fmt_language: entity.fmt_language,
         }
     }
 }
@@ -142,6 +150,8 @@ pub struct CreateBlockDto {
     pub fmt_background_color: Option<String>,
     pub fmt_is_code_block: Option<bool>,
     pub fmt_code_language: Option<String>,
+    pub fmt_hyphenate: Option<bool>,
+    pub fmt_language: Option<String>,
 }
 
 impl From<CreateBlockDto> for Block {
@@ -168,6 +178,8 @@ impl From<CreateBlockDto> for Block {
             fmt_background_color: dto.fmt_background_color,
             fmt_is_code_block: dto.fmt_is_code_block,
             fmt_code_language: dto.fmt_code_language,
+            fmt_hyphenate: dto.fmt_hyphenate,
+            fmt_language: dto.fmt_language,
         }
     }
 }
@@ -196,6 +208,8 @@ impl From<&CreateBlockDto> for Block {
             fmt_background_color: dto.fmt_background_color.clone(),
             fmt_is_code_block: dto.fmt_is_code_block,
             fmt_code_language: dto.fmt_code_language.clone(),
+            fmt_hyphenate: dto.fmt_hyphenate,
+            fmt_language: dto.fmt_language.clone(),
         }
     }
 }
@@ -223,6 +237,8 @@ impl From<Block> for CreateBlockDto {
             fmt_background_color: entity.fmt_background_color,
             fmt_is_code_block: entity.fmt_is_code_block,
             fmt_code_language: entity.fmt_code_language,
+            fmt_hyphenate: entity.fmt_hyphenate,
+            fmt_language: entity.fmt_language,
         }
     }
 }
@@ -249,6 +265,8 @@ pub struct UpdateBlockDto {
     pub fmt_background_color: Option<String>,
     pub fmt_is_code_block: Option<bool>,
     pub fmt_code_language: Option<String>,
+    pub fmt_hyphenate: Option<bool>,
+    pub fmt_language: Option<String>,
 }
 
 impl From<UpdateBlockDto> for Block {
@@ -274,6 +292,8 @@ impl From<UpdateBlockDto> for Block {
             fmt_background_color: dto.fmt_background_color,
             fmt_is_code_block: dto.fmt_is_code_block,
             fmt_code_language: dto.fmt_code_language,
+            fmt_hyphenate: dto.fmt_hyphenate,
+            fmt_language: dto.fmt_language,
             list: Default::default(),
         }
     }
@@ -302,6 +322,8 @@ impl From<&UpdateBlockDto> for Block {
             fmt_background_color: dto.fmt_background_color.clone(),
             fmt_is_code_block: dto.fmt_is_code_block,
             fmt_code_language: dto.fmt_code_language.clone(),
+            fmt_hyphenate: dto.fmt_hyphenate,
+            fmt_language: dto.fmt_language.clone(),
             list: Default::default(),
         }
     }
@@ -330,6 +352,8 @@ impl From<Block> for UpdateBlockDto {
             fmt_background_color: entity.fmt_background_color,
             fmt_is_code_block: entity.fmt_is_code_block,
             fmt_code_language: entity.fmt_code_language,
+            fmt_hyphenate: entity.fmt_hyphenate,
+            fmt_language: entity.fmt_language,
         }
     }
 }
@@ -357,6 +381,8 @@ impl From<BlockDto> for UpdateBlockDto {
             fmt_background_color: dto.fmt_background_color,
             fmt_is_code_block: dto.fmt_is_code_block,
             fmt_code_language: dto.fmt_code_language,
+            fmt_hyphenate: dto.fmt_hyphenate,
+            fmt_language: dto.fmt_language,
         }
     }
 }

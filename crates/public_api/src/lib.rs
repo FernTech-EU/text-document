@@ -168,6 +168,11 @@ pub struct BlockFormat {
     pub background_color: Option<String>,
     pub is_code_block: Option<bool>,
     pub code_language: Option<String>,
+    /// Enable automatic + soft-hyphen hyphenation for this block.
+    pub hyphenate: Option<bool>,
+    /// Block natural language as an ISO 639-1 code (e.g. "en", "fr").
+    /// Selects the hyphenation dictionary.
+    pub language: Option<String>,
 }
 
 /// List formatting. All fields are optional: `None` means

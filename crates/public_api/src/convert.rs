@@ -265,6 +265,8 @@ impl BlockFormat {
             background_color: self.background_color.clone(),
             is_code_block: self.is_code_block,
             code_language: self.code_language.clone(),
+            hyphenate: self.hyphenate,
+            language: self.language.clone(),
             top_margin: self.top_margin.map(|v| v as i64),
             bottom_margin: self.bottom_margin.map(|v| v as i64),
             left_margin: self.left_margin.map(|v| v as i64),
@@ -293,6 +295,8 @@ impl From<&frontend::block::dtos::BlockDto> for BlockFormat {
             background_color: b.fmt_background_color.clone(),
             is_code_block: b.fmt_is_code_block,
             code_language: b.fmt_code_language.clone(),
+            hyphenate: b.fmt_hyphenate,
+            language: b.fmt_language.clone(),
         }
     }
 }

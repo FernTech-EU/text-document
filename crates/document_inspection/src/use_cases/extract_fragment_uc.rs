@@ -469,6 +469,16 @@ fn block_to_fragment_block(
         } else {
             None
         },
+        hyphenate: if is_full_block {
+            block.fmt_hyphenate
+        } else {
+            None
+        },
+        language: if is_full_block {
+            block.fmt_language.clone()
+        } else {
+            None
+        },
     }
 }
 

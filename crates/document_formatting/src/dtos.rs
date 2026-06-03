@@ -69,6 +69,8 @@ pub struct SetBlockFormatDto {
     pub background_color: Option<String>,
     pub is_code_block: Option<bool>,
     pub code_language: Option<String>,
+    pub hyphenate: Option<bool>,
+    pub language: Option<String>,
     pub top_margin: Option<i64>,
     pub bottom_margin: Option<i64>,
     pub left_margin: Option<i64>,

@@ -165,6 +165,8 @@ fn execute_insert_block(
         fmt_background_color: current_block.fmt_background_color.clone(),
         fmt_is_code_block: current_block.fmt_is_code_block,
         fmt_code_language: current_block.fmt_code_language.clone(),
+        fmt_hyphenate: current_block.fmt_hyphenate,
+        fmt_language: current_block.fmt_language.clone(),
     };
 
     fn find_owner_frame(

@@ -126,6 +126,13 @@ pub struct Block {
     pub fmt_background_color: Option<String>,
     pub fmt_is_code_block: Option<bool>,
     pub fmt_code_language: Option<String>,
+    /// Enable automatic + soft-hyphen hyphenation for this block.
+    #[serde(default)]
+    pub fmt_hyphenate: Option<bool>,
+    /// Natural language of this block as an ISO 639-1 code (e.g. "en",
+    /// "fr"); drives hyphenation dictionary selection.
+    #[serde(default)]
+    pub fmt_language: Option<String>,
 }
 
 impl HasId for Block {

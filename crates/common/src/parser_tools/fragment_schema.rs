@@ -77,6 +77,10 @@ pub struct FragmentBlock {
     pub background_color: Option<String>,
     pub is_code_block: Option<bool>,
     pub code_language: Option<String>,
+    #[serde(default)]
+    pub hyphenate: Option<bool>,
+    #[serde(default)]
+    pub language: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -152,6 +156,8 @@ impl FragmentBlock {
             && self.background_color.is_none()
             && self.is_code_block.is_none()
             && self.code_language.is_none()
+            && self.hyphenate.is_none()
+            && self.language.is_none()
     }
 }
 

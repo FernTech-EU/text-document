@@ -34,6 +34,8 @@ fn test_set_block_format_all_fields() -> Result<()> {
             background_color: Some("#ff0000".into()),
             is_code_block: Some(true),
             code_language: Some("rust".into()),
+            hyphenate: Some(true),
+            language: Some("en".into()),
             top_margin: Some(10),
             bottom_margin: Some(20),
             left_margin: Some(30),
@@ -64,6 +66,8 @@ fn test_set_block_format_all_fields() -> Result<()> {
     assert_eq!(block.fmt_background_color, Some("#ff0000".into()));
     assert_eq!(block.fmt_is_code_block, Some(true));
     assert_eq!(block.fmt_code_language, Some("rust".into()));
+    assert_eq!(block.fmt_hyphenate, Some(true));
+    assert_eq!(block.fmt_language, Some("en".into()));
     assert_eq!(block.fmt_top_margin, Some(10));
     assert_eq!(block.fmt_bottom_margin, Some(20));
     assert_eq!(block.fmt_left_margin, Some(30));
@@ -201,6 +205,8 @@ fn test_set_block_format_in_table_cell() -> Result<()> {
             anchor: cell_pos,
             is_code_block: Some(true),
             code_language: Some("python".into()),
+            hyphenate: Some(true),
+            language: Some("fr".into()),
             background_color: Some("#1e1e1e".into()),
             ..Default::default()
         },
@@ -209,6 +215,8 @@ fn test_set_block_format_in_table_cell() -> Result<()> {
     let cell_block_after = block_controller::get(&db, &cell_block_ids[0])?.unwrap();
     assert_eq!(cell_block_after.fmt_is_code_block, Some(true));
     assert_eq!(cell_block_after.fmt_code_language, Some("python".into()));
+    assert_eq!(cell_block_after.fmt_hyphenate, Some(true));
+    assert_eq!(cell_block_after.fmt_language, Some("fr".into()));
     assert_eq!(
         cell_block_after.fmt_background_color,
         Some("#1e1e1e".into())
