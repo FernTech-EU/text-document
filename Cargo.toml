@@ -34,7 +34,7 @@ categories = ["data-structures", "text-editors", "text-processing", "parsing"]
 license = "MPL-2.0"
 readme = "README.md"
 edition = "2024"
-version = "1.6.0"
+version = "1.6.1"
 
 [workspace.dependencies]
 thiserror = "2.0"
@@ -46,17 +46,17 @@ chrono = { version = "0.4" , features = ["serde"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 
 # Internal crates (keys match the alias used in each crate's Cargo.toml)
-common = { version = "1.6.0", path = "crates/common", package = "text-document-common" }
-macros = { version = "1.6.0", path = "crates/macros", package = "text-document-macros" }
-direct_access = { version = "1.6.0", path = "crates/direct_access", package = "text-document-direct-access" }
-document_editing = { version = "1.6.0", path = "crates/document_editing", package = "text-document-editing" }
-document_formatting = { version = "1.6.0", path = "crates/document_formatting", package = "text-document-formatting" }
-document_inspection = { version = "1.6.0", path = "crates/document_inspection", package = "text-document-inspection" }
-document_io = { version = "1.6.0", path = "crates/document_io", package = "text-document-io" }
-document_search = { version = "1.6.0", path = "crates/document_search", package = "text-document-search" }
-frontend = { version = "1.6.0", path = "crates/frontend", package = "text-document-frontend" }
-text-document = { version = "1.6.0", path = "crates/public_api" }
-test_harness = { version = "1.6.0", path = "crates/test_harness", package = "text-document-test-harness" }
+common = { version = "1.6.1", path = "crates/common", package = "text-document-common" }
+macros = { version = "1.6.1", path = "crates/macros", package = "text-document-macros" }
+direct_access = { version = "1.6.1", path = "crates/direct_access", package = "text-document-direct-access" }
+document_editing = { version = "1.6.1", path = "crates/document_editing", package = "text-document-editing" }
+document_formatting = { version = "1.6.1", path = "crates/document_formatting", package = "text-document-formatting" }
+document_inspection = { version = "1.6.1", path = "crates/document_inspection", package = "text-document-inspection" }
+document_io = { version = "1.6.1", path = "crates/document_io", package = "text-document-io" }
+document_search = { version = "1.6.1", path = "crates/document_search", package = "text-document-search" }
+frontend = { version = "1.6.1", path = "crates/frontend", package = "text-document-frontend" }
+text-document = { version = "1.6.1", path = "crates/public_api" }
+test_harness = { version = "1.6.1", path = "crates/test_harness", package = "text-document-test-harness" }
 
 [profile.release]
 lto = "thin"
