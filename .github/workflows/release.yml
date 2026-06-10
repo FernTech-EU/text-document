@@ -110,6 +110,8 @@ jobs:
     timeout-minutes: 15
     environment:
       name: release
+    permissions:
+      id-token: write
     # Skip for pre-release tags
     if: ${{ !contains(github.ref_name, '-') }}
     steps:
@@ -121,6 +123,10 @@ jobs:
 
       - name: Cache Rust dependencies
         uses: Swatinem/rust-cache@v2
+
+      - name: Auth for trusted publishing on crates.io
+        uses: rust-lang/crates-io-auth-action@v1
+        id: auth
 
       - name: Publish crates to crates.io
         run: cargo publish --workspace
