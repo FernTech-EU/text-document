@@ -839,7 +839,7 @@ fn undo_paste_fragment_over_selection_is_atomic() {
 enum ElementFingerprint {
     Block {
         text: String,
-        block_format: BlockFormat,
+        block_format: Box<BlockFormat>,
         list_style: Option<text_document::ListStyle>,
         list_indent: Option<u8>,
         fragment_texts: Vec<String>,
@@ -890,7 +890,7 @@ fn fingerprint_block(snap: &BlockSnapshot) -> ElementFingerprint {
     }
     ElementFingerprint::Block {
         text: snap.text.clone(),
-        block_format: snap.block_format.clone(),
+        block_format: Box::new(snap.block_format.clone()),
         list_style: snap.list_info.as_ref().map(|l| l.style.clone()),
         list_indent: snap.list_info.as_ref().map(|l| l.indent),
         fragment_texts: frag_texts,
