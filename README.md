@@ -7,7 +7,7 @@
 
 # text-document
 
-A rich text document model for Rust, inspired by Qt's QTextDocument/QTextCursor API. Companion crate is text-typeset, which render a document to GPU quads.
+A rich text document model for Rust, inspired by Qt's QTextDocument/QTextCursor API. Companion crate is text-typeset, which renders a document to GPU quads.
 
 Built on a [ropey](https://github.com/cessen/ropey)-backed text store with a [Qleany](https://github.com/ferntech-eu/qleany)-generated Clean Architecture skeleton, full undo/redo, and multi-cursor support.
 
