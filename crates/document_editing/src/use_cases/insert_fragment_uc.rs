@@ -256,22 +256,28 @@ fn try_replace_table_cells(
         .first()
         .ok_or_else(|| anyhow!("Document has no frames"))?;
 
-    let block_ids = uow.get_frame_relationship(&frame_id, &FrameRelationshipField::Blocks)?;
-    let blocks_opt = uow.get_block_multi(&block_ids)?;
+    // Collect every block in the frame tree — including blockquote
+    // sub-frames and table cell frames. Fetching only the root frame's
+    // blocks here would miss a cursor sitting in a quoted paragraph,
+    // making `find_block_at_position` fall back to the wrong block and
+    // potentially mis-trigger a cell replacement.
+    let all_block_ids: Vec<EntityId> = {
+        let get_table_cell_frames = |table_id: &EntityId| -> Result<Vec<EntityId>> {
+            let cell_ids = uow.get_table_relationship(table_id, &TableRelationshipField::Cells)?;
+            let cells = uow.get_table_cell_multi(&cell_ids)?;
+            let mut sorted: Vec<_> = cells.into_iter().flatten().collect();
+            sorted.sort_by(|a, b| a.row.cmp(&b.row).then(a.column.cmp(&b.column)));
+            Ok(sorted.into_iter().filter_map(|c| c.cell_frame).collect())
+        };
+        collect_block_ids_recursive(
+            &|id| uow.get_frame(id),
+            &|id, field| uow.get_frame_relationship(id, field),
+            &get_table_cell_frames,
+            &frame_id,
+        )?
+    };
+    let blocks_opt = uow.get_block_multi(&all_block_ids)?;
     let mut all_blocks: Vec<Block> = blocks_opt.into_iter().flatten().collect();
-
-    for &tid in &uow.get_document_relationship(&doc_id, &DocumentRelationshipField::Tables)? {
-        let cell_ids = uow.get_table_relationship(&tid, &TableRelationshipField::Cells)?;
-        let cells = uow.get_table_cell_multi(&cell_ids)?;
-        for cell in cells.into_iter().flatten() {
-            if let Some(cf_id) = cell.cell_frame {
-                let cf_blk_ids =
-                    uow.get_frame_relationship(&cf_id, &FrameRelationshipField::Blocks)?;
-                let cf_blks = uow.get_block_multi(&cf_blk_ids)?;
-                all_blocks.extend(cf_blks.into_iter().flatten());
-            }
-        }
-    }
     all_blocks.sort_by_key(|b| b.document_position);
 
     let (cursor_block, _, _) = find_block_at_position(&all_blocks, dto.position, &uow.store())?;
@@ -402,27 +408,62 @@ fn insert_table_fragment(
     let snapshot = uow.snapshot_document(&[doc_id])?;
 
     let frame_ids = uow.get_document_relationship(&doc_id, &DocumentRelationshipField::Frames)?;
-    let frame_id = *frame_ids
+    let root_frame_id = *frame_ids
         .first()
         .ok_or_else(|| anyhow!("Document has no frames"))?;
 
-    let block_ids = uow.get_frame_relationship(&frame_id, &FrameRelationshipField::Blocks)?;
-    let blocks_opt = uow.get_block_multi(&block_ids)?;
+    // Resolve every block in the frame tree (blockquote sub-frames and
+    // table cell frames included) and remember each block's owning frame,
+    // so a paste with the cursor inside a blockquote anchors the table to
+    // the blockquote frame — not the root frame.
+    let mut block_to_frame: HashMap<EntityId, EntityId> = HashMap::new();
+    collect_all_blocks_with_frame(&**uow, &root_frame_id, &mut block_to_frame)?;
+
+    let all_block_ids: Vec<EntityId> = {
+        let get_table_cell_frames = |table_id: &EntityId| -> Result<Vec<EntityId>> {
+            let cell_ids = uow.get_table_relationship(table_id, &TableRelationshipField::Cells)?;
+            let cells = uow.get_table_cell_multi(&cell_ids)?;
+            let mut sorted: Vec<_> = cells.into_iter().flatten().collect();
+            sorted.sort_by(|a, b| a.row.cmp(&b.row).then(a.column.cmp(&b.column)));
+            Ok(sorted.into_iter().filter_map(|c| c.cell_frame).collect())
+        };
+        collect_block_ids_recursive(
+            &|id| uow.get_frame(id),
+            &|id, field| uow.get_frame_relationship(id, field),
+            &get_table_cell_frames,
+            &root_frame_id,
+        )?
+    };
+
+    let blocks_opt = uow.get_block_multi(&all_block_ids)?;
     let mut blocks: Vec<Block> = blocks_opt.into_iter().flatten().collect();
     blocks.sort_by_key(|b| b.document_position);
 
     let insert_pos = dto.position;
 
-    let child_order_insert_idx = if blocks.is_empty() {
-        0usize
+    // The frame that receives the table anchor: the owning frame of the
+    // block at the cursor position (root frame when the document is empty).
+    let (frame_id, child_order_insert_idx) = if blocks.is_empty() {
+        (root_frame_id, 0usize)
     } else {
         let (target_block, _, _) = find_block_at_position(&blocks, insert_pos, &uow.store())?;
-        let blk_ids = uow.get_frame_relationship(&frame_id, &FrameRelationshipField::Blocks)?;
-        blk_ids
+        let owning_frame_id = block_to_frame
+            .get(&target_block.id)
+            .copied()
+            .unwrap_or(root_frame_id);
+        let owning_frame = uow
+            .get_frame(&owning_frame_id)?
+            .ok_or_else(|| anyhow!("Owning frame not found"))?;
+        // Insert after the target block's entry in the owning frame's
+        // child_order (positive entries are block ids; negative entries
+        // are sub-frames and must be skipped by the id match).
+        let idx = owning_frame
+            .child_order
             .iter()
-            .position(|&bid| bid == target_block.id)
+            .position(|&e| e > 0 && e as EntityId == target_block.id)
             .map(|i| i + 1)
-            .unwrap_or(0)
+            .unwrap_or(owning_frame.child_order.len());
+        (owning_frame_id, idx)
     };
 
     let mut total_blocks_added: i64 = 0;
@@ -624,8 +665,9 @@ fn insert_table_fragment(
                 let mut iter = cell_blocks.iter();
                 if let Some((first_id, first_text)) = iter.next() {
                     // First cell-block goes at top_level_frame_end_byte
-                    // of the table's parent frame (= frame_id, the
-                    // document's top-level frame in this UC).
+                    // of the table's parent frame. `frame_id` may be a
+                    // nested blockquote frame; the helper walks up
+                    // `parent_frame` to the top-level ancestor.
                     let pos = top_level_frame_end_byte(&store, frame_id);
                     rope_insert_block_at(&store, pos, *first_id, first_text);
                     let mut prev_id = *first_id;

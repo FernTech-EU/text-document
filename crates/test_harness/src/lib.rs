@@ -8,13 +8,13 @@
 //! dev-dependency chain.
 
 use anyhow::Result;
-use common::database::db_context::DbContext;
-use common::event::EventHub;
 use common::types::EntityId;
 use common::undo_redo::UndoRedoManager;
 use std::sync::Arc;
 
 // Re-export commonly used types and controllers for convenience
+pub use common::database::db_context::DbContext;
+pub use common::event::EventHub;
 pub use common::direct_access::block::block_repository::BlockRelationshipField;
 pub use common::direct_access::document::document_repository::DocumentRelationshipField;
 pub use common::direct_access::frame::frame_repository::FrameRelationshipField;
@@ -31,7 +31,7 @@ pub use direct_access::block::dtos::{
 };
 pub use direct_access::document::document_controller;
 pub use direct_access::document::dtos::CreateDocumentDto;
-pub use direct_access::frame::dtos::CreateFrameDto;
+pub use direct_access::frame::dtos::{CreateFrameDto, FrameDto};
 pub use direct_access::frame::frame_controller;
 pub use direct_access::list::dtos::CreateListDto as CreateListEntityDto;
 pub use direct_access::list::list_controller;

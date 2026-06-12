@@ -30,6 +30,11 @@ pub trait ImportHtmlUnitOfWorkFactoryTrait: Send + Sync {
 #[macros::uow_action(entity = "Frame", action = "Get", thread_safe = true)]
 #[macros::uow_action(entity = "Frame", action = "Create", thread_safe = true)]
 #[macros::uow_action(entity = "Frame", action = "Update", thread_safe = true)]
+#[macros::uow_action(
+    entity = "Frame",
+    action = "UpdateWithRelationships",
+    thread_safe = true
+)]
 #[macros::uow_action(entity = "Frame", action = "Remove", thread_safe = true)]
 #[macros::uow_action(entity = "Frame", action = "GetRelationship", thread_safe = true)]
 #[macros::uow_action(entity = "Block", action = "Create", thread_safe = true)]
@@ -43,6 +48,64 @@ pub trait ImportHtmlUnitOfWorkTrait: CommandUnitOfWork + Send + Sync {}
 pub struct ImportHtmlUseCase {
     uow_factory: Box<dyn ImportHtmlUnitOfWorkFactoryTrait>,
     dto: ImportHtmlDto,
+}
+
+struct FrameState {
+    frame_id: EntityId,
+    child_order: Vec<i64>,
+}
+
+/// Advance the blockquote frame stack to match `target_depth`, finalising
+/// frames that close (writing back their `child_order`) and creating new
+/// blockquote sub-frames as depth increases. Resets `list_grouper` on every
+/// frame boundary so lists never group across blockquote boundaries.
+///
+/// Touches only Frame entities — never the rope — so rope mirroring and
+/// `document_position` bookkeeping in the caller are unaffected.
+fn transition_bq_depth(
+    uow: &mut Box<dyn ImportHtmlUnitOfWorkTrait>,
+    doc_id: EntityId,
+    frame_stack: &mut Vec<FrameState>,
+    current_bq_depth: &mut u32,
+    target_depth: u32,
+    list_grouper: &mut ListGrouper,
+) -> Result<()> {
+    // Close blockquote frames if depth decreased
+    while *current_bq_depth > target_depth && frame_stack.len() > 1 {
+        let finished = frame_stack.pop().unwrap();
+        let mut frame_entity = uow
+            .get_frame(&finished.frame_id)?
+            .ok_or_else(|| anyhow!("Blockquote frame not found"))?;
+        frame_entity.child_order = finished.child_order;
+        uow.update_frame(&frame_entity)?;
+        *current_bq_depth -= 1;
+        list_grouper.reset();
+    }
+
+    // Open blockquote frames if depth increased
+    while *current_bq_depth < target_depth {
+        let parent_frame_id = frame_stack.last().unwrap().frame_id;
+        let bq_frame = Frame {
+            fmt_is_blockquote: Some(true),
+            fmt_position: Some(FramePosition::InFlow),
+            parent_frame: Some(parent_frame_id),
+            ..Frame::default()
+        };
+        let created_bq = uow.create_frame(&bq_frame, doc_id, -1)?;
+        frame_stack
+            .last_mut()
+            .unwrap()
+            .child_order
+            .push(-(created_bq.id as i64));
+        frame_stack.push(FrameState {
+            frame_id: created_bq.id,
+            child_order: Vec::new(),
+        });
+        *current_bq_depth += 1;
+        list_grouper.reset();
+    }
+
+    Ok(())
 }
 
 impl ImportHtmlUseCase {
@@ -130,11 +193,6 @@ impl LongOperation for ImportHtmlUseCase {
         let mut total_block_count: i64 = 0;
         let mut document_position: i64 = 0;
 
-        struct FrameState {
-            frame_id: common::types::EntityId,
-            child_order: Vec<i64>,
-        }
-
         let mut frame_stack: Vec<FrameState> = vec![FrameState {
             frame_id: created_frame.id,
             child_order: Vec::new(),
@@ -154,42 +212,14 @@ impl LongOperation for ImportHtmlUseCase {
 
             match parsed_element {
                 ParsedElement::Block(parsed_block) => {
-                    let bq_depth = parsed_block.blockquote_depth;
-
-                    // Close blockquote frames if depth decreased
-                    while current_bq_depth > bq_depth && frame_stack.len() > 1 {
-                        let finished = frame_stack.pop().unwrap();
-                        let mut frame_entity = uow
-                            .get_frame(&finished.frame_id)?
-                            .ok_or_else(|| anyhow!("Blockquote frame not found"))?;
-                        frame_entity.child_order = finished.child_order;
-                        uow.update_frame(&frame_entity)?;
-                        current_bq_depth -= 1;
-                        list_grouper.reset();
-                    }
-
-                    // Open blockquote frames if depth increased
-                    while current_bq_depth < bq_depth {
-                        let parent_frame_id = frame_stack.last().unwrap().frame_id;
-                        let bq_frame = Frame {
-                            fmt_is_blockquote: Some(true),
-                            fmt_position: Some(FramePosition::InFlow),
-                            parent_frame: Some(parent_frame_id),
-                            ..Frame::default()
-                        };
-                        let created_bq = uow.create_frame(&bq_frame, doc_id, -1)?;
-                        frame_stack
-                            .last_mut()
-                            .unwrap()
-                            .child_order
-                            .push(-(created_bq.id as i64));
-                        frame_stack.push(FrameState {
-                            frame_id: created_bq.id,
-                            child_order: Vec::new(),
-                        });
-                        current_bq_depth += 1;
-                        list_grouper.reset();
-                    }
+                    transition_bq_depth(
+                        &mut uow,
+                        doc_id,
+                        &mut frame_stack,
+                        &mut current_bq_depth,
+                        parsed_block.blockquote_depth,
+                        &mut list_grouper,
+                    )?;
 
                     let (plain_text, format_runs) =
                         format_runs_from_spans(&parsed_block.spans, parsed_block.is_code_block);
@@ -279,6 +309,19 @@ impl LongOperation for ImportHtmlUseCase {
                 }
 
                 ParsedElement::Table(parsed_table) => {
+                    // Synchronise the blockquote frame stack with the table's
+                    // depth so a table inside (or right after) a blockquote
+                    // lands in the correct frame.
+                    transition_bq_depth(
+                        &mut uow,
+                        doc_id,
+                        &mut frame_stack,
+                        &mut current_bq_depth,
+                        parsed_table.blockquote_depth,
+                        &mut list_grouper,
+                    )?;
+
+                    // A table always interrupts a list, regardless of depth.
                     list_grouper.reset();
                     let num_rows = parsed_table.rows.len() as i64;
                     let num_cols = parsed_table.rows.first().map_or(0, |r| r.len()) as i64;
@@ -304,11 +347,13 @@ impl LongOperation for ImportHtmlUseCase {
                     let current_frame_id = frame_stack.last().unwrap().frame_id;
                     let total_cells = num_rows * num_cols;
                     let mut cell_count: i64 = 0;
+                    let mut created_cell_frame_ids: Vec<EntityId> = Vec::new();
 
                     for (r, row) in parsed_table.rows.iter().enumerate() {
                         for (c, cell) in row.iter().enumerate() {
                             let cell_frame = Frame::default();
                             let created_cell_frame = uow.create_frame(&cell_frame, doc_id, -1)?;
+                            created_cell_frame_ids.push(created_cell_frame.id);
 
                             let (plain_text, format_runs) =
                                 format_runs_from_spans(&cell.spans, false);
@@ -368,6 +413,25 @@ impl LongOperation for ImportHtmlUseCase {
                         ..Frame::default()
                     };
                     let created_anchor = uow.create_frame(&anchor_frame, doc_id, -1)?;
+
+                    // Backfill each cell frame's `parent_frame` to point at
+                    // the anchor frame. Cell frames are created before the
+                    // anchor (we don't know the anchor id yet), so this
+                    // can't be set at creation time. Without this, walking
+                    // up from a cell to find its containing table fails —
+                    // breaking `insert_table_uc`'s "is the cursor inside an
+                    // existing table?" check.
+                    for cell_frame_id in &created_cell_frame_ids {
+                        if let Some(cf) = uow.get_frame(cell_frame_id)? {
+                            let mut updated = cf;
+                            updated.parent_frame = Some(created_anchor.id);
+                            // `update_frame` is scalar-only and preserves
+                            // the existing parent_frame to guard against
+                            // stale-entity writes; use the relationship-
+                            // aware variant so this write actually lands.
+                            uow.update_frame_with_relationships(&updated)?;
+                        }
+                    }
 
                     frame_stack
                         .last_mut()

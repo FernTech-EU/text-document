@@ -25,6 +25,9 @@ pub struct ParsedTable {
     pub header_rows: usize,
     /// All rows (header + body), each containing cells with their inline spans.
     pub rows: Vec<Vec<ParsedTableCell>>,
+    /// Blockquote nesting depth at the point the table appeared
+    /// (0 = not inside a blockquote), mirroring `ParsedBlock::blockquote_depth`.
+    pub blockquote_depth: u32,
 }
 
 /// A parsed element: either a block or a table.
@@ -52,7 +55,7 @@ impl ParsedElement {
                                 list_indent: 0,
                                 is_code_block: false,
                                 code_language: None,
-                                blockquote_depth: 0,
+                                blockquote_depth: t.blockquote_depth,
                                 line_height: None,
                                 non_breakable_lines: None,
                                 direction: None,
@@ -303,6 +306,7 @@ pub fn parse_markdown(markdown: &str) -> Vec<ParsedElement> {
                 elements.push(ParsedElement::Table(ParsedTable {
                     header_rows: table_header_rows,
                     rows: std::mem::take(&mut table_rows),
+                    blockquote_depth,
                 }));
                 in_table = false;
             }
@@ -662,7 +666,13 @@ pub fn parse_html_elements(html: &str) -> Vec<ParsedElement> {
             header_rows = 1;
         }
 
-        ParsedTable { header_rows, rows }
+        ParsedTable {
+            header_rows,
+            rows,
+            // The caller (`walk_node`) sets the real depth — this helper has
+            // no visibility into the surrounding blockquote nesting.
+            blockquote_depth: 0,
+        }
     }
 
     fn walk_node(
@@ -769,8 +779,9 @@ pub fn parse_html_elements(html: &str) -> Vec<ParsedElement> {
 
                 if tag == "table" {
                     // Parse table structure into a ParsedTable
-                    let parsed_table = parse_table_element(node);
+                    let mut parsed_table = parse_table_element(node);
                     if !parsed_table.rows.is_empty() {
+                        parsed_table.blockquote_depth = bq_depth;
                         elements.push(ParsedElement::Table(parsed_table));
                     }
                     return;
@@ -1197,6 +1208,82 @@ mod tests {
         assert!(blocks.len() >= 2);
         assert_eq!(blocks[0].list_style, Some(ListStyle::Disc));
         assert_eq!(blocks[1].list_style, Some(ListStyle::Disc));
+    }
+
+    /// Helper: extract (is_table, blockquote_depth) per element for nesting assertions.
+    fn element_depths(elements: &[ParsedElement]) -> Vec<(bool, u32)> {
+        elements
+            .iter()
+            .map(|e| match e {
+                ParsedElement::Block(b) => (false, b.blockquote_depth),
+                ParsedElement::Table(t) => (true, t.blockquote_depth),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn test_parse_markdown_table_in_blockquote_records_depth() {
+        let elements = parse_markdown("> | a | b |\n> |---|---|\n> | c | d |");
+        assert_eq!(element_depths(&elements), vec![(true, 1)]);
+    }
+
+    #[test]
+    fn test_parse_markdown_text_then_table_in_blockquote() {
+        let elements = parse_markdown("> Para\n>\n> | a | b |\n> |---|---|\n> | c | d |");
+        assert_eq!(element_depths(&elements), vec![(false, 1), (true, 1)]);
+    }
+
+    #[test]
+    fn test_parse_markdown_table_after_blockquote_closes() {
+        let elements = parse_markdown("> Para\n\n| a | b |\n|---|---|\n| c | d |");
+        assert_eq!(element_depths(&elements), vec![(false, 1), (true, 0)]);
+    }
+
+    #[test]
+    fn test_parse_markdown_table_in_nested_blockquote() {
+        let elements = parse_markdown(">> | a | b |\n>> |---|---|\n>> | c | d |");
+        assert_eq!(element_depths(&elements), vec![(true, 2)]);
+    }
+
+    #[test]
+    fn test_parse_markdown_list_in_blockquote_records_depth() {
+        let elements = parse_markdown("> - item1\n> - item2");
+        let depths = element_depths(&elements);
+        assert_eq!(depths, vec![(false, 1), (false, 1)]);
+        for e in &elements {
+            if let ParsedElement::Block(b) = e {
+                assert_eq!(b.list_style, Some(ListStyle::Disc));
+            }
+        }
+    }
+
+    #[test]
+    fn test_parse_html_table_in_blockquote_records_depth() {
+        let elements = parse_html_elements(
+            "<blockquote><table><tr><th>A</th></tr><tr><td>x</td></tr></table></blockquote>",
+        );
+        assert_eq!(element_depths(&elements), vec![(true, 1)]);
+    }
+
+    #[test]
+    fn test_parse_html_table_after_blockquote() {
+        let elements = parse_html_elements(
+            "<blockquote><p>Para</p></blockquote><table><tr><td>X</td></tr></table>",
+        );
+        let depths = element_depths(&elements);
+        // The blockquote paragraph carries depth 1; the table is outside (depth 0).
+        assert!(depths.contains(&(false, 1)), "depths: {depths:?}");
+        assert!(depths.contains(&(true, 0)), "depths: {depths:?}");
+    }
+
+    #[test]
+    fn test_flatten_to_blocks_propagates_blockquote_depth() {
+        let elements = parse_markdown("> | a | b |\n> |---|---|\n> | c | d |");
+        let blocks = ParsedElement::flatten_to_blocks(elements);
+        assert!(!blocks.is_empty());
+        for b in &blocks {
+            assert_eq!(b.blockquote_depth, 1);
+        }
     }
 
     #[test]
