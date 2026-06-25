@@ -582,6 +582,12 @@ impl TextCursor {
         self.insert_fragment(&frag)
     }
 
+    /// Insert a djot fragment at the cursor position. Replaces selection if any.
+    pub fn insert_djot(&self, djot: &str) -> Result<()> {
+        let frag = DocumentFragment::from_djot(djot);
+        self.insert_fragment(&frag)
+    }
+
     /// Insert a document fragment at the cursor. Replaces selection if any.
     pub fn insert_fragment(&self, fragment: &DocumentFragment) -> Result<()> {
         let (pos, anchor) = self.read_cursor();

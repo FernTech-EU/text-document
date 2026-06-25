@@ -163,6 +163,17 @@ pub struct InsertMarkdownAtPositionResultDto {
     pub blocks_added: i64,
 }
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+pub struct InsertDjotAtPositionDto {
+    pub position: i64,
+    pub anchor: i64,
+    pub djot: String,
+}
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+pub struct InsertDjotAtPositionResultDto {
+    pub new_position: i64,
+    pub blocks_added: i64,
+}
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct InsertTableDto {
     pub position: i64,
     pub anchor: i64,

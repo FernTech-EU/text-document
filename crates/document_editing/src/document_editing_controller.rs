@@ -19,6 +19,8 @@ use crate::InsertImageDto;
 use crate::InsertImageResultDto;
 use crate::InsertListDto;
 use crate::InsertListResultDto;
+use crate::InsertDjotAtPositionDto;
+use crate::InsertDjotAtPositionResultDto;
 use crate::InsertMarkdownAtPositionDto;
 use crate::InsertMarkdownAtPositionResultDto;
 use crate::InsertTableColumnDto;
@@ -55,6 +57,7 @@ use crate::units_of_work::insert_frame_uow::InsertFrameUnitOfWorkFactory;
 use crate::units_of_work::insert_html_at_position_uow::InsertHtmlAtPositionUnitOfWorkFactory;
 use crate::units_of_work::insert_image_uow::InsertImageUnitOfWorkFactory;
 use crate::units_of_work::insert_list_uow::InsertListUnitOfWorkFactory;
+use crate::units_of_work::insert_djot_at_position_uow::InsertDjotAtPositionUnitOfWorkFactory;
 use crate::units_of_work::insert_markdown_at_position_uow::InsertMarkdownAtPositionUnitOfWorkFactory;
 use crate::units_of_work::insert_table_column_uow::InsertTableColumnUnitOfWorkFactory;
 use crate::units_of_work::insert_table_row_uow::InsertTableRowUnitOfWorkFactory;
@@ -79,6 +82,7 @@ use crate::use_cases::insert_frame_uc::InsertFrameUseCase;
 use crate::use_cases::insert_html_at_position_uc::InsertHtmlAtPositionUseCase;
 use crate::use_cases::insert_image_uc::InsertImageUseCase;
 use crate::use_cases::insert_list_uc::InsertListUseCase;
+use crate::use_cases::insert_djot_at_position_uc::InsertDjotAtPositionUseCase;
 use crate::use_cases::insert_markdown_at_position_uc::InsertMarkdownAtPositionUseCase;
 use crate::use_cases::insert_table_column_uc::InsertTableColumnUseCase;
 use crate::use_cases::insert_table_row_uc::InsertTableRowUseCase;
@@ -106,6 +110,7 @@ use common::event::DocumentEditingEvent::InsertFrame;
 use common::event::DocumentEditingEvent::InsertHtmlAtPosition;
 use common::event::DocumentEditingEvent::InsertImage;
 use common::event::DocumentEditingEvent::InsertList;
+use common::event::DocumentEditingEvent::InsertDjotAtPosition;
 use common::event::DocumentEditingEvent::InsertMarkdownAtPosition;
 use common::event::DocumentEditingEvent::InsertTable;
 use common::event::DocumentEditingEvent::InsertTableColumn;
@@ -339,6 +344,25 @@ pub fn insert_markdown_at_position(
     // Notify that the handling manifest has been loaded
     event_hub.send_event(Event {
         origin: Origin::DocumentEditing(InsertMarkdownAtPosition),
+        ids: vec![],
+        data: None,
+    });
+    Ok(return_dto)
+}
+
+pub fn insert_djot_at_position(
+    db_context: &DbContext,
+    event_hub: &Arc<EventHub>,
+    undo_redo_manager: &mut UndoRedoManager,
+    stack_id: Option<u64>,
+    dto: &InsertDjotAtPositionDto,
+) -> Result<InsertDjotAtPositionResultDto> {
+    let uow_context = InsertDjotAtPositionUnitOfWorkFactory::new(db_context, event_hub);
+    let mut uc = InsertDjotAtPositionUseCase::new(Box::new(uow_context));
+    let return_dto = uc.execute(dto)?;
+    undo_redo_manager.add_command_to_stack(Box::new(uc), stack_id)?;
+    event_hub.send_event(Event {
+        origin: Origin::DocumentEditing(InsertDjotAtPosition),
         ids: vec![],
         data: None,
     });

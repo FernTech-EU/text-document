@@ -6,6 +6,7 @@ pub(crate) mod delete_text_uow;
 pub(crate) mod insert_block_uow;
 pub(crate) mod insert_formatted_text_uow;
 pub(crate) mod insert_fragment_uow;
+pub(crate) mod insert_djot_at_position_uow;
 pub(crate) mod insert_frame_uow;
 pub(crate) mod insert_html_at_position_uow;
 pub(crate) mod insert_image_uow;

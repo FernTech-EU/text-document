@@ -61,6 +61,7 @@ pub enum FlatEventKind {
     DocumentEditingInsertFragment,
     DocumentEditingInsertHtmlAtPosition,
     DocumentEditingInsertMarkdownAtPosition,
+    DocumentEditingInsertDjotAtPosition,
     DocumentEditingInsertTable,
     DocumentEditingRemoveTable,
     DocumentEditingInsertTableRow,
@@ -85,6 +86,8 @@ pub enum FlatEventKind {
     DocumentIoExportPlainText,
     DocumentIoImportMarkdown,
     DocumentIoExportMarkdown,
+    DocumentIoImportDjot,
+    DocumentIoExportDjot,
     DocumentIoImportHtml,
     DocumentIoExportHtml,
     DocumentIoExportLatex,
@@ -201,6 +204,9 @@ impl From<Event> for FlatEvent {
                 DocumentEditingEvent::InsertMarkdownAtPosition => {
                     FlatEventKind::DocumentEditingInsertMarkdownAtPosition
                 }
+                DocumentEditingEvent::InsertDjotAtPosition => {
+                    FlatEventKind::DocumentEditingInsertDjotAtPosition
+                }
                 DocumentEditingEvent::InsertTable => FlatEventKind::DocumentEditingInsertTable,
                 DocumentEditingEvent::RemoveTable => FlatEventKind::DocumentEditingRemoveTable,
                 DocumentEditingEvent::InsertTableRow => {
@@ -257,6 +263,8 @@ impl From<Event> for FlatEvent {
                 DocumentIoEvent::ExportPlainText => FlatEventKind::DocumentIoExportPlainText,
                 DocumentIoEvent::ImportMarkdown => FlatEventKind::DocumentIoImportMarkdown,
                 DocumentIoEvent::ExportMarkdown => FlatEventKind::DocumentIoExportMarkdown,
+                DocumentIoEvent::ImportDjot => FlatEventKind::DocumentIoImportDjot,
+                DocumentIoEvent::ExportDjot => FlatEventKind::DocumentIoExportDjot,
                 DocumentIoEvent::ImportHtml => FlatEventKind::DocumentIoImportHtml,
                 DocumentIoEvent::ExportHtml => FlatEventKind::DocumentIoExportHtml,
                 DocumentIoEvent::ExportLatex => FlatEventKind::DocumentIoExportLatex,

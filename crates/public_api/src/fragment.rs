@@ -100,6 +100,12 @@ impl DocumentFragment {
         parsed_elements_to_fragment(parsed)
     }
 
+    /// Create a fragment from djot markup.
+    pub fn from_djot(djot: &str) -> Self {
+        let parsed = frontend::common::parser_tools::content_parser::parse_djot(djot);
+        parsed_elements_to_fragment(parsed)
+    }
+
     /// Create a fragment from an entire document.
     pub fn from_document(doc: &crate::TextDocument) -> crate::Result<Self> {
         let inner = doc.inner.lock();

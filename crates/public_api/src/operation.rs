@@ -120,6 +120,12 @@ pub struct HtmlImportResult {
     pub block_count: usize,
 }
 
+/// Result of a djot import (`set_djot`).
+#[derive(Debug, Clone)]
+pub struct DjotImportResult {
+    pub block_count: usize,
+}
+
 /// Result of a DOCX export (`to_docx`).
 #[derive(Debug, Clone)]
 pub struct DocxExportResult {

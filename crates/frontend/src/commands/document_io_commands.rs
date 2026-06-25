@@ -5,9 +5,10 @@
 use crate::app_context::AppContext;
 use anyhow::{Context, Result};
 use document_io::{
-    ExportDocxDto, ExportDocxResultDto, ExportHtmlDto, ExportLatexDto, ExportLatexResultDto,
-    ExportMarkdownDto, ExportPlainTextDto, ImportHtmlDto, ImportHtmlResultDto, ImportMarkdownDto,
-    ImportMarkdownResultDto, ImportPlainTextDto, document_io_controller,
+    ExportDjotDto, ExportDocxDto, ExportDocxResultDto, ExportHtmlDto, ExportLatexDto,
+    ExportLatexResultDto, ExportMarkdownDto, ExportPlainTextDto, ImportDjotDto, ImportDjotResultDto,
+    ImportHtmlDto, ImportHtmlResultDto, ImportMarkdownDto, ImportMarkdownResultDto,
+    ImportPlainTextDto, document_io_controller,
 };
 
 use common::long_operation::OperationProgress;
@@ -59,6 +60,35 @@ pub fn get_import_markdown_result(
 pub fn export_markdown(ctx: &AppContext) -> Result<ExportMarkdownDto> {
     document_io_controller::export_markdown(&ctx.db_context, &ctx.event_hub)
         .context("export_markdown")
+}
+
+/// import_djot (long operation)
+pub fn import_djot(ctx: &AppContext, dto: &ImportDjotDto) -> Result<String> {
+    document_io_controller::import_djot(
+        &ctx.db_context,
+        &ctx.event_hub,
+        &mut ctx.long_operation_manager.lock(),
+        dto,
+    )
+    .context("import_djot")
+}
+
+/// Get the progress of a import_djot operation
+pub fn get_import_djot_progress(ctx: &AppContext, operation_id: &str) -> Option<OperationProgress> {
+    document_io_controller::get_import_djot_progress(&ctx.long_operation_manager.lock(), operation_id)
+}
+
+/// Get the result of a import_djot operation
+pub fn get_import_djot_result(
+    ctx: &AppContext,
+    operation_id: &str,
+) -> Result<Option<ImportDjotResultDto>> {
+    document_io_controller::get_import_djot_result(&ctx.long_operation_manager.lock(), operation_id)
+        .context("getting import_djot result")
+}
+
+pub fn export_djot(ctx: &AppContext) -> Result<ExportDjotDto> {
+    document_io_controller::export_djot(&ctx.db_context, &ctx.event_hub).context("export_djot")
 }
 
 /// import_html (long operation)

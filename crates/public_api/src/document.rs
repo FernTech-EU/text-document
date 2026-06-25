@@ -20,7 +20,9 @@ use crate::cursor::TextCursor;
 use crate::events::{self, DocumentEvent, Subscription};
 use crate::flow::FormatChangeKind;
 use crate::inner::TextDocumentInner;
-use crate::operation::{DocxExportResult, HtmlImportResult, MarkdownImportResult, Operation};
+use crate::operation::{
+    DjotImportResult, DocxExportResult, HtmlImportResult, MarkdownImportResult, Operation,
+};
 use crate::{BlockFormat, BlockInfo, DocumentStats, FindMatch, FindOptions};
 
 /// A rich text document.
@@ -221,6 +223,39 @@ impl TextDocument {
         let inner = self.inner.lock();
         let dto = document_io_commands::export_markdown(&inner.ctx)?;
         Ok(dto.markdown_text)
+    }
+
+    /// Replace the entire document with djot markup. Clears undo history.
+    ///
+    /// This is a **long operation**. Returns a typed [`Operation`] handle.
+    pub fn set_djot(&self, djot: &str) -> Result<Operation<DjotImportResult>> {
+        let mut inner = self.inner.lock();
+        inner.invalidate_text_cache();
+        let dto = frontend::document_io::ImportDjotDto {
+            djot_text: djot.into(),
+        };
+        let op_id = document_io_commands::import_djot(&inner.ctx, &dto)?;
+        Ok(Operation::new(
+            op_id,
+            &inner.ctx,
+            Box::new(|ctx, id| {
+                document_io_commands::get_import_djot_result(ctx, id)
+                    .ok()
+                    .flatten()
+                    .map(|r| {
+                        Ok(DjotImportResult {
+                            block_count: to_usize(r.block_count),
+                        })
+                    })
+            }),
+        ))
+    }
+
+    /// Export the entire document as djot markup.
+    pub fn to_djot(&self) -> Result<String> {
+        let inner = self.inner.lock();
+        let dto = document_io_commands::export_djot(&inner.ctx)?;
+        Ok(dto.djot_text)
     }
 
     /// Replace the entire document with HTML. Clears undo history.
