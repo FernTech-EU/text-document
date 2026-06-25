@@ -1,4 +1,4 @@
-use crate::entities::{ListStyle, TextDirection};
+use crate::entities::{ListStyle, MarkerType, TextDirection};
 
 /// A parsed inline span with formatting info
 #[derive(Debug, Clone, Default)]
@@ -9,6 +9,10 @@ pub struct ParsedSpan {
     pub underline: bool,
     pub strikeout: bool,
     pub code: bool,
+    /// Superscript (djot `^x^`). Maps to `CharVerticalAlignment::SuperScript`.
+    pub superscript: bool,
+    /// Subscript (djot `~x~`). Maps to `CharVerticalAlignment::SubScript`.
+    pub subscript: bool,
     pub link_href: Option<String>,
 }
 
@@ -53,6 +57,9 @@ impl ParsedElement {
                                 heading_level: None,
                                 list_style: None,
                                 list_indent: 0,
+                                list_prefix: String::new(),
+                                list_suffix: String::new(),
+                                marker: None,
                                 is_code_block: false,
                                 code_language: None,
                                 blockquote_depth: t.blockquote_depth,
@@ -75,6 +82,9 @@ impl ParsedElement {
                 heading_level: None,
                 list_style: None,
                 list_indent: 0,
+                list_prefix: String::new(),
+                list_suffix: String::new(),
+                marker: None,
                 is_code_block: false,
                 code_language: None,
                 blockquote_depth: 0,
@@ -95,6 +105,15 @@ pub struct ParsedBlock {
     pub heading_level: Option<i64>,
     pub list_style: Option<ListStyle>,
     pub list_indent: u32,
+    /// Ordered-list delimiter prefix (e.g. `"("` for djot `(1)` lists; empty
+    /// otherwise). Stored on the `List` entity for round-trip fidelity.
+    pub list_prefix: String,
+    /// Ordered-list delimiter suffix (`"."` for `1.`, `")"` for `1)`/`(1)`;
+    /// empty for unordered lists).
+    pub list_suffix: String,
+    /// Task-list checkbox marker (djot `- [ ]` / `- [x]`). Maps to
+    /// `Block.fmt_marker`. `None` for non-task blocks.
+    pub marker: Option<MarkerType>,
     pub is_code_block: bool,
     pub code_language: Option<String>,
     pub blockquote_depth: u32,
@@ -169,6 +188,9 @@ pub fn parse_markdown(markdown: &str) -> Vec<ParsedElement> {
                         heading_level: current_heading.take(),
                         list_style: current_list_style.clone(),
                         list_indent: current_list_indent,
+                        list_prefix: String::new(),
+                        list_suffix: String::new(),
+                        marker: None,
                         is_code_block: false,
                         code_language: None,
                         blockquote_depth,
@@ -192,6 +214,9 @@ pub fn parse_markdown(markdown: &str) -> Vec<ParsedElement> {
                     heading_level: current_heading.take(),
                     list_style: None,
                     list_indent: 0,
+                    list_prefix: String::new(),
+                    list_suffix: String::new(),
+                    marker: None,
                     is_code_block: false,
                     code_language: None,
                     blockquote_depth,
@@ -222,6 +247,9 @@ pub fn parse_markdown(markdown: &str) -> Vec<ParsedElement> {
                         heading_level: None,
                         list_style: current_list_style.clone(),
                         list_indent: current_list_indent,
+                        list_prefix: String::new(),
+                        list_suffix: String::new(),
+                        marker: None,
                         is_code_block: false,
                         code_language: None,
                         blockquote_depth,
@@ -248,6 +276,9 @@ pub fn parse_markdown(markdown: &str) -> Vec<ParsedElement> {
                         heading_level: None,
                         list_style: current_list_style.clone(),
                         list_indent: current_list_indent,
+                        list_prefix: String::new(),
+                        list_suffix: String::new(),
+                        marker: None,
                         is_code_block: false,
                         code_language: None,
                         blockquote_depth,
@@ -282,6 +313,9 @@ pub fn parse_markdown(markdown: &str) -> Vec<ParsedElement> {
                     heading_level: None,
                     list_style: None,
                     list_indent: 0,
+                    list_prefix: String::new(),
+                    list_suffix: String::new(),
+                    marker: None,
                     is_code_block: true,
                     code_language: code_language.take(),
                     blockquote_depth,
@@ -368,6 +402,8 @@ pub fn parse_markdown(markdown: &str) -> Vec<ParsedElement> {
                     underline: false,
                     strikeout,
                     code: is_code_block,
+                    superscript: false,
+                    subscript: false,
                     link_href: link_href.clone(),
                 };
                 if in_table {
@@ -387,6 +423,8 @@ pub fn parse_markdown(markdown: &str) -> Vec<ParsedElement> {
                     underline: false,
                     strikeout,
                     code: true,
+                    superscript: false,
+                    subscript: false,
                     link_href: link_href.clone(),
                 };
                 if in_table {
@@ -406,6 +444,8 @@ pub fn parse_markdown(markdown: &str) -> Vec<ParsedElement> {
                     underline: false,
                     strikeout,
                     code: false,
+                    superscript: false,
+                    subscript: false,
                     link_href: link_href.clone(),
                 };
                 if in_table {
@@ -421,6 +461,9 @@ pub fn parse_markdown(markdown: &str) -> Vec<ParsedElement> {
                     heading_level: current_heading.take(),
                     list_style: current_list_style.clone(),
                     list_indent: current_list_indent,
+                    list_prefix: String::new(),
+                    list_suffix: String::new(),
+                    marker: None,
                     is_code_block,
                     code_language: code_language.clone(),
                     blockquote_depth,
@@ -447,6 +490,9 @@ pub fn parse_markdown(markdown: &str) -> Vec<ParsedElement> {
             heading_level: current_heading,
             list_style: current_list_style,
             list_indent: current_list_indent,
+            list_prefix: String::new(),
+            list_suffix: String::new(),
+            marker: None,
             is_code_block,
             code_language: code_language.take(),
             blockquote_depth,
@@ -467,6 +513,9 @@ pub fn parse_markdown(markdown: &str) -> Vec<ParsedElement> {
             heading_level: None,
             list_style: None,
             list_indent: 0,
+            list_prefix: String::new(),
+            list_suffix: String::new(),
+            marker: None,
             is_code_block: false,
             code_language: None,
             blockquote_depth: 0,
@@ -588,6 +637,8 @@ pub fn parse_html_elements(html: &str) -> Vec<ParsedElement> {
                             underline: state.underline,
                             strikeout: state.strikeout,
                             code: state.code,
+                            superscript: false,
+                            subscript: false,
                             link_href: state.link_href.clone(),
                         });
                     }
@@ -797,6 +848,9 @@ pub fn parse_html_elements(html: &str) -> Vec<ParsedElement> {
                         heading_level: None,
                         list_style: None,
                         list_indent: 0,
+                        list_prefix: String::new(),
+                        list_suffix: String::new(),
+                        marker: None,
                         is_code_block: false,
                         code_language: None,
                         blockquote_depth: bq_depth,
@@ -857,6 +911,9 @@ pub fn parse_html_elements(html: &str) -> Vec<ParsedElement> {
                             heading_level,
                             list_style: list_style_for_block,
                             list_indent: list_indent_for_block,
+                            list_prefix: String::new(),
+                            list_suffix: String::new(),
+                            marker: None,
                             is_code_block,
                             code_language,
                             blockquote_depth: bq_depth,
@@ -909,11 +966,16 @@ pub fn parse_html_elements(html: &str) -> Vec<ParsedElement> {
                             underline: state.underline,
                             strikeout: state.strikeout,
                             code: state.code,
+                            superscript: false,
+                            subscript: false,
                             link_href: state.link_href.clone(),
                         }],
                         heading_level: None,
                         list_style: None,
                         list_indent: 0,
+                        list_prefix: String::new(),
+                        list_suffix: String::new(),
+                        marker: None,
                         is_code_block: false,
                         code_language: None,
                         blockquote_depth,
@@ -970,6 +1032,8 @@ pub fn parse_html_elements(html: &str) -> Vec<ParsedElement> {
                             underline: state.underline,
                             strikeout: state.strikeout,
                             code: state.code,
+                            superscript: false,
+                            subscript: false,
                             link_href: state.link_href.clone(),
                         });
                     }
@@ -1067,6 +1131,9 @@ pub fn parse_html_elements(html: &str) -> Vec<ParsedElement> {
             heading_level: None,
             list_style: None,
             list_indent: 0,
+            list_prefix: String::new(),
+            list_suffix: String::new(),
+            marker: None,
             is_code_block: false,
             code_language: None,
             blockquote_depth: 0,
@@ -1087,6 +1154,9 @@ pub fn parse_html_elements(html: &str) -> Vec<ParsedElement> {
             heading_level: None,
             list_style: None,
             list_indent: 0,
+            list_prefix: String::new(),
+            list_suffix: String::new(),
+            marker: None,
             is_code_block: false,
             code_language: None,
             blockquote_depth: 0,
@@ -1107,6 +1177,7 @@ pub fn character_format_from_span(
     span: &ParsedSpan,
     is_code_block: bool,
 ) -> crate::format_runs::CharacterFormat {
+    use crate::entities::CharVerticalAlignment;
     crate::format_runs::CharacterFormat {
         font_bold: if span.bold { Some(true) } else { None },
         font_italic: if span.italic { Some(true) } else { None },
@@ -1120,6 +1191,13 @@ pub fn character_format_from_span(
         anchor_href: span.link_href.clone(),
         is_anchor: if span.link_href.is_some() {
             Some(true)
+        } else {
+            None
+        },
+        vertical_alignment: if span.superscript {
+            Some(CharVerticalAlignment::SuperScript)
+        } else if span.subscript {
+            Some(CharVerticalAlignment::SubScript)
         } else {
             None
         },

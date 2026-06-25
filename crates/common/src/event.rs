@@ -65,6 +65,7 @@ pub enum DocumentEditingEvent {
     InsertFragment,
     InsertHtmlAtPosition,
     InsertMarkdownAtPosition,
+    InsertDjotAtPosition,
     InsertTable,
     RemoveTable,
     InsertTableRow,
@@ -97,6 +98,8 @@ pub enum DocumentIoEvent {
     ExportMarkdown,
     ImportHtml,
     ExportHtml,
+    ImportDjot,
+    ExportDjot,
     ExportLatex,
     ExportDocx,
 }
