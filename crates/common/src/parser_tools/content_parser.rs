@@ -1247,6 +1247,484 @@ pub fn format_runs_from_spans(
     (plain_text, runs)
 }
 
+// ─── Djot parsing ────────────────────────────────────────────────────
+
+/// Map a jotdown unordered/task bullet marker to a model `ListStyle`.
+///
+/// The mapping is a stable bijection (`-`↔Disc, `*`↔Circle, `+`↔Square) so the
+/// djot exporter can recover the exact bullet character for a lossless
+/// round-trip.
+fn djot_bullet_style(b: jotdown::ListBulletType) -> ListStyle {
+    use jotdown::ListBulletType as B;
+    match b {
+        B::Dash => ListStyle::Disc,
+        B::Star => ListStyle::Circle,
+        B::Plus => ListStyle::Square,
+    }
+}
+
+/// Map a jotdown ordered-list numbering scheme to a model `ListStyle`.
+fn djot_ordered_style(n: jotdown::OrderedListNumbering) -> ListStyle {
+    use jotdown::OrderedListNumbering as N;
+    match n {
+        N::Decimal => ListStyle::Decimal,
+        N::AlphaLower => ListStyle::LowerAlpha,
+        N::AlphaUpper => ListStyle::UpperAlpha,
+        N::RomanLower => ListStyle::LowerRoman,
+        N::RomanUpper => ListStyle::UpperRoman,
+    }
+}
+
+/// Map a jotdown ordered-list delimiter to the `(prefix, suffix)` affixes
+/// stored on the `List` entity (`1.` → `("", ".")`, `1)` → `("", ")")`,
+/// `(1)` → `("(", ")")`).
+fn djot_ordered_affixes(style: jotdown::OrderedListStyle) -> (String, String) {
+    use jotdown::OrderedListStyle as S;
+    match style {
+        S::Period => (String::new(), ".".to_string()),
+        S::Paren => (String::new(), ")".to_string()),
+        S::ParenParen => ("(".to_string(), ")".to_string()),
+    }
+}
+
+/// Push a finished block into `elements` (only the block-level fields djot uses
+/// are set; CSS-derived fields stay `None`).
+#[allow(clippy::too_many_arguments)]
+fn djot_push_block(
+    elements: &mut Vec<ParsedElement>,
+    spans: Vec<ParsedSpan>,
+    heading_level: Option<i64>,
+    list_style: Option<ListStyle>,
+    list_indent: u32,
+    list_prefix: String,
+    list_suffix: String,
+    marker: Option<MarkerType>,
+    is_code_block: bool,
+    code_language: Option<String>,
+    blockquote_depth: u32,
+) {
+    elements.push(ParsedElement::Block(ParsedBlock {
+        spans,
+        heading_level,
+        list_style,
+        list_indent,
+        list_prefix,
+        list_suffix,
+        marker,
+        is_code_block,
+        code_language,
+        blockquote_depth,
+        line_height: None,
+        non_breakable_lines: None,
+        direction: None,
+        background_color: None,
+    }));
+}
+
+/// Parse djot source into the shared [`ParsedElement`] intermediate, mirroring
+/// [`parse_markdown`]. Uses the [`jotdown`] pull parser.
+///
+/// Constructs the document model cannot represent are dropped, and their text
+/// content is discarded so it never leaks into the document: footnotes, math,
+/// fenced divs, raw blocks/inline, thematic breaks, description lists,
+/// captions, symbols, link-reference definitions, and highlight/`mark`. Inline
+/// images keep their alt text as plain text (the image itself is not modelled),
+/// matching the Markdown importer. Smart-punctuation events are normalised to
+/// their canonical Unicode characters so the model→djot→model round-trip is a
+/// fixpoint.
+///
+/// Known model limitations (normalised, not preserved on round-trip):
+/// ordered-list start number, table column alignment, and list tight/loose.
+pub fn parse_djot(djot: &str) -> Vec<ParsedElement> {
+    use jotdown::{Container as C, Event as E, ListKind, Parser};
+
+    let mut elements: Vec<ParsedElement> = Vec::new();
+    let mut current_spans: Vec<ParsedSpan> = Vec::new();
+    let mut current_heading: Option<i64> = None;
+    let mut is_code_block = false;
+    let mut code_language: Option<String> = None;
+    let mut blockquote_depth: u32 = 0;
+
+    // Inline formatting state.
+    let mut bold = false;
+    let mut italic = false;
+    let mut underline = false;
+    let mut strikeout = false;
+    let mut code = false;
+    let mut superscript = false;
+    let mut subscript = false;
+    let mut link_href: Option<String> = None;
+
+    // List nesting: each entry is (style, prefix, suffix); depth = indent + 1.
+    let mut list_stack: Vec<(ListStyle, String, String)> = Vec::new();
+    // Context applied to the next flushed block while inside a list item.
+    let mut cur_list_style: Option<ListStyle> = None;
+    let mut cur_list_prefix = String::new();
+    let mut cur_list_suffix = String::new();
+    let mut cur_list_indent: u32 = 0;
+    let mut cur_marker: Option<MarkerType> = None;
+
+    // Table accumulation.
+    let mut in_table_cell = false;
+    let mut table_rows: Vec<Vec<ParsedTableCell>> = Vec::new();
+    let mut current_row: Vec<ParsedTableCell> = Vec::new();
+    let mut current_cell_spans: Vec<ParsedSpan> = Vec::new();
+    let mut table_header_rows: usize = 0;
+    let mut row_is_head = false;
+
+    // Subtree-skip depth for unrepresentable containers (their entire content
+    // is dropped). Incremented on the dropped container's `Start` and on every
+    // nested `Start`; decremented on every `End`.
+    let mut skip_depth: u32 = 0;
+
+    // Push one inline span carrying the current formatting state into the
+    // active sink (table cell or block). A macro (not a closure) to avoid
+    // borrowing `current_spans`/`current_cell_spans` across the formatting
+    // state reads.
+    macro_rules! push_text {
+        ($t:expr) => {{
+            let sp = ParsedSpan {
+                text: ($t).to_string(),
+                bold,
+                italic,
+                underline,
+                strikeout,
+                code,
+                superscript,
+                subscript,
+                link_href: link_href.clone(),
+            };
+            if in_table_cell {
+                current_cell_spans.push(sp);
+            } else {
+                current_spans.push(sp);
+            }
+        }};
+    }
+
+    // Enter a list item, flushing any unterminated inline content first and
+    // capturing the list context + task marker for the item's block.
+    macro_rules! enter_item {
+        ($marker:expr) => {{
+            if !current_spans.is_empty() {
+                djot_push_block(
+                    &mut elements,
+                    std::mem::take(&mut current_spans),
+                    None,
+                    cur_list_style.clone(),
+                    cur_list_indent,
+                    cur_list_prefix.clone(),
+                    cur_list_suffix.clone(),
+                    cur_marker.clone(),
+                    false,
+                    None,
+                    blockquote_depth,
+                );
+            }
+            let (style, prefix, suffix) = list_stack
+                .last()
+                .cloned()
+                .unwrap_or((ListStyle::Disc, String::new(), String::new()));
+            cur_list_style = Some(style);
+            cur_list_prefix = prefix;
+            cur_list_suffix = suffix;
+            cur_list_indent = list_stack.len().saturating_sub(1) as u32;
+            cur_marker = $marker;
+        }};
+    }
+
+    for event in Parser::new(djot) {
+        if skip_depth > 0 {
+            match event {
+                E::Start(..) => skip_depth += 1,
+                E::End(_) => skip_depth -= 1,
+                _ => {}
+            }
+            continue;
+        }
+
+        match event {
+            // ── Transparent wrappers (unwrap, keep content) ──
+            E::Start(C::Document, _) | E::End(C::Document) => {}
+            E::Start(C::Section { .. }, _) | E::End(C::Section { .. }) => {}
+            E::Start(C::Div { .. }, _) | E::End(C::Div { .. }) => {}
+
+            // ── Blockquote ──
+            E::Start(C::Blockquote, _) => blockquote_depth += 1,
+            E::End(C::Blockquote) => blockquote_depth = blockquote_depth.saturating_sub(1),
+
+            // ── Lists ──
+            E::Start(C::List { kind, .. }, _) => {
+                let (style, prefix, suffix) = match kind {
+                    ListKind::Unordered(b) | ListKind::Task(b) => {
+                        (djot_bullet_style(b), String::new(), String::new())
+                    }
+                    ListKind::Ordered {
+                        numbering, style, ..
+                    } => {
+                        let (p, s) = djot_ordered_affixes(style);
+                        (djot_ordered_style(numbering), p, s)
+                    }
+                };
+                list_stack.push((style, prefix, suffix));
+            }
+            E::End(C::List { .. }) => {
+                list_stack.pop();
+                cur_list_style = None;
+                cur_marker = None;
+            }
+            E::Start(C::ListItem, _) => enter_item!(None),
+            E::Start(C::TaskListItem { checked }, _) => enter_item!(Some(if checked {
+                MarkerType::Checked
+            } else {
+                MarkerType::Unchecked
+            })),
+            E::End(C::ListItem) | E::End(C::TaskListItem { .. }) => {
+                // Tight item without a wrapping paragraph (defensive flush).
+                if !current_spans.is_empty() {
+                    djot_push_block(
+                        &mut elements,
+                        std::mem::take(&mut current_spans),
+                        None,
+                        cur_list_style.clone(),
+                        cur_list_indent,
+                        cur_list_prefix.clone(),
+                        cur_list_suffix.clone(),
+                        cur_marker.clone(),
+                        false,
+                        None,
+                        blockquote_depth,
+                    );
+                }
+                cur_list_style = None;
+                cur_marker = None;
+            }
+
+            // ── Headings, paragraphs, code blocks ──
+            E::Start(C::Heading { level, .. }, _) => current_heading = Some(level as i64),
+            E::End(C::Heading { .. }) => {
+                djot_push_block(
+                    &mut elements,
+                    std::mem::take(&mut current_spans),
+                    current_heading.take(),
+                    None,
+                    0,
+                    String::new(),
+                    String::new(),
+                    None,
+                    false,
+                    None,
+                    blockquote_depth,
+                );
+            }
+            E::Start(C::Paragraph, _) => current_heading = None,
+            E::End(C::Paragraph) => {
+                if !current_spans.is_empty() {
+                    djot_push_block(
+                        &mut elements,
+                        std::mem::take(&mut current_spans),
+                        None,
+                        cur_list_style.clone(),
+                        cur_list_indent,
+                        cur_list_prefix.clone(),
+                        cur_list_suffix.clone(),
+                        cur_marker.clone(),
+                        false,
+                        None,
+                        blockquote_depth,
+                    );
+                }
+                cur_list_style = None;
+                cur_marker = None;
+            }
+            E::Start(C::CodeBlock { language }, _) => {
+                is_code_block = true;
+                code_language = if language.is_empty() {
+                    None
+                } else {
+                    Some(language.to_string())
+                };
+            }
+            E::End(C::CodeBlock { .. }) => {
+                // Strip the single trailing newline jotdown appends.
+                if let Some(last) = current_spans.last_mut()
+                    && last.text.ends_with('\n')
+                {
+                    last.text.pop();
+                }
+                djot_push_block(
+                    &mut elements,
+                    std::mem::take(&mut current_spans),
+                    None,
+                    None,
+                    0,
+                    String::new(),
+                    String::new(),
+                    None,
+                    true,
+                    code_language.take(),
+                    blockquote_depth,
+                );
+                is_code_block = false;
+            }
+
+            // ── Tables ──
+            E::Start(C::Table, _) => {
+                table_rows.clear();
+                current_row.clear();
+                current_cell_spans.clear();
+                table_header_rows = 0;
+            }
+            E::End(C::Table) => {
+                elements.push(ParsedElement::Table(ParsedTable {
+                    header_rows: table_header_rows,
+                    rows: std::mem::take(&mut table_rows),
+                    blockquote_depth,
+                }));
+            }
+            E::Start(C::TableRow { head }, _) => {
+                row_is_head = head;
+                current_row.clear();
+            }
+            E::End(C::TableRow { .. }) => {
+                if row_is_head {
+                    table_header_rows += 1;
+                }
+                table_rows.push(std::mem::take(&mut current_row));
+            }
+            E::Start(C::TableCell { .. }, _) => {
+                in_table_cell = true;
+                current_cell_spans.clear();
+            }
+            E::End(C::TableCell { .. }) => {
+                in_table_cell = false;
+                current_row.push(ParsedTableCell {
+                    spans: std::mem::take(&mut current_cell_spans),
+                });
+            }
+
+            // ── Inline formatting ──
+            E::Start(C::Strong, _) => bold = true,
+            E::End(C::Strong) => bold = false,
+            E::Start(C::Emphasis, _) => italic = true,
+            E::End(C::Emphasis) => italic = false,
+            E::Start(C::Verbatim, _) => code = true,
+            E::End(C::Verbatim) => code = false,
+            E::Start(C::Superscript, _) => superscript = true,
+            E::End(C::Superscript) => superscript = false,
+            E::Start(C::Subscript, _) => subscript = true,
+            E::End(C::Subscript) => subscript = false,
+            E::Start(C::Insert, _) => underline = true,
+            E::End(C::Insert) => underline = false,
+            E::Start(C::Delete, _) => strikeout = true,
+            E::End(C::Delete) => strikeout = false,
+            // Highlight/mark and bare spans have no model field — keep the text.
+            E::Start(C::Mark, _) | E::End(C::Mark) => {}
+            E::Start(C::Span, _) | E::End(C::Span) => {}
+            E::Start(C::Link(dst, _), _) => link_href = Some(dst.to_string()),
+            E::End(C::Link(..)) => link_href = None,
+            // Inline images: keep alt text as plain text (image not modelled).
+            E::Start(C::Image(..), _) | E::End(C::Image(..)) => {}
+
+            // ── Unrepresentable containers: drop the entire subtree ──
+            E::Start(
+                C::Footnote { .. }
+                | C::Math { .. }
+                | C::RawBlock { .. }
+                | C::RawInline { .. }
+                | C::DescriptionList
+                | C::DescriptionDetails
+                | C::DescriptionTerm
+                | C::Caption
+                | C::LinkDefinition { .. },
+                _,
+            ) => skip_depth = 1,
+
+            // ── Text + atoms ──
+            E::Str(s) => push_text!(s.as_ref()),
+            E::Softbreak => push_text!(" "),
+            E::LeftSingleQuote => push_text!("\u{2018}"),
+            E::RightSingleQuote => push_text!("\u{2019}"),
+            E::LeftDoubleQuote => push_text!("\u{201C}"),
+            E::RightDoubleQuote => push_text!("\u{201D}"),
+            E::Ellipsis => push_text!("\u{2026}"),
+            E::EnDash => push_text!("\u{2013}"),
+            E::EmDash => push_text!("\u{2014}"),
+            E::NonBreakingSpace => push_text!("\u{00A0}"),
+            E::Hardbreak => {
+                if in_table_cell {
+                    push_text!(" ");
+                } else if !current_spans.is_empty() {
+                    // Mirrors the Markdown importer: a hard break splits the
+                    // paragraph into a new block.
+                    djot_push_block(
+                        &mut elements,
+                        std::mem::take(&mut current_spans),
+                        None,
+                        cur_list_style.clone(),
+                        cur_list_indent,
+                        cur_list_prefix.clone(),
+                        cur_list_suffix.clone(),
+                        cur_marker.clone(),
+                        is_code_block,
+                        code_language.clone(),
+                        blockquote_depth,
+                    );
+                }
+            }
+            // Symbols, footnote refs, escapes, blanklines, thematic breaks and
+            // dangling block attributes carry no representable content.
+            E::Symbol(_) | E::FootnoteReference(_) => {}
+            E::Escape | E::Blankline => {}
+            E::ThematicBreak(_) | E::Attributes(_) => {}
+
+            // Ends of dropped containers (never reached at skip_depth 0) and any
+            // future variants.
+            _ => {}
+        }
+    }
+
+    // Flush any trailing inline content (defensive — Document End closes blocks).
+    if !current_spans.is_empty() {
+        djot_push_block(
+            &mut elements,
+            std::mem::take(&mut current_spans),
+            current_heading.take(),
+            cur_list_style.clone(),
+            cur_list_indent,
+            cur_list_prefix.clone(),
+            cur_list_suffix.clone(),
+            cur_marker.clone(),
+            is_code_block,
+            code_language.take(),
+            blockquote_depth,
+        );
+    }
+
+    // An empty document still yields a single empty paragraph (matches
+    // `parse_markdown`).
+    if elements.is_empty() {
+        djot_push_block(
+            &mut elements,
+            vec![ParsedSpan {
+                text: String::new(),
+                ..Default::default()
+            }],
+            None,
+            None,
+            0,
+            String::new(),
+            String::new(),
+            None,
+            false,
+            None,
+            0,
+        );
+    }
+
+    elements
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1625,5 +2103,171 @@ mod tests {
         assert!(matches!(&elements[0], ParsedElement::Block(_)));
         assert!(matches!(&elements[1], ParsedElement::Table(_)));
         assert!(matches!(&elements[2], ParsedElement::Block(_)));
+    }
+}
+
+#[cfg(test)]
+mod djot_tests {
+    use super::*;
+    use crate::entities::MarkerType;
+
+    fn blocks(d: &str) -> Vec<ParsedBlock> {
+        ParsedElement::flatten_to_blocks(parse_djot(d))
+    }
+
+    fn first_span_with<'a>(b: &'a ParsedBlock, pred: impl Fn(&ParsedSpan) -> bool) -> &'a ParsedSpan {
+        b.spans.iter().find(|s| pred(s)).expect("span not found")
+    }
+
+    #[test]
+    fn paragraph_bold_italic() {
+        let b = blocks("normal *bold* _italic_");
+        assert_eq!(b.len(), 1);
+        assert!(first_span_with(&b[0], |s| s.text == "bold").bold);
+        assert!(first_span_with(&b[0], |s| s.text == "italic").italic);
+    }
+
+    #[test]
+    fn heading_levels() {
+        assert_eq!(blocks("# H1")[0].heading_level, Some(1));
+        assert_eq!(blocks("### H3")[0].heading_level, Some(3));
+        assert_eq!(blocks("###### H6")[0].heading_level, Some(6));
+    }
+
+    #[test]
+    fn unordered_bullet_styles_are_distinct() {
+        assert_eq!(blocks("- a")[0].list_style, Some(ListStyle::Disc));
+        assert_eq!(blocks("* a")[0].list_style, Some(ListStyle::Circle));
+        assert_eq!(blocks("+ a")[0].list_style, Some(ListStyle::Square));
+    }
+
+    #[test]
+    fn ordered_delimiters() {
+        let period = blocks("1. a");
+        assert_eq!(period[0].list_style, Some(ListStyle::Decimal));
+        assert_eq!(period[0].list_prefix, "");
+        assert_eq!(period[0].list_suffix, ".");
+
+        let paren = blocks("1) a");
+        assert_eq!(paren[0].list_suffix, ")");
+        assert_eq!(paren[0].list_prefix, "");
+
+        let paren_paren = blocks("(1) a");
+        assert_eq!(paren_paren[0].list_prefix, "(");
+        assert_eq!(paren_paren[0].list_suffix, ")");
+    }
+
+    #[test]
+    fn task_list_markers() {
+        let b = blocks("- [ ] a\n- [x] b");
+        assert_eq!(b.len(), 2);
+        assert_eq!(b[0].marker, Some(MarkerType::Unchecked));
+        assert_eq!(b[1].marker, Some(MarkerType::Checked));
+    }
+
+    #[test]
+    fn code_block_with_language() {
+        let b = blocks("```rust\nfn main() {}\n```");
+        assert_eq!(b.len(), 1);
+        assert!(b[0].is_code_block);
+        assert_eq!(b[0].code_language.as_deref(), Some("rust"));
+        let text: String = b[0].spans.iter().map(|s| s.text.as_str()).collect();
+        assert_eq!(text, "fn main() {}");
+    }
+
+    #[test]
+    fn link_href() {
+        let b = blocks("[text](http://example.com)");
+        let s = first_span_with(&b[0], |s| s.text == "text");
+        assert_eq!(s.link_href.as_deref(), Some("http://example.com"));
+    }
+
+    #[test]
+    fn superscript_subscript() {
+        assert!(first_span_with(&blocks("a^b^")[0], |s| s.text == "b").superscript);
+        assert!(first_span_with(&blocks("a~b~")[0], |s| s.text == "b").subscript);
+    }
+
+    #[test]
+    fn delete_insert_verbatim() {
+        assert!(first_span_with(&blocks("{-x-}")[0], |s| s.text == "x").strikeout);
+        assert!(first_span_with(&blocks("{+x+}")[0], |s| s.text == "x").underline);
+        assert!(first_span_with(&blocks("`x`")[0], |s| s.text == "x").code);
+    }
+
+    #[test]
+    fn blockquote_depth() {
+        let els = parse_djot("> quoted");
+        match &els[0] {
+            ParsedElement::Block(b) => assert_eq!(b.blockquote_depth, 1),
+            _ => panic!("expected block"),
+        }
+    }
+
+    #[test]
+    fn nested_list_indent() {
+        // Djot nests a sub-list only when a blank line separates it from the
+        // parent item and it is indented to the parent's content column
+        // (2 spaces per level). Without the blank line the markers fold into
+        // the paragraph as lazy continuation.
+        let b = blocks("- a\n\n  - b\n\n    - c");
+        assert_eq!(b.len(), 3);
+        assert_eq!(b[0].list_indent, 0);
+        assert_eq!(b[1].list_indent, 1);
+        assert_eq!(b[2].list_indent, 2);
+    }
+
+    #[test]
+    fn table_parsed_as_table() {
+        let els = parse_djot("| a | b |\n|---|---|\n| c | d |");
+        assert_eq!(els.len(), 1);
+        match &els[0] {
+            ParsedElement::Table(t) => {
+                assert_eq!(t.header_rows, 1);
+                assert_eq!(t.rows.len(), 2);
+                assert_eq!(t.rows[0][0].spans[0].text, "a");
+                assert_eq!(t.rows[1][1].spans[0].text, "d");
+            }
+            _ => panic!("expected table"),
+        }
+    }
+
+    #[test]
+    fn smart_punctuation_normalised_to_unicode() {
+        let text: String = blocks("a... b---c")[0]
+            .spans
+            .iter()
+            .map(|s| s.text.as_str())
+            .collect();
+        assert!(text.contains('\u{2026}'), "ellipsis: {text:?}");
+        assert!(text.contains('\u{2014}'), "em dash: {text:?}");
+    }
+
+    #[test]
+    fn unrepresentable_constructs_dropped_without_leaking_text() {
+        // Thematic break between two paragraphs: no extra block, no stray text.
+        let b = blocks("para1\n\n---\n\npara2");
+        assert_eq!(b.len(), 2);
+        assert_eq!(b[0].spans.iter().map(|s| s.text.as_str()).collect::<String>(), "para1");
+        assert_eq!(b[1].spans.iter().map(|s| s.text.as_str()).collect::<String>(), "para2");
+
+        // Fenced div is unwrapped: its content survives, the fence does not.
+        let d = blocks(":::\ninside\n:::");
+        let joined: String = d.iter().flat_map(|b| b.spans.iter()).map(|s| s.text.as_str()).collect();
+        assert_eq!(joined, "inside");
+
+        // Inline math content is dropped, surrounding text kept.
+        let m = blocks("before $`E=mc^2` after");
+        let joined: String = m.iter().flat_map(|b| b.spans.iter()).map(|s| s.text.as_str()).collect();
+        assert!(joined.contains("before"), "{joined:?}");
+        assert!(joined.contains("after"), "{joined:?}");
+        assert!(!joined.contains("E=mc"), "math leaked: {joined:?}");
+    }
+
+    #[test]
+    fn empty_document_yields_one_empty_block() {
+        let b = blocks("");
+        assert_eq!(b.len(), 1);
+        assert!(b[0].spans.iter().all(|s| s.text.is_empty()));
     }
 }
