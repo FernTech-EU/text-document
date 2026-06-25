@@ -23,6 +23,18 @@ pub struct ExportMarkdownDto {
     pub markdown_text: String,
 }
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+pub struct ImportDjotDto {
+    pub djot_text: String,
+}
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+pub struct ImportDjotResultDto {
+    pub block_count: i64,
+}
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+pub struct ExportDjotDto {
+    pub djot_text: String,
+}
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct ImportHtmlDto {
     pub html_text: String,
 }

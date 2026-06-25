@@ -740,6 +740,26 @@ features:
             - name: blocks_added
               type: integer
 
+      - name: insert_djot_at_position
+        undoable: true
+        entities: [Document, Frame, Block, List, Table, TableCell]
+        dto_in:
+          name: InsertDjotAtPositionDto
+          fields:
+            - name: position
+              type: integer
+            - name: anchor
+              type: integer
+            - name: djot
+              type: string
+        dto_out:
+          name: InsertDjotAtPositionResultDto
+          fields:
+            - name: new_position
+              type: integer
+            - name: blocks_added
+              type: integer
+
       - name: insert_table
         undoable: true
         entities: [Document, Frame, Block, Table, TableCell]
@@ -1242,6 +1262,31 @@ features:
           name: ExportHtmlDto
           fields:
             - name: html_text
+              type: string
+
+      - name: import_djot
+        undoable: false
+        long_operation: true
+        entities: [Root, Document, Frame, Block, List, Table, TableCell]
+        dto_in:
+          name: ImportDjotDto
+          fields:
+            - name: djot_text
+              type: string
+        dto_out:
+          name: ImportDjotResultDto
+          fields:
+            - name: block_count
+              type: integer
+
+      - name: export_djot
+        undoable: false
+        read_only: true
+        entities: [Document, Frame, Block, List, Table, TableCell]
+        dto_out:
+          name: ExportDjotDto
+          fields:
+            - name: djot_text
               type: string
 
       - name: export_latex
