@@ -8,7 +8,7 @@ use crate::{DocumentError, Result};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
 
-use crate::{ResourceType, TextDirection, WrapMode};
+use crate::{DjotExportOptions, DjotImportOptions, ResourceType, TextDirection, WrapMode};
 use frontend::commands::{
     block_commands, document_commands, document_inspection_commands, document_io_commands,
     document_search_commands, frame_commands, resource_commands, table_cell_commands,
@@ -229,10 +229,24 @@ impl TextDocument {
     ///
     /// This is a **long operation**. Returns a typed [`Operation`] handle.
     pub fn set_djot(&self, djot: &str) -> Result<Operation<DjotImportResult>> {
+        self.set_djot_with_options(djot, DjotImportOptions::default())
+    }
+
+    /// Replace the entire document with djot markup, selecting which optional
+    /// block attributes (alignment, line height, direction, non-breakable
+    /// lines, background color) are applied via `options`. Clears undo history.
+    ///
+    /// This is a **long operation**. Returns a typed [`Operation`] handle.
+    pub fn set_djot_with_options(
+        &self,
+        djot: &str,
+        options: DjotImportOptions,
+    ) -> Result<Operation<DjotImportResult>> {
         let mut inner = self.inner.lock();
         inner.invalidate_text_cache();
         let dto = frontend::document_io::ImportDjotDto {
             djot_text: djot.into(),
+            options,
         };
         let op_id = document_io_commands::import_djot(&inner.ctx, &dto)?;
         Ok(Operation::new(
@@ -253,8 +267,15 @@ impl TextDocument {
 
     /// Export the entire document as djot markup.
     pub fn to_djot(&self) -> Result<String> {
+        self.to_djot_with_options(DjotExportOptions::default())
+    }
+
+    /// Export the entire document as djot markup, selecting which optional block
+    /// attributes (alignment, line height, direction, non-breakable lines,
+    /// background color) are emitted via `options`.
+    pub fn to_djot_with_options(&self, options: DjotExportOptions) -> Result<String> {
         let inner = self.inner.lock();
-        let dto = document_io_commands::export_djot(&inner.ctx)?;
+        let dto = document_io_commands::export_djot(&inner.ctx, &options)?;
         Ok(dto.djot_text)
     }
 

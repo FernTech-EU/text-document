@@ -12,6 +12,7 @@ use document_io::{
 };
 
 use common::long_operation::OperationProgress;
+use common::parser_tools::DjotExportOptions;
 
 pub fn import_plain_text(ctx: &AppContext, dto: &ImportPlainTextDto) -> Result<()> {
     document_io_controller::import_plain_text(&ctx.db_context, &ctx.event_hub, dto)
@@ -90,8 +91,9 @@ pub fn get_import_djot_result(
         .context("getting import_djot result")
 }
 
-pub fn export_djot(ctx: &AppContext) -> Result<ExportDjotDto> {
-    document_io_controller::export_djot(&ctx.db_context, &ctx.event_hub).context("export_djot")
+pub fn export_djot(ctx: &AppContext, options: &DjotExportOptions) -> Result<ExportDjotDto> {
+    document_io_controller::export_djot(&ctx.db_context, &ctx.event_hub, options)
+        .context("export_djot")
 }
 
 /// import_html (long operation)

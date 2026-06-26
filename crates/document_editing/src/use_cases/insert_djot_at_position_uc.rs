@@ -643,7 +643,10 @@ fn execute_insert_djot(
     uow: &mut Box<dyn InsertDjotAtPositionUnitOfWorkTrait>,
     dto: &InsertDjotAtPositionDto,
 ) -> Result<(InsertDjotAtPositionResultDto, EntityTreeSnapshot)> {
-    let parsed_elements = content_parser::parse_djot(&dto.djot);
+    let parsed_elements = content_parser::parse_djot(
+        &dto.djot,
+        &common::parser_tools::DjotImportOptions::default(),
+    );
     let parsed_blocks = content_parser::ParsedElement::flatten_to_blocks(parsed_elements);
     let (new_position, blocks_added, snapshot) =
         execute_content_insert(uow, dto.position, dto.anchor, &parsed_blocks)?;

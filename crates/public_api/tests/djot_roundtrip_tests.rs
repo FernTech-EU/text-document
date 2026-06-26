@@ -37,10 +37,48 @@ enum Inline {
     Link(String, String),
 }
 
+/// Optional block-style attributes, emitted as a djot `{…}` block-attribute
+/// line before a paragraph or heading. Mirrors the five model fields the
+/// exporter round-trips; all-`None` emits nothing.
+#[derive(Debug, Clone, Default)]
+struct BlockStyle {
+    alignment: Option<&'static str>,
+    line_height: Option<i64>,
+    direction: Option<&'static str>,
+    non_breakable_lines: Option<bool>,
+    background: Option<&'static str>,
+}
+
+impl BlockStyle {
+    fn emit(&self) -> String {
+        let mut pairs: Vec<String> = Vec::new();
+        if let Some(a) = self.alignment {
+            pairs.push(format!("alignment={a}"));
+        }
+        if let Some(lh) = self.line_height {
+            pairs.push(format!("line_height={lh}"));
+        }
+        if let Some(d) = self.direction {
+            pairs.push(format!("direction={d}"));
+        }
+        if let Some(n) = self.non_breakable_lines {
+            pairs.push(format!("non_breakable_lines={n}"));
+        }
+        if let Some(bg) = self.background {
+            pairs.push(format!("background_color=\"{bg}\""));
+        }
+        if pairs.is_empty() {
+            String::new()
+        } else {
+            format!("{{{}}}\n", pairs.join(" "))
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 enum Block {
-    Para(Vec<Inline>),
-    Heading(u8, String),
+    Para(BlockStyle, Vec<Inline>),
+    Heading(BlockStyle, u8, String),
     Fenced(Option<String>, String),
     Bullet(Vec<String>),
     Ordered(Vec<String>),
@@ -66,8 +104,14 @@ fn emit_inline(i: &Inline) -> String {
 
 fn emit_block(b: &Block) -> String {
     match b {
-        Block::Para(inlines) => inlines.iter().map(emit_inline).collect::<String>(),
-        Block::Heading(level, s) => format!("{} {s}", "#".repeat(*level as usize)),
+        Block::Para(style, inlines) => format!(
+            "{}{}",
+            style.emit(),
+            inlines.iter().map(emit_inline).collect::<String>()
+        ),
+        Block::Heading(style, level, s) => {
+            format!("{}{} {s}", style.emit(), "#".repeat(*level as usize))
+        }
         Block::Fenced(lang, content) => {
             format!("```{}\n{content}\n```", lang.as_deref().unwrap_or(""))
         }
@@ -138,10 +182,38 @@ fn inline() -> impl Strategy<Value = Inline> {
     ]
 }
 
+fn block_style() -> impl Strategy<Value = BlockStyle> {
+    (
+        prop::option::of(prop_oneof![
+            Just("left"),
+            Just("right"),
+            Just("center"),
+            Just("justify")
+        ]),
+        prop::option::of(1i64..3000),
+        prop::option::of(prop_oneof![Just("ltr"), Just("rtl")]),
+        prop::option::of(any::<bool>()),
+        prop::option::of(prop_oneof![
+            Just("#ff0000"),
+            Just("#00ff00"),
+            Just("yellow")
+        ]),
+    )
+        .prop_map(
+            |(alignment, line_height, direction, non_breakable_lines, background)| BlockStyle {
+                alignment,
+                line_height,
+                direction,
+                non_breakable_lines,
+                background,
+            },
+        )
+}
+
 fn block() -> impl Strategy<Value = Block> {
     prop_oneof![
-        prop::collection::vec(inline(), 1..5).prop_map(Block::Para),
-        (1u8..=6, word()).prop_map(|(l, s)| Block::Heading(l, s)),
+        (block_style(), prop::collection::vec(inline(), 1..5)).prop_map(|(s, i)| Block::Para(s, i)),
+        (block_style(), 1u8..=6, word()).prop_map(|(st, l, s)| Block::Heading(st, l, s)),
         (
             prop::option::of(prop_oneof![
                 Just("rust".to_string()),

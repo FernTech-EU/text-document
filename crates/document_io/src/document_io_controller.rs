@@ -37,6 +37,7 @@ use crate::use_cases::import_markdown_uc::ImportMarkdownUseCase;
 use crate::use_cases::import_plain_text_uc::ImportPlainTextUseCase;
 use anyhow::Result;
 use common::event::{Event, Origin};
+use common::parser_tools::DjotExportOptions;
 
 use common::event::DocumentIoEvent::ExportDjot;
 use common::event::DocumentIoEvent::ExportHtml;
@@ -165,10 +166,14 @@ pub fn get_import_djot_result(
     Ok(Some(result_dto))
 }
 
-pub fn export_djot(db_context: &DbContext, event_hub: &Arc<EventHub>) -> Result<ExportDjotDto> {
+pub fn export_djot(
+    db_context: &DbContext,
+    event_hub: &Arc<EventHub>,
+    options: &DjotExportOptions,
+) -> Result<ExportDjotDto> {
     let uow_context = ExportDjotUnitOfWorkFactory::new(db_context);
     let mut uc = ExportDjotUseCase::new(Box::new(uow_context));
-    let return_dto = uc.execute()?;
+    let return_dto = uc.execute(options)?;
     event_hub.send_event(Event {
         origin: Origin::DocumentIo(ExportDjot),
         ids: vec![],

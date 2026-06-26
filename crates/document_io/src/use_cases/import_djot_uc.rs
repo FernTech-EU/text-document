@@ -220,6 +220,11 @@ fn import_parsed_elements(
                         None
                     },
                     fmt_code_language: parsed_block.code_language.clone(),
+                    fmt_alignment: parsed_block.alignment.clone(),
+                    fmt_line_height: parsed_block.line_height,
+                    fmt_non_breakable_lines: parsed_block.non_breakable_lines,
+                    fmt_direction: parsed_block.direction.clone(),
+                    fmt_background_color: parsed_block.background_color.clone(),
                     ..Block::default()
                 };
 
@@ -498,7 +503,7 @@ impl LongOperation for ImportDjotUseCase {
         ));
 
         // Parse djot
-        let parsed_elements = parse_djot(&self.dto.djot_text);
+        let parsed_elements = parse_djot(&self.dto.djot_text, &self.dto.options);
 
         let mut uow = self.uow_factory.create();
         uow.begin_transaction()?;

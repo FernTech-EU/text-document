@@ -29,6 +29,7 @@ fn import_then_export(input: &str) -> String {
         &mut mgr,
         &ImportDjotDto {
             djot_text: input.to_string(),
+            options: Default::default(),
         },
     )
     .expect("import_djot");
@@ -38,7 +39,7 @@ fn import_then_export(input: &str) -> String {
         Some(OperationStatus::Completed),
         "import of {input:?} did not complete"
     );
-    document_io_controller::export_djot(&db, &ev)
+    document_io_controller::export_djot(&db, &ev, &Default::default())
         .expect("export_djot")
         .djot_text
 }
@@ -239,4 +240,125 @@ fn mixed_document() {
     assert_contains(&dj, "[link](https://example.com)");
     assert_contains(&dj, "> a quote");
     assert_contains(&dj, "```rust");
+}
+
+// ── Optional block attributes (alignment, line height, direction, ──────────
+//    non-breakable lines, background color) round-tripped via djot `{…}`.
+
+#[test]
+fn block_alignment_round_trips() {
+    assert_contains(
+        &fixpoint("{alignment=right}\nRight aligned."),
+        "{alignment=right}",
+    );
+}
+
+#[test]
+fn block_line_height_round_trips() {
+    assert_contains(
+        &fixpoint("{line_height=1500}\nTall lines."),
+        "line_height=1500",
+    );
+}
+
+#[test]
+fn block_direction_round_trips() {
+    assert_contains(
+        &fixpoint("{direction=rtl}\nRight to left."),
+        "direction=rtl",
+    );
+}
+
+#[test]
+fn block_non_breakable_lines_round_trips() {
+    assert_contains(
+        &fixpoint("{non_breakable_lines=true}\nKeep together."),
+        "non_breakable_lines=true",
+    );
+}
+
+#[test]
+fn block_background_color_round_trips() {
+    assert_contains(
+        &fixpoint("{background_color=\"#ff0000\"}\nColoured."),
+        "background_color=\"#ff0000\"",
+    );
+}
+
+#[test]
+fn multiple_block_attributes_combine() {
+    let dj = fixpoint("{alignment=center line_height=1500}\nBoth set.");
+    assert_contains(&dj, "alignment=center");
+    assert_contains(&dj, "line_height=1500");
+}
+
+#[test]
+fn heading_alignment_round_trips() {
+    let dj = fixpoint("{alignment=center}\n# Centered Title");
+    assert_contains(&dj, "{alignment=center}");
+    assert_contains(&dj, "# Centered Title");
+}
+
+#[test]
+fn block_attributes_survive_inside_blockquote() {
+    let dj = fixpoint("> {alignment=center}\n> Quoted and centered.");
+    assert_contains(&dj, "alignment=center");
+    assert_contains(&dj, "> ");
+}
+
+#[test]
+fn export_options_can_suppress_an_attribute() {
+    let (db, ev, _) = setup().expect("setup");
+    let mut mgr = LongOperationManager::new();
+    let op = document_io_controller::import_djot(
+        &db,
+        &ev,
+        &mut mgr,
+        &ImportDjotDto {
+            djot_text: "{alignment=center}\nhi".into(),
+            options: Default::default(),
+        },
+    )
+    .expect("import_djot");
+    wait(&mgr, &op);
+    let opts = common::parser_tools::DjotExportOptions {
+        alignment: false,
+        ..Default::default()
+    };
+    let dj = document_io_controller::export_djot(&db, &ev, &opts)
+        .expect("export_djot")
+        .djot_text;
+    assert!(
+        !dj.contains("alignment"),
+        "alignment should be suppressed:\n{dj}"
+    );
+    assert!(dj.contains("hi"));
+}
+
+#[test]
+fn import_options_can_ignore_an_attribute() {
+    let (db, ev, _) = setup().expect("setup");
+    let mut mgr = LongOperationManager::new();
+    let op = document_io_controller::import_djot(
+        &db,
+        &ev,
+        &mut mgr,
+        &ImportDjotDto {
+            djot_text: "{alignment=center}\nhi".into(),
+            options: common::parser_tools::DjotImportOptions {
+                alignment: false,
+                ..Default::default()
+            },
+        },
+    )
+    .expect("import_djot");
+    wait(&mgr, &op);
+    let dj = document_io_controller::export_djot(&db, &ev, &Default::default())
+        .expect("export_djot")
+        .djot_text;
+    assert!(
+        !dj.contains("alignment"),
+        "alignment should not have been imported:\n{dj}"
+    );
+    assert!(dj.contains("hi"));
 }

@@ -1,4 +1,5 @@
-use crate::entities::{ListStyle, MarkerType, TextDirection};
+use crate::entities::{Alignment, ListStyle, MarkerType, TextDirection};
+use crate::parser_tools::djot_options::DjotImportOptions;
 
 /// A parsed inline span with formatting info
 #[derive(Debug, Clone, Default)]
@@ -67,6 +68,7 @@ impl ParsedElement {
                                 non_breakable_lines: None,
                                 direction: None,
                                 background_color: None,
+                                alignment: None,
                             });
                         }
                     }
@@ -92,6 +94,7 @@ impl ParsedElement {
                 non_breakable_lines: None,
                 direction: None,
                 background_color: None,
+                alignment: None,
             });
         }
         blocks
@@ -121,6 +124,9 @@ pub struct ParsedBlock {
     pub non_breakable_lines: Option<bool>,
     pub direction: Option<TextDirection>,
     pub background_color: Option<String>,
+    /// Paragraph alignment (djot `{alignment=left|right|center|justify}`). Maps
+    /// to `Block.fmt_alignment`. `None` when no alignment attribute is present.
+    pub alignment: Option<Alignment>,
 }
 
 impl ParsedBlock {
@@ -135,6 +141,7 @@ impl ParsedBlock {
             && self.non_breakable_lines.is_none()
             && self.direction.is_none()
             && self.background_color.is_none()
+            && self.alignment.is_none()
     }
 }
 
@@ -198,6 +205,7 @@ pub fn parse_markdown(markdown: &str) -> Vec<ParsedElement> {
                         non_breakable_lines: None,
                         direction: None,
                         background_color: None,
+                        alignment: None,
                     }));
                 }
                 in_block = false;
@@ -224,6 +232,7 @@ pub fn parse_markdown(markdown: &str) -> Vec<ParsedElement> {
                     non_breakable_lines: None,
                     direction: None,
                     background_color: None,
+                    alignment: None,
                 }));
                 in_block = false;
             }
@@ -257,6 +266,7 @@ pub fn parse_markdown(markdown: &str) -> Vec<ParsedElement> {
                         non_breakable_lines: None,
                         direction: None,
                         background_color: None,
+                        alignment: None,
                     }));
                 }
                 in_block = true;
@@ -286,6 +296,7 @@ pub fn parse_markdown(markdown: &str) -> Vec<ParsedElement> {
                         non_breakable_lines: None,
                         direction: None,
                         background_color: None,
+                        alignment: None,
                     }));
                 }
                 in_block = false;
@@ -323,6 +334,7 @@ pub fn parse_markdown(markdown: &str) -> Vec<ParsedElement> {
                     non_breakable_lines: None,
                     direction: None,
                     background_color: None,
+                    alignment: None,
                 }));
                 in_block = false;
                 is_code_block = false;
@@ -471,6 +483,7 @@ pub fn parse_markdown(markdown: &str) -> Vec<ParsedElement> {
                     non_breakable_lines: None,
                     direction: None,
                     background_color: None,
+                    alignment: None,
                 }));
             }
             Event::Start(Tag::BlockQuote(_)) => {
@@ -500,6 +513,7 @@ pub fn parse_markdown(markdown: &str) -> Vec<ParsedElement> {
             non_breakable_lines: None,
             direction: None,
             background_color: None,
+            alignment: None,
         }));
     }
 
@@ -523,6 +537,7 @@ pub fn parse_markdown(markdown: &str) -> Vec<ParsedElement> {
             non_breakable_lines: None,
             direction: None,
             background_color: None,
+            alignment: None,
         }));
     }
 
@@ -858,6 +873,7 @@ pub fn parse_html_elements(html: &str) -> Vec<ParsedElement> {
                         non_breakable_lines: None,
                         direction: None,
                         background_color: None,
+                        alignment: None,
                     }));
                     return;
                 }
@@ -921,6 +937,7 @@ pub fn parse_html_elements(html: &str) -> Vec<ParsedElement> {
                             non_breakable_lines: css.non_breakable_lines,
                             direction: css.direction,
                             background_color: css.background_color,
+                            alignment: None,
                         }));
                     }
                     // Append nested block elements after the parent block
@@ -983,6 +1000,7 @@ pub fn parse_html_elements(html: &str) -> Vec<ParsedElement> {
                         non_breakable_lines: None,
                         direction: None,
                         background_color: None,
+                        alignment: None,
                     }));
                 }
             }
@@ -1141,6 +1159,7 @@ pub fn parse_html_elements(html: &str) -> Vec<ParsedElement> {
             non_breakable_lines: None,
             direction: None,
             background_color: None,
+            alignment: None,
         }));
     }
 
@@ -1164,6 +1183,7 @@ pub fn parse_html_elements(html: &str) -> Vec<ParsedElement> {
             non_breakable_lines: None,
             direction: None,
             background_color: None,
+            alignment: None,
         }));
     }
 
@@ -1287,8 +1307,93 @@ fn djot_ordered_affixes(style: jotdown::OrderedListStyle) -> (String, String) {
     }
 }
 
-/// Push a finished block into `elements` (only the block-level fields djot uses
-/// are set; CSS-derived fields stay `None`).
+/// Optional block-level style attributes carried on a djot block through its
+/// `{key=value}` block attributes. All `None` when the block has no such
+/// attributes (or they were filtered out by [`DjotImportOptions`]).
+#[derive(Debug, Clone, Default)]
+struct DjotBlockStyle {
+    alignment: Option<Alignment>,
+    line_height: Option<i64>,
+    non_breakable_lines: Option<bool>,
+    direction: Option<TextDirection>,
+    background_color: Option<String>,
+}
+
+impl DjotBlockStyle {
+    /// Overlay the `Some` fields of `other` onto `self`, leaving `self`'s
+    /// existing values for any field `other` does not set. Used to combine a
+    /// heading's enclosing-`Section` attributes with any on the heading itself.
+    fn merge_from(&mut self, other: DjotBlockStyle) {
+        if other.alignment.is_some() {
+            self.alignment = other.alignment;
+        }
+        if other.line_height.is_some() {
+            self.line_height = other.line_height;
+        }
+        if other.non_breakable_lines.is_some() {
+            self.non_breakable_lines = other.non_breakable_lines;
+        }
+        if other.direction.is_some() {
+            self.direction = other.direction;
+        }
+        if other.background_color.is_some() {
+            self.background_color = other.background_color;
+        }
+    }
+}
+
+/// Read the round-tripped block-style attributes off a djot block's
+/// [`jotdown::Attributes`], honouring the import [`DjotImportOptions`]. Keys are
+/// the model field names (`alignment`, `line_height`, `direction`,
+/// `non_breakable_lines`, `background_color`); unrecognised values are ignored.
+fn block_attrs_to_style(attrs: &jotdown::Attributes, opts: &DjotImportOptions) -> DjotBlockStyle {
+    let mut style = DjotBlockStyle::default();
+
+    if opts.alignment
+        && let Some(v) = attrs.get_value("alignment")
+    {
+        style.alignment = match v.to_string().as_str() {
+            "left" => Some(Alignment::Left),
+            "right" => Some(Alignment::Right),
+            "center" => Some(Alignment::Center),
+            "justify" => Some(Alignment::Justify),
+            _ => None,
+        };
+    }
+    if opts.line_height
+        && let Some(v) = attrs.get_value("line_height")
+    {
+        style.line_height = v.to_string().parse::<i64>().ok();
+    }
+    if opts.direction
+        && let Some(v) = attrs.get_value("direction")
+    {
+        style.direction = match v.to_string().as_str() {
+            "ltr" => Some(TextDirection::LeftToRight),
+            "rtl" => Some(TextDirection::RightToLeft),
+            _ => None,
+        };
+    }
+    if opts.non_breakable_lines
+        && let Some(v) = attrs.get_value("non_breakable_lines")
+    {
+        style.non_breakable_lines = match v.to_string().as_str() {
+            "true" => Some(true),
+            "false" => Some(false),
+            _ => None,
+        };
+    }
+    if opts.background_color
+        && let Some(v) = attrs.get_value("background_color")
+    {
+        style.background_color = Some(v.to_string());
+    }
+
+    style
+}
+
+/// Push a finished block into `elements`, applying the djot block-level fields
+/// plus any round-tripped block-style attributes carried in `style`.
 #[allow(clippy::too_many_arguments)]
 fn djot_push_block(
     elements: &mut Vec<ParsedElement>,
@@ -1302,6 +1407,7 @@ fn djot_push_block(
     is_code_block: bool,
     code_language: Option<String>,
     blockquote_depth: u32,
+    style: DjotBlockStyle,
 ) {
     elements.push(ParsedElement::Block(ParsedBlock {
         spans,
@@ -1314,10 +1420,11 @@ fn djot_push_block(
         is_code_block,
         code_language,
         blockquote_depth,
-        line_height: None,
-        non_breakable_lines: None,
-        direction: None,
-        background_color: None,
+        line_height: style.line_height,
+        non_breakable_lines: style.non_breakable_lines,
+        direction: style.direction,
+        background_color: style.background_color,
+        alignment: style.alignment,
     }));
 }
 
@@ -1333,9 +1440,15 @@ fn djot_push_block(
 /// their canonical Unicode characters so the model→djot→model round-trip is a
 /// fixpoint.
 ///
+/// Standalone paragraphs and headings additionally carry the optional
+/// block-style attributes selected by `options` — paragraph alignment, line
+/// height, text direction, non-breakable lines and background color — read from
+/// djot `{key=value}` block attributes (see [`DjotImportOptions`]). List items,
+/// code blocks and table cells normalise their block styling away.
+///
 /// Known model limitations (normalised, not preserved on round-trip):
 /// ordered-list start number, table column alignment, and list tight/loose.
-pub fn parse_djot(djot: &str) -> Vec<ParsedElement> {
+pub fn parse_djot(djot: &str, options: &DjotImportOptions) -> Vec<ParsedElement> {
     use jotdown::{Container as C, Event as E, ListKind, Parser};
 
     let mut elements: Vec<ParsedElement> = Vec::new();
@@ -1344,6 +1457,9 @@ pub fn parse_djot(djot: &str) -> Vec<ParsedElement> {
     let mut is_code_block = false;
     let mut code_language: Option<String> = None;
     let mut blockquote_depth: u32 = 0;
+    // Block-style attributes captured from a standalone paragraph/heading's djot
+    // `{…}` block attributes, consumed when that block is flushed.
+    let mut pending_style = DjotBlockStyle::default();
 
     // Inline formatting state.
     let mut bold = false;
@@ -1419,6 +1535,7 @@ pub fn parse_djot(djot: &str) -> Vec<ParsedElement> {
                     false,
                     None,
                     blockquote_depth,
+                    DjotBlockStyle::default(),
                 );
             }
             let (style, prefix, suffix) = list_stack.last().cloned().unwrap_or((
@@ -1447,7 +1564,14 @@ pub fn parse_djot(djot: &str) -> Vec<ParsedElement> {
         match event {
             // ── Transparent wrappers (unwrap, keep content) ──
             E::Start(C::Document, _) | E::End(C::Document) => {}
-            E::Start(C::Section { .. }, _) | E::End(C::Section { .. }) => {}
+            E::Start(C::Section { .. }, attrs) => {
+                // A heading's block attributes attach to its enclosing Section,
+                // not the heading itself; capture them for the heading's flush.
+                if list_stack.is_empty() {
+                    pending_style.merge_from(block_attrs_to_style(&attrs, options));
+                }
+            }
+            E::End(C::Section { .. }) => {}
             E::Start(C::Div { .. }, _) | E::End(C::Div { .. }) => {}
 
             // ── Blockquote ──
@@ -1495,6 +1619,7 @@ pub fn parse_djot(djot: &str) -> Vec<ParsedElement> {
                         false,
                         None,
                         blockquote_depth,
+                        DjotBlockStyle::default(),
                     );
                 }
                 cur_list_style = None;
@@ -1502,7 +1627,12 @@ pub fn parse_djot(djot: &str) -> Vec<ParsedElement> {
             }
 
             // ── Headings, paragraphs, code blocks ──
-            E::Start(C::Heading { level, .. }, _) => current_heading = Some(level as i64),
+            E::Start(C::Heading { level, .. }, attrs) => {
+                current_heading = Some(level as i64);
+                // The block-style attributes live on the enclosing Section;
+                // merge any placed directly on the heading without clearing them.
+                pending_style.merge_from(block_attrs_to_style(&attrs, options));
+            }
             E::End(C::Heading { .. }) => {
                 djot_push_block(
                     &mut elements,
@@ -1516,9 +1646,20 @@ pub fn parse_djot(djot: &str) -> Vec<ParsedElement> {
                     false,
                     None,
                     blockquote_depth,
+                    std::mem::take(&mut pending_style),
                 );
             }
-            E::Start(C::Paragraph, _) => current_heading = None,
+            E::Start(C::Paragraph, attrs) => {
+                current_heading = None;
+                // Block attributes only apply to standalone paragraphs;
+                // list-item paragraphs normalise their styling away (matching
+                // the exporter).
+                pending_style = if list_stack.is_empty() {
+                    block_attrs_to_style(&attrs, options)
+                } else {
+                    DjotBlockStyle::default()
+                };
+            }
             E::End(C::Paragraph) => {
                 if !current_spans.is_empty() {
                     djot_push_block(
@@ -1533,6 +1674,7 @@ pub fn parse_djot(djot: &str) -> Vec<ParsedElement> {
                         false,
                         None,
                         blockquote_depth,
+                        std::mem::take(&mut pending_style),
                     );
                 }
                 cur_list_style = None;
@@ -1565,6 +1707,7 @@ pub fn parse_djot(djot: &str) -> Vec<ParsedElement> {
                     true,
                     code_language.take(),
                     blockquote_depth,
+                    DjotBlockStyle::default(),
                 );
                 is_code_block = false;
             }
@@ -1670,6 +1813,7 @@ pub fn parse_djot(djot: &str) -> Vec<ParsedElement> {
                         is_code_block,
                         code_language.clone(),
                         blockquote_depth,
+                        pending_style.clone(),
                     );
                 }
             }
@@ -1699,6 +1843,7 @@ pub fn parse_djot(djot: &str) -> Vec<ParsedElement> {
             is_code_block,
             code_language.take(),
             blockquote_depth,
+            std::mem::take(&mut pending_style),
         );
     }
 
@@ -1720,6 +1865,7 @@ pub fn parse_djot(djot: &str) -> Vec<ParsedElement> {
             false,
             None,
             0,
+            DjotBlockStyle::default(),
         );
     }
 
@@ -2113,7 +2259,7 @@ mod djot_tests {
     use crate::entities::MarkerType;
 
     fn blocks(d: &str) -> Vec<ParsedBlock> {
-        ParsedElement::flatten_to_blocks(parse_djot(d))
+        ParsedElement::flatten_to_blocks(parse_djot(d, &DjotImportOptions::default()))
     }
 
     fn first_span_with(b: &ParsedBlock, pred: impl Fn(&ParsedSpan) -> bool) -> &ParsedSpan {
@@ -2198,7 +2344,7 @@ mod djot_tests {
 
     #[test]
     fn blockquote_depth() {
-        let els = parse_djot("> quoted");
+        let els = parse_djot("> quoted", &DjotImportOptions::default());
         match &els[0] {
             ParsedElement::Block(b) => assert_eq!(b.blockquote_depth, 1),
             _ => panic!("expected block"),
@@ -2220,7 +2366,10 @@ mod djot_tests {
 
     #[test]
     fn table_parsed_as_table() {
-        let els = parse_djot("| a | b |\n|---|---|\n| c | d |");
+        let els = parse_djot(
+            "| a | b |\n|---|---|\n| c | d |",
+            &DjotImportOptions::default(),
+        );
         assert_eq!(els.len(), 1);
         match &els[0] {
             ParsedElement::Table(t) => {
@@ -2290,5 +2439,56 @@ mod djot_tests {
         let b = blocks("");
         assert_eq!(b.len(), 1);
         assert!(b[0].spans.iter().all(|s| s.text.is_empty()));
+    }
+
+    #[test]
+    fn block_attributes_parse_into_block() {
+        let b = blocks(
+            "{alignment=center line_height=1500 direction=rtl non_breakable_lines=true background_color=\"#ff0000\"}\nhello",
+        );
+        assert_eq!(b.len(), 1);
+        assert_eq!(b[0].alignment, Some(Alignment::Center));
+        assert_eq!(b[0].line_height, Some(1500));
+        assert_eq!(b[0].direction, Some(TextDirection::RightToLeft));
+        assert_eq!(b[0].non_breakable_lines, Some(true));
+        assert_eq!(b[0].background_color, Some("#ff0000".to_string()));
+    }
+
+    #[test]
+    fn block_attributes_on_heading() {
+        let b = blocks("{alignment=right}\n# Title");
+        assert_eq!(b[0].heading_level, Some(1));
+        assert_eq!(b[0].alignment, Some(Alignment::Right));
+    }
+
+    #[test]
+    fn block_attributes_respect_import_options() {
+        // With every optional attribute disabled, the `{…}` block attributes are
+        // parsed and discarded — only the core paragraph survives.
+        let src = "{alignment=center line_height=1500}\nhello";
+        let b = ParsedElement::flatten_to_blocks(parse_djot(src, &DjotImportOptions::none()));
+        assert_eq!(b[0].alignment, None);
+        assert_eq!(b[0].line_height, None);
+        assert_eq!(
+            b[0].spans
+                .iter()
+                .map(|s| s.text.as_str())
+                .collect::<String>(),
+            "hello"
+        );
+    }
+
+    #[test]
+    fn list_item_block_attributes_are_dropped() {
+        // Block attributes only bind to standalone paragraphs/headings; a list
+        // item normalises them away (symmetric with the exporter).
+        let b = blocks("{alignment=center}\n- item");
+        assert!(b.iter().all(|blk| blk.alignment.is_none()));
+    }
+
+    #[test]
+    fn unknown_alignment_value_is_ignored() {
+        let b = blocks("{alignment=sideways}\nhello");
+        assert_eq!(b[0].alignment, None);
     }
 }

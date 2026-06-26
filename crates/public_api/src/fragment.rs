@@ -100,9 +100,14 @@ impl DocumentFragment {
         parsed_elements_to_fragment(parsed)
     }
 
-    /// Create a fragment from djot markup.
+    /// Create a fragment from djot markup. Paste always uses the lossless
+    /// default [`crate::DjotImportOptions`]; per-feature selection is exposed on
+    /// the document-level import path (`TextDocument::set_djot_with_options`).
     pub fn from_djot(djot: &str) -> Self {
-        let parsed = frontend::common::parser_tools::content_parser::parse_djot(djot);
+        let parsed = frontend::common::parser_tools::content_parser::parse_djot(
+            djot,
+            &frontend::common::parser_tools::DjotImportOptions::default(),
+        );
         parsed_elements_to_fragment(parsed)
     }
 

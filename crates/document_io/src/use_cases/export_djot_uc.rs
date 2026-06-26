@@ -4,10 +4,11 @@ use anyhow::{Result, anyhow};
 use common::database::QueryUnitOfWork;
 use common::database::rope_helpers::block_content_via_store;
 use common::entities::{
-    Block, CharVerticalAlignment, Document, Frame, List, ListStyle, MarkerType, Root, Table,
-    TableCell,
+    Alignment, Block, CharVerticalAlignment, Document, Frame, List, ListStyle, MarkerType, Root,
+    Table, TableCell, TextDirection,
 };
 use common::format_runs::{InlineContent, InlineSegment};
+use common::parser_tools::DjotExportOptions;
 use common::types::{EntityId, ROOT_ENTITY_ID};
 use std::collections::HashSet;
 
@@ -40,7 +41,7 @@ impl ExportDjotUseCase {
         ExportDjotUseCase { uow_factory }
     }
 
-    pub fn execute(&mut self) -> Result<ExportDjotDto> {
+    pub fn execute(&mut self, options: &DjotExportOptions) -> Result<ExportDjotDto> {
         let uow = self.uow_factory.create();
         uow.begin_transaction()?;
 
@@ -112,7 +113,8 @@ impl ExportDjotUseCase {
             }
 
             if let Some(ref f) = frame {
-                let frame_text = self.render_frame_content(&*uow, f, &cell_frame_ids, "")?;
+                let frame_text =
+                    self.render_frame_content(&*uow, f, &cell_frame_ids, "", options)?;
                 if !frame_text.is_empty() {
                     if !output_parts.is_empty() {
                         output_parts.push("\n\n".to_string());
@@ -144,6 +146,7 @@ impl ExportDjotUseCase {
         frame: &Frame,
         cell_frame_ids: &HashSet<EntityId>,
         quote_prefix: &str,
+        options: &DjotExportOptions,
     ) -> Result<String> {
         let mut result = String::new();
         let mut ordered_list_counter: i64 = 0;
@@ -170,6 +173,7 @@ impl ExportDjotUseCase {
                             quote_prefix,
                             &mut ordered_list_counter,
                             &mut current_list_id,
+                            options,
                         )?;
                         if !result.is_empty() {
                             result.push_str("\n\n");
@@ -208,8 +212,13 @@ impl ExportDjotUseCase {
                             quote_prefix.to_string()
                         };
 
-                        let sub_text =
-                            self.render_frame_content(uow, sf, cell_frame_ids, &sub_prefix)?;
+                        let sub_text = self.render_frame_content(
+                            uow,
+                            sf,
+                            cell_frame_ids,
+                            &sub_prefix,
+                            options,
+                        )?;
                         if !sub_text.is_empty() {
                             if !result.is_empty() {
                                 result.push_str("\n\n");
@@ -243,6 +252,7 @@ impl ExportDjotUseCase {
                     quote_prefix,
                     &mut ordered_list_counter,
                     &mut current_list_id,
+                    options,
                 )?;
                 if !result.is_empty() {
                     result.push_str("\n\n");
@@ -263,6 +273,7 @@ impl ExportDjotUseCase {
         quote_prefix: &str,
         ordered_list_counter: &mut i64,
         current_list_id: &mut Option<EntityId>,
+        options: &DjotExportOptions,
     ) -> Result<(String, bool)> {
         // Check if this is a code block
         if block.fmt_is_code_block == Some(true) {
@@ -329,10 +340,14 @@ impl ExportDjotUseCase {
         // Build inline djot text
         let inline_md = self.render_inline_segments(&elements)?;
 
-        // Build the block line
+        // Build the block line. Standalone paragraphs and headings may carry a
+        // leading `{key=value}` djot block-attribute line for the optional
+        // block-style attributes; list items and code blocks do not.
+        let attr_line = render_block_attrs(block, options);
         let block_line = if let Some(level) = block.fmt_heading_level {
             let prefix = "#".repeat(level as usize);
-            format!("{}{} {}", quote_prefix, prefix, inline_md)
+            let head = format!("{}{} {}", quote_prefix, prefix, inline_md);
+            prepend_block_attrs(&attr_line, quote_prefix, head)
         } else if let Some(ref list_entity) = list {
             let indent_prefix = "  ".repeat(list_entity.indent.max(0) as usize);
             let is_task = matches!(
@@ -386,7 +401,8 @@ impl ExportDjotUseCase {
             *ordered_list_counter = 0;
             // A paragraph's content sits at the start of a line; guard against
             // its leading characters being parsed as a block-construct marker.
-            format!("{}{}", quote_prefix, guard_block_start(&inline_md))
+            let para = format!("{}{}", quote_prefix, guard_block_start(&inline_md));
+            prepend_block_attrs(&attr_line, quote_prefix, para)
         };
 
         Ok((block_line, is_list_item))
@@ -560,6 +576,76 @@ fn prefix_lines(text: &str, prefix: &str) -> String {
         .map(|line| format!("{}{}", prefix, line))
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+/// Render the optional block-style attributes of `block` as a djot
+/// `{key=value …}` block-attribute string, honouring the export `options`.
+/// Returns an empty string when the block carries none of the selected
+/// attributes. Keys are the model field names so the importer reads them back
+/// verbatim, making the model→djot→model round-trip a fixpoint.
+fn render_block_attrs(block: &Block, options: &DjotExportOptions) -> String {
+    let mut pairs: Vec<String> = Vec::new();
+
+    if options.alignment
+        && let Some(alignment) = &block.fmt_alignment
+    {
+        let v = match alignment {
+            Alignment::Left => "left",
+            Alignment::Right => "right",
+            Alignment::Center => "center",
+            Alignment::Justify => "justify",
+        };
+        pairs.push(format!("alignment={v}"));
+    }
+    if options.line_height
+        && let Some(lh) = block.fmt_line_height
+    {
+        pairs.push(format!("line_height={lh}"));
+    }
+    if options.direction
+        && let Some(direction) = &block.fmt_direction
+    {
+        let v = match direction {
+            TextDirection::LeftToRight => "ltr",
+            TextDirection::RightToLeft => "rtl",
+        };
+        pairs.push(format!("direction={v}"));
+    }
+    if options.non_breakable_lines
+        && let Some(nbl) = block.fmt_non_breakable_lines
+    {
+        pairs.push(format!("non_breakable_lines={nbl}"));
+    }
+    if options.background_color
+        && let Some(bg) = &block.fmt_background_color
+    {
+        pairs.push(format!("background_color={}", djot_attr_value(bg)));
+    }
+
+    if pairs.is_empty() {
+        String::new()
+    } else {
+        format!("{{{}}}", pairs.join(" "))
+    }
+}
+
+/// Prepend a block-attribute line to a rendered block `body`, repeating the
+/// blockquote `quote_prefix` on the attribute line. A no-op when `attr_line` is
+/// empty.
+fn prepend_block_attrs(attr_line: &str, quote_prefix: &str, body: String) -> String {
+    if attr_line.is_empty() {
+        body
+    } else {
+        format!("{quote_prefix}{attr_line}\n{body}")
+    }
+}
+
+/// Encode an arbitrary attribute value as a double-quoted djot attribute value,
+/// escaping `\` and `"` so it round-trips through jotdown's attribute parser
+/// verbatim (covers colors like `#ff0000` and values containing spaces).
+fn djot_attr_value(value: &str) -> String {
+    let escaped = value.replace('\\', "\\\\").replace('"', "\\\"");
+    format!("\"{escaped}\"")
 }
 
 /// Backslash-escape every character that can trigger djot *inline* markup, so

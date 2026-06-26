@@ -42,6 +42,7 @@ mod text_table;
 // ── Re-exports from entity DTOs (enums that consumers need) ──────
 pub use frontend::block::dtos::{Alignment, MarkerType};
 pub use frontend::block::dtos::{CharVerticalAlignment, InlineContent, UnderlineStyle};
+pub use frontend::common::parser_tools::{DjotExportOptions, DjotImportOptions};
 pub use frontend::document::dtos::{TextDirection, WrapMode};
 pub use frontend::frame::dtos::FramePosition;
 pub use frontend::list::dtos::ListStyle;
