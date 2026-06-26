@@ -2115,7 +2115,7 @@ mod djot_tests {
         ParsedElement::flatten_to_blocks(parse_djot(d))
     }
 
-    fn first_span_with<'a>(b: &'a ParsedBlock, pred: impl Fn(&ParsedSpan) -> bool) -> &'a ParsedSpan {
+    fn first_span_with(b: &ParsedBlock, pred: impl Fn(&ParsedSpan) -> bool) -> &ParsedSpan {
         b.spans.iter().find(|s| pred(s)).expect("span not found")
     }
 

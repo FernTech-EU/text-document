@@ -41,7 +41,7 @@ enum Inline {
 enum Block {
     Para(Vec<Inline>),
     Heading(u8, String),
-    CodeBlock(Option<String>, String),
+    Fenced(Option<String>, String),
     Bullet(Vec<String>),
     Ordered(Vec<String>),
     Task(Vec<(bool, String)>),
@@ -68,7 +68,7 @@ fn emit_block(b: &Block) -> String {
     match b {
         Block::Para(inlines) => inlines.iter().map(emit_inline).collect::<String>(),
         Block::Heading(level, s) => format!("{} {s}", "#".repeat(*level as usize)),
-        Block::CodeBlock(lang, content) => {
+        Block::Fenced(lang, content) => {
             format!("```{}\n{content}\n```", lang.as_deref().unwrap_or(""))
         }
         // Lists are emitted "loose" (blank line between items): the canonical
@@ -142,7 +142,7 @@ fn block() -> impl Strategy<Value = Block> {
             prop::option::of(prop_oneof![Just("rust".to_string()), Just("py".to_string())]),
             "[a-zA-Z0-9 ;=()]{0,30}",
         )
-            .prop_map(|(lang, c)| Block::CodeBlock(lang, c)),
+            .prop_map(|(lang, c)| Block::Fenced(lang, c)),
         prop::collection::vec(word(), 1..4).prop_map(Block::Bullet),
         prop::collection::vec(word(), 1..4).prop_map(Block::Ordered),
         prop::collection::vec((any::<bool>(), word()), 1..4).prop_map(Block::Task),
