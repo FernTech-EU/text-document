@@ -1768,6 +1768,7 @@ dependencies = [
  "chrono",
  "docx-rs",
  "parking_lot",
+ "proptest",
  "regex",
  "serde",
  "serde_json",

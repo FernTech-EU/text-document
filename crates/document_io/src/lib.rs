@@ -5,3 +5,10 @@ mod units_of_work;
 pub(crate) mod use_cases;
 
 pub use dtos::*;
+
+/// Re-export of the `docx-rs` crate used by the DOCX exporter, so that callers
+/// (notably tests inspecting the output of
+/// [`document_io_controller::build_docx_document`]) can name its types against
+/// the exact version this crate links.
+#[doc(hidden)]
+pub use docx_rs;

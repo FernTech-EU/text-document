@@ -4,12 +4,15 @@ use crate::ExportDocxResultDto;
 use anyhow::{Result, anyhow};
 use common::database::QueryUnitOfWork;
 use common::database::rope_helpers::block_content_via_store;
-use common::entities::{Block, Document, Frame, List, Root, Table, TableCell};
-use common::format_runs::InlineContent;
+use common::entities::{
+    Alignment, Block, Document, Frame, List, ListStyle, MarkerType, Root, Table, TableCell,
+};
+use common::format_runs::{InlineContent, InlineSegment};
 use common::long_operation::LongOperation;
 use common::types::{EntityId, ROOT_ENTITY_ID};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 pub trait ExportDocxUnitOfWorkFactoryTrait: Send + Sync {
     fn create(&self) -> Box<dyn ExportDocxUnitOfWorkTrait>;
@@ -21,6 +24,7 @@ pub trait ExportDocxUnitOfWorkFactoryTrait: Send + Sync {
 #[macros::uow_action(entity = "Document", action = "GetRelationshipRO", thread_safe = true)]
 #[macros::uow_action(entity = "Frame", action = "GetRO", thread_safe = true)]
 #[macros::uow_action(entity = "Frame", action = "GetRelationshipRO", thread_safe = true)]
+#[macros::uow_action(entity = "Block", action = "GetRO", thread_safe = true)]
 #[macros::uow_action(entity = "Block", action = "GetMultiRO", thread_safe = true)]
 #[macros::uow_action(entity = "Block", action = "GetRelationshipRO", thread_safe = true)]
 #[macros::uow_action(entity = "List", action = "GetRO", thread_safe = true)]
@@ -52,11 +56,8 @@ impl LongOperation for ExportDocxUseCase {
     fn execute(
         &self,
         progress_callback: Box<dyn Fn(common::long_operation::OperationProgress) + Send>,
-        cancel_flag: Arc<std::sync::atomic::AtomicBool>,
+        cancel_flag: Arc<AtomicBool>,
     ) -> Result<Self::Output> {
-        use docx_rs::*;
-        use std::sync::atomic::Ordering;
-
         // Validate output path
         let output_path = std::path::Path::new(&self.dto.output_path);
         if let Some(parent) = output_path.parent()
@@ -77,171 +78,15 @@ impl LongOperation for ExportDocxUseCase {
         let uow = self.uow_factory.create();
         uow.begin_transaction()?;
 
-        // Step 1: Get Root and Document
-        let root = uow
-            .get_root(&ROOT_ENTITY_ID)?
-            .ok_or_else(|| anyhow!("Root entity not found"))?;
-
-        let doc_ids = uow.get_root_relationship(
-            &root.id,
-            &common::direct_access::root::RootRelationshipField::Document,
-        )?;
-        let doc_id = *doc_ids
-            .first()
-            .ok_or_else(|| anyhow!("Root has no associated Document"))?;
-
-        let frame_ids = uow.get_document_relationship(
-            &doc_id,
-            &common::direct_access::document::DocumentRelationshipField::Frames,
-        )?;
-
-        // Collect all cell frame IDs so we can skip them in the main loop
-        let table_ids = uow.get_document_relationship(
-            &doc_id,
-            &common::direct_access::document::DocumentRelationshipField::Tables,
-        )?;
-        let mut cell_frame_ids: HashSet<EntityId> = HashSet::new();
-        for tid in &table_ids {
-            let cell_ids = uow.get_table_relationship(
-                tid,
-                &common::direct_access::table::TableRelationshipField::Cells,
-            )?;
-            let cells_opt = uow.get_table_cell_multi(&cell_ids)?;
-            for cell in cells_opt.into_iter().flatten() {
-                if let Some(cf_id) = cell.cell_frame {
-                    cell_frame_ids.insert(cf_id);
-                }
-            }
-        }
-
-        let mut docx = Docx::new();
-        let mut paragraph_count: i64 = 0;
-
-        progress_callback(common::long_operation::OperationProgress::new(
-            10.0,
-            Some("Walking document tree...".to_string()),
-        ));
-
-        for frame_id in &frame_ids {
-            if cancel_flag.load(Ordering::Relaxed) {
-                uow.end_transaction()?;
-                return Err(anyhow!("Operation was cancelled"));
-            }
-
-            // Skip cell frames — they're rendered as part of their table
-            if cell_frame_ids.contains(frame_id) {
-                continue;
-            }
-
-            // Check if this is a table anchor frame
-            let frame = uow.get_frame(frame_id)?;
-            if let Some(ref f) = frame
-                && let Some(table_id) = f.table
-            {
-                let table = self.render_table_docx(&*uow, &table_id)?;
-                docx = docx.add_table(table);
-                paragraph_count += 1;
-                continue;
-            }
-
-            let block_ids = uow.get_frame_relationship(
-                frame_id,
-                &common::direct_access::frame::FrameRelationshipField::Blocks,
-            )?;
-
-            if block_ids.is_empty() {
-                continue;
-            }
-
-            let blocks_opt = uow.get_block_multi(&block_ids)?;
-            let mut blocks: Vec<Block> = blocks_opt.into_iter().flatten().collect();
-            blocks.sort_by_key(|b| b.document_position);
-            let total = blocks.len();
-
-            for (idx, block) in blocks.iter().enumerate() {
-                if cancel_flag.load(Ordering::Relaxed) {
-                    uow.end_transaction()?;
-                    return Err(anyhow!("Operation was cancelled"));
-                }
-
-                let block_text = block_content_via_store(block, &uow.store());
-                let elements = common::format_runs_query::inline_segments_for_block(
-                    &uow.store(),
-                    block.id,
-                    &block_text,
-                );
-
-                let mut paragraph = Paragraph::new();
-
-                // Apply heading style
-                if let Some(level) = block.fmt_heading_level {
-                    let style_name = format!("Heading{}", level.clamp(1, 6));
-                    paragraph = paragraph.style(&style_name);
-                }
-                // Apply line height (thousandths → 240ths: 1000 = 240, 1500 = 360)
-                if let Some(lh) = block.fmt_line_height {
-                    let twips = (lh as f64 / 1000.0 * 240.0) as i32;
-                    paragraph = paragraph.line_spacing(
-                        LineSpacing::new()
-                            .line_rule(LineSpacingType::Auto)
-                            .line(twips),
-                    );
-                }
-                // Apply non-breakable lines
-                if block.fmt_non_breakable_lines == Some(true) {
-                    paragraph = paragraph.keep_lines(true);
-                }
-                // Note: bidi (RTL direction) and paragraph shading (background_color)
-                // are not directly exposed on Paragraph in docx-rs 0.4.
-
-                for elem in &elements {
-                    let text = match &elem.content {
-                        InlineContent::Text(t) => t.clone(),
-                        InlineContent::Image { name, .. } => {
-                            format!("[Image: {}]", name)
-                        }
-                        InlineContent::Empty => String::new(),
-                    };
-
-                    if text.is_empty() {
-                        continue;
-                    }
-
-                    let mut run = Run::new().add_text(text);
-
-                    if elem.fmt_font_bold == Some(true) {
-                        run = run.bold();
-                    }
-                    if elem.fmt_font_italic == Some(true) {
-                        run = run.italic();
-                    }
-                    if elem.fmt_font_underline == Some(true) {
-                        run = run.underline("single");
-                    }
-                    if elem.fmt_font_strikeout == Some(true) {
-                        run = run.strike();
-                    }
-                    if elem.fmt_font_family.as_deref() == Some("monospace") {
-                        run = run.fonts(RunFonts::new().ascii("Courier New"));
-                    }
-
-                    paragraph = paragraph.add_run(run);
-                }
-
-                docx = docx.add_paragraph(paragraph);
-                paragraph_count += 1;
-
-                if idx % 10 == 0 {
-                    let pct = 10.0 + (idx as f32 / total as f32) * 80.0;
-                    progress_callback(common::long_operation::OperationProgress::new(
-                        pct,
-                        Some(format!("Processing paragraph {}/{}", idx + 1, total)),
-                    ));
-                }
-            }
-        }
+        let build_result = self.build_docx(
+            &*uow,
+            progress_callback.as_ref(),
+            Some(cancel_flag.as_ref()),
+        );
 
         uow.end_transaction()?;
+
+        let (docx, paragraph_count) = build_result?;
 
         progress_callback(common::long_operation::OperationProgress::new(
             90.0,
@@ -272,11 +117,403 @@ impl LongOperation for ExportDocxUseCase {
     }
 }
 
+/// One unit-step of left indentation, in twips (1/20 pt). 720 twips = 0.5",
+/// the conventional Word indent step used for both blockquote nesting and list
+/// indentation.
+const INDENT_STEP_TWIPS: i32 = 720;
+
+/// Hanging indent applied to numbered/bulleted/task paragraphs so the marker
+/// sits in the gutter and the text aligns, in twips.
+const HANGING_TWIPS: i32 = 360;
+
+/// Light-grey fill behind code blocks, as an `RRGGBB` hex string.
+const CODE_BLOCK_FILL: &str = "F5F5F5";
+
+/// A rendered top-level document child. The DOCX builder consumes `self` and
+/// returns a new value on every `add_*`, so we cannot thread a `&mut Docx`
+/// through the recursive frame walk; instead each block/table is rendered into
+/// one of these and applied to the document in a final pass.
+enum DocxElement {
+    Paragraph(Box<docx_rs::Paragraph>),
+    Table(Box<docx_rs::Table>),
+}
+
+/// Accumulates the numbering definitions referenced by list paragraphs.
+///
+/// Each `List` entity maps to its own numbering instance so that ordered
+/// counters restart per list (two separate ordered lists each begin at 1).
+/// Definitions are registered on the `Docx` after the whole tree is walked.
+#[derive(Default)]
+struct NumberingBuilder {
+    /// `List` entity id -> assigned numbering id.
+    map: HashMap<EntityId, usize>,
+    defs: Vec<(docx_rs::AbstractNumbering, docx_rs::Numbering)>,
+}
+
+impl NumberingBuilder {
+    /// Return the numbering id for `list`, creating its abstract-numbering and
+    /// numbering definitions on first use.
+    fn get_or_create(&mut self, list_id: EntityId, list: &List) -> usize {
+        if let Some(&id) = self.map.get(&list_id) {
+            return id;
+        }
+        // Numbering ids are 1-based; `map.len()` is the count assigned so far.
+        let id = self.map.len() + 1;
+        let abstract_num = build_abstract_numbering(id, list);
+        let numbering = docx_rs::Numbering::new(id, id);
+        self.defs.push((abstract_num, numbering));
+        self.map.insert(list_id, id);
+        id
+    }
+}
+
 impl ExportDocxUseCase {
+    /// Assemble the in-memory DOCX document from the store, performing no file
+    /// I/O. Returns the document together with the number of top-level elements
+    /// (paragraphs and tables) emitted, which is reported as `paragraph_count`.
+    ///
+    /// `execute` uses it and then packs the result to disk; the controller
+    /// exposes a file-less variant for tests via [`Self::build_document`].
+    pub(crate) fn build_docx(
+        &self,
+        uow: &dyn ExportDocxUnitOfWorkTrait,
+        progress_callback: &dyn Fn(common::long_operation::OperationProgress),
+        cancel_flag: Option<&AtomicBool>,
+    ) -> Result<(docx_rs::Docx, i64)> {
+        use docx_rs::*;
+
+        // Step 1: Get Root and Document
+        let root = uow
+            .get_root(&ROOT_ENTITY_ID)?
+            .ok_or_else(|| anyhow!("Root entity not found"))?;
+
+        let doc_ids = uow.get_root_relationship(
+            &root.id,
+            &common::direct_access::root::RootRelationshipField::Document,
+        )?;
+        let doc_id = *doc_ids
+            .first()
+            .ok_or_else(|| anyhow!("Root has no associated Document"))?;
+
+        let frame_ids = uow.get_document_relationship(
+            &doc_id,
+            &common::direct_access::document::DocumentRelationshipField::Frames,
+        )?;
+
+        // Collect all cell frame IDs so we can skip them in the main walk; they
+        // are rendered as part of their owning table.
+        let table_ids = uow.get_document_relationship(
+            &doc_id,
+            &common::direct_access::document::DocumentRelationshipField::Tables,
+        )?;
+        let mut cell_frame_ids: HashSet<EntityId> = HashSet::new();
+        for tid in &table_ids {
+            let cell_ids = uow.get_table_relationship(
+                tid,
+                &common::direct_access::table::TableRelationshipField::Cells,
+            )?;
+            let cells_opt = uow.get_table_cell_multi(&cell_ids)?;
+            for cell in cells_opt.into_iter().flatten() {
+                if let Some(cf_id) = cell.cell_frame {
+                    cell_frame_ids.insert(cf_id);
+                }
+            }
+        }
+
+        progress_callback(common::long_operation::OperationProgress::new(
+            10.0,
+            Some("Walking document tree...".to_string()),
+        ));
+
+        let mut numbering = NumberingBuilder::default();
+        let mut elements: Vec<DocxElement> = Vec::new();
+
+        let total_frames = frame_ids.len().max(1);
+        for (frame_idx, frame_id) in frame_ids.iter().enumerate() {
+            check_cancelled(cancel_flag)?;
+
+            // Skip cell frames — rendered as part of their table.
+            if cell_frame_ids.contains(frame_id) {
+                continue;
+            }
+
+            let frame = uow.get_frame(frame_id)?;
+            let Some(frame) = frame else {
+                continue;
+            };
+
+            // Only top-level frames are walked here. Sub-frames (blockquotes,
+            // nested content) are reached recursively from their parent's
+            // `child_order`; rendering them again at the top level would
+            // duplicate their content.
+            if frame.parent_frame.is_some() {
+                continue;
+            }
+
+            // A table anchor frame contributes one table.
+            if let Some(table_id) = frame.table {
+                let table = self.render_table_docx(uow, &table_id, &mut numbering)?;
+                elements.push(DocxElement::Table(Box::new(table)));
+                continue;
+            }
+
+            self.render_frame_content(
+                uow,
+                &frame,
+                &cell_frame_ids,
+                0,
+                &mut numbering,
+                cancel_flag,
+                &mut elements,
+            )?;
+
+            let pct = 10.0 + (frame_idx as f32 / total_frames as f32) * 70.0;
+            progress_callback(common::long_operation::OperationProgress::new(
+                pct,
+                Some(format!(
+                    "Processing frame {}/{}",
+                    frame_idx + 1,
+                    total_frames
+                )),
+            ));
+        }
+
+        progress_callback(common::long_operation::OperationProgress::new(
+            85.0,
+            Some("Assembling document...".to_string()),
+        ));
+
+        let paragraph_count = elements.len() as i64;
+
+        let mut docx = Docx::new();
+        // Register numbering definitions before the body so the referenced ids
+        // resolve.
+        for (abstract_num, num) in numbering.defs {
+            docx = docx.add_abstract_numbering(abstract_num).add_numbering(num);
+        }
+        for element in elements {
+            docx = match element {
+                DocxElement::Paragraph(p) => docx.add_paragraph(*p),
+                DocxElement::Table(t) => docx.add_table(*t),
+            };
+        }
+
+        Ok((docx, paragraph_count))
+    }
+
+    /// Build the document without any file I/O, using a no-op progress callback
+    /// and no cancellation. Intended for callers (notably tests) that want to
+    /// inspect the produced structure directly.
+    pub(crate) fn build_document(&self) -> Result<(docx_rs::Docx, i64)> {
+        let uow = self.uow_factory.create();
+        uow.begin_transaction()?;
+        let result = self.build_docx(&*uow, &|_progress| {}, None);
+        uow.end_transaction()?;
+        result
+    }
+
+    /// Walk a frame's `child_order`, appending rendered paragraphs/tables to
+    /// `out`. `quote_depth` is the current blockquote nesting level (0 at the
+    /// document body), used to compute left indentation.
+    #[allow(clippy::too_many_arguments)]
+    fn render_frame_content(
+        &self,
+        uow: &dyn ExportDocxUnitOfWorkTrait,
+        frame: &Frame,
+        cell_frame_ids: &HashSet<EntityId>,
+        quote_depth: usize,
+        numbering: &mut NumberingBuilder,
+        cancel_flag: Option<&AtomicBool>,
+        out: &mut Vec<DocxElement>,
+    ) -> Result<()> {
+        if !frame.child_order.is_empty() {
+            for &entry in &frame.child_order {
+                check_cancelled(cancel_flag)?;
+                // `child_order` encodes block ids as positive and sub-frame ids
+                // as negated. Entity ids are 1-based, so a 0 entry is malformed;
+                // skip it rather than dispatching it as the sub-frame `-0`.
+                if entry == 0 {
+                    continue;
+                }
+                if entry > 0 {
+                    // Positive: a block id.
+                    let block_id = entry as EntityId;
+                    if let Some(block) = uow.get_block(&block_id)? {
+                        let paragraph = self.render_block(uow, &block, quote_depth, numbering)?;
+                        out.push(DocxElement::Paragraph(Box::new(paragraph)));
+                    }
+                } else {
+                    // Negative: a negated sub-frame id.
+                    let sub_frame_id = (-entry) as EntityId;
+                    if cell_frame_ids.contains(&sub_frame_id) {
+                        continue;
+                    }
+                    if let Some(sub_frame) = uow.get_frame(&sub_frame_id)? {
+                        // Table anchor sub-frame.
+                        if let Some(table_id) = sub_frame.table {
+                            let table = self.render_table_docx(uow, &table_id, numbering)?;
+                            out.push(DocxElement::Table(Box::new(table)));
+                            continue;
+                        }
+                        // A blockquote sub-frame deepens the indent; any other
+                        // sub-frame is rendered inline at the same depth.
+                        let sub_depth = if sub_frame.fmt_is_blockquote == Some(true) {
+                            quote_depth + 1
+                        } else {
+                            quote_depth
+                        };
+                        self.render_frame_content(
+                            uow,
+                            &sub_frame,
+                            cell_frame_ids,
+                            sub_depth,
+                            numbering,
+                            cancel_flag,
+                            out,
+                        )?;
+                    }
+                }
+            }
+        } else {
+            // Fallback: no child_order recorded — iterate the Blocks
+            // relationship in document order.
+            let block_ids = uow.get_frame_relationship(
+                &frame.id,
+                &common::direct_access::frame::FrameRelationshipField::Blocks,
+            )?;
+            if block_ids.is_empty() {
+                return Ok(());
+            }
+            let blocks_opt = uow.get_block_multi(&block_ids)?;
+            let mut blocks: Vec<Block> = blocks_opt.into_iter().flatten().collect();
+            blocks.sort_by_key(|b| b.document_position);
+            for block in &blocks {
+                check_cancelled(cancel_flag)?;
+                let paragraph = self.render_block(uow, block, quote_depth, numbering)?;
+                out.push(DocxElement::Paragraph(Box::new(paragraph)));
+            }
+        }
+        Ok(())
+    }
+
+    /// Render a single block into one DOCX paragraph.
+    ///
+    /// Dispatch priority mirrors the djot exporter: code block, then heading,
+    /// then list item, then plain paragraph.
+    fn render_block(
+        &self,
+        uow: &dyn ExportDocxUnitOfWorkTrait,
+        block: &Block,
+        quote_depth: usize,
+        numbering: &mut NumberingBuilder,
+    ) -> Result<docx_rs::Paragraph> {
+        use docx_rs::*;
+
+        let block_text = block_content_via_store(block, &uow.store());
+        let elements = common::format_runs_query::inline_segments_for_block(
+            &uow.store(),
+            block.id,
+            &block_text,
+        );
+
+        let quote_indent = quote_depth as i32 * INDENT_STEP_TWIPS;
+
+        // --- Code block ------------------------------------------------------
+        if block.fmt_is_code_block == Some(true) {
+            return Ok(render_code_block(&elements, quote_indent));
+        }
+
+        // --- Resolve list membership ----------------------------------------
+        let list_ids = uow.get_block_relationship(
+            &block.id,
+            &common::direct_access::block::BlockRelationshipField::List,
+        )?;
+        let list = match list_ids.first() {
+            Some(list_id) => uow.get_list(list_id)?.map(|l| (*list_id, l)),
+            None => None,
+        };
+
+        let mut paragraph = Paragraph::new();
+
+        // Common paragraph-level formatting. Heading style is applied in the
+        // dispatch below so it does not interfere with list/code handling.
+        if let Some(lh) = block.fmt_line_height {
+            // thousandths → 240ths: 1000 = single (240), 1500 = 1.5 (360).
+            let twips = (lh as f64 / 1000.0 * 240.0) as i32;
+            paragraph = paragraph.line_spacing(
+                LineSpacing::new()
+                    .line_rule(LineSpacingType::Auto)
+                    .line(twips),
+            );
+        }
+        if block.fmt_non_breakable_lines == Some(true) {
+            paragraph = paragraph.keep_lines(true);
+        }
+        if let Some(alignment) = &block.fmt_alignment {
+            paragraph = paragraph.align(map_alignment(alignment));
+        }
+
+        let is_task = matches!(
+            block.fmt_marker,
+            Some(MarkerType::Checked) | Some(MarkerType::Unchecked)
+        );
+
+        if let Some(level) = block.fmt_heading_level {
+            // Heading takes priority over list membership (mirrors djot).
+            let style_name = format!("Heading{}", level.clamp(1, 6));
+            paragraph = paragraph.style(&style_name);
+            if quote_indent > 0 {
+                paragraph = paragraph.indent(Some(quote_indent), None, None, None);
+            }
+        } else if let Some((list_id, list_entity)) = &list {
+            let level = list_entity.indent.clamp(0, 8) as usize;
+            if is_task {
+                // Task items carry a checkbox glyph instead of an auto-number;
+                // they are indented like a list item.
+                let left = quote_indent + INDENT_STEP_TWIPS * (level as i32 + 1);
+                paragraph = paragraph.indent(
+                    Some(left),
+                    Some(SpecialIndentType::Hanging(HANGING_TWIPS)),
+                    None,
+                    None,
+                );
+                let glyph = if block.fmt_marker == Some(MarkerType::Checked) {
+                    "\u{2612} " // ☒
+                } else {
+                    "\u{2610} " // ☐
+                };
+                paragraph = paragraph.add_run(Run::new().add_text(glyph));
+            } else {
+                let num_id = numbering.get_or_create(*list_id, list_entity);
+                paragraph = paragraph.numbering(NumberingId::new(num_id), IndentLevel::new(level));
+                // A blockquoted list needs an explicit left indent on top of
+                // the numbering geometry; an un-quoted list relies on the
+                // numbering definition's own indent.
+                if quote_indent > 0 {
+                    let left = quote_indent + INDENT_STEP_TWIPS * (level as i32 + 1);
+                    paragraph = paragraph.indent(
+                        Some(left),
+                        Some(SpecialIndentType::Hanging(HANGING_TWIPS)),
+                        None,
+                        None,
+                    );
+                }
+            }
+        } else {
+            // Plain paragraph.
+            if quote_indent > 0 {
+                paragraph = paragraph.indent(Some(quote_indent), None, None, None);
+            }
+        }
+
+        Ok(add_inline_content(paragraph, &elements))
+    }
+
     fn render_table_docx(
         &self,
         uow: &dyn ExportDocxUnitOfWorkTrait,
         table_id: &EntityId,
+        numbering: &mut NumberingBuilder,
     ) -> Result<docx_rs::Table> {
         use docx_rs::*;
 
@@ -292,12 +529,12 @@ impl ExportDocxUseCase {
         let mut cells: Vec<common::entities::TableCell> = cells_opt.into_iter().flatten().collect();
         cells.sort_by(|a, b| a.row.cmp(&b.row).then(a.column.cmp(&b.column)));
 
-        // Build a grid to track which cells are covered by spans
+        // Build a grid to track which cells are covered by spans.
         let rows = table.rows as usize;
         let cols = table.columns as usize;
         let mut covered = vec![vec![false; cols]; rows];
 
-        // Build column grid widths
+        // Build column grid widths.
         let grid: Vec<usize> = table.column_widths.iter().map(|w| *w as usize).collect();
 
         let mut docx_rows: Vec<TableRow> = Vec::new();
@@ -307,12 +544,10 @@ impl ExportDocxUseCase {
 
             for c in 0..cols {
                 if covered[r][c] {
-                    // This position is covered by a row/column span from another cell.
-                    // In DOCX, vertically merged continuation cells still need a <w:tc>
-                    // with vMerge continue. For column spans, the cell is simply absent.
-                    // Check if this is a vertical merge continuation (a cell above spans into this row)
+                    // Position covered by a row/column span from another cell.
+                    // A vertically merged continuation still needs a <w:tc>
+                    // with vMerge continue; a column span simply omits the cell.
                     let needs_vmerge_continue = r > 0 && {
-                        // Look for a cell above that spans into this row
                         cells.iter().any(|cell| {
                             cell.column == c as i64
                                 && cell.row < r as i64
@@ -327,7 +562,6 @@ impl ExportDocxUseCase {
                     continue;
                 }
 
-                // Find the cell at this position
                 let cell = cells
                     .iter()
                     .find(|cell| cell.row == r as i64 && cell.column == c as i64);
@@ -335,76 +569,48 @@ impl ExportDocxUseCase {
                 if let Some(cell) = cell {
                     let mut docx_cell = docx_rs::TableCell::new();
 
-                    // Apply column span
-                    if cell.column_span > 1 {
-                        docx_cell = docx_cell.grid_span(cell.column_span as usize);
-                    }
+                    // Spans are `i64`; clamp to >= 1 before any `as usize` so a
+                    // malformed (0 or negative) span can never wrap to a huge
+                    // `usize` and blow up the coverage loop or the grid span.
+                    let row_span = cell.row_span.max(1) as usize;
+                    let col_span = cell.column_span.max(1) as usize;
 
-                    // Apply vertical merge for row spans
-                    if cell.row_span > 1 {
+                    if col_span > 1 {
+                        docx_cell = docx_cell.grid_span(col_span);
+                    }
+                    if row_span > 1 {
                         docx_cell = docx_cell.vertical_merge(VMergeType::Restart);
                     }
 
-                    // Render cell content from the cell's frame
-                    if let Some(cf_id) = cell.cell_frame {
-                        let block_ids = uow.get_frame_relationship(
-                            &cf_id,
-                            &common::direct_access::frame::FrameRelationshipField::Blocks,
+                    // Render the cell's frame as a sequence of paragraphs/tables.
+                    if let Some(cf_id) = cell.cell_frame
+                        && let Some(cell_frame) = uow.get_frame(&cf_id)?
+                    {
+                        let mut cell_elements: Vec<DocxElement> = Vec::new();
+                        // The document-level cell-frame skip set does not apply
+                        // inside a cell, so pass an empty set here.
+                        self.render_frame_content(
+                            uow,
+                            &cell_frame,
+                            &HashSet::new(),
+                            0,
+                            numbering,
+                            None,
+                            &mut cell_elements,
                         )?;
-                        let blocks_opt = uow.get_block_multi(&block_ids)?;
-                        let mut blocks: Vec<Block> = blocks_opt.into_iter().flatten().collect();
-                        blocks.sort_by_key(|b| b.document_position);
-
-                        for block in &blocks {
-                            let block_text = block_content_via_store(block, &uow.store());
-                            let elements = common::format_runs_query::inline_segments_for_block(
-                                &uow.store(),
-                                block.id,
-                                &block_text,
-                            );
-
-                            let mut paragraph = Paragraph::new();
-                            for elem in &elements {
-                                let text = match &elem.content {
-                                    InlineContent::Text(t) => t.clone(),
-                                    InlineContent::Image { name, .. } => {
-                                        format!("[Image: {}]", name)
-                                    }
-                                    InlineContent::Empty => String::new(),
-                                };
-
-                                if text.is_empty() {
-                                    continue;
-                                }
-
-                                let mut run = Run::new().add_text(text);
-                                if elem.fmt_font_bold == Some(true) {
-                                    run = run.bold();
-                                }
-                                if elem.fmt_font_italic == Some(true) {
-                                    run = run.italic();
-                                }
-                                if elem.fmt_font_underline == Some(true) {
-                                    run = run.underline("single");
-                                }
-                                if elem.fmt_font_strikeout == Some(true) {
-                                    run = run.strike();
-                                }
-                                if elem.fmt_font_family.as_deref() == Some("monospace") {
-                                    run = run.fonts(RunFonts::new().ascii("Courier New"));
-                                }
-
-                                paragraph = paragraph.add_run(run);
-                            }
-                            docx_cell = docx_cell.add_paragraph(paragraph);
+                        for element in cell_elements {
+                            docx_cell = match element {
+                                DocxElement::Paragraph(p) => docx_cell.add_paragraph(*p),
+                                DocxElement::Table(t) => docx_cell.add_table(*t),
+                            };
                         }
                     }
 
                     docx_cells.push(docx_cell);
 
-                    // Mark spanned cells as covered
-                    for sr in 0..cell.row_span as usize {
-                        for sc in 0..cell.column_span as usize {
+                    // Mark spanned cells as covered.
+                    for sr in 0..row_span {
+                        for sc in 0..col_span {
                             if sr == 0 && sc == 0 {
                                 continue;
                             }
@@ -414,7 +620,7 @@ impl ExportDocxUseCase {
                         }
                     }
                 } else {
-                    // Empty cell — no TableCell entity at this position
+                    // Empty cell — no TableCell entity at this position.
                     let docx_cell = docx_rs::TableCell::new().add_paragraph(Paragraph::new());
                     docx_cells.push(docx_cell);
                 }
@@ -430,4 +636,202 @@ impl ExportDocxUseCase {
 
         Ok(docx_table)
     }
+}
+
+/// Return `Err` if a cancellation flag is present and set.
+fn check_cancelled(cancel_flag: Option<&AtomicBool>) -> Result<()> {
+    if let Some(flag) = cancel_flag
+        && flag.load(Ordering::Relaxed)
+    {
+        return Err(anyhow!("Operation was cancelled"));
+    }
+    Ok(())
+}
+
+/// Map the model's paragraph alignment to docx-rs.
+fn map_alignment(alignment: &Alignment) -> docx_rs::AlignmentType {
+    use docx_rs::AlignmentType;
+    match alignment {
+        Alignment::Left => AlignmentType::Left,
+        Alignment::Right => AlignmentType::Right,
+        Alignment::Center => AlignmentType::Center,
+        Alignment::Justify => AlignmentType::Justified,
+    }
+}
+
+/// Render a fenced/code block as a single monospaced, shaded paragraph.
+///
+/// Inline formatting is dropped (only the raw text matters, mirroring djot).
+/// Embedded newlines become soft line breaks so a multi-line block stays one
+/// paragraph.
+fn render_code_block(elements: &[InlineSegment], quote_indent: i32) -> docx_rs::Paragraph {
+    use docx_rs::*;
+
+    let mut raw = String::new();
+    for elem in elements {
+        if let InlineContent::Text(t) = &elem.content {
+            raw.push_str(t);
+        }
+    }
+
+    let mut paragraph = Paragraph::new().keep_lines(true);
+    if quote_indent > 0 {
+        paragraph = paragraph.indent(Some(quote_indent), None, None, None);
+    }
+
+    for (idx, line) in raw.split('\n').enumerate() {
+        let mut run = Run::new()
+            .fonts(RunFonts::new().ascii("Courier New").hi_ansi("Courier New"))
+            .shading(
+                Shading::new()
+                    .shd_type(ShdType::Clear)
+                    .fill(CODE_BLOCK_FILL),
+            );
+        if idx > 0 {
+            run = run.add_break(BreakType::TextWrapping);
+        }
+        if !line.is_empty() {
+            run = run.add_text(line);
+        }
+        paragraph = paragraph.add_run(run);
+    }
+
+    paragraph
+}
+
+/// Build a DOCX run for one inline segment, applying its character formatting.
+/// Returns `None` for segments that contribute no text.
+fn build_run(elem: &InlineSegment) -> Option<docx_rs::Run> {
+    use docx_rs::*;
+
+    let text = match &elem.content {
+        InlineContent::Text(t) => t.clone(),
+        InlineContent::Image { name, .. } => format!("[Image: {}]", name),
+        InlineContent::Empty => return None,
+    };
+    if text.is_empty() {
+        return None;
+    }
+
+    let mut run = Run::new().add_text(text);
+    if elem.fmt_font_bold == Some(true) {
+        run = run.bold();
+    }
+    if elem.fmt_font_italic == Some(true) {
+        run = run.italic();
+    }
+    if elem.fmt_font_underline == Some(true) {
+        run = run.underline("single");
+    }
+    if elem.fmt_font_strikeout == Some(true) {
+        run = run.strike();
+    }
+    if elem.fmt_font_family.as_deref() == Some("monospace") {
+        run = run.fonts(RunFonts::new().ascii("Courier New").hi_ansi("Courier New"));
+    }
+    Some(run)
+}
+
+/// Append the inline content of a block to `paragraph`, wrapping runs that
+/// share a hyperlink `href` in a single `<w:hyperlink>`.
+fn add_inline_content(
+    mut paragraph: docx_rs::Paragraph,
+    elements: &[InlineSegment],
+) -> docx_rs::Paragraph {
+    use docx_rs::*;
+
+    // Coalesce consecutive segments with the same href into one piece so a
+    // link spanning multiple format runs renders as a single hyperlink.
+    enum Piece {
+        Run(Box<Run>),
+        Link(String, Vec<Run>),
+    }
+
+    let mut pieces: Vec<Piece> = Vec::new();
+    for elem in elements {
+        let Some(run) = build_run(elem) else {
+            continue;
+        };
+        match &elem.fmt_anchor_href {
+            Some(href) if !href.is_empty() => {
+                if let Some(Piece::Link(open_href, runs)) = pieces.last_mut()
+                    && open_href == href
+                {
+                    runs.push(run);
+                    continue;
+                }
+                pieces.push(Piece::Link(href.clone(), vec![run]));
+            }
+            _ => pieces.push(Piece::Run(Box::new(run))),
+        }
+    }
+
+    for piece in pieces {
+        paragraph = match piece {
+            Piece::Run(run) => paragraph.add_run(*run),
+            Piece::Link(href, runs) => {
+                let mut link = Hyperlink::new(href, HyperlinkType::External);
+                for run in runs {
+                    link = link.add_run(run);
+                }
+                paragraph.add_hyperlink(link)
+            }
+        };
+    }
+
+    paragraph
+}
+
+/// Build a complete abstract-numbering definition (levels 0..=8) for `list`.
+///
+/// Levels beyond the list's own `indent` are defined too so any nesting level
+/// resolves; they all share the list's style.
+fn build_abstract_numbering(id: usize, list: &List) -> docx_rs::AbstractNumbering {
+    let mut abstract_num = docx_rs::AbstractNumbering::new(id);
+    for level in 0..=8usize {
+        abstract_num = abstract_num.add_level(build_level(level, list));
+    }
+    abstract_num
+}
+
+/// Build one numbering level for `list` at the given nesting `level`.
+fn build_level(level: usize, list: &List) -> docx_rs::Level {
+    use docx_rs::*;
+
+    let (format, text) = match list.style {
+        ListStyle::Decimal => ("decimal", ordered_level_text(level, list)),
+        ListStyle::LowerAlpha => ("lowerLetter", ordered_level_text(level, list)),
+        ListStyle::UpperAlpha => ("upperLetter", ordered_level_text(level, list)),
+        ListStyle::LowerRoman => ("lowerRoman", ordered_level_text(level, list)),
+        ListStyle::UpperRoman => ("upperRoman", ordered_level_text(level, list)),
+        ListStyle::Disc => ("bullet", "\u{2022}".to_string()), // •
+        ListStyle::Circle => ("bullet", "\u{25CB}".to_string()), // ○
+        ListStyle::Square => ("bullet", "\u{25AA}".to_string()), // ▪
+    };
+
+    let left = INDENT_STEP_TWIPS * (level as i32 + 1);
+    Level::new(
+        level,
+        Start::new(1),
+        NumberFormat::new(format),
+        LevelText::new(text),
+        LevelJc::new("left"),
+    )
+    .indent(
+        Some(left),
+        Some(SpecialIndentType::Hanging(HANGING_TWIPS)),
+        None,
+        None,
+    )
+}
+
+/// `LevelText` for an ordered list level, e.g. `"1."` or `"(a)"`, honouring the
+/// list's recorded prefix/suffix. The `%N` placeholder is 1-based on the level.
+fn ordered_level_text(level: usize, list: &List) -> String {
+    let suffix = if list.suffix.is_empty() {
+        "."
+    } else {
+        list.suffix.as_str()
+    };
+    format!("{}%{}{}", list.prefix, level + 1, suffix)
 }

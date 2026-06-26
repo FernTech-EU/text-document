@@ -28,6 +28,7 @@ docx-rs = "0.4"
 
 [dev-dependencies]
 test_harness = { workspace = true }
+proptest = "1"
 
 [lints]
 workspace = true

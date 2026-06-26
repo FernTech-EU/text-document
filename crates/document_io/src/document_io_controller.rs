@@ -260,6 +260,20 @@ pub fn export_docx(
     Ok(operation_id)
 }
 
+/// Build the in-memory DOCX document for `db_context` without writing a file.
+///
+/// This runs the exact same builder used by [`export_docx`] but returns the
+/// assembled [`docx_rs::Docx`] instead of packing it to disk, so callers can
+/// inspect the produced structure. Intended for tests; the type is re-exported
+/// as [`crate::docx_rs`] so callers can name it.
+#[doc(hidden)]
+pub fn build_docx_document(db_context: &DbContext, dto: &ExportDocxDto) -> Result<docx_rs::Docx> {
+    let uow_context = ExportDocxUnitOfWorkFactory::new(db_context);
+    let uc = ExportDocxUseCase::new(Box::new(uow_context), dto);
+    let (docx, _paragraph_count) = uc.build_document()?;
+    Ok(docx)
+}
+
 pub fn get_export_docx_progress(
     long_operation_manager: &LongOperationManager,
     operation_id: &str,
