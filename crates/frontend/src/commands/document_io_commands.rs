@@ -6,9 +6,9 @@ use crate::app_context::AppContext;
 use anyhow::{Context, Result};
 use document_io::{
     ExportDjotDto, ExportDocxDto, ExportDocxResultDto, ExportHtmlDto, ExportLatexDto,
-    ExportLatexResultDto, ExportMarkdownDto, ExportPlainTextDto, ImportDjotDto, ImportDjotResultDto,
-    ImportHtmlDto, ImportHtmlResultDto, ImportMarkdownDto, ImportMarkdownResultDto,
-    ImportPlainTextDto, document_io_controller,
+    ExportLatexResultDto, ExportMarkdownDto, ExportPlainTextDto, ImportDjotDto,
+    ImportDjotResultDto, ImportHtmlDto, ImportHtmlResultDto, ImportMarkdownDto,
+    ImportMarkdownResultDto, ImportPlainTextDto, document_io_controller,
 };
 
 use common::long_operation::OperationProgress;
@@ -75,7 +75,10 @@ pub fn import_djot(ctx: &AppContext, dto: &ImportDjotDto) -> Result<String> {
 
 /// Get the progress of a import_djot operation
 pub fn get_import_djot_progress(ctx: &AppContext, operation_id: &str) -> Option<OperationProgress> {
-    document_io_controller::get_import_djot_progress(&ctx.long_operation_manager.lock(), operation_id)
+    document_io_controller::get_import_djot_progress(
+        &ctx.long_operation_manager.lock(),
+        operation_id,
+    )
 }
 
 /// Get the result of a import_djot operation

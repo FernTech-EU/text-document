@@ -19,7 +19,9 @@ fn cursor_insert_djot_inline() {
 fn cursor_insert_djot_blocks() {
     let doc = TextDocument::new();
     doc.set_plain_text("intro").unwrap();
-    doc.cursor_at(5).insert_djot("\n\n# Heading\n\nbody").unwrap();
+    doc.cursor_at(5)
+        .insert_djot("\n\n# Heading\n\nbody")
+        .unwrap();
     let dj = doc.to_djot().unwrap();
     assert!(dj.contains("# Heading"), "{dj}");
     assert!(dj.contains("body"), "{dj}");

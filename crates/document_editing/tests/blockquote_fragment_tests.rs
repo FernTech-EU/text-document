@@ -8,7 +8,9 @@ extern crate text_document_editing as document_editing;
 use anyhow::Result;
 use common::types::EntityId;
 
-use test_harness::{DbContext, FrameDto, frame_controller, get_block_ids, get_frame_id, setup_with_text};
+use test_harness::{
+    DbContext, FrameDto, frame_controller, get_block_ids, get_frame_id, setup_with_text,
+};
 
 use document_editing::document_editing_controller;
 use document_editing::{InsertFragmentDto, WrapBlocksInFrameDto};

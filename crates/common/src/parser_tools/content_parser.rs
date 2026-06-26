@@ -1421,10 +1421,11 @@ pub fn parse_djot(djot: &str) -> Vec<ParsedElement> {
                     blockquote_depth,
                 );
             }
-            let (style, prefix, suffix) = list_stack
-                .last()
-                .cloned()
-                .unwrap_or((ListStyle::Disc, String::new(), String::new()));
+            let (style, prefix, suffix) = list_stack.last().cloned().unwrap_or((
+                ListStyle::Disc,
+                String::new(),
+                String::new(),
+            ));
             cur_list_style = Some(style);
             cur_list_prefix = prefix;
             cur_list_suffix = suffix;
@@ -2248,17 +2249,37 @@ mod djot_tests {
         // Thematic break between two paragraphs: no extra block, no stray text.
         let b = blocks("para1\n\n---\n\npara2");
         assert_eq!(b.len(), 2);
-        assert_eq!(b[0].spans.iter().map(|s| s.text.as_str()).collect::<String>(), "para1");
-        assert_eq!(b[1].spans.iter().map(|s| s.text.as_str()).collect::<String>(), "para2");
+        assert_eq!(
+            b[0].spans
+                .iter()
+                .map(|s| s.text.as_str())
+                .collect::<String>(),
+            "para1"
+        );
+        assert_eq!(
+            b[1].spans
+                .iter()
+                .map(|s| s.text.as_str())
+                .collect::<String>(),
+            "para2"
+        );
 
         // Fenced div is unwrapped: its content survives, the fence does not.
         let d = blocks(":::\ninside\n:::");
-        let joined: String = d.iter().flat_map(|b| b.spans.iter()).map(|s| s.text.as_str()).collect();
+        let joined: String = d
+            .iter()
+            .flat_map(|b| b.spans.iter())
+            .map(|s| s.text.as_str())
+            .collect();
         assert_eq!(joined, "inside");
 
         // Inline math content is dropped, surrounding text kept.
         let m = blocks("before $`E=mc^2` after");
-        let joined: String = m.iter().flat_map(|b| b.spans.iter()).map(|s| s.text.as_str()).collect();
+        let joined: String = m
+            .iter()
+            .flat_map(|b| b.spans.iter())
+            .map(|s| s.text.as_str())
+            .collect();
         assert!(joined.contains("before"), "{joined:?}");
         assert!(joined.contains("after"), "{joined:?}");
         assert!(!joined.contains("E=mc"), "math leaked: {joined:?}");

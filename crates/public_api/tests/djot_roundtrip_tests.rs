@@ -94,7 +94,11 @@ fn emit_block(b: &Block) -> String {
 }
 
 fn emit(blocks: &[Block]) -> String {
-    blocks.iter().map(emit_block).collect::<Vec<_>>().join("\n\n")
+    blocks
+        .iter()
+        .map(emit_block)
+        .collect::<Vec<_>>()
+        .join("\n\n")
 }
 
 // ── Strategies ──────────────────────────────────────────────────
@@ -139,7 +143,10 @@ fn block() -> impl Strategy<Value = Block> {
         prop::collection::vec(inline(), 1..5).prop_map(Block::Para),
         (1u8..=6, word()).prop_map(|(l, s)| Block::Heading(l, s)),
         (
-            prop::option::of(prop_oneof![Just("rust".to_string()), Just("py".to_string())]),
+            prop::option::of(prop_oneof![
+                Just("rust".to_string()),
+                Just("py".to_string())
+            ]),
             "[a-zA-Z0-9 ;=()]{0,30}",
         )
             .prop_map(|(lang, c)| Block::Fenced(lang, c)),

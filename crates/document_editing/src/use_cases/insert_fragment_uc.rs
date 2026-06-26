@@ -260,7 +260,7 @@ fn try_replace_table_cells(
     // sub-frames and table cell frames. Fetching only the root frame's
     // blocks here would miss a cursor sitting in a quoted paragraph,
     // making `find_block_at_position` fall back to the wrong block and
-    // potentially mis-trigger a cell replacement.
+    // potentially trigger a spurious cell replacement.
     let all_block_ids: Vec<EntityId> = {
         let get_table_cell_frames = |table_id: &EntityId| -> Result<Vec<EntityId>> {
             let cell_ids = uow.get_table_relationship(table_id, &TableRelationshipField::Cells)?;

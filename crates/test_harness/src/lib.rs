@@ -14,11 +14,11 @@ use std::sync::Arc;
 
 // Re-export commonly used types and controllers for convenience
 pub use common::database::db_context::DbContext;
-pub use common::event::EventHub;
 pub use common::direct_access::block::block_repository::BlockRelationshipField;
 pub use common::direct_access::document::document_repository::DocumentRelationshipField;
 pub use common::direct_access::frame::frame_repository::FrameRelationshipField;
 pub use common::direct_access::root::root_repository::RootRelationshipField;
+pub use common::event::EventHub;
 pub use common::format_runs::InlineSegment;
 pub use common::format_runs::{FormatRun, ImageAnchor};
 pub use common::format_runs_query::{get_block_images, get_format_runs, inline_segments_for_block};

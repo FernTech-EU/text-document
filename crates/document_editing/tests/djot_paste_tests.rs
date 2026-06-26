@@ -3,8 +3,8 @@
 extern crate text_document_editing as document_editing;
 use anyhow::Result;
 
-use document_editing::document_editing_controller;
 use document_editing::InsertDjotAtPositionDto;
+use document_editing::document_editing_controller;
 use test_harness::{export_text, get_document_stats, setup_with_text};
 
 #[test]

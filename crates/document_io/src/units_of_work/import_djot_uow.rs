@@ -127,9 +127,6 @@ impl ImportDjotUnitOfWorkFactory {
 
 impl ImportDjotUnitOfWorkFactoryTrait for ImportDjotUnitOfWorkFactory {
     fn create(&self) -> Box<dyn ImportDjotUnitOfWorkTrait> {
-        Box::new(ImportDjotUnitOfWork::new(
-            &self.context,
-            &self.event_hub,
-        ))
+        Box::new(ImportDjotUnitOfWork::new(&self.context, &self.event_hub))
     }
 }

@@ -143,10 +143,7 @@ mod tests {
         // djot `1.` then `1)`: same numbering, different delimiter → two lists.
         let mut g = ListGrouper::new();
         g.register_delim(10, ListStyle::Decimal, 0, String::new(), ".".to_string());
-        assert!(
-            g.try_reuse_delim(&ListStyle::Decimal, 0, "", ")")
-                .is_none()
-        );
+        assert!(g.try_reuse_delim(&ListStyle::Decimal, 0, "", ")").is_none());
     }
 
     #[test]

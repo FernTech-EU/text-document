@@ -21,7 +21,11 @@ fn wait_for_long_operation(long_op_manager: &LongOperationManager, op_id: &str) 
     }
 }
 
-fn import_markdown(db: &test_harness::DbContext, ev: &std::sync::Arc<test_harness::EventHub>, md: &str) -> Result<()> {
+fn import_markdown(
+    db: &test_harness::DbContext,
+    ev: &std::sync::Arc<test_harness::EventHub>,
+    md: &str,
+) -> Result<()> {
     let mut long_op_manager = LongOperationManager::new();
     let op_id = document_io_controller::import_markdown(
         db,
@@ -40,7 +44,11 @@ fn import_markdown(db: &test_harness::DbContext, ev: &std::sync::Arc<test_harnes
     Ok(())
 }
 
-fn import_html(db: &test_harness::DbContext, ev: &std::sync::Arc<test_harness::EventHub>, html: &str) -> Result<()> {
+fn import_html(
+    db: &test_harness::DbContext,
+    ev: &std::sync::Arc<test_harness::EventHub>,
+    html: &str,
+) -> Result<()> {
     let mut long_op_manager = LongOperationManager::new();
     let op_id = document_io_controller::import_html(
         db,
@@ -103,7 +111,11 @@ fn test_md_import_table_first_in_blockquote() -> Result<()> {
     assert!(block_entries(&root).is_empty(), "no loose blocks at root");
 
     let bq = get_frame(&db, root_subs[0]);
-    assert_eq!(bq.fmt_is_blockquote, Some(true), "sub-frame is a blockquote");
+    assert_eq!(
+        bq.fmt_is_blockquote,
+        Some(true),
+        "sub-frame is a blockquote"
+    );
     assert!(bq.table.is_none(), "blockquote frame is not a table anchor");
 
     let bq_subs = sub_frame_ids(&bq);
@@ -119,7 +131,11 @@ fn test_md_import_table_first_in_blockquote() -> Result<()> {
 #[test]
 fn test_md_import_text_then_table_in_blockquote() -> Result<()> {
     let (db, ev, _) = setup()?;
-    import_markdown(&db, &ev, "> Some text\n>\n> | a | b |\n> |---|---|\n> | c | d |")?;
+    import_markdown(
+        &db,
+        &ev,
+        "> Some text\n>\n> | a | b |\n> |---|---|\n> | c | d |",
+    )?;
 
     let root = get_frame(&db, get_frame_id(&db)?);
     let root_subs = sub_frame_ids(&root);
@@ -158,7 +174,10 @@ fn test_md_import_table_after_blockquote_closes() -> Result<()> {
     assert_eq!(block_entries(&bq).len(), 1);
 
     let anchor = get_frame(&db, root_subs[1]);
-    assert!(anchor.table.is_some(), "second sub-frame is the table anchor");
+    assert!(
+        anchor.table.is_some(),
+        "second sub-frame is the table anchor"
+    );
     assert_eq!(anchor.parent_frame, Some(root.id));
     Ok(())
 }
@@ -278,7 +297,10 @@ fn test_html_import_table_after_blockquote() -> Result<()> {
 
     let bq = get_frame(&db, root_subs[0]);
     assert_eq!(bq.fmt_is_blockquote, Some(true));
-    assert!(sub_frame_ids(&bq).is_empty(), "table stays outside the quote");
+    assert!(
+        sub_frame_ids(&bq).is_empty(),
+        "table stays outside the quote"
+    );
 
     let anchor = get_frame(&db, root_subs[1]);
     assert!(anchor.table.is_some());

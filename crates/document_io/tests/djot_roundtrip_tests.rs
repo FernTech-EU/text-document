@@ -99,7 +99,10 @@ fn code_block_with_language() {
 
 #[test]
 fn link() {
-    assert_contains(&fixpoint("[text](https://example.com)"), "[text](https://example.com)");
+    assert_contains(
+        &fixpoint("[text](https://example.com)"),
+        "[text](https://example.com)",
+    );
 }
 
 #[test]
@@ -205,7 +208,12 @@ fn metacharacters_escaped_and_preserved() {
 fn paragraph_starting_with_block_marker_is_guarded() {
     // A paragraph whose text begins with a block marker must not be re-parsed
     // as that block construct.
-    for input in ["# not a heading", "> not a quote", "- not a list", "1. not ordered"] {
+    for input in [
+        "# not a heading",
+        "> not a quote",
+        "- not a list",
+        "1. not ordered",
+    ] {
         let dj = fixpoint(input);
         // The visible text survives intact after one normalization pass.
         let twice = import_then_export(&dj);

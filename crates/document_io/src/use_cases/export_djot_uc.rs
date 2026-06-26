@@ -719,7 +719,7 @@ fn split_surrounding_ws(s: &str) -> (&str, &str, &str) {
 }
 
 /// Render a link destination. Wrap in angle brackets when it contains a
-/// character that would otherwise terminate or mis-parse the `(...)` dest.
+/// character that would otherwise terminate or corrupt the `(...)` dest.
 fn djot_link_dest(href: &str) -> String {
     if href.contains([')', '(', ' ', '<', '>']) {
         format!("<{}>", href.replace('>', "%3E").replace('<', "%3C"))

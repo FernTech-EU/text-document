@@ -34,8 +34,16 @@ fn snapshot_table_in_blockquote_is_nested_in_frame() {
     if let FlowElementSnapshot::Table(t) = tables[0] {
         assert_eq!(t.rows, 2);
         assert_eq!(t.columns, 2);
-        let texts: Vec<&str> = t.cells.iter().flat_map(|c| &c.blocks).map(|b| b.text.as_str()).collect();
-        assert!(texts.contains(&"a") && texts.contains(&"d"), "cell texts: {texts:?}");
+        let texts: Vec<&str> = t
+            .cells
+            .iter()
+            .flat_map(|c| &c.blocks)
+            .map(|b| b.text.as_str())
+            .collect();
+        assert!(
+            texts.contains(&"a") && texts.contains(&"d"),
+            "cell texts: {texts:?}"
+        );
     }
 }
 
@@ -45,13 +53,17 @@ fn snapshot_table_after_blockquote_stays_top_level() {
     let snap = doc.snapshot_flow();
 
     assert_eq!(snap.elements.len(), 2, "elements: {:?}", snap.elements);
-    assert!(matches!(&snap.elements[0], FlowElementSnapshot::Frame(f) if f.format.is_blockquote == Some(true)));
+    assert!(
+        matches!(&snap.elements[0], FlowElementSnapshot::Frame(f) if f.format.is_blockquote == Some(true))
+    );
     assert!(matches!(&snap.elements[1], FlowElementSnapshot::Table(_)));
 
     // And nothing leaked into the quote.
     if let FlowElementSnapshot::Frame(f) = &snap.elements[0] {
         assert!(
-            f.elements.iter().all(|e| matches!(e, FlowElementSnapshot::Block(_))),
+            f.elements
+                .iter()
+                .all(|e| matches!(e, FlowElementSnapshot::Block(_))),
             "frame elements: {:?}",
             f.elements
         );
