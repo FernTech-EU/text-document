@@ -402,48 +402,55 @@ impl ExportDjotUseCase {
         let mut inline = String::new();
         for elem in elements {
             let is_code = elem.fmt_font_family.as_deref() == Some("monospace");
-            let mut formatted = match &elem.content {
+
+            // `(lead, body, trail)`: djot emphasis-family markers (`*`, `_`,
+            // `^`, `~`, `{- -}`, `{+ +}`) must not sit directly against
+            // whitespace, so for non-code text we move leading/trailing spaces
+            // OUTSIDE all markers. Code is verbatim (jotdown keeps spaces), so
+            // it is left intact.
+            let (lead, mut formatted, trail): (&str, String, &str) = match &elem.content {
+                InlineContent::Text(t) if is_code => ("", djot_inline_code(t), ""),
                 InlineContent::Text(t) => {
-                    if is_code {
-                        // Code spans are emitted verbatim inside backtick fences.
-                        djot_inline_code(t)
-                    } else {
-                        escape_djot(t)
+                    let (l, core, tr) = split_surrounding_ws(t);
+                    if core.is_empty() {
+                        // Whitespace-only (or empty) run: emit verbatim, no
+                        // markers (it carries no visible formatting).
+                        inline.push_str(t);
+                        continue;
                     }
+                    (l, escape_djot(core), tr)
                 }
                 InlineContent::Image { name, .. } => {
-                    format!("![{}]({})", escape_djot(name), name)
+                    ("", format!("![{}]({})", escape_djot(name), name), "")
                 }
-                InlineContent::Empty => String::new(),
+                InlineContent::Empty => continue,
             };
 
-            if formatted.is_empty() {
-                continue;
-            }
-
             if elem.fmt_vertical_alignment == Some(CharVerticalAlignment::SubScript) {
-                formatted = format!("~{}~", formatted);
+                formatted = format!("~{formatted}~");
             } else if elem.fmt_vertical_alignment == Some(CharVerticalAlignment::SuperScript) {
-                formatted = format!("^{}^", formatted);
+                formatted = format!("^{formatted}^");
             }
             if elem.fmt_font_strikeout == Some(true) {
-                formatted = format!("{{-{}-}}", formatted);
+                formatted = format!("{{-{formatted}-}}");
             }
             if elem.fmt_font_underline == Some(true) {
-                formatted = format!("{{+{}+}}", formatted);
+                formatted = format!("{{+{formatted}+}}");
             }
             if elem.fmt_font_bold == Some(true) && elem.fmt_font_italic == Some(true) {
-                formatted = format!("*_{}_*", formatted);
+                formatted = format!("*_{formatted}_*");
             } else if elem.fmt_font_bold == Some(true) {
-                formatted = format!("*{}*", formatted);
+                formatted = format!("*{formatted}*");
             } else if elem.fmt_font_italic == Some(true) {
-                formatted = format!("_{}_", formatted);
+                formatted = format!("_{formatted}_");
             }
             if let Some(ref href) = elem.fmt_anchor_href {
-                formatted = format!("[{}]({})", formatted, djot_link_dest(href));
+                formatted = format!("[{formatted}]({})", djot_link_dest(href));
             }
 
+            inline.push_str(lead);
             inline.push_str(&formatted);
+            inline.push_str(trail);
         }
         Ok(inline)
     }
@@ -681,12 +688,34 @@ fn djot_inline_code(text: &str) -> String {
         }
     }
     let fence = "`".repeat(max_run + 1);
-    let pad = if text.starts_with('`') || text.ends_with('`') || text.is_empty() {
-        " "
+    // jotdown verbatim is fully literal — it does NOT strip surrounding spaces
+    // (verified against the reference) — so we must NOT pad: a pad space would
+    // become part of the content and grow on every round trip. Sizing the fence
+    // one wider than the longest interior backtick run is enough for all
+    // import-reachable content (including content with leading/trailing spaces),
+    // making `export∘import` a fixpoint.
+    //
+    // The sole exception is content that begins or ends with a backtick, which
+    // would merge with the fence and produce invalid djot. We insert one space
+    // there purely to keep the output valid. This case is not reachable by
+    // importing djot (jotdown never emits verbatim whose content touches a
+    // backtick), so it cannot occur on a real round trip.
+    let lead = if text.starts_with('`') { " " } else { "" };
+    let trail = if text.ends_with('`') { " " } else { "" };
+    format!("{fence}{lead}{text}{trail}{fence}")
+}
+
+/// Split off leading/trailing ASCII space/tab runs: `(lead, core, trail)`.
+/// `core` is empty when the input is entirely whitespace.
+fn split_surrounding_ws(s: &str) -> (&str, &str, &str) {
+    let is_ws = |c: char| c == ' ' || c == '\t';
+    let start = s.len() - s.trim_start_matches(is_ws).len();
+    let end = s.trim_end_matches(is_ws).len();
+    if end <= start {
+        (s, "", "")
     } else {
-        ""
-    };
-    format!("{fence}{pad}{text}{pad}")
+        (&s[..start], &s[start..end], &s[end..])
+    }
 }
 
 /// Render a link destination. Wrap in angle brackets when it contains a

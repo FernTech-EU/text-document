@@ -1,0 +1,8 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 450228aa2afcd7364c5b00617b25c4bf7995a3add63a381dc432fe034e88d3bd # shrinks to blocks = [Para([Code(" "), Code("0")])]
+cc e69cd8c7a51eb37b2503e8ea97fc4c392eda8e41d9de439a0e27cf487c155fc7 # shrinks to blocks = [Para([Text("a*A ~a~*")])]
