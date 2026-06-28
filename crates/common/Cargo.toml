@@ -30,7 +30,7 @@ chrono = { workspace = true }
 uuid = { workspace = true }
 log = "0.4"
 pulldown-cmark = "0.13.1"
-scraper = "0.26.0"
+scraper = "0.27.0"
 ego-tree = "0.11.0"
 ropey = "1.6"
 jotdown = { version = "0.10", default-features = false }
