@@ -454,16 +454,16 @@ dependencies = [
 
 [[package]]
 name = "docx-rs"
-version = "0.4.19"
+version = "0.4.20"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "70395eb132dcc1761533e62c54878a9deb2b637863ecb52e9c5f66148616398e"
+checksum = "ed73cbf5e1c37baa23f4132569ac1187829f03922c206bd68fe109e3001a343d"
 dependencies = [
  "base64",
  "image",
+ "quick-xml",
  "serde",
  "serde_json",
  "thiserror",
- "xml-rs",
  "zip",
 ]
 
@@ -499,6 +499,15 @@ name = "encode_unicode"
 version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "34aa73646ffb006b8f5147f3dc182bd4bcb190227ce861fc4a4844bf8e3cb2c0"
+
+[[package]]
+name = "encoding_rs"
+version = "0.8.35"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "75030f3c4f45dafd7586dd6780965a8c7e8e285a5ecb86713e63a79c5b2766f3"
+dependencies = [
+ "cfg-if",
+]
 
 [[package]]
 name = "equivalent"
@@ -1204,6 +1213,16 @@ name = "quick-error"
 version = "2.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a993555f31e5a609f617c12db6250dedcac1b0a85076912c436e6fc9b2c8e6a3"
+
+[[package]]
+name = "quick-xml"
+version = "0.36.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f7649a7b4df05aed9ea7ec6f628c67c9953a43869b8bc50929569b2999d443fe"
+dependencies = [
+ "encoding_rs",
+ "memchr",
+]
 
 [[package]]
 name = "quote"
@@ -2271,12 +2290,6 @@ dependencies = [
  "unicode-xid",
  "wasmparser",
 ]
-
-[[package]]
-name = "xml-rs"
-version = "0.8.28"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3ae8337f8a065cfc972643663ea4279e04e7256de865aa66fe25cec5fb912d3f"
 
 [[package]]
 name = "zerocopy"
