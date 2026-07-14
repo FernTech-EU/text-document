@@ -53,9 +53,7 @@ fn an_empty_first_block_still_separates_the_table_anchor() {
 #[test]
 fn the_anchor_does_not_sit_on_top_of_the_empty_block() {
     let doc = doc_with("```\n\n```\n\n| Aa |\n|---|\n| aa |");
-    let anchor = doc
-        .find_all("\u{FFFC}", &FindOptions::default())
-        .unwrap();
+    let anchor = doc.find_all("\u{FFFC}", &FindOptions::default()).unwrap();
     assert_eq!(anchor.len(), 1);
     assert_eq!(
         anchor[0].position, 1,
@@ -75,7 +73,10 @@ fn a_table_that_starts_the_document_gets_no_leading_boundary() {
     let doc = doc_with(djot);
 
     let extracted = djot_to_plain_text(djot, &DjotImportOptions::default());
-    assert_eq!(extracted, "\u{FFFC}\nAa\naa", "no boundary before the first element");
+    assert_eq!(
+        extracted, "\u{FFFC}\nAa\naa",
+        "no boundary before the first element"
+    );
 
     let hits = doc.find_all(&extracted, &FindOptions::default()).unwrap();
     assert_eq!(hits.len(), 1);

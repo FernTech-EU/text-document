@@ -412,8 +412,22 @@ impl ExportDjotUseCase {
     ///
     /// Marks are applied innermost→outermost so the re-parse nests identically,
     /// producing a canonical form that makes export∘import a fixpoint:
-    /// verbatim → subscript → superscript → delete → insert → strong/emphasis →
-    /// link.
+    /// verbatim → **link** → subscript → superscript → delete → insert →
+    /// strong/emphasis.
+    ///
+    /// # The link must be innermost
+    ///
+    /// It used to be outermost, which meant a **superscript link** was written
+    /// `[^aa^](url)` — the `^` markers inside the brackets. `[^…]` is djot's
+    /// **footnote-reference** syntax, so the re-parse read it as a footnote and
+    /// the link was destroyed: `^[aa](url)^` exported to `[^aa^](url)`, which
+    /// re-exported to `\(url\)`. Silent, total loss of the link text, in the
+    /// format a manuscript is *saved* in.
+    ///
+    /// Wrapping the other way (`^[aa](url)^`) is equally valid djot for the same
+    /// entity state, collides with nothing, and round-trips. The other marks
+    /// (`*`, `_`, `{-`, `{+`) do not collide either way, so the one order that is
+    /// safe for all of them is: link first, marks around it.
     fn render_inline_segments(&self, elements: &[InlineSegment]) -> Result<String> {
         let mut inline = String::new();
         for elem in elements {
@@ -442,6 +456,11 @@ impl ExportDjotUseCase {
                 InlineContent::Empty => continue,
             };
 
+            // Innermost: the link. Putting it outside the marks writes `[^aa^](url)`,
+            // and `[^…]` is a footnote reference — see the note above.
+            if let Some(ref href) = elem.fmt_anchor_href {
+                formatted = format!("[{formatted}]({})", djot_link_dest(href));
+            }
             if elem.fmt_vertical_alignment == Some(CharVerticalAlignment::SubScript) {
                 formatted = format!("~{formatted}~");
             } else if elem.fmt_vertical_alignment == Some(CharVerticalAlignment::SuperScript) {
@@ -459,9 +478,6 @@ impl ExportDjotUseCase {
                 formatted = format!("*{formatted}*");
             } else if elem.fmt_font_italic == Some(true) {
                 formatted = format!("_{formatted}_");
-            }
-            if let Some(ref href) = elem.fmt_anchor_href {
-                formatted = format!("[{formatted}]({})", djot_link_dest(href));
             }
 
             inline.push_str(lead);
