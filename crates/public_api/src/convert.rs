@@ -61,6 +61,8 @@ impl FindOptions {
             query: query.into(),
             case_sensitive: self.case_sensitive,
             whole_word: self.whole_word,
+            diacritic_sensitive: self.diacritic_sensitive,
+            language: self.language.clone(),
             use_regex: self.use_regex,
             search_backward: self.search_backward,
             start_position: to_i64(start_position),
@@ -72,6 +74,8 @@ impl FindOptions {
             query: query.into(),
             case_sensitive: self.case_sensitive,
             whole_word: self.whole_word,
+            diacritic_sensitive: self.diacritic_sensitive,
+            language: self.language.clone(),
             use_regex: self.use_regex,
         }
     }
@@ -112,6 +116,8 @@ impl crate::ReplaceOptions {
             replacement: replacement.into(),
             case_sensitive: self.find.case_sensitive,
             whole_word: self.find.whole_word,
+            diacritic_sensitive: self.find.diacritic_sensitive,
+            language: self.find.language.clone(),
             use_regex: self.find.use_regex,
             replace_all,
             format_policy: self.format_policy,
@@ -124,19 +130,27 @@ pub fn find_result_to_match(dto: &frontend::document_search::FindResultDto) -> O
         Some(FindMatch {
             position: to_usize(dto.position),
             length: to_usize(dto.length),
+            matched_text: dto.matched_text.clone(),
         })
     } else {
         None
     }
 }
 
+/// The three lists are parallel by construction (one `FindAllResultDto` is built in one
+/// pass), so `zip` is safe — but zip *truncates*, and a truncated match list is a search that
+/// silently loses its last hits. Assert instead.
 pub fn find_all_to_matches(dto: &frontend::document_search::FindAllResultDto) -> Vec<FindMatch> {
+    debug_assert_eq!(dto.positions.len(), dto.lengths.len());
+    debug_assert_eq!(dto.positions.len(), dto.matched_texts.len());
     dto.positions
         .iter()
         .zip(dto.lengths.iter())
-        .map(|(&pos, &len)| FindMatch {
+        .zip(dto.matched_texts.iter())
+        .map(|((&pos, &len), text)| FindMatch {
             position: to_usize(pos),
             length: to_usize(len),
+            matched_text: text.clone(),
         })
         .collect()
 }

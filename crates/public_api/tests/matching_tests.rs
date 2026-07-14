@@ -126,6 +126,7 @@ fn the_public_matcher_agrees_with_the_documents_own_find() {
         let match_opts = MatchOptions {
             case_sensitive: false,
             whole_word,
+            ..MatchOptions::default()
         };
         let from_matcher: Vec<(usize, usize)> = find_all(text, query, &match_opts)
             .into_iter()

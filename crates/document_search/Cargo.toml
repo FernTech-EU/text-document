@@ -24,6 +24,9 @@ chrono = { workspace = true }
 uuid = { workspace = true }
 regex = "1"
 unicode-segmentation = { workspace = true }
+caseless = { workspace = true }
+unicode-normalization = { workspace = true }
+unicode-properties = { workspace = true }
 
 [dev-dependencies]
 test_harness = { workspace = true }

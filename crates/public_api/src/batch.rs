@@ -70,7 +70,7 @@ impl BatchDocument {
             &self.ctx,
             &ImportDjotDto {
                 djot_text: djot.to_string(),
-                options: options.clone(),
+                options: *options,
             },
         )?;
         Ok(())
@@ -90,15 +90,10 @@ impl BatchDocument {
     pub fn find_all(&self, query: &str, options: &FindOptions) -> Result<Vec<FindMatch>> {
         let result =
             document_search_commands::find_all(&self.ctx, &options.to_find_all_dto(query))?;
-        Ok(result
-            .positions
-            .into_iter()
-            .zip(result.lengths)
-            .map(|(position, length)| FindMatch {
-                position: position as usize,
-                length: length as usize,
-            })
-            .collect())
+        // The same conversion `TextDocument::find_all` uses. Written twice, the two would
+        // drift — and a batch search that disagreed with the live one about what it matched
+        // is precisely the bug this crate keeps re-learning.
+        Ok(crate::convert::find_all_to_matches(&result))
     }
 
     /// Find every match of `query` and let `decide` choose what each becomes — the whole

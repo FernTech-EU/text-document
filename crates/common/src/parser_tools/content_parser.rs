@@ -2556,7 +2556,7 @@ pub fn djot_to_plain_text(djot: &str, options: &DjotImportOptions) -> String {
     // holds an empty line for it, and an emptiness test would swallow both the block and
     // its separator, shifting every offset after it by one.
     let mut first = true;
-    let mut push = |text: &str, out: &mut String, first: &mut bool| {
+    let push = |text: &str, out: &mut String, first: &mut bool| {
         if *first {
             *first = false;
         } else {

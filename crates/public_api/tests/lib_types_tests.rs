@@ -274,6 +274,7 @@ fn find_match_debug_clone_eq() {
     let m = FindMatch {
         position: 5,
         length: 3,
+        matched_text: "café".to_string(),
     };
     assert_eq!(m, m.clone());
     let _ = format!("{:?}", m);
@@ -295,6 +296,8 @@ fn find_options_debug_clone() {
     let opts = FindOptions {
         case_sensitive: true,
         whole_word: true,
+        diacritic_sensitive: true,
+        language: "tr".to_string(),
         use_regex: false,
         search_backward: true,
     };

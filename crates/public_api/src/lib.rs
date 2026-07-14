@@ -58,8 +58,13 @@ pub use frontend::common::parser_tools::{
 /// rolled its own would disagree with this crate's in-document find about whole-word
 /// rules and case folding, and a writer would meet that as "the editor found it but the
 /// search panel didn't".
+/// The same goes for **folding** and for **case preservation**: an app that lowercased its
+/// own corpus would miss `Straße` and half-rename a Turkish manuscript. `FoldLocale` is how
+/// a per-scene language reaches the fold.
 pub mod matching {
-    pub use frontend::document_search::matching::{Match, MatchOptions, find_all};
+    pub use frontend::document_search::matching::{
+        FoldLocale, Match, MatchOptions, find_all, preserve_case,
+    };
 }
 pub use frontend::document::dtos::{TextDirection, WrapMode};
 pub use frontend::frame::dtos::FramePosition;
@@ -298,13 +303,38 @@ pub struct BlockInfo {
 pub struct FindMatch {
     pub position: usize,
     pub length: usize,
+    /// The text that was actually matched, sliced from the document's own search text.
+    ///
+    /// Carried here so no caller ever slices it themselves — and with folding on, that is no
+    /// longer a convenience. A search for `cafe` matches `café`; a search for `strasse`
+    /// matches `straße`. The query is **not** the matched text, `length` is not the query's
+    /// length, and the only other whole-document string a caller can reach
+    /// ([`TextDocument::to_plain_text`]) does not even use the same offset space — it drops
+    /// the `U+FFFC` anchor an embedded table occupies.
+    pub matched_text: String,
 }
 
 /// Options for find / find_all / replace operations.
+///
+/// Both folding toggles default to **off = folded**, which is what a writer means by
+/// "search": `aurelien` finds `Aurélien`, `strasse` finds `Straße`, `احمد` finds `أَحْمَد`.
+/// Turn one on to be literal about it.
 #[derive(Debug, Clone, Default)]
 pub struct FindOptions {
     pub case_sensitive: bool,
     pub whole_word: bool,
+    /// `false` (the default) folds diacritics, ligatures and Arabic orthography.
+    pub diacritic_sensitive: bool,
+    /// The BCP-47 tag of the text being searched — **per document**, not per search.
+    ///
+    /// Only Turkish and Azerbaijani (`tr`, `az`) change how text folds: there the dotted
+    /// and dotless `i` are different letters, and merging them turns one word into another.
+    /// Every other tag — including an empty or malformed one — folds untailored, so this is
+    /// safe to leave alone and safe to feed a user's raw project setting.
+    ///
+    /// It decides *how* to fold, never *whether* to: the toggles above stay global across a
+    /// search, or the same checkbox would mean different things in different chapters.
+    pub language: String,
     pub use_regex: bool,
     pub search_backward: bool,
 }

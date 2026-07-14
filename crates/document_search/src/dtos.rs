@@ -8,6 +8,12 @@ pub struct FindTextDto {
     pub query: String,
     pub case_sensitive: bool,
     pub whole_word: bool,
+    /// `false` (the default) folds diacritics, ligatures and Arabic orthography, so that
+    /// `aurelien` finds `Aurélien`. See `crate::folding`.
+    pub diacritic_sensitive: bool,
+    /// The BCP-47 tag of the text being searched. Only Turkish and Azerbaijani change how
+    /// text *folds*; anything else — including an empty or malformed tag — is untailored.
+    pub language: String,
     pub use_regex: bool,
     pub search_backward: bool,
     pub start_position: i64,
@@ -17,12 +23,19 @@ pub struct FindResultDto {
     pub found: bool,
     pub position: i64,
     pub length: i64,
+    /// The text that was actually matched. Folding means the query is not it: `cafe` matches
+    /// `café`. Sliced from the text the search ran on, so a caller never has to.
+    pub matched_text: String,
 }
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct FindAllDto {
     pub query: String,
     pub case_sensitive: bool,
     pub whole_word: bool,
+    /// See [`FindTextDto::diacritic_sensitive`].
+    pub diacritic_sensitive: bool,
+    /// See [`FindTextDto::language`].
+    pub language: String,
     pub use_regex: bool,
 }
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
@@ -44,6 +57,10 @@ pub struct ReplaceTextDto {
     pub replacement: String,
     pub case_sensitive: bool,
     pub whole_word: bool,
+    /// See [`FindTextDto::diacritic_sensitive`].
+    pub diacritic_sensitive: bool,
+    /// See [`FindTextDto::language`].
+    pub language: String,
     pub use_regex: bool,
     pub replace_all: bool,
     /// What the replacement text wears where it overwrites formatted prose.

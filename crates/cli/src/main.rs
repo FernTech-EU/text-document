@@ -4,7 +4,7 @@ use std::path::Path;
 use std::process;
 
 use anyhow::{Context, Result, bail};
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 
 use text_document::{FindOptions, TextDocument};
 
@@ -17,6 +17,41 @@ use text_document::{FindOptions, TextDocument};
 struct Cli {
     #[command(subcommand)]
     command: Commands,
+}
+
+/// What counts as a match — shared by `find` and `replace`, so the two can never be given
+/// different rules by accident.
+///
+/// Both folds are **on by default**, which is what a reader means by "search": `aurelien`
+/// finds `Aurélien`, `strasse` finds `Straße`. The flags below turn them off.
+#[derive(Args, Clone)]
+struct MatchArgs {
+    /// Match case exactly (by default `CAFÉ`, `Café` and `café` are the same word)
+    #[arg(long, short = 'c')]
+    case_sensitive: bool,
+    /// Match diacritics exactly (by default `cafe` finds `café`, and `احمد` finds `أَحْمَد`)
+    #[arg(long, short = 'd')]
+    diacritic_sensitive: bool,
+    /// Match whole words only
+    #[arg(long, short = 'w')]
+    whole_word: bool,
+    /// Language of the text, as a BCP-47 tag. Only `tr`/`az` change folding: there the
+    /// dotted and dotless i are different letters. Anything else is untailored.
+    #[arg(long, short = 'l', default_value = "")]
+    language: String,
+}
+
+impl MatchArgs {
+    fn to_find_options(&self, use_regex: bool) -> FindOptions {
+        FindOptions {
+            case_sensitive: self.case_sensitive,
+            diacritic_sensitive: self.diacritic_sensitive,
+            whole_word: self.whole_word,
+            language: self.language.clone(),
+            use_regex,
+            search_backward: false,
+        }
+    }
 }
 
 #[derive(Subcommand)]
@@ -47,10 +82,8 @@ enum Commands {
         file: String,
         /// Search query
         query: String,
-        #[arg(long, short = 'c')]
-        case_sensitive: bool,
-        #[arg(long, short = 'w')]
-        whole_word: bool,
+        #[command(flatten)]
+        matching: MatchArgs,
         #[arg(long, short = 'e')]
         regex: bool,
     },
@@ -66,10 +99,8 @@ enum Commands {
         /// Output file (defaults to overwriting input)
         #[arg(short, long)]
         output: Option<String>,
-        #[arg(long, short = 'c')]
-        case_sensitive: bool,
-        #[arg(long, short = 'w')]
-        whole_word: bool,
+        #[command(flatten)]
+        matching: MatchArgs,
         #[arg(long, short = 'e')]
         regex: bool,
     },
@@ -201,21 +232,9 @@ fn cmd_stats(file: &str) -> Result<()> {
     Ok(())
 }
 
-fn cmd_find(
-    file: &str,
-    query: &str,
-    case_sensitive: bool,
-    whole_word: bool,
-    use_regex: bool,
-) -> Result<()> {
+fn cmd_find(file: &str, query: &str, opts: &FindOptions) -> Result<()> {
     let doc = load_document(file)?;
-    let opts = FindOptions {
-        case_sensitive,
-        whole_word,
-        use_regex,
-        search_backward: false,
-    };
-    let matches = doc.find_all(query, &opts)?;
+    let matches = doc.find_all(query, opts)?;
 
     if matches.is_empty() {
         eprintln!("no matches found");
@@ -241,17 +260,9 @@ fn cmd_replace(
     query: &str,
     replacement: &str,
     output: Option<&str>,
-    case_sensitive: bool,
-    whole_word: bool,
-    use_regex: bool,
+    opts: &FindOptions,
 ) -> Result<()> {
     let doc = load_document(file)?;
-    let opts = FindOptions {
-        case_sensitive,
-        whole_word,
-        use_regex,
-        search_backward: false,
-    };
     let count = doc.replace_text(
         query,
         replacement,
@@ -307,27 +318,23 @@ fn main() {
         Commands::Find {
             file,
             query,
-            case_sensitive,
-            whole_word,
+            matching,
             regex,
-        } => cmd_find(file, query, *case_sensitive, *whole_word, *regex),
+        } => cmd_find(file, query, &matching.to_find_options(*regex)),
 
         Commands::Replace {
             file,
             query,
             replacement,
             output,
-            case_sensitive,
-            whole_word,
+            matching,
             regex,
         } => cmd_replace(
             file,
             query,
             replacement,
             output.as_deref(),
-            *case_sensitive,
-            *whole_word,
-            *regex,
+            &matching.to_find_options(*regex),
         ),
 
         Commands::Cat { file, format } => cmd_cat(file, format),

@@ -86,13 +86,7 @@ fn execute_replace(
 
     let (full_text, blocks) = fetch_blocks_and_build_text(uow.as_ref())?;
 
-    let mut matches = find_all_matches(
-        &full_text,
-        &dto.query,
-        dto.case_sensitive,
-        dto.whole_word,
-        dto.use_regex,
-    )?;
+    let mut matches = find_all_matches(&full_text, &dto.query, &dto.into(), dto.use_regex)?;
     if !dto.replace_all {
         matches.truncate(1);
     }

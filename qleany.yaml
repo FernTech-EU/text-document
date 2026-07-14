@@ -1340,6 +1340,14 @@ features:
               type: boolean
             - name: whole_word
               type: boolean
+            # false (the default) folds diacritics, ligatures and Arabic orthography, so
+            # that `aurelien` finds `Aurélien`.
+            - name: diacritic_sensitive
+              type: boolean
+            # BCP-47 tag of the text being searched. Only tr/az change how text FOLDS (the
+            # dotted vs dotless i); an empty or malformed tag is untailored, never an error.
+            - name: language
+              type: string
             - name: use_regex
               type: boolean
             - name: search_backward
@@ -1355,6 +1363,10 @@ features:
               type: integer
             - name: length
               type: integer
+            # The text actually matched. With folding on, the query is NOT it: `cafe` finds
+            # `café`. Returned so no caller ever slices the document themselves.
+            - name: matched_text
+              type: string
 
       - name: find_all
         undoable: false
@@ -1369,6 +1381,10 @@ features:
               type: boolean
             - name: whole_word
               type: boolean
+            - name: diacritic_sensitive
+              type: boolean
+            - name: language
+              type: string
             - name: use_regex
               type: boolean
         dto_out:
@@ -1414,6 +1430,10 @@ features:
               type: boolean
             - name: whole_word
               type: boolean
+            - name: diacritic_sensitive
+              type: boolean
+            - name: language
+              type: string
             - name: use_regex
               type: boolean
             - name: replace_all
