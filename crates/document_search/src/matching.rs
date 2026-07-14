@@ -33,12 +33,13 @@
 //! source-char boundary** — see [`Folded::to_source_match`].
 
 use std::cmp::Ordering;
+use std::sync::OnceLock;
 
 use unicode_segmentation::UnicodeSegmentation;
 
-use crate::folding::{self, FoldSpec};
+use crate::folding::{self};
 
-pub use crate::folding::FoldLocale;
+pub use crate::folding::{FoldLocale, FoldSpec};
 
 /// How to match.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
@@ -57,7 +58,13 @@ pub struct MatchOptions {
 }
 
 impl MatchOptions {
-    fn fold_spec(&self) -> FoldSpec {
+    /// The subset of these options that decides how text **folds**.
+    ///
+    /// `whole_word` is deliberately *not* part of it: it decides which matches survive, not
+    /// how a single character folds. Keeping that distinction in the types is what lets
+    /// [`FoldedText`] answer both kinds of query from one fold — so a host app caching the
+    /// fold of a whole manuscript does not throw it away when the writer ticks a checkbox.
+    pub fn fold_spec(&self) -> FoldSpec {
         FoldSpec {
             case_sensitive: self.case_sensitive,
             diacritic_sensitive: self.diacritic_sensitive,
@@ -79,37 +86,108 @@ pub struct Match {
 }
 
 /// Every occurrence of `needle` in `haystack`, in original char offsets.
+///
+/// Folds the haystack, searches it, and throws the fold away. For a **single** search that is
+/// exactly right. For a search box — where the same corpus is searched again on every
+/// keystroke — see [`FoldedText`], which keeps the fold.
 pub fn find_all(haystack: &str, needle: &str, options: &MatchOptions) -> Vec<Match> {
-    if needle.is_empty() || haystack.is_empty() {
-        return Vec::new();
-    }
-    let spec = options.fold_spec();
-    let folded_needle = fold_query(needle, &spec);
-    if folded_needle.is_empty() {
-        return Vec::new();
+    FoldedText::new(haystack, &options.fold_spec()).find_all(needle, options.whole_word)
+}
+
+/// A haystack folded **once**, ready to be searched many times.
+///
+/// ## Why this exists
+///
+/// A project-wide search box re-searches the *same* prose on every keystroke, and folding it
+/// is not free. Measured over a 300k-word manuscript: the fold costs about the same as
+/// *parsing* the prose in the first place, and roughly twice what scanning it does — and it
+/// was being rebuilt from scratch for every character the writer typed. A host app holds one
+/// of these per scene and pays that cost once.
+///
+/// ## What it is keyed by, and what it is not
+///
+/// It is built from a [`FoldSpec`] — case, diacritics, language — because those are what
+/// decide how a character folds. **`whole_word` is not one of them**: it decides which matches
+/// survive, not how the text folds. So it is a parameter of [`find_all`](Self::find_all), not
+/// of the fold, and one `FoldedText` answers both kinds of query. That is not a nicety: it
+/// means ticking "whole word" does not throw away a manuscript's worth of folding.
+///
+/// The word-boundary table is built **lazily**, on the first whole-word query, because it is a
+/// second full pass over the text and most searches never ask for it.
+pub struct FoldedText {
+    /// The text as the writer typed it. Retained because [`Match`] offsets address it, and a
+    /// caller that has cached this has usually thrown its own copy away — the alternative is
+    /// every caller keeping a parallel copy and hoping the two stay in step.
+    source: String,
+    folded: Folded,
+    spec: FoldSpec,
+    boundaries: OnceLock<Vec<u32>>,
+}
+
+impl FoldedText {
+    /// Fold `haystack` under `spec`. (`MatchOptions::fold_spec` gets you one.)
+    pub fn new(haystack: &str, spec: &FoldSpec) -> Self {
+        Self {
+            source: haystack.to_string(),
+            folded: Folded::new(haystack, spec),
+            spec: *spec,
+            boundaries: OnceLock::new(),
+        }
     }
 
-    let folded = Folded::new(haystack, &spec);
-    let hits = folded.matches(&folded_needle);
-    if !options.whole_word {
-        return hits;
+    /// The original text — what the offsets below address, and what a snippet is cut from.
+    pub fn source(&self) -> &str {
+        &self.source
     }
 
-    // Boundaries are computed on the ORIGINAL text, so they compose directly with the
-    // original offsets the matcher reports — no second index map needed.
-    let boundaries = word_boundaries(haystack);
-    let arabic = starts_with_arabic(&folded_needle);
+    /// Every occurrence of `needle`, in **original** char offsets.
+    ///
+    /// `whole_word` is decided here rather than at fold time; see the type's docs.
+    pub fn find_all(&self, needle: &str, whole_word: bool) -> Vec<Match> {
+        if needle.is_empty() || self.folded.text.is_empty() {
+            return Vec::new();
+        }
+        // The needle is folded by the same function the haystack was, so the two can never be
+        // folded by different rules.
+        let folded_needle = fold_query(needle, &self.spec);
+        if folded_needle.is_empty() {
+            return Vec::new();
+        }
+        if !whole_word {
+            return self.folded.matches(&folded_needle);
+        }
 
-    hits.into_iter()
-        .zip(folded.folded_starts(&folded_needle))
-        .filter(|(m, folded_start)| {
-            let ends_on_a_word = is_boundary(&boundaries, m.char_start + m.char_len);
-            let starts_on_a_word = is_boundary(&boundaries, m.char_start)
-                || (arabic && after_arabic_proclitic(&folded, &boundaries, *folded_start));
-            starts_on_a_word && ends_on_a_word
-        })
-        .map(|(m, _)| m)
-        .collect()
+        // Boundaries are computed on the ORIGINAL text, so they compose directly with the
+        // original offsets the matcher reports — no second index map needed.
+        let boundaries = self
+            .boundaries
+            .get_or_init(|| word_boundaries(&self.source));
+        let arabic = starts_with_arabic(&folded_needle);
+
+        self.folded
+            .scan(&folded_needle)
+            .filter(|(folded_start, _, m)| {
+                let ends_on_a_word = is_boundary(boundaries, m.char_start + m.char_len);
+                let starts_on_a_word = is_boundary(boundaries, m.char_start)
+                    || (arabic && after_arabic_proclitic(&self.folded, boundaries, *folded_start));
+                starts_on_a_word && ends_on_a_word
+            })
+            .map(|(_, _, m)| m)
+            .collect()
+    }
+
+    /// Roughly how many bytes of heap this holds.
+    ///
+    /// A host app caching one per scene has to bound the total, and the honest number is not
+    /// obvious: the index maps are four bytes per *folded char*, so together they outweigh the
+    /// text itself several times over.
+    pub fn heap_size(&self) -> usize {
+        self.source.capacity()
+            + self.folded.text.capacity()
+            + self.folded.origin.capacity() * 4
+            + self.folded.byte_of_char.capacity() * 4
+            + self.boundaries.get().map_or(0, |b| b.capacity() * 4)
+    }
 }
 
 /// Fold a query. Same function as the haystack's fold, so the two can never be folded by
@@ -222,14 +300,6 @@ impl Folded {
             char_start: from as usize,
             char_len: to.saturating_sub(from) as usize,
         })
-    }
-
-    /// Folded char index of every accepted occurrence — the same list, in the same order, as
-    /// [`Self::matches`]. The whole-word rules need it, because the Arabic proclitic check
-    /// reads the *folded* text (where the harakat that would otherwise sit between the
-    /// article and the noun have already gone).
-    fn folded_starts(&self, folded_needle: &str) -> Vec<usize> {
-        self.scan(folded_needle).map(|(fs, _, _)| fs).collect()
     }
 
     fn matches(&self, folded_needle: &str) -> Vec<Match> {

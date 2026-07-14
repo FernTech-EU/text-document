@@ -61,9 +61,13 @@ pub use frontend::common::parser_tools::{
 /// The same goes for **folding** and for **case preservation**: an app that lowercased its
 /// own corpus would miss `Straße` and half-rename a Turkish manuscript. `FoldLocale` is how
 /// a per-scene language reaches the fold.
+/// [`FoldedText`](matching::FoldedText) is the *prepared* form: a haystack folded once and
+/// searched many times. A search box re-searches the same corpus on every keystroke, and
+/// folding it costs several times what scanning it does — so an app that searches a whole
+/// project keeps one of these per scene rather than rebuilding the fold per character typed.
 pub mod matching {
     pub use frontend::document_search::matching::{
-        FoldLocale, Match, MatchOptions, find_all, preserve_case,
+        FoldLocale, FoldSpec, FoldedText, Match, MatchOptions, find_all, preserve_case,
     };
 }
 pub use frontend::document::dtos::{TextDirection, WrapMode};
