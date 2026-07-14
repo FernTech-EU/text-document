@@ -413,7 +413,7 @@ proptest! {
 
         // Create a fresh doc for replace (since replace mutates)
         let doc2 = new_doc(&text);
-        let replace_count = doc2.replace_text(&query, "X", true, &opts).unwrap();
+        let replace_count = doc2.replace_text(&query, "X", true, &text_document::ReplaceOptions::new(opts.clone())).unwrap();
 
         prop_assert_eq!(replace_count, find_count,
             "replace_all count {} != find_all count {} for query '{}'",

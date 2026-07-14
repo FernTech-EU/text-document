@@ -22,6 +22,7 @@ fn test_replace_single() -> Result<()> {
             whole_word: false,
             use_regex: false,
             replace_all: false,
+            format_policy: Default::default(),
         },
     )?;
 
@@ -48,6 +49,7 @@ fn test_replace_all() -> Result<()> {
             whole_word: false,
             use_regex: false,
             replace_all: true,
+            format_policy: Default::default(),
         },
     )?;
 
@@ -74,6 +76,7 @@ fn test_replace_case_insensitive() -> Result<()> {
             whole_word: false,
             use_regex: false,
             replace_all: true,
+            format_policy: Default::default(),
         },
     )?;
 
@@ -100,6 +103,7 @@ fn test_replace_regex() -> Result<()> {
             whole_word: false,
             use_regex: true,
             replace_all: true,
+            format_policy: Default::default(),
         },
     )?;
 
@@ -126,6 +130,7 @@ fn test_replace_not_found() -> Result<()> {
             whole_word: false,
             use_regex: false,
             replace_all: true,
+            format_policy: Default::default(),
         },
     )?;
 
@@ -152,6 +157,7 @@ fn test_replace_empty_query() -> Result<()> {
             whole_word: false,
             use_regex: false,
             replace_all: true,
+            format_policy: Default::default(),
         },
     )?;
 
@@ -178,6 +184,7 @@ fn test_replace_undo() -> Result<()> {
             whole_word: false,
             use_regex: false,
             replace_all: true,
+            format_policy: Default::default(),
         },
     )?;
 
@@ -210,6 +217,7 @@ fn test_replace_all_across_blocks() -> Result<()> {
             whole_word: false,
             use_regex: false,
             replace_all: true,
+            format_policy: Default::default(),
         },
     )?;
 
@@ -236,6 +244,7 @@ fn test_replace_redo() -> Result<()> {
             whole_word: false,
             use_regex: false,
             replace_all: true,
+            format_policy: Default::default(),
         },
     )?;
 
@@ -266,6 +275,7 @@ fn test_replace_with_empty_deletes() -> Result<()> {
             whole_word: false,
             use_regex: false,
             replace_all: true,
+            format_policy: Default::default(),
         },
     )?;
 
@@ -291,6 +301,7 @@ fn test_replace_with_longer_text() -> Result<()> {
             whole_word: false,
             use_regex: false,
             replace_all: true,
+            format_policy: Default::default(),
         },
     )?;
 

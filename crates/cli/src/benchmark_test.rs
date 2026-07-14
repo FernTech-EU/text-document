@@ -120,8 +120,18 @@ pub fn run_benchmark_test() -> Result<()> {
     for _ in 0..20 {
         let _ = doc.find_all("Lorem", &find_opts)?;
     }
-    doc.replace_text("Lorem", "LOREM", true, &find_opts)?;
-    doc.replace_text("LOREM", "Lorem", true, &find_opts)?;
+    doc.replace_text(
+        "Lorem",
+        "LOREM",
+        true,
+        &text_document::ReplaceOptions::new(find_opts.clone()),
+    )?;
+    doc.replace_text(
+        "LOREM",
+        "Lorem",
+        true,
+        &text_document::ReplaceOptions::new(find_opts.clone()),
+    )?;
 
     // 9. Undo / redo churn — stacks touch many entities.
     for _ in 0..30 {

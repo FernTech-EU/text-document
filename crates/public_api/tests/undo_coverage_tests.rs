@@ -388,7 +388,14 @@ fn undo_redo_set_frame_format() {
 fn undo_redo_replace_text() {
     let doc = new_doc("foo bar foo baz");
     let opts = FindOptions::default();
-    let count = doc.replace_text("foo", "XXX", true, &opts).unwrap();
+    let count = doc
+        .replace_text(
+            "foo",
+            "XXX",
+            true,
+            &text_document::ReplaceOptions::new(opts.clone()),
+        )
+        .unwrap();
     assert_eq!(count, 2);
     assert_eq!(doc.to_plain_text().unwrap(), "XXX bar XXX baz");
 

@@ -13,9 +13,103 @@
 //! Invariants are documented on [`FormatRun`] and enforced by
 //! [`debug_assert_well_formed`] and by [`splice_range`] / [`shift_after`]
 //! which rebuild the run list while preserving them.
+//!
+//! **In a release build a `debug_assert!` is not enforcement.** It is compiled out, so
+//! a contract violation there produced a malformed run list *silently* — and autosave
+//! wrote that corruption to the writer's file seconds later. The bulk-edit path
+//! therefore uses the checked siblings, which report instead of assert:
+//! [`check_well_formed`], [`try_splice_range`] and [`shift_runs_for_replace`], all
+//! returning [`FormatRunError`].
 
 use crate::entities::{CharVerticalAlignment, UnderlineStyle};
 use serde::{Deserialize, Serialize};
+use thiserror::Error;
+
+/// A violation of the format-run invariants, reported instead of asserted.
+///
+/// The invariants used to be guarded only by `debug_assert!`, which is **compiled out
+/// of release builds** — so a contract violation silently produced a malformed run list
+/// in a shipped binary, and (with autosave) that corruption became the file's new truth
+/// within seconds. Anything on the *replace* path returns this instead, so the use case
+/// can refuse the edit and say why rather than quietly mangle a writer's formatting.
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum FormatRunError {
+    #[error("byte range {start}..{end} is reversed")]
+    ReversedRange { start: u32, end: u32 },
+
+    #[error(
+        "replacement run {run_start}..{run_end} falls outside the spliced range \
+         {range_start}..{range_end}"
+    )]
+    ReplacementOutsideRange {
+        run_start: u32,
+        run_end: u32,
+        range_start: u32,
+        range_end: u32,
+    },
+
+    #[error("run {start}..{end} is empty or reversed")]
+    EmptyRun { start: u32, end: u32 },
+
+    #[error("runs overlap or are out of order at index {index}: {left:?} then {right:?}")]
+    RunsOverlap {
+        index: usize,
+        left: Box<FormatRun>,
+        right: Box<FormatRun>,
+    },
+
+    #[error("adjacent runs with identical formatting were left uncoalesced at index {index}")]
+    RunsNotCoalesced { index: usize },
+
+    #[error("run {start}..{end} runs past the end of the block's {text_len} bytes")]
+    RunPastEndOfBlock {
+        start: u32,
+        end: u32,
+        text_len: usize,
+    },
+}
+
+/// What the replacement text wears when it overwrites formatted text.
+///
+/// Before this existed the behaviour was **emergent, not chosen**: a replace was a
+/// delete followed by an insert, and `shift_runs_for_insert` hardcodes "the inserted
+/// text inherits whatever run ends at the insertion point". That silently destroys
+/// formatting — renaming a character whose name reads `Auré**lien**` dropped the bold
+/// entirely, and not one test in the repo covered it.
+///
+/// The old behaviour is still the default (and is byte-for-byte identical); it is now
+/// simply one option among four, and the caller has to look at it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum ReplaceFormatPolicy {
+    /// The replacement inherits the format of the run that straddles the start of the
+    /// replaced range or ends exactly on it (precisely: `byte_start < start &&
+    /// byte_end >= start`); otherwise it is unformatted. A run beginning *exactly* at
+    /// the start never contributes.
+    ///
+    /// This is the Qt / ProseMirror insertion convention, and it is what
+    /// delete-then-insert has always produced — byte for byte, which
+    /// `inherit_preceding_matches_the_historical_delete_then_insert` pins *differentially*
+    /// (it runs the historical primitives and compares, rather than trusting a
+    /// transcription of them).
+    #[default]
+    InheritPreceding,
+
+    /// If a **single run covers the whole replaced range**, the replacement keeps that
+    /// run's format; otherwise fall back to [`Self::InheritPreceding`]. "Rename a name
+    /// that was entirely bold and it stays bold" — without guessing when the range is
+    /// formatted unevenly.
+    PreserveIfFullyCovered,
+
+    /// The replacement takes the format that covered the **most bytes** of the replaced
+    /// range. Unformatted gaps count as a candidate, so a mostly-plain range stays
+    /// plain; ties go to the *formatted* run, because a tie means the writer's
+    /// formatting covered at least as much as its absence and dropping it is the
+    /// destructive answer.
+    KeepDominantRun,
+
+    /// The replacement carries no formatting at all.
+    PreserveNothing,
+}
 
 /// Content type for an inline segment: text, image, or empty.
 #[derive(Serialize, Deserialize, Default, Clone, Debug, PartialEq, Eq)]
@@ -123,33 +217,53 @@ pub struct ImageAnchor {
 ///    consecutive runs satisfy `byte_end == next.byte_start &&
 ///    format == next.format`).
 pub fn debug_assert_well_formed(runs: &[FormatRun], block_text_len: usize) {
+    // Only pay the O(n) walk where the assertion would actually fire.
+    if cfg!(debug_assertions)
+        && let Err(e) = check_well_formed(runs, block_text_len)
+    {
+        debug_assert!(false, "format runs are malformed: {e}");
+    }
+}
+
+/// The same invariants as [`debug_assert_well_formed`], but **reported rather than
+/// asserted** — so a caller that must not corrupt a block can refuse the edit.
+///
+/// This exists because `debug_assert!` is compiled out of release builds: a malformed
+/// run list produced in a shipped binary went completely undetected, and autosave wrote
+/// it to disk seconds later. The replace path calls this and propagates the error.
+pub fn check_well_formed(runs: &[FormatRun], block_text_len: usize) -> Result<(), FormatRunError> {
     if runs.is_empty() {
-        return;
+        return Ok(());
     }
     for run in runs {
-        debug_assert!(
-            run.byte_start < run.byte_end,
-            "format run is empty or reversed: {run:?}"
-        );
+        if run.byte_start >= run.byte_end {
+            return Err(FormatRunError::EmptyRun {
+                start: run.byte_start,
+                end: run.byte_end,
+            });
+        }
     }
     for i in 0..runs.len() - 1 {
-        debug_assert!(
-            runs[i].byte_end <= runs[i + 1].byte_start,
-            "format runs overlap or unsorted at {i}: {:?} then {:?}",
-            runs[i],
-            runs[i + 1]
-        );
-        debug_assert!(
-            !(runs[i].byte_end == runs[i + 1].byte_start && runs[i].format == runs[i + 1].format),
-            "adjacent identical format runs at {i} not coalesced: {:?}",
-            runs[i]
-        );
+        if runs[i].byte_end > runs[i + 1].byte_start {
+            return Err(FormatRunError::RunsOverlap {
+                index: i,
+                left: Box::new(runs[i].clone()),
+                right: Box::new(runs[i + 1].clone()),
+            });
+        }
+        if runs[i].byte_end == runs[i + 1].byte_start && runs[i].format == runs[i + 1].format {
+            return Err(FormatRunError::RunsNotCoalesced { index: i });
+        }
     }
-    debug_assert!(
-        runs.last().unwrap().byte_end as usize <= block_text_len,
-        "last format run {:?} exceeds block text len {block_text_len}",
-        runs.last().unwrap()
-    );
+    let last = runs.last().expect("non-empty");
+    if last.byte_end as usize > block_text_len {
+        return Err(FormatRunError::RunPastEndOfBlock {
+            start: last.byte_start,
+            end: last.byte_end,
+            text_len: block_text_len,
+        });
+    }
+    Ok(())
 }
 
 /// Merge adjacent runs that have identical formatting. O(n).
@@ -186,9 +300,58 @@ pub fn splice_range(
     range: std::ops::Range<u32>,
     replacement: Vec<FormatRun>,
 ) {
-    debug_assert!(range.start <= range.end);
+    if let Err(e) = try_splice_range(runs, range, replacement) {
+        // Previously this was a bare `debug_assert!` — compiled OUT of release, where a
+        // contract violation therefore went on to build a malformed run list and corrupt
+        // the block's formatting silently. Keep the loud failure in debug; in release,
+        // refuse the splice and leave `runs` untouched rather than mangle it.
+        //
+        // No existing caller can reach this: every one either builds a replacement that
+        // spans exactly the range, or goes through `shift_runs_for_delete`, which
+        // early-returns on an inverted range. It is a net, not a behaviour change.
+        debug_assert!(false, "splice_range contract violated: {e}");
+    }
+}
+
+/// [`splice_range`], but the contract is **checked and reported** instead of asserted.
+///
+/// `runs` is left completely untouched when this returns `Err` — validation happens
+/// before any mutation, so a rejected splice cannot half-apply.
+pub fn try_splice_range(
+    runs: &mut Vec<FormatRun>,
+    range: std::ops::Range<u32>,
+    replacement: Vec<FormatRun>,
+) -> Result<(), FormatRunError> {
+    if range.start > range.end {
+        return Err(FormatRunError::ReversedRange {
+            start: range.start,
+            end: range.end,
+        });
+    }
     for r in &replacement {
-        debug_assert!(r.byte_start >= range.start && r.byte_end <= range.end);
+        if r.byte_start >= r.byte_end {
+            return Err(FormatRunError::EmptyRun {
+                start: r.byte_start,
+                end: r.byte_end,
+            });
+        }
+        if r.byte_start < range.start || r.byte_end > range.end {
+            return Err(FormatRunError::ReplacementOutsideRange {
+                run_start: r.byte_start,
+                run_end: r.byte_end,
+                range_start: range.start,
+                range_end: range.end,
+            });
+        }
+    }
+    for i in 1..replacement.len() {
+        if replacement[i - 1].byte_end > replacement[i].byte_start {
+            return Err(FormatRunError::RunsOverlap {
+                index: i - 1,
+                left: Box::new(replacement[i - 1].clone()),
+                right: Box::new(replacement[i].clone()),
+            });
+        }
     }
 
     let mut result: Vec<FormatRun> = Vec::with_capacity(runs.len() + replacement.len());
@@ -226,6 +389,7 @@ pub fn splice_range(
 
     coalesce_in_place(&mut result);
     *runs = result;
+    Ok(())
 }
 
 /// Capture the slice of `runs` that intersects `[start..end)`, clipped
@@ -366,6 +530,133 @@ pub fn shift_runs_for_delete(runs: &mut Vec<FormatRun>, byte_start: u32, byte_en
     // The shift can make a left-clipped run abut a shifted trailing run
     // with identical format; coalesce once more to restore the invariant.
     coalesce_in_place(runs);
+}
+
+/// Apply a "replace byte range `[byte_start..byte_end)` with `replacement_bytes` bytes"
+/// mutation to a block's runs, choosing explicitly what the replacement wears.
+///
+/// This is the one edit where the old delete-then-insert composition quietly lost a
+/// writer's formatting: replacing `Auré**lien**` deletes both runs under the range and
+/// then lets the replacement inherit whatever preceded it, so the bold is gone. That
+/// behaviour is still available — and is still the default — but it is now a *decision*
+/// ([`ReplaceFormatPolicy`]) rather than an accident of two functions being called in
+/// sequence.
+///
+/// Additive by design: `shift_runs_for_delete` / `shift_runs_for_insert` are untouched,
+/// because 13 other call sites across delete/insert/paste depend on their exact
+/// behaviour. [`ReplaceFormatPolicy::InheritPreceding`] is implemented *by calling that
+/// very composition*, so the default cannot drift away from what shipped.
+///
+/// Returns `Err` rather than corrupting the block if the range is inverted or the
+/// re-splice would violate the run invariants — see [`FormatRunError`].
+pub fn shift_runs_for_replace(
+    runs: &mut Vec<FormatRun>,
+    byte_start: u32,
+    byte_end: u32,
+    replacement_bytes: u32,
+    policy: ReplaceFormatPolicy,
+) -> Result<(), FormatRunError> {
+    if byte_end < byte_start {
+        return Err(FormatRunError::ReversedRange {
+            start: byte_start,
+            end: byte_end,
+        });
+    }
+
+    // Decide what the replacement wears from the runs as they stand BEFORE the edit —
+    // afterwards the runs under the range are gone and the evidence with them.
+    //
+    // `None` here means "do not override": let the composition below decide, which is
+    // exactly `InheritPreceding`.
+    //
+    // An empty range replaces nothing, so it is an *insertion*, and the two
+    // coverage-based policies have nothing to reason about — they must defer to the
+    // insert convention rather than strip the format the typed text would have
+    // inherited. Only `PreserveNothing`, which is an explicit request for unformatted
+    // text, still applies.
+    let destroys_formatting = byte_end > byte_start;
+    let override_format: Option<Option<CharacterFormat>> = match policy {
+        ReplaceFormatPolicy::InheritPreceding => None,
+        ReplaceFormatPolicy::PreserveNothing => Some(None),
+        ReplaceFormatPolicy::PreserveIfFullyCovered => {
+            covering_format(runs, byte_start, byte_end).map(Some)
+        }
+        ReplaceFormatPolicy::KeepDominantRun if destroys_formatting => {
+            Some(dominant_format(runs, byte_start, byte_end))
+        }
+        ReplaceFormatPolicy::KeepDominantRun => None,
+    };
+
+    // The historical composition. This IS `InheritPreceding`, byte for byte.
+    shift_runs_for_delete(runs, byte_start, byte_end);
+    shift_runs_for_insert(runs, byte_start, replacement_bytes);
+
+    // Every other policy is a targeted re-splice of exactly the replacement's span.
+    if let Some(format) = override_format
+        && replacement_bytes > 0
+    {
+        let span = byte_start..byte_start + replacement_bytes;
+        let replacement = match format {
+            Some(format) => vec![FormatRun {
+                byte_start: span.start,
+                byte_end: span.end,
+                format,
+            }],
+            None => Vec::new(),
+        };
+        try_splice_range(runs, span, replacement)?;
+    }
+    Ok(())
+}
+
+/// The format of the single run covering **all** of `[start..end)`, if one does.
+///
+/// An empty range is covered by nothing: a pure insertion has no formatting of its own
+/// to preserve, so every policy falls back to inheritance there rather than silently
+/// formatting typed text from a run it merely sits next to.
+fn covering_format(runs: &[FormatRun], start: u32, end: u32) -> Option<CharacterFormat> {
+    if end <= start {
+        return None;
+    }
+    runs.iter()
+        .find(|r| r.byte_start <= start && r.byte_end >= end)
+        .map(|r| r.format.clone())
+}
+
+/// The format covering the most bytes of `[start..end)`, or `None` if unformatted text
+/// covers more than any single run.
+///
+/// Gaps count as a candidate, so renaming inside a mostly-plain range stays plain. Ties
+/// go to the formatted run: a tie means the formatting covered at least as much of the
+/// range as its absence did, and dropping it is the destructive outcome.
+fn dominant_format(runs: &[FormatRun], start: u32, end: u32) -> Option<CharacterFormat> {
+    if end <= start {
+        return None;
+    }
+    let span = u64::from(end - start);
+    let mut covered = 0u64;
+    let mut best: Option<(u64, &FormatRun)> = None;
+
+    for r in runs {
+        let lo = r.byte_start.max(start);
+        let hi = r.byte_end.min(end);
+        if hi <= lo {
+            continue;
+        }
+        let overlap = u64::from(hi - lo);
+        covered += overlap;
+        // `>` keeps the EARLIEST run on a tie between two runs, so the result does not
+        // depend on iteration order beyond the list's own sortedness.
+        if best.is_none_or(|(best_overlap, _)| overlap > best_overlap) {
+            best = Some((overlap, r));
+        }
+    }
+
+    let plain = span - covered;
+    match best {
+        Some((overlap, run)) if overlap >= plain => Some(run.format.clone()),
+        _ => None,
+    }
 }
 
 /// Apply an "insert" shift to a block's image anchors. Anchors at or
@@ -717,5 +1008,514 @@ mod tests {
         assert_eq!(rs[0].byte_start, 0); // unchanged
         assert_eq!(rs[1].byte_start, 13);
         assert_eq!(rs[1].byte_end, 18);
+    }
+}
+
+/// The adversarial corpus for [`shift_runs_for_replace`].
+///
+/// Replace is the one edit that rewrites a writer's prose *in bulk*, so its formatting
+/// behaviour has to be pinned rather than inherited by accident. Before this module
+/// there were 11 replace tests in the repo and **not one** of them mentioned
+/// `FormatRun`: the behaviour was emergent, undecided, and untested.
+#[cfg(test)]
+mod replace_policy_tests {
+    use super::*;
+
+    fn fmt(tag: &str) -> CharacterFormat {
+        CharacterFormat {
+            font_bold: Some(tag == "B"),
+            font_italic: Some(tag == "I"),
+            ..Default::default()
+        }
+    }
+    fn r(start: u32, end: u32, tag: &str) -> FormatRun {
+        FormatRun {
+            byte_start: start,
+            byte_end: end,
+            format: fmt(tag),
+        }
+    }
+    /// Compact "0..5=B 8..12=I" rendering, so a failure shows the whole run list.
+    fn show(runs: &[FormatRun]) -> String {
+        if runs.is_empty() {
+            return "[]".to_string();
+        }
+        runs.iter()
+            .map(|x| {
+                let tag = if x.format.font_bold == Some(true) {
+                    "B"
+                } else if x.format.font_italic == Some(true) {
+                    "I"
+                } else {
+                    "p"
+                };
+                format!("{}..{}={tag}", x.byte_start, x.byte_end)
+            })
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+    fn replace(
+        runs: &[FormatRun],
+        start: u32,
+        end: u32,
+        n: u32,
+        policy: ReplaceFormatPolicy,
+    ) -> Vec<FormatRun> {
+        let mut runs = runs.to_vec();
+        shift_runs_for_replace(&mut runs, start, end, n, policy).expect("valid replace");
+        runs
+    }
+
+    /// **The spec-conformance test.** `InheritPreceding` must be byte-for-byte what
+    /// today's `shift_runs_for_delete` + `shift_runs_for_insert` produces — anything
+    /// else silently rewrites the formatting of every replace that ever shipped.
+    ///
+    /// Differential, not hand-transcribed: it runs the historical primitives directly
+    /// and compares, so it stays honest even if their behaviour is ever changed.
+    #[test]
+    fn inherit_preceding_matches_the_historical_delete_then_insert() {
+        let corpus: Vec<(&str, Vec<FormatRun>, u32, u32, u32)> = vec![
+            ("run ends exactly at start", vec![r(0, 5, "B")], 5, 10, 3),
+            ("run begins exactly at start", vec![r(5, 8, "B")], 5, 10, 3),
+            (
+                "run begins at start, outlives end",
+                vec![r(5, 20, "B")],
+                5,
+                10,
+                3,
+            ),
+            (
+                "run straddles the whole range",
+                vec![r(0, 20, "B")],
+                5,
+                10,
+                3,
+            ),
+            ("no run touches the start", vec![r(12, 20, "B")], 5, 10, 3),
+            ("bold tail inside the range", vec![r(9, 13, "B")], 5, 13, 4),
+            ("pure delete", vec![r(0, 20, "B")], 5, 10, 0),
+            ("pure insert", vec![r(0, 20, "B")], 5, 5, 3),
+            (
+                "same format either side coalesces",
+                vec![r(0, 5, "B"), r(10, 15, "B")],
+                5,
+                10,
+                3,
+            ),
+            (
+                "different formats either side",
+                vec![r(0, 5, "B"), r(10, 15, "I")],
+                5,
+                10,
+                3,
+            ),
+            ("empty run list", vec![], 5, 10, 3),
+            ("the only run is consumed", vec![r(5, 10, "B")], 5, 10, 3),
+            (
+                "replacement longer than the range",
+                vec![r(0, 5, "B")],
+                5,
+                10,
+                20,
+            ),
+            (
+                "three runs straddled",
+                vec![r(0, 3, "B"), r(3, 6, "I"), r(6, 9, "B")],
+                2,
+                7,
+                4,
+            ),
+            (
+                "gap between two same-format runs is deleted",
+                vec![r(0, 5, "B"), r(8, 13, "B")],
+                5,
+                8,
+                0,
+            ),
+        ];
+
+        for (name, runs, start, end, n) in corpus {
+            // The historical composition, run for real.
+            let mut expected = runs.clone();
+            shift_runs_for_delete(&mut expected, start, end);
+            shift_runs_for_insert(&mut expected, start, n);
+
+            let got = replace(&runs, start, end, n, ReplaceFormatPolicy::InheritPreceding);
+
+            assert_eq!(
+                show(&got),
+                show(&expected),
+                "InheritPreceding diverged from delete+insert for {name:?} \
+                 (replace {start}..{end}, n={n})\n  before:   {}\n  historical: {}\n  got:        {}",
+                show(&runs),
+                show(&expected),
+                show(&got),
+            );
+        }
+    }
+
+    /// The motivating data loss: renaming a character whose name reads `Auré**lien**`.
+    /// The default drops the bold — that is what shipped, and it is now visible and
+    /// chosen rather than emergent. Every other policy is a way to not lose it.
+    #[test]
+    fn the_four_policies_diverge_on_a_partly_bold_name() {
+        // "Auré" plain (bytes 0..5, é is two bytes), "lien" bold (5..9).
+        let runs = vec![r(5, 9, "B")];
+        let (start, end, n) = (0, 9, 9); // rename the whole name, same length
+
+        use ReplaceFormatPolicy::*;
+        assert_eq!(
+            show(&replace(&runs, start, end, n, InheritPreceding)),
+            "[]",
+            "the historical default destroys the bold — pinned, not endorsed"
+        );
+        assert_eq!(
+            show(&replace(&runs, start, end, n, PreserveNothing)),
+            "[]",
+            "explicitly unformatted"
+        );
+        assert_eq!(
+            show(&replace(&runs, start, end, n, PreserveIfFullyCovered)),
+            "[]",
+            "no SINGLE run covers 0..9 — it must fall back to inheritance, not guess"
+        );
+        // Bold covers 4 of the 9 bytes, plain covers 5 → plain dominates.
+        assert_eq!(
+            show(&replace(&runs, start, end, n, KeepDominantRun)),
+            "[]",
+            "plain covers more of the name than the bold does"
+        );
+
+        // …but when the bold covers MOST of the name, KeepDominantRun keeps it.
+        let mostly_bold = vec![r(1, 9, "B")];
+        assert_eq!(
+            show(&replace(&mostly_bold, 0, 9, 9, KeepDominantRun)),
+            "0..9=B",
+            "bold covers 8 of 9 bytes — the rename must keep it"
+        );
+    }
+
+    /// "Fully covered" means ONE run covers the range — not "the runs jointly span it".
+    /// A gapless Italic+Bold union spanning the range exactly must NOT be treated as
+    /// covered, or the replacement silently inherits whichever run was looked at first.
+    #[test]
+    fn fully_covered_means_a_single_run_not_a_gapless_union() {
+        let two = vec![r(0, 3, "I"), r(3, 10, "B")];
+        assert_eq!(
+            show(&replace(
+                &two,
+                0,
+                10,
+                4,
+                ReplaceFormatPolicy::PreserveIfFullyCovered
+            )),
+            "[]",
+            "two different-format runs jointly spanning the range are not 'covered'; \
+             with no run preceding the start, the fallback is unformatted"
+        );
+
+        // One run that really does cover it, and begins exactly at the start — the case
+        // InheritPreceding cannot see (a run at `start` never inherits).
+        let one = vec![r(5, 20, "B")];
+        assert_eq!(
+            show(&replace(
+                &one,
+                5,
+                10,
+                3,
+                ReplaceFormatPolicy::PreserveIfFullyCovered
+            )),
+            "5..18=B",
+            "a single covering run keeps its format across the rename"
+        );
+        assert_eq!(
+            show(&replace(
+                &one,
+                5,
+                10,
+                3,
+                ReplaceFormatPolicy::InheritPreceding
+            )),
+            "8..18=B",
+            "…which the default would have lost: the replacement lands unformatted"
+        );
+    }
+
+    /// A run that merely *touches* the range must not leak its format to the whole
+    /// replacement.
+    #[test]
+    fn a_partially_overlapping_run_does_not_count_as_covering() {
+        let runs = vec![r(0, 8, "B")]; // covers only 5..8 of the range 5..12
+        assert_eq!(
+            show(&replace(
+                &runs,
+                5,
+                12,
+                4,
+                ReplaceFormatPolicy::PreserveIfFullyCovered
+            )),
+            "0..9=B",
+            "not covered → falls back to inheritance, which extends the preceding bold; \
+             it must NOT format the whole replacement as though bold had covered it"
+        );
+    }
+
+    /// Ties between two runs resolve to the EARLIEST, deterministically.
+    ///
+    /// `Iterator::max_by_key` returns the LAST maximum, so the obvious one-liner would
+    /// have silently picked the other run here.
+    #[test]
+    fn a_dominance_tie_between_two_runs_goes_to_the_earlier() {
+        let runs = vec![r(0, 3, "B"), r(3, 6, "I")]; // 3 bytes each
+        assert_eq!(
+            show(&replace(
+                &runs,
+                0,
+                6,
+                4,
+                ReplaceFormatPolicy::KeepDominantRun
+            )),
+            "0..4=B",
+            "a true tie must resolve to the earlier run, not to whichever the iterator \
+             happened to visit last"
+        );
+    }
+
+    /// A tie between a run and the unformatted gap goes to the run: losing formatting is
+    /// the destructive outcome, so it needs a strict majority of *plain* to win.
+    #[test]
+    fn a_dominance_tie_against_plain_text_keeps_the_formatting() {
+        let runs = vec![r(4, 8, "B")]; // 4 bold bytes, 4 plain bytes in 0..8
+        assert_eq!(
+            show(&replace(
+                &runs,
+                0,
+                8,
+                5,
+                ReplaceFormatPolicy::KeepDominantRun
+            )),
+            "0..5=B",
+            "an even split must keep the formatting rather than silently drop it"
+        );
+    }
+
+    /// An empty range replaces nothing, so it is an insertion — and every policy that
+    /// reasons about "what was covered" must defer to the insert convention instead of
+    /// stripping the format the typed text would have inherited.
+    #[test]
+    fn an_empty_range_is_an_insert_and_no_coverage_policy_overrides_it() {
+        let runs = vec![r(0, 5, "B"), r(5, 10, "I")];
+        use ReplaceFormatPolicy::*;
+        for policy in [InheritPreceding, PreserveIfFullyCovered, KeepDominantRun] {
+            assert_eq!(
+                show(&replace(&runs, 5, 5, 2, policy)),
+                "0..7=B 7..12=I",
+                "{policy:?}: typing at a boundary must inherit the run to the LEFT (Qt \
+                 convention) — an empty range destroyed no formatting, so there is \
+                 nothing for a coverage policy to override"
+            );
+        }
+        // The one policy that is an explicit request, not an inference, still applies.
+        assert_eq!(
+            show(&replace(&runs, 5, 5, 2, PreserveNothing)),
+            "0..5=B 7..12=I",
+            "PreserveNothing asks for unformatted text, and means it even on an insert"
+        );
+    }
+
+    /// Nothing to do must mean nothing done — no fabricated runs, no lost ones.
+    #[test]
+    fn a_zero_width_zero_length_replace_is_the_identity() {
+        let runs = vec![r(0, 5, "B"), r(7, 12, "I")];
+        for policy in [
+            ReplaceFormatPolicy::InheritPreceding,
+            ReplaceFormatPolicy::PreserveIfFullyCovered,
+            ReplaceFormatPolicy::KeepDominantRun,
+            ReplaceFormatPolicy::PreserveNothing,
+        ] {
+            assert_eq!(
+                show(&replace(&runs, 6, 6, 0, policy)),
+                "0..5=B 7..12=I",
+                "{policy:?} changed a no-op edit"
+            );
+        }
+    }
+
+    /// `PreserveNothing` must leave the region genuinely *unformatted* — not covered by
+    /// a fabricated run carrying `CharacterFormat::default()`, which is a different
+    /// thing and would defeat coalescing forever after.
+    #[test]
+    fn preserve_nothing_fabricates_no_default_run() {
+        let runs = vec![r(0, 5, "B")];
+        let got = replace(&runs, 7, 9, 2, ReplaceFormatPolicy::PreserveNothing);
+        assert_eq!(show(&got), "0..5=B", "no run may be invented for the gap");
+        assert!(
+            got.iter().all(|x| x.byte_start < 7 || x.byte_end > 9),
+            "the replaced span must carry no run at all"
+        );
+    }
+
+    /// Offsets are BYTES, not chars. A 4-byte emoji replaced by 2 ASCII bytes must
+    /// shift downstream runs by -2, not by -1 (chars) or 0.
+    #[test]
+    fn offsets_are_bytes_not_characters() {
+        // "🎉" (4 bytes, bold) + " " + "abcd" (italic).
+        let runs = vec![r(0, 4, "B"), r(5, 9, "I")];
+        let got = replace(&runs, 0, 4, 2, ReplaceFormatPolicy::KeepDominantRun);
+        assert_eq!(
+            show(&got),
+            "0..2=B 3..7=I",
+            "the trailing italic must shift back by the BYTE delta (4 -> 2 = -2)"
+        );
+    }
+
+    /// Every policy must leave the run list well-formed — sorted, non-overlapping,
+    /// coalesced, inside the block. This is the invariant a release build no longer
+    /// merely asserts.
+    #[test]
+    fn every_policy_leaves_the_runs_well_formed() {
+        let setups: Vec<(Vec<FormatRun>, u32, u32, u32, usize)> = vec![
+            (vec![r(0, 3, "B"), r(3, 6, "I"), r(6, 9, "B")], 2, 7, 4, 8),
+            (vec![r(0, 5, "B"), r(8, 13, "B")], 5, 8, 0, 10),
+            (vec![r(0, 5, "B"), r(7, 12, "B")], 8, 10, 2, 12),
+            (vec![r(3, 7, "B")], 3, 7, 0, 6),
+            (vec![], 2, 6, 3, 9),
+        ];
+        for (runs, start, end, n, text_len) in setups {
+            for policy in [
+                ReplaceFormatPolicy::InheritPreceding,
+                ReplaceFormatPolicy::PreserveIfFullyCovered,
+                ReplaceFormatPolicy::KeepDominantRun,
+                ReplaceFormatPolicy::PreserveNothing,
+            ] {
+                let got = replace(&runs, start, end, n, policy);
+                check_well_formed(&got, text_len).unwrap_or_else(|e| {
+                    panic!(
+                        "{policy:?} produced malformed runs from {} (replace {start}..{end}, \
+                         n={n}): {} — {e}",
+                        show(&runs),
+                        show(&got)
+                    )
+                });
+            }
+        }
+    }
+
+    /// Two same-format runs separated by an untouched gap must stay separate — coalescing
+    /// is for *adjacent* runs, and over-eager merging would swallow the plain text between
+    /// them.
+    #[test]
+    fn an_untouched_gap_between_equal_runs_survives() {
+        let runs = vec![r(0, 5, "B"), r(7, 12, "B")];
+        assert_eq!(
+            show(&replace(
+                &runs,
+                8,
+                10,
+                2,
+                ReplaceFormatPolicy::InheritPreceding
+            )),
+            "0..5=B 7..12=B",
+            "the plain gap at 5..7 must not be swallowed"
+        );
+    }
+
+    /// An inverted range is refused, not asserted away.
+    #[test]
+    fn an_inverted_range_is_an_error_not_a_panic() {
+        let mut runs = vec![r(0, 5, "B")];
+        let err =
+            shift_runs_for_replace(&mut runs, 10, 5, 3, ReplaceFormatPolicy::InheritPreceding)
+                .expect_err("an inverted range must be rejected");
+        assert!(matches!(
+            err,
+            FormatRunError::ReversedRange { start: 10, end: 5 }
+        ));
+        assert_eq!(show(&runs), "0..5=B", "a refused edit must change nothing");
+    }
+}
+
+/// The runtime guards that replaced the release-mode-invisible `debug_assert!`s.
+#[cfg(test)]
+mod invariant_check_tests {
+    use super::*;
+
+    fn run(start: u32, end: u32, bold: bool) -> FormatRun {
+        FormatRun {
+            byte_start: start,
+            byte_end: end,
+            format: CharacterFormat {
+                font_bold: Some(bold),
+                ..Default::default()
+            },
+        }
+    }
+
+    /// The whole point: in a **release** build `debug_assert!` is gone, so a violating
+    /// splice used to sail straight through and build a malformed run list. Now it is
+    /// reported, and the caller's runs are left exactly as they were.
+    #[test]
+    fn a_replacement_outside_the_range_is_rejected_without_mutating() {
+        let mut runs = vec![run(0, 20, true)];
+        let before = runs.clone();
+
+        let err = try_splice_range(&mut runs, 5..10, vec![run(5, 15, false)])
+            .expect_err("a replacement run reaching past range.end must be rejected");
+
+        assert!(matches!(
+            err,
+            FormatRunError::ReplacementOutsideRange {
+                run_end: 15,
+                range_end: 10,
+                ..
+            }
+        ));
+        assert_eq!(
+            runs, before,
+            "a rejected splice must not half-apply — validation happens before mutation"
+        );
+    }
+
+    #[test]
+    // The inverted range is the whole point of the test — it is what a caller must not
+    // be able to sneak past a release build.
+    #[allow(clippy::reversed_empty_ranges)]
+    fn a_reversed_range_is_rejected() {
+        let mut runs = vec![run(0, 20, true)];
+        assert!(matches!(
+            try_splice_range(&mut runs, 10..5, vec![]),
+            Err(FormatRunError::ReversedRange { start: 10, end: 5 })
+        ));
+    }
+
+    #[test]
+    fn a_legal_splice_still_works_through_the_checked_path() {
+        let mut runs = vec![run(0, 20, true)];
+        try_splice_range(&mut runs, 5..15, vec![run(5, 15, false)]).expect("legal");
+        assert_eq!(runs.len(), 3);
+        assert_eq!(runs[1].format.font_bold, Some(false));
+    }
+
+    #[test]
+    fn check_well_formed_catches_what_debug_assert_used_to() {
+        assert!(check_well_formed(&[], 0).is_ok());
+        assert!(check_well_formed(&[run(0, 5, true)], 5).is_ok());
+
+        assert!(matches!(
+            check_well_formed(&[run(5, 5, true)], 10),
+            Err(FormatRunError::EmptyRun { .. })
+        ));
+        assert!(matches!(
+            check_well_formed(&[run(0, 8, true), run(5, 10, false)], 10),
+            Err(FormatRunError::RunsOverlap { .. })
+        ));
+        assert!(matches!(
+            check_well_formed(&[run(0, 5, true), run(5, 10, true)], 10),
+            Err(FormatRunError::RunsNotCoalesced { .. })
+        ));
+        assert!(matches!(
+            check_well_formed(&[run(0, 20, true)], 10),
+            Err(FormatRunError::RunPastEndOfBlock { text_len: 10, .. })
+        ));
     }
 }

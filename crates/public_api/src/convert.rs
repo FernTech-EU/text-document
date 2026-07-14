@@ -75,7 +75,9 @@ impl FindOptions {
             use_regex: self.use_regex,
         }
     }
+}
 
+impl crate::ReplaceOptions {
     pub(crate) fn to_replace_dto(
         &self,
         query: &str,
@@ -85,10 +87,11 @@ impl FindOptions {
         frontend::document_search::ReplaceTextDto {
             query: query.into(),
             replacement: replacement.into(),
-            case_sensitive: self.case_sensitive,
-            whole_word: self.whole_word,
-            use_regex: self.use_regex,
+            case_sensitive: self.find.case_sensitive,
+            whole_word: self.find.whole_word,
+            use_regex: self.find.use_regex,
             replace_all,
+            format_policy: self.format_policy,
         }
     }
 }

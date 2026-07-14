@@ -252,7 +252,12 @@ fn cmd_replace(
         use_regex,
         search_backward: false,
     };
-    let count = doc.replace_text(query, replacement, true, &opts)?;
+    let count = doc.replace_text(
+        query,
+        replacement,
+        true,
+        &text_document::ReplaceOptions::new(opts.clone()),
+    )?;
 
     if count == 0 {
         eprintln!("no matches found, file unchanged");

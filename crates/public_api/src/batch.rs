@@ -29,10 +29,10 @@ use frontend::AppContext;
 use frontend::commands::{
     document_commands, document_io_commands, document_search_commands, root_commands,
 };
-use frontend::document::dtos::CreateDocumentDto;
-use frontend::root::dtos::CreateRootDto;
 use frontend::common::parser_tools::{DjotExportOptions, DjotImportOptions};
+use frontend::document::dtos::CreateDocumentDto;
 use frontend::document_io::ImportDjotDto;
+use frontend::root::dtos::CreateRootDto;
 
 use crate::error::Result;
 use crate::{FindMatch, FindOptions};
@@ -88,7 +88,8 @@ impl BatchDocument {
     /// offsets into the Djot source the document was parsed from: markup means the two
     /// disagree on almost any real paragraph, and mixing them corrupts a replace.
     pub fn find_all(&self, query: &str, options: &FindOptions) -> Result<Vec<FindMatch>> {
-        let result = document_search_commands::find_all(&self.ctx, &options.to_find_all_dto(query))?;
+        let result =
+            document_search_commands::find_all(&self.ctx, &options.to_find_all_dto(query))?;
         Ok(result
             .positions
             .into_iter()

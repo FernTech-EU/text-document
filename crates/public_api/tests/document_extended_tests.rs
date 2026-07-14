@@ -360,7 +360,14 @@ fn inline_content_variants_are_accessible() {
 fn replace_text_single_occurrence() {
     let doc = new_doc("foo bar foo baz foo");
     let opts = FindOptions::default();
-    let count = doc.replace_text("foo", "X", false, &opts).unwrap();
+    let count = doc
+        .replace_text(
+            "foo",
+            "X",
+            false,
+            &text_document::ReplaceOptions::new(opts.clone()),
+        )
+        .unwrap();
     assert_eq!(count, 1);
     let text = doc.to_plain_text().unwrap();
     assert!(text.starts_with("X bar"));

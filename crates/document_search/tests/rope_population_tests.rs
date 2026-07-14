@@ -29,6 +29,7 @@ fn replace_text_mirrors_to_rope() -> Result<()> {
             whole_word: false,
             use_regex: false,
             replace_all: true,
+            format_policy: Default::default(),
         },
     )?;
 
@@ -59,6 +60,7 @@ fn replace_text_in_one_block_of_many_preserves_other_blocks() -> Result<()> {
             whole_word: false,
             use_regex: false,
             replace_all: true,
+            format_policy: Default::default(),
         },
     )?;
 

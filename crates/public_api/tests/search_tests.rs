@@ -80,7 +80,14 @@ fn find_case_sensitive() {
 fn replace_text_all() {
     let doc = new_doc_with_text("foo bar foo");
     let opts = FindOptions::default();
-    let count = doc.replace_text("foo", "baz", true, &opts).unwrap();
+    let count = doc
+        .replace_text(
+            "foo",
+            "baz",
+            true,
+            &text_document::ReplaceOptions::new(opts.clone()),
+        )
+        .unwrap();
     assert_eq!(count, 2);
     assert_eq!(doc.to_plain_text().unwrap(), "baz bar baz");
 }
@@ -89,7 +96,13 @@ fn replace_text_all() {
 fn replace_text_is_undoable() {
     let doc = new_doc_with_text("foo bar foo");
     let opts = FindOptions::default();
-    doc.replace_text("foo", "baz", true, &opts).unwrap();
+    doc.replace_text(
+        "foo",
+        "baz",
+        true,
+        &text_document::ReplaceOptions::new(opts.clone()),
+    )
+    .unwrap();
     assert_eq!(doc.to_plain_text().unwrap(), "baz bar baz");
 
     doc.undo().unwrap();

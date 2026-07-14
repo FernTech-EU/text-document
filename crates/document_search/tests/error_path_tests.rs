@@ -158,6 +158,7 @@ fn test_replace_no_matches() -> Result<()> {
             whole_word: false,
             use_regex: false,
             replace_all: true,
+            format_policy: Default::default(),
         },
     )?;
 
@@ -182,6 +183,7 @@ fn test_replace_with_empty_string() -> Result<()> {
             whole_word: false,
             use_regex: false,
             replace_all: false,
+            format_policy: Default::default(),
         },
     )?;
 
@@ -206,6 +208,7 @@ fn test_replace_in_empty_document() -> Result<()> {
             whole_word: false,
             use_regex: false,
             replace_all: true,
+            format_policy: Default::default(),
         },
     )?;
 

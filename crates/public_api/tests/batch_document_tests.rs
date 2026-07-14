@@ -12,7 +12,9 @@ fn round_trip(djot: &str) -> String {
     batch
         .set_djot(djot, &DjotImportOptions::default())
         .expect("set_djot");
-    batch.to_djot(&DjotExportOptions::default()).expect("to_djot")
+    batch
+        .to_djot(&DjotExportOptions::default())
+        .expect("to_djot")
 }
 
 /// Prose survives the trip. This is the load-bearing property: a replace parses the
@@ -119,7 +121,11 @@ fn find_all_searches_the_prose_not_the_markup() {
     let hits = batch
         .find_all("Aurélien", &FindOptions::default())
         .expect("find_all");
-    assert_eq!(hits.len(), 2, "both occurrences, including the emphasised one");
+    assert_eq!(
+        hits.len(),
+        2,
+        "both occurrences, including the emphasised one"
+    );
 
     // The first hit must sit where the NAME is in the prose ("She called " = 11 chars),
     // not where it is in the source (which the `*` would push along by one).
@@ -143,7 +149,9 @@ fn set_djot_replaces_rather_than_appends() {
         .set_djot("the second scene", &DjotImportOptions::default())
         .expect("second");
 
-    let out = batch.to_djot(&DjotExportOptions::default()).expect("to_djot");
+    let out = batch
+        .to_djot(&DjotExportOptions::default())
+        .expect("to_djot");
     assert!(out.contains("second"), "the newest import must be present");
     assert!(
         !out.contains("first"),

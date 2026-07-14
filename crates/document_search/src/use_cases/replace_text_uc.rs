@@ -13,8 +13,8 @@ use common::direct_access::frame::frame_repository::FrameRelationshipField;
 use common::direct_access::root::root_repository::RootRelationshipField;
 use common::entities::{Block, Document, Frame, Root};
 use common::format_runs::{
-    debug_assert_well_formed, logical_offset_to_byte, shift_images_for_delete,
-    shift_images_for_insert, shift_runs_for_delete, shift_runs_for_insert,
+    ReplaceFormatPolicy, check_well_formed, logical_offset_to_byte, shift_images_for_delete,
+    shift_images_for_insert, shift_runs_for_replace,
 };
 
 use common::snapshot::EntityTreeSnapshot;
@@ -106,16 +106,22 @@ fn match_in_single_block(
 }
 
 /// Replace a logical char range `[char_start..char_end)` inside one
-/// block with `replacement`. Mutates plain_text, format_runs (clearing
-/// the deleted range, then re-shifting + leaving the replacement bytes
-/// uncovered = default-format inheritance per Qt), block_images, the
+/// block with `replacement`. Mutates plain_text, format_runs, block_images, the
 /// block entity, and reverse-syncs inline_elements.
+///
+/// `policy` decides what the replacement text wears where it overwrites formatted
+/// prose. It used to be no decision at all: a delete followed by an insert, which let
+/// the replacement inherit whatever run preceded it and silently destroyed formatting
+/// under the range (renaming `Auré**lien**` lost the bold). That is still the default,
+/// but it is now [`ReplaceFormatPolicy::InheritPreceding`] — a named choice the caller
+/// can see and override.
 fn replace_in_block(
     uow: &mut Box<dyn ReplaceTextUnitOfWorkTrait>,
     block: &Block,
     char_start: usize,
     char_end: usize,
     replacement: &str,
+    policy: ReplaceFormatPolicy,
 ) -> Result<()> {
     let store = uow.store();
     let images_before = store
@@ -143,18 +149,16 @@ fn replace_in_block(
         .chars()
         .count() as i64;
 
-    // Mutate format_runs: first delete the range, then make room for the
-    // insertion (no run carries formatting — replacement inherits
-    // surrounding format via shift_runs_for_insert).
+    // Mutate format_runs under an explicit policy (see `shift_runs_for_replace`), and
+    // then CHECK the result rather than assert it: `debug_assert_well_formed` is
+    // compiled out of release, so a malformed run list produced in a shipped build went
+    // entirely undetected — and autosave wrote it to the writer's file seconds later.
+    // A replace that would corrupt a block's formatting now fails loudly instead.
     {
         let mut runs_map = store.format_runs.write();
         let runs = runs_map.entry(block.id).or_default();
-        shift_runs_for_delete(runs, byte_start, byte_end);
-        // After delete, the trailing runs sit at the (byte_start) cursor.
-        // shift_runs_for_insert at byte_start expands the run whose
-        // byte_end == byte_start (Qt convention).
-        shift_runs_for_insert(runs, byte_start, inserted_byte_len);
-        debug_assert_well_formed(runs, new_plain.len());
+        shift_runs_for_replace(runs, byte_start, byte_end, inserted_byte_len, policy)?;
+        check_well_formed(runs, new_plain.len())?;
     }
     let _images_removed = {
         let mut images_map = store.block_images.write();
@@ -258,6 +262,7 @@ fn execute_replace(
             block_offset,
             block_offset + match_len,
             replacement,
+            dto.format_policy,
         )?;
 
         cumulative_delta += delta;

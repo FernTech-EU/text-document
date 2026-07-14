@@ -40,11 +40,11 @@ use common::event::{Event, Origin};
 use common::parser_tools::DjotExportOptions;
 
 use common::event::DocumentIoEvent::ExportDjot;
-use common::event::DocumentIoEvent::ImportDjot;
 use common::event::DocumentIoEvent::ExportHtml;
 use common::event::DocumentIoEvent::ExportLatex;
 use common::event::DocumentIoEvent::ExportMarkdown;
 use common::event::DocumentIoEvent::ExportPlainText;
+use common::event::DocumentIoEvent::ImportDjot;
 use common::event::DocumentIoEvent::ImportPlainText;
 
 use common::long_operation::{LongOperation, LongOperationManager, OperationProgress};

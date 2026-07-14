@@ -94,7 +94,14 @@ fn unicode_find() {
 fn unicode_replace() {
     let doc = new_doc_with_text("café");
     let opts = text_document::FindOptions::default();
-    let count = doc.replace_text("café", "coffee", true, &opts).unwrap();
+    let count = doc
+        .replace_text(
+            "café",
+            "coffee",
+            true,
+            &text_document::ReplaceOptions::new(opts.clone()),
+        )
+        .unwrap();
     assert_eq!(count, 1);
     assert_eq!(doc.to_plain_text().unwrap(), "coffee");
 }

@@ -43,6 +43,7 @@ mod text_table;
 // ── Re-exports from entity DTOs (enums that consumers need) ──────
 pub use frontend::block::dtos::{Alignment, MarkerType};
 pub use frontend::block::dtos::{CharVerticalAlignment, InlineContent, UnderlineStyle};
+pub use frontend::common::format_runs::ReplaceFormatPolicy;
 pub use frontend::common::parser_tools::{DjotExportOptions, DjotImportOptions};
 pub use frontend::document::dtos::{TextDirection, WrapMode};
 pub use frontend::frame::dtos::FramePosition;
@@ -290,4 +291,36 @@ pub struct FindOptions {
     pub whole_word: bool,
     pub use_regex: bool,
     pub search_backward: bool,
+}
+
+/// Options for a replace: how to *find* the text, and what the replacement wears where
+/// it overwrites formatted prose.
+///
+/// The format policy is deliberately not on [`FindOptions`] — it means nothing to a
+/// find, and a search option that silently only applies to half the calls that take it
+/// is how dead toggles are born.
+#[derive(Debug, Clone, Default)]
+pub struct ReplaceOptions {
+    pub find: FindOptions,
+    /// Defaults to [`ReplaceFormatPolicy::InheritPreceding`] — the behaviour that has
+    /// always shipped, which drops the formatting under the replaced range. Choose
+    /// another policy when the range may be formatted and losing that would be wrong
+    /// (a character rename landing on a partly-bold name).
+    pub format_policy: ReplaceFormatPolicy,
+}
+
+impl ReplaceOptions {
+    /// A replace that finds the text exactly as `find` describes and keeps the default
+    /// (historical) format policy.
+    pub fn new(find: FindOptions) -> Self {
+        Self {
+            find,
+            format_policy: ReplaceFormatPolicy::default(),
+        }
+    }
+
+    pub fn with_format_policy(mut self, policy: ReplaceFormatPolicy) -> Self {
+        self.format_policy = policy;
+        self
+    }
 }

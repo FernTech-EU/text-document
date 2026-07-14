@@ -807,12 +807,18 @@ impl TextDocument {
     }
 
     /// Replace occurrences. Returns the number of replacements. Undoable.
+    ///
+    /// `options` carries both how to find the text and — via
+    /// [`ReplaceOptions::format_policy`] — what the replacement wears where it
+    /// overwrites formatted prose. The default drops the formatting under the replaced
+    /// range, which is fine for plain text and destructive for a rename that lands on a
+    /// partly-bold name; pass a different policy when that matters.
     pub fn replace_text(
         &self,
         query: &str,
         replacement: &str,
         replace_all: bool,
-        options: &FindOptions,
+        options: &crate::ReplaceOptions,
     ) -> Result<usize> {
         let (count, queued) = {
             let mut inner = self.inner.lock();
