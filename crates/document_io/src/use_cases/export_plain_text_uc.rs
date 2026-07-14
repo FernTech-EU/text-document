@@ -61,33 +61,47 @@ impl ExportPlainTextUseCase {
             return Ok(ExportPlainTextDto { plain_text });
         }
 
-        // Slow path: tables or multi-frame documents require the
-        // per-frame, per-block traversal because cell content lives in
-        // separate byte ranges later in the rope (plan §1.6).
-        let mut all_plain_texts: Vec<String> = Vec::new();
-
+        // Slow path: tables or multi-frame documents. Cell content and a blockquote's prose
+        // live in their own Frames, so the whole document's blocks have to be gathered and
+        // put back into reading order.
+        //
+        // Pool EVERY frame's blocks first, then sort ONCE, GLOBALLY, by `document_position`.
+        //
+        // This used to sort each frame's blocks against only *their own frame's* siblings and
+        // then concatenate the frames in the order `Document.Frames` hands them back — which
+        // is frame-CREATION order (the root frame is created up front; a blockquote's frame
+        // when the quote is opened, a table's cell frames when the table is reached). That
+        // silently assumed creation order equals document order, and it is false the instant a
+        // sub-frame's content precedes sibling content in the parent's flow. `"> a0\n\na"`
+        // exported as `"a\na0"`: every blockquote's prose was hoisted to the END of the
+        // document. The CLI's `cat`/`convert` wrote that straight to stdout.
+        //
+        // A global sort is correct because `document_position` is a single counter over the
+        // WHOLE parse — declared once, outside the frame-stack machinery, and advanced for
+        // every block regardless of which frame it lands in (`import_djot_uc`). It is a
+        // globally comparable reading-order key ACROSS frame boundaries, not a per-frame one.
+        // This is exactly what `find_all` already does to build the text it searches, and why
+        // search and this export used to disagree about where a blockquote sat.
+        let mut all_block_ids: Vec<EntityId> = Vec::new();
         for frame_id in &frame_ids {
-            // Get Block IDs from the Frame.Blocks relationship
-            let block_ids = uow.get_frame_relationship(
+            all_block_ids.extend(uow.get_frame_relationship(
                 frame_id,
                 &common::direct_access::frame::FrameRelationshipField::Blocks,
-            )?;
-
-            if block_ids.is_empty() {
-                continue;
-            }
-
-            // Get all blocks in batch and sort by document_position
-            let blocks_opt = uow.get_block_multi(&block_ids)?;
-            let mut blocks: Vec<Block> = blocks_opt.into_iter().flatten().collect();
-            blocks.sort_by_key(|b| b.document_position);
-
-            for block in &blocks {
-                all_plain_texts.push(block_content_via_store(block, &store));
-            }
+            )?);
         }
 
-        let plain_text = all_plain_texts.join("\n");
+        let mut blocks: Vec<Block> = uow
+            .get_block_multi(&all_block_ids)?
+            .into_iter()
+            .flatten()
+            .collect();
+        blocks.sort_by_key(|b| b.document_position);
+
+        let plain_text = blocks
+            .iter()
+            .map(|block| block_content_via_store(block, &store))
+            .collect::<Vec<String>>()
+            .join("\n");
 
         uow.end_transaction()?;
 

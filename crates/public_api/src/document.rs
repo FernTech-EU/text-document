@@ -186,7 +186,26 @@ impl TextDocument {
         Ok(())
     }
 
-    /// Export the entire document as plain text.
+    /// Export the entire document as plain text, in reading order.
+    ///
+    /// This is the **human-readable** view: prose only. Embedded objects (a table) contribute
+    /// their content but not the `U+FFFC` anchor the document holds where they sit — which is
+    /// what you want for a `cat`-style export, and is why the crate's fast path bails the
+    /// moment a table exists.
+    ///
+    /// **Do not compute offsets from this string.** It is deliberately not
+    /// character-for-character the text a search runs against: that text carries the object
+    /// anchors, so a position taken here is short by two characters per preceding table. For
+    /// an addressable view — one whose offsets [`find_all`](Self::find_all) and
+    /// [`replace_text`](Self::replace_text) agree with — use
+    /// [`djot_to_plain_text`](crate::djot_to_plain_text), which is pinned to match the
+    /// document's own search text exactly.
+    ///
+    /// The two are allowed to differ in that one respect and no other; in particular they
+    /// agree on **order**. They did not always: this export used to hoist every blockquote's
+    /// prose to the end of the document (`"> a0\n\na"` came back as `"a\na0"`), because it
+    /// concatenated frames in creation order instead of sorting all blocks by
+    /// `document_position`. See `plain_text_order_tests`.
     pub fn to_plain_text(&self) -> Result<String> {
         let mut inner = self.inner.lock();
         Ok(inner.plain_text()?.to_string())
