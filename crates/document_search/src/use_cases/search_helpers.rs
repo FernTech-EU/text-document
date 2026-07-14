@@ -176,6 +176,14 @@ pub fn find_all_matches(
 
     let mut results = Vec::new();
     for mat in re.find_iter(folded.text()) {
+        // A regex can match **nothing** — `a*`, `x?`, `\b` all match the empty string at every
+        // position. The literal path cannot produce one (an empty needle returns early), so
+        // nothing downstream expects one: `replace_text` would take a zero-length range as an
+        // *insertion* and splice the replacement in at every character of the document, having
+        // matched nothing at all. Refuse it here, where the concept of an empty match exists.
+        if mat.start() == mat.end() {
+            continue;
+        }
         // A regex can match at a position that is not a char start only if the pattern
         // matched inside a multi-byte char, which `regex` does not do — but the map is a
         // lookup, not an assumption, so a miss is skipped rather than panicking.

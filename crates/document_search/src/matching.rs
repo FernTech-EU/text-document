@@ -176,11 +176,30 @@ impl FoldedText {
             .collect()
     }
 
+    /// Build the word-boundary table now, rather than on the first whole-word query.
+    ///
+    /// **A caller that caches a `FoldedText` should call this**, and the reason is
+    /// [`heap_size`](Self::heap_size), not speed. The table is lazy so that the throwaway
+    /// path — fold, search once, drop — does not pay a UAX#29 pass it never uses. But a
+    /// *cached* instance is measured once, when it is stored, and then grows silently the
+    /// first time someone ticks "whole word": its recorded size is stale from that moment on,
+    /// and a cache bounded by the sum of those sizes holds materially more than it believes.
+    ///
+    /// Forcing it here makes the size final, so what the cache measures is what it has.
+    pub fn prepare_word_boundaries(&self) {
+        self.boundaries
+            .get_or_init(|| word_boundaries(&self.source));
+    }
+
     /// Roughly how many bytes of heap this holds.
     ///
     /// A host app caching one per scene has to bound the total, and the honest number is not
     /// obvious: the index maps are four bytes per *folded char*, so together they outweigh the
     /// text itself several times over.
+    ///
+    /// **Not stable until [`prepare_word_boundaries`](Self::prepare_word_boundaries) has been
+    /// called** — the boundary table is built lazily, so before then this under-reports by
+    /// whatever that table will come to weigh.
     pub fn heap_size(&self) -> usize {
         self.source.capacity()
             + self.folded.text.capacity()
@@ -441,23 +460,36 @@ pub(crate) fn is_boundary(boundaries: &[u32], char_idx: usize) -> bool {
 /// Dress `replacement` in the case of the text it is replacing.
 ///
 /// A reviewed rename hits `Aurélien`, `AURÉLIEN` and `aurélien` in the same manuscript, and
-/// the writer means one rename, not three. Three shapes are recognised — all-caps, initial
-/// capital, and anything else (left alone).
+/// the writer means one rename, not three.
 ///
-/// Takes the **locale**, and must: in Turkish the uppercase of `i` is `İ`, not `I`. A
-/// case-preserver blind to that would rewrite Turkish prose into a different word — the
-/// same class of silent corruption as folding the dotless `ı` onto `i`.
+/// Exactly three shapes are recognised, and everything else is left **verbatim**. That last
+/// part is the important one: this function guesses at what a writer meant, and a guess it is
+/// not sure about must not be written into their book. `McDonald`, `iPhone`, `eBay` are
+/// deliberately not "initial capital" — they are their own thing, and the replacement the
+/// caller supplied is a better answer than anything inferred from them.
+///
+/// ## ALL CAPS needs **two** letters
+///
+/// A single capital is not shouting. `O`, `K`, `É` are all-uppercase by inspection and
+/// titlecase by intent, and treating them as SHOUTING turns a rename of a one-letter name
+/// into `ELENA` where the prose wanted `Elena` — silently, at every occurrence, in someone's
+/// manuscript. There is no way to tell the two apart from one letter, so the tie goes to the
+/// quieter answer.
+///
+/// ## Locale
+///
+/// In Turkish the uppercase of `i` is `İ`, not `I`. A case-preserver blind to that would
+/// rewrite Turkish prose into a different word — the same class of silent corruption as
+/// folding the dotless `ı` onto `i`.
 pub fn preserve_case(matched: &str, replacement: &str, locale: FoldLocale) -> String {
-    let mut cased = matched.chars().filter(|c| c.is_alphabetic()).peekable();
-    if cased.peek().is_none() {
+    let letters: Vec<char> = matched.chars().filter(|c| c.is_alphabetic()).collect();
+    let Some(&first) = letters.first() else {
+        // Nothing cased to copy from (digits, punctuation): take the replacement as given.
         return replacement.to_string();
-    }
+    };
 
-    let all_upper = matched
-        .chars()
-        .filter(|c| c.is_alphabetic())
-        .all(char::is_uppercase);
-    if all_upper {
+    // ALL CAPS — and it takes at least two letters to say so. See above.
+    if letters.len() > 1 && letters.iter().all(|c| c.is_uppercase()) {
         let mut out = String::with_capacity(replacement.len());
         for c in replacement.chars() {
             folding::to_upper(c, locale, &mut out);
@@ -465,15 +497,13 @@ pub fn preserve_case(matched: &str, replacement: &str, locale: FoldLocale) -> St
         return out;
     }
 
-    let leads_upper = matched
-        .chars()
-        .find(|c| c.is_alphabetic())
-        .is_some_and(char::is_uppercase);
-    if leads_upper {
+    // Titlecase — a leading capital and *nothing else* capitalised. `McDonald` fails this on
+    // purpose: it is neither titlecase nor shouting, so the replacement stands as written.
+    if first.is_uppercase() && letters[1..].iter().all(|c| c.is_lowercase()) {
         let mut out = String::with_capacity(replacement.len());
         let mut chars = replacement.chars();
-        if let Some(first) = chars.next() {
-            folding::to_upper(first, locale, &mut out);
+        if let Some(c) = chars.next() {
+            folding::to_upper(c, locale, &mut out);
         }
         out.extend(chars);
         return out;
@@ -771,6 +801,61 @@ mod tests {
         );
         // Nothing cased to copy: leave the replacement exactly as given.
         assert_eq!(preserve_case("123", "abc", FoldLocale::Root), "abc");
+    }
+
+    /// **A single capital is not shouting.** Nothing distinguishes a one-letter titlecase word
+    /// from a one-letter shout, so the tie goes to the quieter answer — otherwise renaming a
+    /// character called `O` to `Elena` writes `ELENA` into the manuscript, at every
+    /// occurrence, and the writer finds out by reading it.
+    #[test]
+    fn a_single_capital_is_titlecased_not_shouted() {
+        assert_eq!(preserve_case("O", "elena", FoldLocale::Root), "Elena");
+        assert_eq!(preserve_case("É", "elena", FoldLocale::Root), "Elena");
+        assert_eq!(preserve_case("o", "elena", FoldLocale::Root), "elena");
+        // …but two capitals ARE shouting.
+        assert_eq!(preserve_case("OK", "elena", FoldLocale::Root), "ELENA");
+        // …and the Turkish tailoring still applies to the single-capital path.
+        assert_eq!(preserve_case("O", "ilk", FoldLocale::Turkic), "İlk");
+    }
+
+    /// Anything that is neither titlecase nor shouting is left **verbatim**. This function
+    /// guesses at what a writer meant, and a guess it is not sure about must not be written
+    /// into their book: the replacement they typed is a better answer than one inferred from
+    /// `McDonald`.
+    #[test]
+    fn an_unrecognised_shape_leaves_the_replacement_alone() {
+        assert_eq!(
+            preserve_case("McDonald", "elena", FoldLocale::Root),
+            "elena"
+        );
+        assert_eq!(preserve_case("iPhone", "elena", FoldLocale::Root), "elena");
+        assert_eq!(preserve_case("eBay", "elena", FoldLocale::Root), "elena");
+    }
+
+    /// `heap_size` grows when the lazy boundary table is built, and `prepare_word_boundaries`
+    /// is what lets a cache measure an entry once and have the number stay true. Without it a
+    /// cache bounded by the sum of these sizes silently holds more than it thinks.
+    #[test]
+    fn heap_size_is_only_stable_once_the_boundaries_are_prepared() {
+        let text = "un arbre, le marbre, et la forêt d'Aurélien qui s'étirait".repeat(50);
+
+        let lazy = FoldedText::new(&text, &FoldSpec::default());
+        let before = lazy.heap_size();
+        lazy.find_all("arbre", true); // the first whole-word query builds the table
+        assert!(
+            lazy.heap_size() > before,
+            "the boundary table must actually weigh something, or this guards nothing"
+        );
+
+        let prepared = FoldedText::new(&text, &FoldSpec::default());
+        prepared.prepare_word_boundaries();
+        let measured = prepared.heap_size();
+        prepared.find_all("arbre", true);
+        assert_eq!(
+            prepared.heap_size(),
+            measured,
+            "once prepared, the size a cache recorded must stay the size it holds"
+        );
     }
 
     /// The Turkish trap: the uppercase of `i` is `İ`. An untailored case-preserver would

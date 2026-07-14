@@ -270,6 +270,52 @@ fn the_regex_path_honours_the_diacritic_fold() {
     );
 }
 
+/// A regex that matches **nothing** must find nothing — and must certainly not be replaced.
+///
+/// `a*`, `x?` and `\b` all match the empty string at every position. Nothing downstream
+/// expects a zero-length match: `replace_text` takes a range and splices, so a zero-length one
+/// is an *insertion*, and the replacement would be spliced in at every character of the
+/// document having matched no text at all. The literal path cannot produce one (an empty
+/// needle returns early); the regex path could.
+#[test]
+fn a_regex_that_matches_the_empty_string_replaces_nothing() {
+    for pattern in [r"x*", r"y?", r"\b"] {
+        let doc = doc_with("Elena rentra chez elle.");
+        let opts = FindOptions {
+            use_regex: true,
+            ..FindOptions::default()
+        };
+        assert!(
+            doc.find_all(pattern, &opts).unwrap().is_empty(),
+            "{pattern:?} matches the empty string — it must report no matches"
+        );
+
+        let count = doc
+            .replace_text(pattern, "XX", true, &ReplaceOptions::new(opts))
+            .unwrap();
+        assert_eq!(count, 0, "{pattern:?} must not splice anything");
+        assert_eq!(
+            djot(&doc),
+            "Elena rentra chez elle.",
+            "the prose must be untouched by {pattern:?}"
+        );
+    }
+}
+
+/// …but a regex that *can* match empty and also matches real text still finds the real text.
+#[test]
+fn a_regex_with_an_optional_part_still_finds_its_real_matches() {
+    let doc = doc_with("Elena et Elenas.");
+    let opts = FindOptions {
+        use_regex: true,
+        ..FindOptions::default()
+    };
+    let hits = doc.find_all(r"elenas?", &opts).unwrap();
+    assert_eq!(hits.len(), 2);
+    assert_eq!(hits[0].matched_text, "Elena");
+    assert_eq!(hits[1].matched_text, "Elenas");
+}
+
 /// Folding runs per char over the whole document on every keystroke of a search box. It has
 /// to be allocation-free per char; the first draft of this plan called `fold_string(&c
 /// .to_string())`, which heap-allocates for every character in the manuscript.
