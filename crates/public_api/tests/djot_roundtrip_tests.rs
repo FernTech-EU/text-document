@@ -20,7 +20,7 @@
 //! block count would diverge).
 
 use proptest::prelude::*;
-use text_document::TextDocument;
+use text_document::{DjotImportOptions, FindOptions, TextDocument, djot_to_plain_text};
 
 // ── AST over the supported feature set ──────────────────────────
 
@@ -84,6 +84,14 @@ enum Block {
     Ordered(Vec<String>),
     Task(Vec<(bool, String)>),
     Quote(String),
+    /// A table: header row + body rows, all cells plain words.
+    ///
+    /// Tables were absent from this generator, and that absence hid a real bug: a table
+    /// puts a `U+FFFC` anchor into the text the document searches, and the cheap
+    /// `djot_to_plain_text` extractor was silently omitting it — so every offset after a
+    /// table was short by two characters. The parity property below could not see that,
+    /// because it never generated a table.
+    Table(Vec<String>, Vec<Vec<String>>),
 }
 
 // ── Dumb emitter: AST → djot text ───────────────────────────────
@@ -134,6 +142,20 @@ fn emit_block(b: &Block) -> String {
             .collect::<Vec<_>>()
             .join("\n\n"),
         Block::Quote(s) => format!("> {s}"),
+        // No alignment markers in the separator row: column alignment is a documented
+        // model limitation (normalised, not preserved on round-trip), and emitting it
+        // would fail the fixpoint for a reason that has nothing to do with this test.
+        Block::Table(header, rows) => {
+            let mut out = format!("| {} |", header.join(" | "));
+            out.push_str(&format!(
+                "\n|{}|",
+                header.iter().map(|_| " - ").collect::<Vec<_>>().join("|")
+            ));
+            for row in rows {
+                out.push_str(&format!("\n| {} |", row.join(" | ")));
+            }
+            out
+        }
     }
 }
 
@@ -226,7 +248,23 @@ fn block() -> impl Strategy<Value = Block> {
         prop::collection::vec(word(), 1..4).prop_map(Block::Ordered),
         prop::collection::vec((any::<bool>(), word()), 1..4).prop_map(Block::Task),
         word().prop_map(Block::Quote),
+        // 1..3 columns, 1..3 body rows. `cell()` excludes `|` so it cannot break the row
+        // syntax it lives in.
+        (1usize..4)
+            .prop_flat_map(|cols| {
+                (
+                    prop::collection::vec(cell(), cols..=cols),
+                    prop::collection::vec(prop::collection::vec(cell(), cols..=cols), 1..3),
+                )
+            })
+            .prop_map(|(header, rows)| Block::Table(header, rows)),
     ]
+}
+
+/// A table cell: a plain word with no `|` (which would break the row syntax) and no
+/// leading/trailing space (which the parser trims).
+fn cell() -> impl Strategy<Value = String> {
+    "[a-zA-Z0-9][a-zA-Z0-9 ]{0,6}[a-zA-Z0-9]".prop_map(|s| s.trim().to_string())
 }
 
 // ── The fixpoint property ───────────────────────────────────────
@@ -261,5 +299,43 @@ proptest! {
             "plain text diverged"
         );
         prop_assert_eq!(doc1.block_count(), doc2.block_count(), "block count diverged");
+
+        // ── The cheap extractor must BE the text the document searches ──────────
+        //
+        // `djot_to_plain_text` stops at the parse: it never creates a Block entity, never
+        // touches the rope, never writes a format run. That is what makes a project-wide
+        // search viable at all — importing thousands of scenes on every keystroke is not a
+        // slow feature, it is a frozen app.
+        //
+        // But a second, *cheaper* definition of "the text" is only safe if it is not a
+        // second definition. If it drifts by so much as one separator, an occurrence count
+        // taken from it disagrees with what a replace re-derives inside the real document,
+        // and the replace's "the text moved under me, skip this field" guard starts firing
+        // on perfectly good rows.
+        //
+        // The check is behavioural rather than a string compare, because it pins the thing
+        // that actually matters: search the document for the *whole* extracted string. If
+        // the extractor and the document's search text are identical, that matches exactly
+        // once, at offset 0, spanning everything. Any divergence — a lost separator, a
+        // reordered block — and it does not match at all.
+        //
+        // NB this deliberately does NOT compare against `to_plain_text()`. That export
+        // walks frames, so it orders a blockquote's prose differently from the way search
+        // does (`"> a0\n\na"` exports as `"a\na0"` but is *searched* as `"a0\na"`). The
+        // authority here is whatever `find_all` sees, because that is what a replace edits.
+        let extracted = djot_to_plain_text(&t1, &DjotImportOptions::default());
+        if !extracted.is_empty() {
+            let whole = doc1.find_all(&extracted, &FindOptions::default()).unwrap();
+            prop_assert_eq!(
+                whole.len(),
+                1,
+                "the extracted text is not the text the document searches\n\
+                 t1={:?}\nextracted={:?}",
+                t1,
+                extracted
+            );
+            prop_assert_eq!(whole[0].position, 0);
+            prop_assert_eq!(whole[0].length, extracted.chars().count());
+        }
     }
 }

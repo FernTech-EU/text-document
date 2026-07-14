@@ -2492,3 +2492,107 @@ mod djot_tests {
         assert_eq!(b[0].alignment, None);
     }
 }
+
+// ─── Cheap plain-text extraction ─────────────────────────────────────
+
+/// The `U+FFFC OBJECT REPLACEMENT CHARACTER` that stands for a table in the document's
+/// text.
+///
+/// A table is not prose, but it *occupies a position* in the flow: the import mirrors this
+/// single sentinel into the rope where the table sits
+/// (`rope_helpers::rope_append_table_anchor`), then the cells as ordinary blocks. Anything
+/// reconstructing the text a search runs against has to reproduce it, or every offset after
+/// the first table is short by the two characters (the sentinel and its separator) that the
+/// document really holds there.
+pub const TABLE_ANCHOR: &str = "\u{FFFC}";
+
+/// The prose of a Djot document, with no entities, no store, and no threads.
+///
+/// [`parse_djot`] and [`ParsedElement::flatten_to_blocks`] were both already `pub`;
+/// nothing chained them. This does, and that is the whole trick: it stops at the
+/// *parse*, where a full import goes on to create a `Block` entity per paragraph, list
+/// item and table cell, mirror each into the rope, and write its format runs.
+///
+/// # Why a project-wide search needs this
+///
+/// A host app searching a manuscript must ask "does this scene contain that word" of
+/// **thousands** of Djot rows, on every keystroke. Doing that by importing each one into
+/// a document is not a slow feature, it is a frozen app.
+///
+/// And searching the Djot *source* instead — the tempting shortcut — is simply wrong:
+/// the source is markup. `http` matches inside a link's URL, `*` matches an emphasis
+/// marker, and an occurrence count taken from the source does not agree with what a
+/// replace re-derives inside the parsed document. Where a replace guards itself with
+/// "the text moved under me, skip this field", a count taken from markup makes that
+/// guard fire on perfectly good rows.
+///
+/// # The contract
+///
+/// The result is **byte-identical to the text the document searches** for the same Djot:
+/// each block's spans concatenated, blocks joined by a single `\n`, and a table announced
+/// by its [`TABLE_ANCHOR`] sentinel — exactly the string the import mirrors into the rope
+/// and that `build_full_text_via_store` recomposes. So an offset found here is an offset
+/// the document agrees with.
+///
+/// A property in `djot_roundtrip_tests` pins that across the whole generated feature set;
+/// without it this would be a second, silently-diverging definition of "the text".
+///
+/// ⚠ It is **not** the same as `TextDocument::to_plain_text()`, which walks frames and
+/// therefore orders a blockquote's prose differently (`"> a0\n\na"` exports as `"a\na0"`
+/// but is *searched* as `"a0\na"`). The authority is what a search sees, because that is
+/// what a replace edits. See `claude_reviews/text-document-plain-text-ordering.md`.
+pub fn djot_to_plain_text(djot: &str, options: &DjotImportOptions) -> String {
+    // Deliberately NOT `ParsedElement::flatten_to_blocks`: that helper drops a table's
+    // anchor and yields only its cells, which would silently shift every offset in a
+    // document containing a table by the two characters the document actually holds there.
+    let elements = parse_djot(djot, options);
+
+    // Sized from the source: the prose is always shorter than the markup that carries it,
+    // so this allocates once and never grows.
+    let mut out = String::with_capacity(djot.len());
+
+    // The separator is decided by "is this the first block", NOT by "is the output still
+    // empty". An EMPTY block (an empty code fence, say) is still a block: the document
+    // holds an empty line for it, and an emptiness test would swallow both the block and
+    // its separator, shifting every offset after it by one.
+    let mut first = true;
+    let mut push = |text: &str, out: &mut String, first: &mut bool| {
+        if *first {
+            *first = false;
+        } else {
+            out.push('\n');
+        }
+        out.push_str(text);
+    };
+
+    for element in &elements {
+        match element {
+            ParsedElement::Block(block) => {
+                let mut prose = String::new();
+                for span in &block.spans {
+                    prose.push_str(&span.text);
+                }
+                push(&prose, &mut out, &mut first);
+            }
+            ParsedElement::Table(table) => {
+                // The import mirrors a table into the rope as a lone `U+FFFC` sentinel
+                // followed by its cells, one per block (`rope_append_table_anchor`). The
+                // sentinel occupies a real position in the text the document searches, so
+                // it has to occupy one here too — otherwise every offset after a table is
+                // short by two characters, and a snippet taken from this string would be
+                // sliced in the wrong place.
+                push(TABLE_ANCHOR, &mut out, &mut first);
+                for row in &table.rows {
+                    for cell in row {
+                        let mut prose = String::new();
+                        for span in &cell.spans {
+                            prose.push_str(&span.text);
+                        }
+                        push(&prose, &mut out, &mut first);
+                    }
+                }
+            }
+        }
+    }
+    out
+}
