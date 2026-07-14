@@ -2,5 +2,7 @@
 
 pub(crate) mod find_all_uc;
 pub(crate) mod find_text_uc;
+pub(crate) mod replace_core;
+pub(crate) mod replace_ranges_uc;
 pub(crate) mod replace_text_uc;
 pub(crate) mod search_helpers;

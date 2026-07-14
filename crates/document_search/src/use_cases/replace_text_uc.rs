@@ -1,26 +1,21 @@
+use super::replace_core::{self, RangeSpec};
 use super::search_helpers::{build_full_text_via_store, find_all_matches};
 use crate::ReplaceResultDto;
 use crate::ReplaceTextDto;
 use anyhow::{Result, anyhow};
 use common::database::CommandUnitOfWork;
-use common::database::rope_helpers::block_char_length;
 use common::database::rope_helpers::rope_flat_text_if_simple;
-use common::database::rope_helpers::{
-    block_content_via_store, rope_delete_in_block, rope_insert_in_block,
-};
 use common::direct_access::document::document_repository::DocumentRelationshipField;
 use common::direct_access::frame::frame_repository::FrameRelationshipField;
 use common::direct_access::root::root_repository::RootRelationshipField;
 use common::entities::{Block, Document, Frame, Root};
-use common::format_runs::{
-    ReplaceFormatPolicy, check_well_formed, logical_offset_to_byte, shift_images_for_delete,
-    shift_images_for_insert, shift_runs_for_replace,
-};
+use common::format_runs::ReplaceFormatPolicy;
 
 use common::snapshot::EntityTreeSnapshot;
 use common::types::{EntityId, ROOT_ENTITY_ID};
 use common::undo_redo::UndoRedoCommand;
 use std::any::Any;
+use std::collections::HashMap;
 
 pub trait ReplaceTextUnitOfWorkFactoryTrait: Send + Sync {
     fn create(&self) -> Box<dyn ReplaceTextUnitOfWorkTrait>;
@@ -73,114 +68,8 @@ fn fetch_blocks_and_build_text(
     Ok((full_text, blocks))
 }
 
-fn find_block_for_position(
-    blocks: &[Block],
-    position: usize,
-    store: &common::database::Store,
-) -> Option<(usize, usize)> {
-    for (i, block) in blocks.iter().enumerate() {
-        let block_start = block.document_position as usize;
-        let block_end = block_start + block_char_length(block, store) as usize;
-        if position >= block_start && position < block_end {
-            let offset = position - block_start;
-            return Some((i, offset));
-        }
-    }
-    None
-}
-
-fn match_in_single_block(
-    blocks: &[Block],
-    match_pos: usize,
-    match_len: usize,
-    store: &common::database::Store,
-) -> Option<(usize, usize)> {
-    if let Some((block_idx, offset)) = find_block_for_position(blocks, match_pos, store) {
-        let block = &blocks[block_idx];
-        let block_end_offset = block_char_length(block, store) as usize;
-        if offset + match_len <= block_end_offset {
-            return Some((block_idx, offset));
-        }
-    }
-    None
-}
-
-/// Replace a logical char range `[char_start..char_end)` inside one
-/// block with `replacement`. Mutates plain_text, format_runs, block_images, the
-/// block entity, and reverse-syncs inline_elements.
-///
-/// `policy` decides what the replacement text wears where it overwrites formatted
-/// prose. It used to be no decision at all: a delete followed by an insert, which let
-/// the replacement inherit whatever run preceded it and silently destroyed formatting
-/// under the range (renaming `Auré**lien**` lost the bold). That is still the default,
-/// but it is now [`ReplaceFormatPolicy::InheritPreceding`] — a named choice the caller
-/// can see and override.
-fn replace_in_block(
-    uow: &mut Box<dyn ReplaceTextUnitOfWorkTrait>,
-    block: &Block,
-    char_start: usize,
-    char_end: usize,
-    replacement: &str,
-    policy: ReplaceFormatPolicy,
-) -> Result<()> {
-    let store = uow.store();
-    let images_before = store
-        .block_images
-        .read()
-        .get(&block.id)
-        .cloned()
-        .unwrap_or_default();
-    let block_text = block_content_via_store(block, &store);
-
-    let byte_start = logical_offset_to_byte(&block_text, &images_before, char_start as i64);
-    let byte_end = logical_offset_to_byte(&block_text, &images_before, char_end as i64);
-
-    // First splice the existing range out, then insert the replacement.
-    let mut new_plain = String::with_capacity(
-        block_text.len() - (byte_end - byte_start) as usize + replacement.len(),
-    );
-    new_plain.push_str(&block_text[..byte_start as usize]);
-    new_plain.push_str(replacement);
-    new_plain.push_str(&block_text[byte_end as usize..]);
-
-    let inserted_byte_len = replacement.len() as u32;
-    let _replacement_char_len = replacement.chars().count() as i64;
-    let _removed_text_chars = block_text[byte_start as usize..byte_end as usize]
-        .chars()
-        .count() as i64;
-
-    // Mutate format_runs under an explicit policy (see `shift_runs_for_replace`), and
-    // then CHECK the result rather than assert it: `debug_assert_well_formed` is
-    // compiled out of release, so a malformed run list produced in a shipped build went
-    // entirely undetected — and autosave wrote it to the writer's file seconds later.
-    // A replace that would corrupt a block's formatting now fails loudly instead.
-    {
-        let mut runs_map = store.format_runs.write();
-        let runs = runs_map.entry(block.id).or_default();
-        shift_runs_for_replace(runs, byte_start, byte_end, inserted_byte_len, policy)?;
-        check_well_formed(runs, new_plain.len())?;
-    }
-    let _images_removed = {
-        let mut images_map = store.block_images.write();
-        let images = images_map.entry(block.id).or_default();
-        let removed = shift_images_for_delete(images, byte_start, byte_end);
-        shift_images_for_insert(images, byte_start, inserted_byte_len);
-        removed as i64
-    };
-
-    let mut updated_block = block.clone();
-    updated_block.updated_at = chrono::Utc::now();
-    uow.update_block(&updated_block)?;
-
-    // Mirror the in-block splice into the global rope: delete the old
-    // byte range, then insert the replacement at the same position.
-    // No-op under default backend.
-    rope_delete_in_block(&store, block.id, byte_start as u32, byte_end as u32);
-    rope_insert_in_block(&store, block.id, byte_start as u32, replacement);
-
-    Ok(())
-}
-
+/// Find every match and replace it with the same string — which is all `replace_text` can
+/// express. The splice itself is [`replace_core`], shared with `replace_ranges`.
 fn execute_replace(
     uow: &mut Box<dyn ReplaceTextUnitOfWorkTrait>,
     dto: &ReplaceTextDto,
@@ -197,127 +86,91 @@ fn execute_replace(
 
     let (full_text, blocks) = fetch_blocks_and_build_text(uow.as_ref())?;
 
-    let all_matches = find_all_matches(
+    let mut matches = find_all_matches(
         &full_text,
         &dto.query,
         dto.case_sensitive,
         dto.whole_word,
         dto.use_regex,
     )?;
-
-    if all_matches.is_empty() {
-        return Ok((
-            ReplaceResultDto {
-                replacements_count: 0,
-                skipped_cross_block: 0,
-            },
-            snapshot,
-        ));
-    }
-
-    let mut valid_matches: Vec<(usize, usize, usize, usize)> = Vec::new();
-    let mut skipped_cross_block: i64 = 0;
-    let store = uow.store();
-    for &(match_pos, match_len) in &all_matches {
-        if let Some((block_idx, block_offset)) =
-            match_in_single_block(&blocks, match_pos, match_len, &store)
-        {
-            valid_matches.push((match_pos, match_len, block_idx, block_offset));
-        } else {
-            skipped_cross_block += 1;
-        }
-    }
-
     if !dto.replace_all {
-        valid_matches.truncate(1);
+        matches.truncate(1);
     }
 
-    if valid_matches.is_empty() {
-        return Ok((
-            ReplaceResultDto {
-                replacements_count: 0,
-                skipped_cross_block,
-            },
-            snapshot,
-        ));
+    // The same replacement at every match — which is all `replace_text` can express. A
+    // caller that needs a different replacement per occurrence (a rename that preserves the
+    // case it found), or that needs to skip some, uses `replace_ranges` instead. Both go
+    // through the SAME splice: see `replace_core`.
+    let specs: Vec<RangeSpec> = matches
+        .iter()
+        .map(|&(position, length)| RangeSpec {
+            position,
+            length,
+            replacement: dto.replacement.clone(),
+        })
+        .collect();
+
+    let applied = apply_specs(uow, doc_id, &blocks, &specs, dto.format_policy)?;
+
+    Ok((
+        ReplaceResultDto {
+            replacements_count: applied.replacements_count,
+            skipped_cross_block: applied.skipped_cross_block,
+        },
+        snapshot,
+    ))
+}
+
+/// Apply `specs` through the shared splice (see [`replace_core`]), and persist the result.
+///
+/// This is the only part `replace_text` and `replace_ranges` cannot share: each use case
+/// has its own unit-of-work trait, so the *plumbing* is written twice. Everything with a
+/// decision in it — which ranges are legal, in what order they are spliced, how positions
+/// are rebased afterwards — lives once, in `replace_core`.
+fn apply_specs(
+    uow: &mut Box<dyn ReplaceTextUnitOfWorkTrait>,
+    doc_id: EntityId,
+    blocks: &[Block],
+    specs: &[RangeSpec],
+    policy: ReplaceFormatPolicy,
+) -> Result<replace_core::Applied> {
+    let store = uow.store();
+    let plan = replace_core::plan(blocks, specs, &store);
+
+    if plan.edits.is_empty() {
+        return Ok(replace_core::Applied {
+            replacements_count: 0,
+            skipped_cross_block: plan.skipped_cross_block,
+            skipped_overlapping: plan.skipped_overlapping,
+        });
     }
 
-    let replacement = &dto.replacement;
-    let replacement_char_len = replacement.chars().count() as i64;
-    let replacements_count = valid_matches.len() as i64;
-
-    let mut cumulative_delta: i64 = 0;
-
-    for &(_match_pos, match_len, block_idx, block_offset) in valid_matches.iter().rev() {
-        let match_char_len = match_len as i64;
-        let delta = replacement_char_len - match_char_len;
-
+    // DESCENDING. An earlier edit's length change must not move a range a later edit still
+    // has to address.
+    let mut delta_by_block_id: HashMap<EntityId, i64> = HashMap::new();
+    for edit in plan.edits.iter().rev() {
         let block = uow
-            .get_block(&blocks[block_idx].id)?
+            .get_block(&blocks[edit.block_idx].id)?
             .ok_or_else(|| anyhow!("Block not found"))?;
 
-        replace_in_block(
-            uow,
+        let updated = replace_core::apply_in_block(
+            &store,
             &block,
-            block_offset,
-            block_offset + match_len,
-            replacement,
-            dto.format_policy,
+            edit.block_offset,
+            edit.block_offset + edit.length,
+            &edit.replacement,
+            policy,
         )?;
+        uow.update_block(&updated)?;
 
-        cumulative_delta += delta;
+        *delta_by_block_id.entry(block.id).or_insert(0) += replace_core::char_delta(edit);
     }
 
-    let mut all_block_ids: Vec<EntityId> = Vec::new();
-    let frame_ids = uow.get_document_relationship(&doc_id, &DocumentRelationshipField::Frames)?;
-    for frame_id in &frame_ids {
-        let block_ids = uow.get_frame_relationship(frame_id, &FrameRelationshipField::Blocks)?;
-        all_block_ids.extend(block_ids);
-    }
-    let blocks_opt = uow.get_block_multi(&all_block_ids)?;
-    let mut current_blocks: Vec<Block> = blocks_opt.into_iter().flatten().collect();
-    current_blocks.sort_by_key(|b| b.document_position);
-
-    let mut delta_by_block: std::collections::HashMap<usize, i64> =
-        std::collections::HashMap::new();
-    for &(_match_pos, match_len, block_idx, _block_offset) in &valid_matches {
-        let delta = replacement_char_len - match_len as i64;
-        *delta_by_block.entry(block_idx).or_insert(0) += delta;
+    let (moved, total_delta) = replace_core::rebase_positions(blocks, &delta_by_block_id);
+    if !moved.is_empty() {
+        uow.update_block_multi(&moved)?;
     }
 
-    let mut cumulative_shift: i64 = 0;
-    let mut blocks_to_update: Vec<Block> = Vec::new();
-    for block in current_blocks.iter() {
-        let orig_idx = blocks.iter().position(|b| b.id == block.id);
-
-        if let Some(oidx) = orig_idx {
-            if let Some(&d) = delta_by_block.get(&oidx) {
-                if cumulative_shift != 0 {
-                    let mut ub = block.clone();
-                    ub.document_position += cumulative_shift;
-                    ub.updated_at = chrono::Utc::now();
-                    blocks_to_update.push(ub);
-                }
-                cumulative_shift += d;
-            } else if cumulative_shift != 0 {
-                let mut ub = block.clone();
-                ub.document_position += cumulative_shift;
-                ub.updated_at = chrono::Utc::now();
-                blocks_to_update.push(ub);
-            }
-        } else if cumulative_shift != 0 {
-            let mut ub = block.clone();
-            ub.document_position += cumulative_shift;
-            ub.updated_at = chrono::Utc::now();
-            blocks_to_update.push(ub);
-        }
-    }
-
-    if !blocks_to_update.is_empty() {
-        uow.update_block_multi(&blocks_to_update)?;
-    }
-
-    let total_delta = cumulative_delta;
     let mut document = uow
         .get_document(&doc_id)?
         .ok_or_else(|| anyhow!("Document not found"))?;
@@ -325,13 +178,11 @@ fn execute_replace(
     document.updated_at = chrono::Utc::now();
     uow.update_document(&document)?;
 
-    Ok((
-        ReplaceResultDto {
-            replacements_count,
-            skipped_cross_block,
-        },
-        snapshot,
-    ))
+    Ok(replace_core::Applied {
+        replacements_count: plan.edits.len() as i64,
+        skipped_cross_block: plan.skipped_cross_block,
+        skipped_overlapping: plan.skipped_overlapping,
+    })
 }
 
 pub struct ReplaceTextUseCase {

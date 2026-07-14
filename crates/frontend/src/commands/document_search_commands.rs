@@ -5,8 +5,8 @@
 use crate::app_context::AppContext;
 use anyhow::{Context, Result};
 use document_search::{
-    FindAllDto, FindAllResultDto, FindResultDto, FindTextDto, ReplaceResultDto, ReplaceTextDto,
-    document_search_controller,
+    FindAllDto, FindAllResultDto, FindResultDto, FindTextDto, ReplaceRangesDto,
+    ReplaceRangesResultDto, ReplaceResultDto, ReplaceTextDto, document_search_controller,
 };
 
 pub fn find_text(ctx: &AppContext, dto: &FindTextDto) -> Result<FindResultDto> {
@@ -31,4 +31,19 @@ pub fn replace_text(
         dto,
     )
     .context("replace_text")
+}
+
+pub fn replace_ranges(
+    ctx: &AppContext,
+    stack_id: Option<u64>,
+    dto: &ReplaceRangesDto,
+) -> Result<ReplaceRangesResultDto> {
+    let mut undo_redo_manager = ctx.undo_redo_manager.lock();
+    document_search_controller::replace_ranges(
+        &ctx.db_context,
+        &ctx.event_hub,
+        &mut undo_redo_manager,
+        stack_id,
+        dto,
+    )
 }

@@ -325,6 +325,17 @@ pub struct ReplaceOptions {
     pub format_policy: ReplaceFormatPolicy,
 }
 
+/// One range to replace, with **its own** replacement text.
+///
+/// `position` and `length` are **char** offsets into the document's text — the same space
+/// [`FindMatch`] reports in, so a match can be turned into a range directly.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReplaceRange {
+    pub position: usize,
+    pub length: usize,
+    pub replacement: String,
+}
+
 impl ReplaceOptions {
     /// A replace that finds the text exactly as `find` describes and keeps the default
     /// (historical) format policy.

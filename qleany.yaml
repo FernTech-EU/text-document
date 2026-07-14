@@ -1380,9 +1380,26 @@ features:
             - name: lengths
               type: integer
               is_list: true
+            # The matched TEXT of each occurrence, sliced from the document's own search
+            # text. Returned so a caller never has to slice it themselves: the only other
+            # whole-document string available to them is `to_plain_text`, which is the
+            # human-readable view and does NOT carry the U+FFFC anchors an embedded table
+            # occupies — so slicing it with these offsets is wrong by two characters per
+            # preceding table.
+            - name: matched_texts
+              type: string
+              is_list: true
             - name: count
               type: integer
 
+      # NOTE: both replace DTOs carry a hand-added `format_policy:
+      # common::format_runs::ReplaceFormatPolicy` field, which decides what the
+      # replacement text wears where it overwrites formatted prose. It is not declared
+      # here because a DTO field cannot (yet) be an algebraic enum in this manifest —
+      # every field type in this file is a scalar or a list of scalars. Keep the field
+      # when hand-porting a regeneration of `dtos.rs`, or the policy silently reverts to
+      # the historical behaviour and a rename starts destroying the formatting it lands
+      # on. See `common::format_runs::ReplaceFormatPolicy`.
       - name: replace_text
         undoable: true
         entities: [Document, Frame, Block]
@@ -1407,6 +1424,46 @@ features:
             - name: replacements_count
               type: integer
             - name: skipped_cross_block
+              type: integer
+
+      # Replace an explicit SET of ranges, each with its own replacement text.
+      #
+      # `replace_text` can only put the same string at every match. That is not enough for
+      # a reviewed bulk rename, where the writer unticks some occurrences and where a
+      # rename may need to preserve the case it found (AURÉLIEN -> AURÉLIAN, not
+      # aurélian). The alternative — find the matches, then call a replace — is a race:
+      # the document can move between the two calls, and the ranges then address text that
+      # is no longer there. So the caller decides per occurrence, and hands the whole set
+      # over to be applied in one shot.
+      #
+      # The three lists are PARALLEL and must be the same length: range `i` is
+      # `positions[i] .. positions[i] + lengths[i]`, replaced by `replacements[i]`.
+      # Positions are CHAR offsets into the document's search text. (A list of structs is
+      # not expressible here; `FindAllResultDto` uses the same parallel-list idiom.) The
+      # public API exposes the typed `ReplaceRange` shape and converts at this boundary.
+      - name: replace_ranges
+        undoable: true
+        entities: [Document, Frame, Block]
+        dto_in:
+          name: ReplaceRangesDto
+          fields:
+            - name: positions
+              type: integer
+              is_list: true
+            - name: lengths
+              type: integer
+              is_list: true
+            - name: replacements
+              type: string
+              is_list: true
+        dto_out:
+          name: ReplaceRangesResultDto
+          fields:
+            - name: replacements_count
+              type: integer
+            - name: skipped_cross_block
+              type: integer
+            - name: skipped_overlapping
               type: integer
 
   # ── Document Inspection (read-only queries about structure) ──

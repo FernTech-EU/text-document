@@ -2,4 +2,5 @@
 
 pub(crate) mod find_all_uow;
 pub(crate) mod find_text_uow;
+pub(crate) mod replace_ranges_uow;
 pub(crate) mod replace_text_uow;

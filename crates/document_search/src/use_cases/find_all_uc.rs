@@ -85,11 +85,27 @@ impl FindAllUseCase {
 
         let positions: Vec<i64> = all_matches.iter().map(|(pos, _)| *pos as i64).collect();
         let lengths: Vec<i64> = all_matches.iter().map(|(_, len)| *len as i64).collect();
+
+        // Slice each match out of the text we just searched. Done HERE, and returned, so a
+        // caller never has to do it: the only whole-document string they can reach is
+        // `to_plain_text`, which is the human-readable view and carries no `U+FFFC` anchor for
+        // an embedded table — so slicing that with these offsets is wrong by two characters
+        // per preceding table, and a rename built on it would rewrite the wrong words.
+        let chars: Vec<char> = full_text.chars().collect();
+        let matched_texts: Vec<String> = all_matches
+            .iter()
+            .map(|&(pos, len)| {
+                let end = (pos + len).min(chars.len());
+                chars[pos.min(chars.len())..end].iter().collect()
+            })
+            .collect();
+
         let count = all_matches.len() as i64;
 
         Ok(FindAllResultDto {
             positions,
             lengths,
+            matched_texts,
             count,
         })
     }

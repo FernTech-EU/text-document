@@ -29,6 +29,13 @@ pub struct FindAllDto {
 pub struct FindAllResultDto {
     pub positions: Vec<i64>,
     pub lengths: Vec<i64>,
+    /// The matched **text** of each occurrence, sliced from the document's own search text.
+    ///
+    /// Returned so a caller never has to slice it themselves. The only other whole-document
+    /// string available to them is `to_plain_text`, which is the human-readable view and does
+    /// **not** carry the `U+FFFC` anchor an embedded table occupies — so slicing that with
+    /// these offsets is wrong by two characters per preceding table.
+    pub matched_texts: Vec<String>,
     pub count: i64,
 }
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
@@ -50,4 +57,35 @@ pub struct ReplaceTextDto {
 pub struct ReplaceResultDto {
     pub replacements_count: i64,
     pub skipped_cross_block: i64,
+}
+
+/// An explicit set of ranges to replace, each with its own replacement text.
+///
+/// The three lists are **parallel** and must be the same length: range `i` is
+/// `positions[i] .. positions[i] + lengths[i]`, replaced by `replacements[i]`. Positions
+/// are **char** offsets into the document's search text.
+///
+/// A list of structs is not expressible in a DTO here (every field is a scalar or a list
+/// of scalars — `FindAllResultDto` uses the same parallel-list idiom), so the public API
+/// exposes the typed `ReplaceRange` shape and converts at this boundary.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+pub struct ReplaceRangesDto {
+    pub positions: Vec<i64>,
+    pub lengths: Vec<i64>,
+    pub replacements: Vec<String>,
+    /// What each replacement wears where it overwrites formatted prose. See
+    /// [`ReplaceFormatPolicy`].
+    pub format_policy: ReplaceFormatPolicy,
+}
+
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+pub struct ReplaceRangesResultDto {
+    pub replacements_count: i64,
+    /// Ranges that straddled a block boundary. A block is the unit an edit is applied to,
+    /// so a range crossing two of them is refused rather than half-applied.
+    pub skipped_cross_block: i64,
+    /// Ranges that overlapped an earlier one. Two edits to the same characters cannot both
+    /// be honoured; the earlier range wins and the later is reported, never silently
+    /// dropped.
+    pub skipped_overlapping: i64,
 }

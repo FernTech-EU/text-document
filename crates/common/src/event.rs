@@ -109,6 +109,7 @@ pub enum DocumentSearchEvent {
     FindText,
     FindAll,
     ReplaceText,
+    ReplaceRanges,
 }
 
 #[derive(Debug, Clone, Hash, PartialEq, Eq, Serialize)]

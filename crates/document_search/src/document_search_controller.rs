@@ -4,19 +4,24 @@ use crate::FindAllDto;
 use crate::FindAllResultDto;
 use crate::FindResultDto;
 use crate::FindTextDto;
+use crate::ReplaceRangesDto;
+use crate::ReplaceRangesResultDto;
 use crate::ReplaceResultDto;
 use crate::ReplaceTextDto;
 use crate::units_of_work::find_all_uow::FindAllUnitOfWorkFactory;
 use crate::units_of_work::find_text_uow::FindTextUnitOfWorkFactory;
+use crate::units_of_work::replace_ranges_uow::ReplaceRangesUnitOfWorkFactory;
 use crate::units_of_work::replace_text_uow::ReplaceTextUnitOfWorkFactory;
 use crate::use_cases::find_all_uc::FindAllUseCase;
 use crate::use_cases::find_text_uc::FindTextUseCase;
+use crate::use_cases::replace_ranges_uc::ReplaceRangesUseCase;
 use crate::use_cases::replace_text_uc::ReplaceTextUseCase;
 use anyhow::Result;
 use common::event::{Event, Origin};
 
 use common::event::DocumentSearchEvent::FindAll;
 use common::event::DocumentSearchEvent::FindText;
+use common::event::DocumentSearchEvent::ReplaceRanges;
 use common::event::DocumentSearchEvent::ReplaceText;
 
 use common::undo_redo::UndoRedoManager;
@@ -71,6 +76,25 @@ pub fn replace_text(
     // Notify that the handling manifest has been loaded
     event_hub.send_event(Event {
         origin: Origin::DocumentSearch(ReplaceText),
+        ids: vec![],
+        data: None,
+    });
+    Ok(return_dto)
+}
+
+pub fn replace_ranges(
+    db_context: &DbContext,
+    event_hub: &Arc<EventHub>,
+    undo_redo_manager: &mut UndoRedoManager,
+    stack_id: Option<u64>,
+    dto: &ReplaceRangesDto,
+) -> Result<ReplaceRangesResultDto> {
+    let uow_context = ReplaceRangesUnitOfWorkFactory::new(db_context, event_hub);
+    let mut uc = ReplaceRangesUseCase::new(Box::new(uow_context));
+    let return_dto = uc.execute(dto)?;
+    undo_redo_manager.add_command_to_stack(Box::new(uc), stack_id)?;
+    event_hub.send_event(Event {
+        origin: Origin::DocumentSearch(ReplaceRanges),
         ids: vec![],
         data: None,
     });

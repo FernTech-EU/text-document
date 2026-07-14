@@ -78,6 +78,29 @@ impl FindOptions {
 }
 
 impl crate::ReplaceOptions {
+    /// The typed ranges become the DTO's three PARALLEL lists — a list of structs is not
+    /// expressible there (`FindAllResultDto` uses the same idiom). Built in one pass so the
+    /// three can never come out of step, which would make range `i` address the wrong text.
+    pub(crate) fn to_replace_ranges_dto(
+        &self,
+        ranges: &[crate::ReplaceRange],
+    ) -> frontend::document_search::ReplaceRangesDto {
+        let mut positions = Vec::with_capacity(ranges.len());
+        let mut lengths = Vec::with_capacity(ranges.len());
+        let mut replacements = Vec::with_capacity(ranges.len());
+        for range in ranges {
+            positions.push(to_i64(range.position));
+            lengths.push(to_i64(range.length));
+            replacements.push(range.replacement.clone());
+        }
+        frontend::document_search::ReplaceRangesDto {
+            positions,
+            lengths,
+            replacements,
+            format_policy: self.format_policy,
+        }
+    }
+
     pub(crate) fn to_replace_dto(
         &self,
         query: &str,

@@ -23,7 +23,7 @@ use crate::inner::TextDocumentInner;
 use crate::operation::{
     DjotImportResult, DocxExportResult, HtmlImportResult, MarkdownImportResult, Operation,
 };
-use crate::{BlockFormat, BlockInfo, DocumentStats, FindMatch, FindOptions};
+use crate::{BlockFormat, BlockInfo, DocumentStats, FindMatch, FindOptions, ReplaceRange};
 
 /// A rich text document.
 ///
@@ -868,6 +868,141 @@ impl TextDocument {
             (count, inner.take_queued_events())
         };
         crate::inner::dispatch_queued_events(queued);
+        Ok(count)
+    }
+
+    /// Replace an explicit set of ranges, each with **its own** replacement text. Undoable
+    /// as one action, however many ranges it touches.
+    ///
+    /// [`replace_text`](Self::replace_text) can only put the same string at every match.
+    /// This is for the case where the caller decides *per occurrence* — a reviewed bulk
+    /// rename where some occurrences are unticked, or one that preserves the case it found
+    /// (`AURÉLIEN` → `AURÉLIAN`, not `aurélian`).
+    ///
+    /// ⚠ **Do not build the ranges with a separate `find_all` call.** The document can move
+    /// between the two, and the ranges then address text that is no longer there — which
+    /// does not fail, it rewrites *the wrong words*. Use
+    /// [`find_and_replace`](Self::find_and_replace), which does both under one lock.
+    ///
+    /// Ranges that straddle a block boundary, or that overlap one another, are **skipped**;
+    /// the returned count reflects only what was actually applied.
+    pub fn replace_ranges(
+        &self,
+        ranges: &[ReplaceRange],
+        options: &crate::ReplaceOptions,
+    ) -> Result<usize> {
+        let (count, queued) = {
+            let mut inner = self.inner.lock();
+            let count = Self::replace_ranges_locked(&mut inner, ranges, options)?;
+            (count, inner.take_queued_events())
+        };
+        crate::inner::dispatch_queued_events(queued);
+        Ok(count)
+    }
+
+    /// Find every match of `query` and let `decide` choose what each becomes — **atomically**.
+    ///
+    /// `decide` is handed the matched text and the index of the match, and returns the
+    /// replacement, or `None` to leave that occurrence alone. So a rename that preserves case
+    /// and skips the occurrences a writer unticked is one call:
+    ///
+    /// ```no_run
+    /// # use text_document::{TextDocument, FindOptions, ReplaceOptions};
+    /// # let doc = TextDocument::new();
+    /// # let excluded: Vec<usize> = vec![];
+    /// doc.find_and_replace("Aurélien", &ReplaceOptions::new(FindOptions::default()), |matched, i| {
+    ///     if excluded.contains(&i) {
+    ///         return None; // the writer unticked this one
+    ///     }
+    ///     Some(if matched.chars().all(char::is_uppercase) { "AURÉLIAN".into() } else { "Aurélian".into() })
+    /// })?;
+    /// # Ok::<(), text_document::DocumentError>(())
+    /// ```
+    ///
+    /// **The scan and the splice happen under one lock**, which is the whole point. Calling
+    /// `find_all` and then `replace_ranges` would drop the lock in between, and the document
+    /// can be edited there — after which every range addresses text that has moved. That does
+    /// not raise an error; it silently rewrites the wrong words. The document mutex is not
+    /// reentrant, so composing the two public methods cannot close the gap; only doing both
+    /// inside one can.
+    pub fn find_and_replace(
+        &self,
+        query: &str,
+        options: &crate::ReplaceOptions,
+        mut decide: impl FnMut(&str, usize) -> Option<String>,
+    ) -> Result<usize> {
+        let (count, queued) = {
+            let mut inner = self.inner.lock();
+
+            // Scan. The matched TEXT comes back with the offsets, sliced by the use case from
+            // the very text it searched — deliberately, so this never has to slice a
+            // whole-document string of its own. The only one reachable here is
+            // `to_plain_text`, which is the human-readable view and carries no `U+FFFC` anchor
+            // for an embedded table; slicing it with these offsets would be wrong by two
+            // characters per preceding table, and the rename would rewrite the wrong words.
+            let found = {
+                let dto = options.find.to_find_all_dto(query);
+                document_search_commands::find_all(&inner.ctx, &dto)?
+            };
+
+            // …decide, against the document as it is RIGHT NOW…
+            let mut ranges: Vec<ReplaceRange> = Vec::new();
+            for (i, ((&position, &length), matched)) in found
+                .positions
+                .iter()
+                .zip(found.lengths.iter())
+                .zip(found.matched_texts.iter())
+                .enumerate()
+            {
+                if let Some(replacement) = decide(matched, i) {
+                    ranges.push(ReplaceRange {
+                        position: to_usize(position),
+                        length: to_usize(length),
+                        replacement,
+                    });
+                }
+            }
+
+            // …and splice — all without ever letting go of the lock.
+            let count = if ranges.is_empty() {
+                0
+            } else {
+                Self::replace_ranges_locked(&mut inner, &ranges, options)?
+            };
+            (count, inner.take_queued_events())
+        };
+        crate::inner::dispatch_queued_events(queued);
+        Ok(count)
+    }
+
+    /// The splice, with the lock already held. Shared by [`Self::replace_ranges`] and
+    /// [`Self::find_and_replace`] so the second cannot drift from the first.
+    fn replace_ranges_locked(
+        inner: &mut crate::inner::TextDocumentInner,
+        ranges: &[ReplaceRange],
+        options: &crate::ReplaceOptions,
+    ) -> Result<usize> {
+        let dto = options.to_replace_ranges_dto(ranges);
+        let result =
+            document_search_commands::replace_ranges(&inner.ctx, Some(inner.stack_id), &dto)?;
+        let count = to_usize(result.replacements_count);
+
+        inner.invalidate_text_cache();
+        if count > 0 {
+            inner.modified = true;
+            inner.rehighlight_all();
+            inner.queue_event(DocumentEvent::ContentsChanged {
+                position: 0,
+                chars_removed: 0,
+                chars_added: 0,
+                blocks_affected: count,
+            });
+            inner.check_block_count_changed();
+            inner.check_flow_changed();
+            let can_undo = undo_redo_commands::can_undo(&inner.ctx, Some(inner.stack_id));
+            let can_redo = undo_redo_commands::can_redo(&inner.ctx, Some(inner.stack_id));
+            inner.queue_event(DocumentEvent::UndoRedoChanged { can_undo, can_redo });
+        }
         Ok(count)
     }
 

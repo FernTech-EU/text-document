@@ -96,6 +96,7 @@ pub enum FlatEventKind {
     DocumentSearchFindText,
     DocumentSearchFindAll,
     DocumentSearchReplaceText,
+    DocumentSearchReplaceRanges,
 
     DocumentInspectionGetDocumentStats,
     DocumentInspectionGetTextAtPosition,
@@ -274,6 +275,7 @@ impl From<Event> for FlatEvent {
                 DocumentSearchEvent::FindText => FlatEventKind::DocumentSearchFindText,
                 DocumentSearchEvent::FindAll => FlatEventKind::DocumentSearchFindAll,
                 DocumentSearchEvent::ReplaceText => FlatEventKind::DocumentSearchReplaceText,
+                DocumentSearchEvent::ReplaceRanges => FlatEventKind::DocumentSearchReplaceRanges,
             },
             Origin::DocumentInspection(fe) => match fe {
                 DocumentInspectionEvent::GetDocumentStats => {

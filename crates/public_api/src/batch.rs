@@ -35,7 +35,7 @@ use frontend::document_io::ImportDjotDto;
 use frontend::root::dtos::CreateRootDto;
 
 use crate::error::Result;
-use crate::{FindMatch, FindOptions};
+use crate::{FindMatch, FindOptions, ReplaceOptions, ReplaceRange};
 
 /// A headless document: no thread, no view, no cursor. See the module docs.
 pub struct BatchDocument {
@@ -99,5 +99,75 @@ impl BatchDocument {
                 length: length as usize,
             })
             .collect())
+    }
+
+    /// Find every match of `query` and let `decide` choose what each becomes — the whole
+    /// thing in one shot.
+    ///
+    /// `decide` is handed the matched text and the index of the match, and returns the
+    /// replacement, or `None` to leave that occurrence alone. That is exactly what a reviewed
+    /// bulk rename needs: skip the occurrences the writer unticked, and preserve the case of
+    /// the ones that stay (`AURÉLIEN` → `AURÉLIAN`, not `aurélian`).
+    ///
+    /// **This is why a backend batch can stop doing string surgery on markup.** The
+    /// alternative — export the Djot and rewrite it as a string — rewrites a query that also
+    /// occurs inside a link's URL, and drops the character formatting under every match. Here
+    /// the edit happens *inside the document*, at the offsets the parser itself reports, and
+    /// `ReplaceOptions::format_policy` decides what the replacement wears where it overwrites
+    /// formatted prose.
+    ///
+    /// The matched text comes back from the scan itself, sliced from the very text that was
+    /// searched — never from a plain-text export, which is the human-readable view and does
+    /// not carry the `U+FFFC` anchor an embedded table occupies.
+    pub fn find_and_replace(
+        &self,
+        query: &str,
+        options: &ReplaceOptions,
+        mut decide: impl FnMut(&str, usize) -> Option<String>,
+    ) -> Result<usize> {
+        let found =
+            document_search_commands::find_all(&self.ctx, &options.find.to_find_all_dto(query))?;
+
+        let mut ranges: Vec<ReplaceRange> = Vec::new();
+        for (i, ((&position, &length), matched)) in found
+            .positions
+            .iter()
+            .zip(found.lengths.iter())
+            .zip(found.matched_texts.iter())
+            .enumerate()
+        {
+            if let Some(replacement) = decide(matched, i) {
+                ranges.push(ReplaceRange {
+                    position: position as usize,
+                    length: length as usize,
+                    replacement,
+                });
+            }
+        }
+
+        if ranges.is_empty() {
+            return Ok(0);
+        }
+        self.replace_ranges(&ranges, options)
+    }
+
+    /// Replace an explicit set of ranges, each with its own replacement text.
+    ///
+    /// Ranges that straddle a block boundary, or that overlap one another, are skipped; the
+    /// returned count is what was actually applied. Prefer [`Self::find_and_replace`], which
+    /// derives the ranges from a scan of the document as it stands, so they cannot address
+    /// text that has since moved.
+    pub fn replace_ranges(
+        &self,
+        ranges: &[ReplaceRange],
+        options: &ReplaceOptions,
+    ) -> Result<usize> {
+        // `stack_id: None` — a batch has no undo of its own; its caller owns the undo entry.
+        let result = document_search_commands::replace_ranges(
+            &self.ctx,
+            None,
+            &options.to_replace_ranges_dto(ranges),
+        )?;
+        Ok(result.replacements_count.max(0) as usize)
     }
 }
