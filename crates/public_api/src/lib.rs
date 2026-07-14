@@ -24,6 +24,7 @@
 //! doc.undo().unwrap();
 //! ```
 
+mod batch;
 mod convert;
 mod cursor;
 mod document;
@@ -49,6 +50,7 @@ pub use frontend::list::dtos::ListStyle;
 pub use frontend::resource::dtos::ResourceType;
 
 // ── Error type ───────────────────────────────────────────────────
+pub use batch::BatchDocument;
 pub use error::{DocumentError, Result};
 
 // ── Public API types ─────────────────────────────────────────────

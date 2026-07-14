@@ -40,13 +40,14 @@ use common::event::{Event, Origin};
 use common::parser_tools::DjotExportOptions;
 
 use common::event::DocumentIoEvent::ExportDjot;
+use common::event::DocumentIoEvent::ImportDjot;
 use common::event::DocumentIoEvent::ExportHtml;
 use common::event::DocumentIoEvent::ExportLatex;
 use common::event::DocumentIoEvent::ExportMarkdown;
 use common::event::DocumentIoEvent::ExportPlainText;
 use common::event::DocumentIoEvent::ImportPlainText;
 
-use common::long_operation::{LongOperationManager, OperationProgress};
+use common::long_operation::{LongOperation, LongOperationManager, OperationProgress};
 use common::{database::db_context::DbContext, event::EventHub};
 use std::sync::Arc;
 
@@ -145,6 +146,39 @@ pub fn import_djot(
     let uc = ImportDjotUseCase::new(Box::new(uow_context), dto);
     let operation_id = long_operation_manager.start_operation(uc);
     Ok(operation_id)
+}
+
+/// Import Djot **synchronously**, on the calling thread.
+///
+/// [`import_djot`] hands the use case to the `LongOperationManager`, which spawns a
+/// thread for it. That is right for a UI import (it must not block the frame loop),
+/// and wrong for a *batch* caller — a backend that has to parse and rewrite hundreds
+/// of documents in one operation would spawn hundreds of threads to do work it wants
+/// to do inline anyway.
+///
+/// The use case itself is thread-agnostic: it only needs a progress sink and a cancel
+/// flag. So this hands it a no-op sink and a never-set flag and calls it directly. No
+/// thread, no operation id, no polling — the result is simply returned.
+///
+/// (Cancellation is the caller's business here: a synchronous caller can just stop
+/// calling. The flag exists to satisfy the `LongOperation` signature, not to be used.)
+pub fn import_djot_sync(
+    db_context: &DbContext,
+    event_hub: &Arc<EventHub>,
+    dto: &ImportDjotDto,
+) -> Result<ImportDjotResultDto> {
+    let uow_context = ImportDjotUnitOfWorkFactory::new(db_context, event_hub);
+    let uc = ImportDjotUseCase::new(Box::new(uow_context), dto);
+    let result = uc.execute(
+        Box::new(|_progress| {}),
+        Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    )?;
+    event_hub.send_event(Event {
+        origin: Origin::DocumentIo(ImportDjot),
+        ids: vec![],
+        data: None,
+    });
+    Ok(result)
 }
 
 pub fn get_import_djot_progress(

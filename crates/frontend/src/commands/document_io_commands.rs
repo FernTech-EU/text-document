@@ -74,6 +74,17 @@ pub fn import_djot(ctx: &AppContext, dto: &ImportDjotDto) -> Result<String> {
     .context("import_djot")
 }
 
+/// import_djot, **synchronously**, on the calling thread.
+///
+/// [`import_djot`] starts a long operation, which spawns a thread. That is right for a
+/// UI import (it must not block the frame loop) and wrong for a batch caller, which
+/// would spawn one thread per document to do work it wants to do inline. See
+/// `text_document::BatchDocument`, the intended consumer.
+pub fn import_djot_sync(ctx: &AppContext, dto: &ImportDjotDto) -> Result<ImportDjotResultDto> {
+    document_io_controller::import_djot_sync(&ctx.db_context, &ctx.event_hub, dto)
+        .context("import_djot_sync")
+}
+
 /// Get the progress of a import_djot operation
 pub fn get_import_djot_progress(ctx: &AppContext, operation_id: &str) -> Option<OperationProgress> {
     document_io_controller::get_import_djot_progress(
