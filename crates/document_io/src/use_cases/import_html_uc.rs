@@ -340,8 +340,14 @@ impl LongOperation for ImportHtmlUseCase {
 
                     // 1b. Mirror the table-anchor sentinel into the
                     // global rope. Appended at the end (the importer
-                    // processes elements linearly).
-                    rope_append_table_anchor(&uow.store(), created_table.id);
+                    // processes elements linearly). The boundary comes
+                    // from the same positional flag every block uses —
+                    // see the note on `rope_append_table_anchor`.
+                    rope_append_table_anchor(
+                        &uow.store(),
+                        created_table.id,
+                        emitted_any_main_block,
+                    );
 
                     // 2. Create cell frames with content + TableCell entities
                     let current_frame_id = frame_stack.last().unwrap().frame_id;

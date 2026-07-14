@@ -7,3 +7,4 @@
 cc 450228aa2afcd7364c5b00617b25c4bf7995a3add63a381dc432fe034e88d3bd # shrinks to blocks = [Para([Code(" "), Code("0")])]
 cc e69cd8c7a51eb37b2503e8ea97fc4c392eda8e41d9de439a0e27cf487c155fc7 # shrinks to blocks = [Para([Text("a*A ~a~*")])]
 cc b7eeb8d1d49723bad8f6ad0447d9e98e0e152b764d2c665865046ea4bfcafcde # shrinks to blocks = [Quote("a0"), Para(BlockStyle { alignment: None, line_height: None, direction: None, non_breakable_lines: None, background: None }, [Text("a")])]
+cc a6da4bdf61589ac3ff4e2e04210e5a2cdf44ebbe9f3f9a2d1a361be336f7d24a # shrinks to blocks = [Fenced(None, ""), Table(["Aa"], [["aa"]])]

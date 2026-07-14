@@ -682,20 +682,40 @@ pub fn rope_insert_table_anchor(
 }
 
 /// Append a U+FFFC table-anchor sentinel at the end of the rope and
-/// register a `TableAnchor(table_id)` marker. If the rope is already
-/// non-empty, prepends a `\n` boundary so the sentinel doesn't run
-/// into the previous entry's content.
+/// register a `TableAnchor(table_id)` marker.
 ///
-/// Used by import paths (`import_html_uc`, `import_markdown_uc`)
-/// that process the document linearly and append entities as they
-/// encounter them, rather than inserting relative to an existing
-/// target block.
-pub fn rope_append_table_anchor(store: &Store, table_id: EntityId) {
+/// Used by import paths (`import_djot_uc`, `import_html_uc`,
+/// `import_markdown_uc`) that process the document linearly and append
+/// entities as they encounter them, rather than inserting relative to
+/// an existing target block.
+///
+/// # `needs_boundary`
+///
+/// True when something has already been emitted, so the sentinel needs a
+/// `\n` in front of it rather than running into the previous entry.
+///
+/// It is the **caller's** flag, not `rope.len_bytes() == 0`, and the
+/// difference is not academic. Those two answers diverge on exactly one
+/// document: one whose first block is *empty* — an empty code fence, say.
+/// The rope is then still zero bytes long even though a block has been
+/// emitted, so an emptiness check skips the boundary that block is owed.
+/// Its `block_offsets` entry and the anchor's then both point at byte 0:
+/// two entities claiming one offset, in the offset index every edit
+/// resolves through.
+///
+/// Every other element gets its boundary from the importer's own
+/// positional flag (`rope_insert_block_boundary` after the first block).
+/// Deriving the same fact a second way, from the rope's byte length, is
+/// what let the two disagree.
+pub fn rope_append_table_anchor(store: &Store, table_id: EntityId, needs_boundary: bool) {
     let (anchor_byte_start, new_total) = {
         let mut rope = store.rope.write();
-        let was_empty = rope.len_bytes() == 0;
         let char_end = rope.len_chars();
-        let to_insert = if was_empty { "\u{FFFC}" } else { "\n\u{FFFC}" };
+        let to_insert = if needs_boundary {
+            "\n\u{FFFC}"
+        } else {
+            "\u{FFFC}"
+        };
         rope.insert(char_end, to_insert);
         let new_total = rope.len_bytes() as u32;
         // Sentinel is 3 bytes; if a `\n` was prepended that's 1 byte

@@ -334,7 +334,13 @@ fn import_parsed_elements(
                 // 1b. Mirror the table-anchor sentinel into the global
                 // rope. Appended at the end (the importer processes
                 // elements linearly).
-                rope_append_table_anchor(&uow.store(), created_table.id);
+                //
+                // The boundary is decided by the SAME flag every block
+                // uses. Letting the rope re-derive it from its own byte
+                // length loses the boundary whenever the first block is
+                // empty (an empty code fence), because the rope is then
+                // still zero bytes long even though a block was emitted.
+                rope_append_table_anchor(&uow.store(), created_table.id, emitted_any_main_block);
 
                 // 2. Create cell frames with content + TableCell entities
                 let current_frame_id = frame_stack.last().unwrap().frame_id;
