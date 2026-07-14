@@ -45,6 +45,20 @@ pub use frontend::block::dtos::{Alignment, MarkerType};
 pub use frontend::block::dtos::{CharVerticalAlignment, InlineContent, UnderlineStyle};
 pub use frontend::common::format_runs::ReplaceFormatPolicy;
 pub use frontend::common::parser_tools::{DjotExportOptions, DjotImportOptions};
+
+/// The matcher, as a pure function over `&str` — no document, no store, no threads.
+///
+/// A host app searching a whole project cannot afford to build a document per row just
+/// to ask "does this contain that": it would parse every scene in the manuscript on
+/// every keystroke. It extracts the prose cheaply and matches it here instead.
+///
+/// Exposing it is what keeps there being **one** definition of a match. An app that
+/// rolled its own would disagree with this crate's in-document find about whole-word
+/// rules and case folding, and a writer would meet that as "the editor found it but the
+/// search panel didn't".
+pub mod matching {
+    pub use frontend::document_search::matching::{Match, MatchOptions, find_all};
+}
 pub use frontend::document::dtos::{TextDirection, WrapMode};
 pub use frontend::frame::dtos::FramePosition;
 pub use frontend::list::dtos::ListStyle;
