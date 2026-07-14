@@ -593,30 +593,35 @@ impl TextDocument {
         &self,
         position: usize,
     ) -> Option<crate::flow::BlockSnapshot> {
-        self.snapshot_block_at_position_impl(position, true)
+        self.snapshot_block_at_position_masked(position, &crate::highlight::HighlightMask::all())
     }
 
     /// Like [`snapshot_block_at_position`](Self::snapshot_block_at_position)
     /// but with **no highlights applied** — base fragments and empty
-    /// `paint_highlights`, regardless of the active highlighter. Used by the
+    /// `paint_highlights`, regardless of the active sessions. Used by the
     /// incremental relayout path of a view that has opted out of highlights.
     pub fn snapshot_block_at_position_without_highlights(
         &self,
         position: usize,
     ) -> Option<crate::flow::BlockSnapshot> {
-        self.snapshot_block_at_position_impl(position, false)
+        self.snapshot_block_at_position_masked(position, &crate::highlight::HighlightMask::none())
     }
 
-    fn snapshot_block_at_position_impl(
+    /// Like [`snapshot_block_at_position`](Self::snapshot_block_at_position) but rendering
+    /// only the sessions `mask` admits — the per-view incremental path (two panes over one
+    /// document can carry different find sessions). `all()` = the plain method; `none()` = the
+    /// without-highlights method.
+    pub fn snapshot_block_at_position_masked(
         &self,
         position: usize,
-        apply_highlights: bool,
+        mask: &crate::highlight::HighlightMask,
     ) -> Option<crate::flow::BlockSnapshot> {
         let inner = self.inner.lock();
-        let effective_kind = if apply_highlights {
-            inner.highlight_kind
-        } else {
-            crate::highlight::HighlighterKind::None
+        // Effective kind resolved once here (the join over the mask's sessions), then threaded
+        // down with the mask itself.
+        let hl = crate::highlight::SnapshotHighlights {
+            kind: inner.highlights.effective_kind(mask),
+            mask,
         };
         let main_frame_id = get_main_frame_id(&inner);
         let store = inner.ctx.db_context.get_store();
@@ -632,7 +637,7 @@ impl TextDocument {
             && let Some((block_id, _, _)) =
                 common::database::rope_helpers::find_block_at_char_position(store, position as i64)
         {
-            return crate::text_block::build_block_snapshot(&inner, block_id, effective_kind);
+            return crate::text_block::build_block_snapshot(&inner, block_id, hl);
         }
 
         // Collect all block IDs in document order, traversing into nested frames
@@ -653,7 +658,7 @@ impl TextDocument {
                     &inner,
                     block_id,
                     Some(running_pos as usize),
-                    effective_kind,
+                    hl,
                 );
             }
             running_pos = block_end + 1;
@@ -661,7 +666,7 @@ impl TextDocument {
 
         // Fallback to last block
         if let Some(&last_id) = ordered_block_ids.last() {
-            return crate::text_block::build_block_snapshot(&inner, last_id, effective_kind);
+            return crate::text_block::build_block_snapshot(&inner, last_id, hl);
         }
         None
     }
@@ -775,30 +780,41 @@ impl TextDocument {
     /// Returns a [`FlowSnapshot`](crate::FlowSnapshot) containing snapshots
     /// for every element in the flow.
     pub fn snapshot_flow(&self) -> crate::flow::FlowSnapshot {
-        let inner = self.inner.lock();
-        let main_frame_id = get_main_frame_id(&inner);
-        let elements =
-            crate::text_frame::build_flow_snapshot(&inner, main_frame_id, inner.highlight_kind);
-        crate::flow::FlowSnapshot { elements }
+        self.snapshot_flow_masked(&crate::highlight::HighlightMask::all())
     }
 
     /// Snapshot the entire main flow with **no highlights applied** — base
     /// fragments and empty `paint_highlights` on every block, regardless of
-    /// the active syntax highlighter.
+    /// the active sessions.
     ///
     /// This is the per-view opt-out: a read-only viewer that should stay
     /// free of search / spell / syntax highlighting pulls *this* snapshot
     /// instead of [`snapshot_flow`](Self::snapshot_flow). Because suppression
-    /// happens at build time, it works for metric-affecting highlighters too
+    /// happens at build time, it works for metric-affecting sessions too
     /// (whose highlights are otherwise merged into `fragments` irreversibly).
     pub fn snapshot_flow_without_highlights(&self) -> crate::flow::FlowSnapshot {
+        self.snapshot_flow_masked(&crate::highlight::HighlightMask::none())
+    }
+
+    /// Snapshot the entire main flow rendering only the sessions `mask` admits.
+    ///
+    /// The generalization of the plain / without-highlights pair: `all()` shows every session,
+    /// `none()` shows none, and `only([...])` shows a chosen set — which is how two panes over
+    /// one shared document carry different find sessions. The effective
+    /// [`HighlighterKind`](crate::highlight) is resolved **once here**, at the snapshot root,
+    /// and threaded down, so a view showing only paint-only sessions never pays the reshape
+    /// path for a metric session it does not show.
+    pub fn snapshot_flow_masked(
+        &self,
+        mask: &crate::highlight::HighlightMask,
+    ) -> crate::flow::FlowSnapshot {
         let inner = self.inner.lock();
         let main_frame_id = get_main_frame_id(&inner);
-        let elements = crate::text_frame::build_flow_snapshot(
-            &inner,
-            main_frame_id,
-            crate::highlight::HighlighterKind::None,
-        );
+        let hl = crate::highlight::SnapshotHighlights {
+            kind: inner.highlights.effective_kind(mask),
+            mask,
+        };
+        let elements = crate::text_frame::build_flow_snapshot(&inner, main_frame_id, hl);
         crate::flow::FlowSnapshot { elements }
     }
 
@@ -1278,32 +1294,111 @@ impl TextDocument {
 
     // ── Syntax highlighting ──────────────────────────────────
 
-    /// Attach a syntax highlighter to this document.
+    /// Attach a single syntax highlighter to this document — the classic, one-highlighter
+    /// entry point.
     ///
-    /// Immediately re-highlights the entire document. Replaces any
-    /// previously attached highlighter. Pass `None` to remove the
-    /// highlighter and clear all highlight formatting.
+    /// Immediately re-highlights the entire document. **Replaces** any previously attached
+    /// *syntax* highlighter (other session kinds — range sessions for find / spell — are left
+    /// alone). Pass `None` to remove the syntax highlighter.
+    ///
+    /// This is now a convenience over the session registry: it is exactly
+    /// [`remove`](Self::remove all syntax) + [`add_syntax_session`](Self::add_syntax_session).
+    /// A host that wants several layers at once uses the session methods directly.
     pub fn set_syntax_highlighter(&self, highlighter: Option<Arc<dyn crate::SyntaxHighlighter>>) {
         let queued = {
             let mut inner = self.inner.lock();
             let prev_kind = inner.highlight_kind;
+            inner.highlights.remove_all_syntax();
             match highlighter {
                 Some(hl) => {
-                    inner.highlight = Some(crate::highlight::HighlightData {
-                        highlighter: hl,
-                        blocks: std::collections::HashMap::new(),
-                    });
+                    inner.highlights.add_syntax(hl);
                     inner.rehighlight_all(); // recomputes highlight_kind
                 }
                 None => {
-                    inner.highlight = None;
-                    inner.recompute_highlight_kind(); // -> None
+                    inner.recompute_highlight_kind();
                 }
             }
             Self::queue_highlight_changed(&mut inner, 0, 0, prev_kind);
             inner.take_queued_events()
         };
         crate::inner::dispatch_queued_events(queued);
+    }
+
+    /// Register a **syntax session** — a [`SyntaxHighlighter`](crate::SyntaxHighlighter)
+    /// callback with its own per-block state cascade — and return its [`SessionId`].
+    ///
+    /// Unlike [`set_syntax_highlighter`](Self::set_syntax_highlighter), this **adds** rather
+    /// than replaces: a document can carry a syntax highlighter and a spell-checker at once,
+    /// each a session, merged in registration order (a later session's field wins). Sessions
+    /// remain visible only in views whose [`HighlightMask`](crate::highlight::HighlightMask)
+    /// admits them.
+    pub fn add_syntax_session(
+        &self,
+        highlighter: Arc<dyn crate::SyntaxHighlighter>,
+    ) -> crate::highlight::SessionId {
+        let (id, queued) = {
+            let mut inner = self.inner.lock();
+            let prev_kind = inner.highlight_kind;
+            let id = inner.highlights.add_syntax(highlighter);
+            inner.rehighlight_all();
+            Self::queue_highlight_changed(&mut inner, 0, 0, prev_kind);
+            (id, inner.take_queued_events())
+        };
+        crate::inner::dispatch_queued_events(queued);
+        id
+    }
+
+    /// Register an empty **range session** — absolute-offset ranges set with
+    /// [`set_session_ranges`](Self::set_session_ranges), the shape used for search and (later)
+    /// an externally-driven spell-checker. Returns its [`SessionId`].
+    ///
+    /// A view's own find session is a range session it alone admits; that is how two panes
+    /// over one document highlight different queries.
+    pub fn add_range_session(&self) -> crate::highlight::SessionId {
+        let mut inner = self.inner.lock();
+        inner.highlights.add_range()
+        // No repaint: an empty range session shows nothing until its ranges are set.
+    }
+
+    /// Replace the ranges of a range session (absolute char offsets, the space
+    /// [`FindMatch`](crate::FindMatch) reports in). Returns `false` if `id` is not a range
+    /// session.
+    ///
+    /// Fires a highlight-changed event so live views showing this session re-snapshot — the
+    /// only signal there is, since the ranges do not mutate the document.
+    pub fn set_session_ranges(
+        &self,
+        id: crate::highlight::SessionId,
+        ranges: Vec<crate::highlight::RangeHighlight>,
+    ) -> bool {
+        let (ok, queued) = {
+            let mut inner = self.inner.lock();
+            let prev_kind = inner.highlight_kind;
+            let ok = inner.highlights.set_ranges(id, ranges);
+            if ok {
+                inner.recompute_highlight_kind();
+                Self::queue_highlight_changed(&mut inner, 0, 0, prev_kind);
+            }
+            (ok, inner.take_queued_events())
+        };
+        crate::inner::dispatch_queued_events(queued);
+        ok
+    }
+
+    /// Retire a session (of either kind). Returns whether it existed.
+    pub fn remove_session(&self, id: crate::highlight::SessionId) -> bool {
+        let (existed, queued) = {
+            let mut inner = self.inner.lock();
+            let prev_kind = inner.highlight_kind;
+            let existed = inner.highlights.remove(id);
+            if existed {
+                inner.recompute_highlight_kind();
+                Self::queue_highlight_changed(&mut inner, 0, 0, prev_kind);
+            }
+            (existed, inner.take_queued_events())
+        };
+        crate::inner::dispatch_queued_events(queued);
+        existed
     }
 
     /// Re-highlight the entire document.

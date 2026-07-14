@@ -84,7 +84,10 @@ pub use cursor::TextCursor;
 pub use document::TextDocument;
 pub use events::{DocumentEvent, Subscription};
 pub use fragment::DocumentFragment;
-pub use highlight::{HighlightContext, HighlightFormat, HighlightSpan, SyntaxHighlighter};
+pub use highlight::{
+    HighlightContext, HighlightFormat, HighlightMask, HighlightSpan, RangeHighlight, SessionId,
+    SyntaxHighlighter,
+};
 pub use operation::{DocxExportResult, HtmlImportResult, MarkdownImportResult, Operation};
 
 // ── Layout engine API types ─────────────────────────────────────

@@ -31,7 +31,7 @@ use frontend::common::types::EntityId;
 use frontend::event_hub_client::SubscriptionToken;
 
 use crate::DocumentEvent;
-use crate::highlight::HighlightData;
+use crate::highlight::HighlightRegistry;
 
 /// Cursor position data stored inside the document for automatic adjustment.
 pub(crate) struct CursorData {
@@ -94,12 +94,13 @@ pub(crate) struct TextDocumentInner {
     // and emit FlowElementsInserted/FlowElementsRemoved.
     pub last_child_order: Vec<i64>,
 
-    // Syntax highlighting state (shadow formatting layer).
-    pub highlight: Option<HighlightData>,
+    // Highlight sessions (shadow formatting layer): a syntax highlighter, a spell-checker, a
+    // find session per view — each a session with its own id, merged in registration order.
+    pub highlights: HighlightRegistry,
 
-    // Classification of the active highlighter, recomputed after every
-    // rehighlight pass. Drives whether highlights are merged into the
-    // shaping input or kept as a separate paint overlay.
+    // The effective kind under the ALL-sessions mask, recomputed after every rehighlight pass.
+    // Drives whether highlights are merged into the shaping input or kept as a paint overlay
+    // for the unmasked `snapshot_flow()`; masked snapshots derive their own at the root.
     pub highlight_kind: crate::highlight::HighlighterKind,
 
     // Holds SubscriptionTokens for LongOperation event bridges. Dropping a
@@ -395,7 +396,7 @@ impl TextDocumentInner {
             plain_text_cache: None,
             last_block_count: 1, // new document starts with one block
             last_child_order: vec![block.id as i64],
-            highlight: None,
+            highlights: HighlightRegistry::default(),
             highlight_kind: crate::highlight::HighlighterKind::None,
             long_op_subscriptions: Vec::new(),
         })

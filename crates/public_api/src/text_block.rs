@@ -309,11 +309,15 @@ impl TextBlock {
     pub fn display_fragments(&self) -> Vec<FragmentContent> {
         let inner = self.doc.lock();
         let fragments = build_raw_fragments(&inner, self.block_id as u64, None);
-        if let Some(ref hl) = inner.highlight
-            && let Some(block_hl) = hl.blocks.get(&{ self.block_id })
-            && !block_hl.spans.is_empty()
-        {
-            return crate::highlight::merge_highlight_spans(fragments, &block_hl.spans);
+        // The fully-merged visual view: every session, regardless of the paint-vs-metric
+        // split the optimized path draws on.
+        let spans = crate::highlight::merged_spans_for_block(
+            &inner,
+            self.block_id,
+            &crate::highlight::HighlightMask::ALL,
+        );
+        if !spans.is_empty() {
+            return crate::highlight::merge_highlight_spans(fragments, &spans);
         }
         fragments
     }
@@ -352,20 +356,26 @@ impl TextBlock {
     /// All layout-relevant data in one lock acquisition. O(k+n).
     pub fn snapshot(&self) -> BlockSnapshot {
         let inner = self.doc.lock();
-        build_block_snapshot(&inner, self.block_id as u64, inner.highlight_kind).unwrap_or_else(
-            || BlockSnapshot {
-                block_id: self.block_id,
-                position: 0,
-                length: 0,
-                text: String::new(),
-                fragments: Vec::new(),
-                block_format: BlockFormat::default(),
-                list_info: None,
-                parent_frame_id: None,
-                table_cell: None,
-                paint_highlights: Vec::new(),
+        build_block_snapshot(
+            &inner,
+            self.block_id as u64,
+            crate::highlight::SnapshotHighlights {
+                kind: inner.highlight_kind,
+                mask: &crate::highlight::HighlightMask::ALL,
             },
         )
+        .unwrap_or_else(|| BlockSnapshot {
+            block_id: self.block_id,
+            position: 0,
+            length: 0,
+            text: String::new(),
+            fragments: Vec::new(),
+            block_format: BlockFormat::default(),
+            list_info: None,
+            parent_frame_id: None,
+            table_cell: None,
+            paint_highlights: Vec::new(),
+        })
     }
 }
 
@@ -466,7 +476,15 @@ fn compute_block_number(inner: &TextDocumentInner, block_id: u64) -> usize {
 /// Build fragments for a block from its format runs and image anchors,
 /// with highlight spans merged in when a syntax highlighter is attached.
 pub(crate) fn build_fragments(inner: &TextDocumentInner, block_id: u64) -> Vec<FragmentContent> {
-    build_fragments_with_text(inner, block_id, None, inner.highlight_kind)
+    build_fragments_with_text(
+        inner,
+        block_id,
+        None,
+        crate::highlight::SnapshotHighlights {
+            kind: inner.highlight_kind,
+            mask: &crate::highlight::HighlightMask::ALL,
+        },
+    )
 }
 
 /// Like `build_fragments` but accepts a pre-materialized block text to
@@ -478,23 +496,20 @@ pub(crate) fn build_fragments_with_text(
     inner: &TextDocumentInner,
     block_id: u64,
     prefetched_text: Option<&str>,
-    effective_kind: crate::highlight::HighlighterKind,
+    hl: crate::highlight::SnapshotHighlights,
 ) -> Vec<FragmentContent> {
     let fragments = build_raw_fragments(inner, block_id, prefetched_text);
 
-    // Only merge highlights into the shaping input when the effective
-    // highlighter is metric-affecting. Paint-only highlighters keep
-    // fragments as BASE and carry their spans separately in
-    // `BlockSnapshot::paint_highlights`, so the engine can recolor without
-    // reshaping. `effective_kind` is normally `inner.highlight_kind`, but a
-    // "without highlights" snapshot passes `None` to force base fragments
-    // regardless of the live highlighter. See `HighlighterKind`.
-    if effective_kind == crate::highlight::HighlighterKind::Metric
-        && let Some(ref hl) = inner.highlight
-        && let Some(block_hl) = hl.blocks.get(&(block_id as usize))
-        && !block_hl.spans.is_empty()
-    {
-        return crate::highlight::merge_highlight_spans(fragments, &block_hl.spans);
+    // Only merge highlights into the shaping input when the effective kind is
+    // metric-affecting. Paint-only sessions keep fragments as BASE and carry their spans
+    // separately in `BlockSnapshot::paint_highlights`, so the engine can recolor without
+    // reshaping. A "without highlights" (empty-mask) snapshot resolves to `kind == None`,
+    // forcing base fragments regardless of the live sessions. See `HighlighterKind`.
+    if hl.kind == crate::highlight::HighlighterKind::Metric {
+        let spans = crate::highlight::merged_spans_for_block(inner, block_id as usize, hl.mask);
+        if !spans.is_empty() {
+            return crate::highlight::merge_highlight_spans(fragments, &spans);
+        }
     }
 
     fragments
@@ -895,9 +910,9 @@ fn build_list_info(
 pub(crate) fn build_block_snapshot(
     inner: &TextDocumentInner,
     block_id: u64,
-    effective_kind: crate::highlight::HighlighterKind,
+    hl: crate::highlight::SnapshotHighlights,
 ) -> Option<BlockSnapshot> {
-    build_block_snapshot_with_position_and_parent(inner, block_id, None, None, effective_kind)
+    build_block_snapshot_with_position_and_parent(inner, block_id, None, None, hl)
 }
 
 /// Build a BlockSnapshot, optionally overriding the position with a computed value.
@@ -907,15 +922,9 @@ pub(crate) fn build_block_snapshot_with_position(
     inner: &TextDocumentInner,
     block_id: u64,
     computed_position: Option<usize>,
-    effective_kind: crate::highlight::HighlighterKind,
+    hl: crate::highlight::SnapshotHighlights,
 ) -> Option<BlockSnapshot> {
-    build_block_snapshot_with_position_and_parent(
-        inner,
-        block_id,
-        computed_position,
-        None,
-        effective_kind,
-    )
+    build_block_snapshot_with_position_and_parent(inner, block_id, computed_position, None, hl)
 }
 
 /// Build a BlockSnapshot with an optional `parent_frame_hint`. When the
@@ -929,7 +938,7 @@ pub(crate) fn build_block_snapshot_with_position_and_parent(
     block_id: u64,
     computed_position: Option<usize>,
     parent_frame_hint: Option<EntityId>,
-    effective_kind: crate::highlight::HighlighterKind,
+    hl: crate::highlight::SnapshotHighlights,
 ) -> Option<BlockSnapshot> {
     let mut block_dto = block_commands::get_block(&inner.ctx, &block_id)
         .ok()
@@ -979,19 +988,15 @@ pub(crate) fn build_block_snapshot_with_position_and_parent(
     let length = to_usize(common::database::rope_helpers::block_char_length(
         &entity, store,
     ));
-    let fragments = build_fragments_with_text(inner, block_id, Some(&text), effective_kind);
+    let fragments = build_fragments_with_text(inner, block_id, Some(&text), hl);
 
-    // Paint-only highlighter: emit the spans as a separate overlay (fragments
-    // stayed base above). Metric / none: empty (highlights merged into
-    // fragments, or none). A "without highlights" snapshot passes
-    // `effective_kind = None`, so this is empty regardless of the live kind.
-    let paint_highlights = if effective_kind == crate::highlight::HighlighterKind::PaintOnly {
-        inner
-            .highlight
-            .as_ref()
-            .and_then(|hl| hl.blocks.get(&(block_id as usize)))
-            .map(|bd| crate::highlight::extract_paint_spans(&bd.spans, length))
-            .unwrap_or_default()
+    // Paint-only sessions: emit the merged spans as a separate overlay (fragments stayed base
+    // above). Metric / none: empty (highlights merged into fragments, or none). A "without
+    // highlights" (empty-mask) snapshot resolves to `kind == None`, so this is empty
+    // regardless of the live sessions.
+    let paint_highlights = if hl.kind == crate::highlight::HighlighterKind::PaintOnly {
+        let spans = crate::highlight::merged_spans_for_block(inner, block_id as usize, hl.mask);
+        crate::highlight::extract_paint_spans(&spans, length)
     } else {
         Vec::new()
     };
@@ -1014,7 +1019,7 @@ pub(crate) fn build_block_snapshot_with_position_and_parent(
 pub(crate) fn build_blocks_snapshot_for_frame(
     inner: &TextDocumentInner,
     frame_id: u64,
-    effective_kind: crate::highlight::HighlighterKind,
+    hl: crate::highlight::SnapshotHighlights,
 ) -> Vec<BlockSnapshot> {
     let frame_dto = match frame_commands::get_frame(&inner.ctx, &(frame_id as EntityId))
         .ok()
@@ -1039,7 +1044,7 @@ pub(crate) fn build_blocks_snapshot_for_frame(
 
     block_dtos
         .iter()
-        .filter_map(|b| build_block_snapshot(inner, b.id, effective_kind))
+        .filter_map(|b| build_block_snapshot(inner, b.id, hl))
         .collect()
 }
 
@@ -1052,7 +1057,7 @@ pub(crate) fn build_blocks_snapshot_for_frame_with_positions(
     inner: &TextDocumentInner,
     frame_id: u64,
     start_pos: usize,
-    effective_kind: crate::highlight::HighlighterKind,
+    hl: crate::highlight::SnapshotHighlights,
 ) -> (Vec<BlockSnapshot>, usize) {
     let frame_dto = match frame_commands::get_frame(&inner.ctx, &(frame_id as EntityId))
         .ok()
@@ -1078,9 +1083,7 @@ pub(crate) fn build_blocks_snapshot_for_frame_with_positions(
     let mut running_pos = start_pos;
     let mut snapshots = Vec::with_capacity(block_dtos.len());
     for b in &block_dtos {
-        if let Some(snap) =
-            build_block_snapshot_with_position(inner, b.id, Some(running_pos), effective_kind)
-        {
+        if let Some(snap) = build_block_snapshot_with_position(inner, b.id, Some(running_pos), hl) {
             running_pos += snap.length + 1; // +1 for block separator
             snapshots.push(snap);
         }

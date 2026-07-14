@@ -59,7 +59,14 @@ impl TextFrame {
             .flatten()
             .map(|f| frame_dto_to_format(&f))
             .unwrap_or_default();
-        let elements = build_flow_snapshot(&inner, self.frame_id as EntityId, inner.highlight_kind);
+        let elements = build_flow_snapshot(
+            &inner,
+            self.frame_id as EntityId,
+            crate::highlight::SnapshotHighlights {
+                kind: inner.highlight_kind,
+                mask: &crate::highlight::HighlightMask::ALL,
+            },
+        );
         FrameSnapshot {
             frame_id: self.frame_id,
             format,
@@ -227,7 +234,7 @@ fn build_cell_frame_ids(inner: &TextDocumentInner) -> HashSet<EntityId> {
 pub(crate) fn build_flow_snapshot(
     inner: &TextDocumentInner,
     frame_id: EntityId,
-    effective_kind: crate::highlight::HighlighterKind,
+    hl: crate::highlight::SnapshotHighlights,
 ) -> Vec<FlowElementSnapshot> {
     let frame_dto = match frame_commands::get_frame(&inner.ctx, &frame_id)
         .ok()
@@ -239,10 +246,10 @@ pub(crate) fn build_flow_snapshot(
 
     if !frame_dto.child_order.is_empty() {
         let (elements, _) =
-            snapshot_from_child_order(inner, &frame_dto.child_order, 0, frame_id, effective_kind);
+            snapshot_from_child_order(inner, &frame_dto.child_order, 0, frame_id, hl);
         elements
     } else {
-        snapshot_fallback(inner, &frame_dto, effective_kind)
+        snapshot_fallback(inner, &frame_dto, hl)
     }
 }
 
@@ -256,7 +263,7 @@ fn snapshot_from_child_order(
     child_order: &[i64],
     start_pos: usize,
     parent_frame_id: EntityId,
-    effective_kind: crate::highlight::HighlighterKind,
+    hl: crate::highlight::SnapshotHighlights,
 ) -> (Vec<FlowElementSnapshot>, usize) {
     let mut elements = Vec::with_capacity(child_order.len());
     let mut running_pos = start_pos;
@@ -269,7 +276,7 @@ fn snapshot_from_child_order(
                 block_id,
                 Some(running_pos),
                 Some(parent_frame_id),
-                effective_kind,
+                hl,
             ) {
                 running_pos += snap.length + 1; // +1 for block separator
                 elements.push(FlowElementSnapshot::Block(snap));
@@ -281,12 +288,9 @@ fn snapshot_from_child_order(
                 .flatten()
             {
                 if let Some(table_id) = sub_frame.table {
-                    if let Some((snap, new_pos)) = build_table_snapshot_with_positions(
-                        inner,
-                        table_id,
-                        running_pos,
-                        effective_kind,
-                    ) {
+                    if let Some((snap, new_pos)) =
+                        build_table_snapshot_with_positions(inner, table_id, running_pos, hl)
+                    {
                         running_pos = new_pos;
                         elements.push(FlowElementSnapshot::Table(snap));
                     }
@@ -296,7 +300,7 @@ fn snapshot_from_child_order(
                         &sub_frame.child_order,
                         running_pos,
                         sub_frame_id,
-                        effective_kind,
+                        hl,
                     );
                     running_pos = new_pos;
                     elements.push(FlowElementSnapshot::Frame(FrameSnapshot {
@@ -315,7 +319,7 @@ fn snapshot_from_child_order(
 fn snapshot_fallback(
     inner: &TextDocumentInner,
     frame_dto: &frontend::frame::dtos::FrameDto,
-    effective_kind: crate::highlight::HighlighterKind,
+    hl: crate::highlight::SnapshotHighlights,
 ) -> Vec<FlowElementSnapshot> {
     let cell_frame_ids = build_cell_frame_ids(inner);
 
@@ -334,7 +338,7 @@ fn snapshot_fallback(
 
     let mut elements: Vec<FlowElementSnapshot> = block_dtos
         .iter()
-        .filter_map(|b| crate::text_block::build_block_snapshot(inner, b.id, effective_kind))
+        .filter_map(|b| crate::text_block::build_block_snapshot(inner, b.id, hl))
         .map(FlowElementSnapshot::Block)
         .collect();
 
@@ -348,11 +352,11 @@ fn snapshot_fallback(
         }
         if f.parent_frame == Some(frame_dto.id) {
             if let Some(table_id) = f.table {
-                if let Some(snap) = build_table_snapshot(inner, table_id, effective_kind) {
+                if let Some(snap) = build_table_snapshot(inner, table_id, hl) {
                     elements.push(FlowElementSnapshot::Table(snap));
                 }
             } else {
-                let nested = build_flow_snapshot(inner, f.id as EntityId, effective_kind);
+                let nested = build_flow_snapshot(inner, f.id as EntityId, hl);
                 elements.push(FlowElementSnapshot::Frame(FrameSnapshot {
                     frame_id: f.id as usize,
                     format: frame_dto_to_format(f),
@@ -369,7 +373,7 @@ fn snapshot_fallback(
 pub(crate) fn build_table_snapshot(
     inner: &TextDocumentInner,
     table_id: u64,
-    effective_kind: crate::highlight::HighlighterKind,
+    hl: crate::highlight::SnapshotHighlights,
 ) -> Option<TableSnapshot> {
     let table_dto = table_commands::get_table(&inner.ctx, &table_id)
         .ok()
@@ -382,11 +386,7 @@ pub(crate) fn build_table_snapshot(
             .flatten()
         {
             let blocks = if let Some(cell_frame_id) = cell_dto.cell_frame {
-                crate::text_block::build_blocks_snapshot_for_frame(
-                    inner,
-                    cell_frame_id,
-                    effective_kind,
-                )
+                crate::text_block::build_blocks_snapshot_for_frame(inner, cell_frame_id, hl)
             } else {
                 Vec::new()
             };
@@ -421,7 +421,7 @@ fn build_table_snapshot_with_positions(
     inner: &TextDocumentInner,
     table_id: u64,
     start_pos: usize,
-    effective_kind: crate::highlight::HighlighterKind,
+    hl: crate::highlight::SnapshotHighlights,
 ) -> Option<(TableSnapshot, usize)> {
     let table_dto = table_commands::get_table(&inner.ctx, &table_id)
         .ok()
@@ -448,7 +448,7 @@ fn build_table_snapshot_with_positions(
                     inner,
                     cell_frame_id,
                     running_pos,
-                    effective_kind,
+                    hl,
                 );
             running_pos = new_pos;
             snaps
