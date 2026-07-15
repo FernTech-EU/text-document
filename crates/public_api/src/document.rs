@@ -1297,26 +1297,24 @@ impl TextDocument {
     /// Attach a single syntax highlighter to this document — the classic, one-highlighter
     /// entry point.
     ///
-    /// Immediately re-highlights the entire document. **Replaces** any previously attached
-    /// *syntax* highlighter (other session kinds — range sessions for find / spell — are left
-    /// alone). Pass `None` to remove the syntax highlighter.
+    /// Immediately re-highlights the entire document. **Replaces** the one highlighter this
+    /// method manages, and *only* that one: a spell-checker or find layer registered
+    /// independently via [`add_syntax_session`](Self::add_syntax_session) /
+    /// [`add_range_session`](Self::add_range_session) is left untouched. Pass `None` to remove
+    /// it.
     ///
-    /// This is now a convenience over the session registry: it is exactly
-    /// [`remove`](Self::remove all syntax) + [`add_syntax_session`](Self::add_syntax_session).
-    /// A host that wants several layers at once uses the session methods directly.
+    /// This is a convenience over the session registry — it owns exactly one "shim" session. A
+    /// host that wants to manage several layers uses the session methods directly.
     pub fn set_syntax_highlighter(&self, highlighter: Option<Arc<dyn crate::SyntaxHighlighter>>) {
         let queued = {
             let mut inner = self.inner.lock();
             let prev_kind = inner.highlight_kind;
-            inner.highlights.remove_all_syntax();
-            match highlighter {
-                Some(hl) => {
-                    inner.highlights.add_syntax(hl);
-                    inner.rehighlight_all(); // recomputes highlight_kind
-                }
-                None => {
-                    inner.recompute_highlight_kind();
-                }
+            let installed = highlighter.is_some();
+            inner.highlights.set_shim(highlighter);
+            if installed {
+                inner.rehighlight_all(); // recomputes highlight_kind
+            } else {
+                inner.recompute_highlight_kind();
             }
             Self::queue_highlight_changed(&mut inner, 0, 0, prev_kind);
             inner.take_queued_events()

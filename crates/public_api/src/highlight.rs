@@ -312,6 +312,10 @@ pub(crate) struct Session {
 pub(crate) struct HighlightRegistry {
     pub sessions: Vec<Session>,
     next_id: u64,
+    /// The session owned by the classic single-highlighter `set_syntax_highlighter` shim, if
+    /// one is installed. Kept apart so the shim replaces **only its own** session and never a
+    /// spell-checker or find layer another caller added via `add_syntax_session`.
+    shim: Option<SessionId>,
 }
 
 impl HighlightRegistry {
@@ -368,12 +372,17 @@ impl HighlightRegistry {
         self.sessions.len() != before
     }
 
-    /// Drop every syntax session, leaving range sessions in place. Backs the classic
-    /// single-highlighter `set_syntax_highlighter`, whose contract is "replace the syntax
-    /// highlighter" — never touching a find/spell range session.
-    pub(crate) fn remove_all_syntax(&mut self) {
-        self.sessions
-            .retain(|s| !matches!(s.body, SessionBody::Syntax(_)));
+    /// Install / replace / clear the classic single-highlighter shim
+    /// (`set_syntax_highlighter`). Replaces **only** the shim's own session — a spell-checker
+    /// or any other layer registered independently via [`add_syntax`](Self::add_syntax) is left
+    /// untouched. `None` clears the shim.
+    pub(crate) fn set_shim(&mut self, highlighter: Option<Arc<dyn SyntaxHighlighter>>) {
+        if let Some(id) = self.shim.take() {
+            self.remove(id);
+        }
+        if let Some(hl) = highlighter {
+            self.shim = Some(self.add_syntax(hl));
+        }
     }
 
     /// Whether any session is attached.
@@ -922,8 +931,11 @@ pub(crate) fn merged_spans_for_block(
                 let (abs_start, len) = *geom.get_or_insert_with(|| block_geometry(inner, block_id));
                 let block_end = abs_start + len;
                 for rng in &r.ranges {
+                    // Saturating: a range session's offsets come from the host (a future
+                    // externally-driven spell-checker included), so a wild `start + length`
+                    // must clamp, not overflow-panic in debug / wrap in release.
                     let lo = rng.start.max(abs_start);
-                    let hi = (rng.start + rng.length).min(block_end);
+                    let hi = rng.start.saturating_add(rng.length).min(block_end);
                     if lo < hi {
                         out.push(HighlightSpan {
                             start: lo - abs_start,

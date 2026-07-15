@@ -351,6 +351,53 @@ fn set_syntax_highlighter_replaces_syntax_but_spares_range_sessions() {
     assert!(spans.iter().any(|s| s.background_color == Some(GREEN)));
 }
 
+/// `set_syntax_highlighter` owns **one** session and replaces only that — a spell-checker
+/// added independently via `add_syntax_session` must survive it. (Regression: the shim used to
+/// nuke every syntax session.)
+#[test]
+fn set_syntax_highlighter_spares_a_separately_added_syntax_session() {
+    let doc = new_doc("hello world");
+
+    // A spell-like syntax session, added the modern way.
+    struct Underliner;
+    impl SyntaxHighlighter for Underliner {
+        fn highlight_block(&self, text: &str, ctx: &mut HighlightContext) {
+            let n = text.chars().count();
+            if n > 0 {
+                ctx.set_format(
+                    0,
+                    n,
+                    HighlightFormat {
+                        font_underline: Some(true),
+                        ..Default::default()
+                    },
+                );
+            }
+        }
+    }
+    doc.add_syntax_session(Arc::new(Underliner));
+
+    // Now drive the classic shim through an install and a replace.
+    doc.set_syntax_highlighter(Some(Arc::new(ColorAll(RED))));
+    doc.set_syntax_highlighter(Some(Arc::new(ColorAll(BLUE))));
+
+    let spans = masked_paint_spans(&doc, &HighlightMask::all());
+    // The shim's second highlighter is the live foreground…
+    assert!(spans.iter().any(|s| s.foreground_color == Some(BLUE)));
+    assert!(spans.iter().all(|s| s.foreground_color != Some(RED)));
+    // …and the separately-added underliner is STILL there.
+    assert!(
+        spans.iter().any(|s| s.font_underline == Some(true)),
+        "the independently-added syntax session must not be clobbered by the shim"
+    );
+
+    // Clearing the shim likewise spares it.
+    doc.set_syntax_highlighter(None);
+    let spans = masked_paint_spans(&doc, &HighlightMask::all());
+    assert!(spans.iter().all(|s| s.foreground_color.is_none()));
+    assert!(spans.iter().any(|s| s.font_underline == Some(true)));
+}
+
 /// `remove_session` retires exactly one session and leaves the rest.
 #[test]
 fn remove_session_retires_one_layer() {
