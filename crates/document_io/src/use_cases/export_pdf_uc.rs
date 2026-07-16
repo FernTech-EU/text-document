@@ -94,7 +94,8 @@ impl LongOperation for ExportPdfUseCase {
             Some("Compiling Typst to PDF...".to_string()),
         ));
 
-        let pdf_bytes = compile_typst_pdf(&markup, self.dto.options.font_bytes.clone())?;
+        let (pdf_bytes, page_count) =
+            compile_typst_pdf(&markup, self.dto.options.font_bytes.clone())?;
 
         progress_callback(OperationProgress::new(
             95.0,
@@ -113,7 +114,7 @@ impl LongOperation for ExportPdfUseCase {
 
         Ok(ExportPdfResultDto {
             file_path: self.dto.output_path.clone(),
-            page_count: count_pdf_pages(&pdf_bytes),
+            page_count: page_count as i64,
         })
     }
 }
@@ -132,9 +133,9 @@ impl ExportPdfUseCase {
         let result = self.build_markup(&*uow, &|_progress| {}, None);
         uow.end_transaction()?;
         let markup = result?;
-        let pdf_bytes = compile_typst_pdf(&markup, self.dto.options.font_bytes.clone())?;
-        let page_count = count_pdf_pages(&pdf_bytes);
-        Ok((pdf_bytes, page_count))
+        let (pdf_bytes, page_count) =
+            compile_typst_pdf(&markup, self.dto.options.font_bytes.clone())?;
+        Ok((pdf_bytes, page_count as i64))
     }
 
     /// Build the complete Typst source (preamble + body) for `db_context`'s document, walking
@@ -355,17 +356,3 @@ fn check_cancelled(cancel_flag: Option<&AtomicBool>) -> Result<()> {
     Ok(())
 }
 
-/// Count the pages in a compiled PDF by scanning its raw bytes for `/Type/Page` (or
-/// `/Type /Page`) page-object dictionaries — cheap and dependency-free, no PDF parser needed.
-///
-/// Matches on a word boundary after `Page` so a `/Type/Pages` **tree root** (the one object every
-/// PDF has exactly one of, regardless of page count) is never miscounted as a page — `/Pages` and
-/// `/Page` share the `/Type/Page` prefix, so a naive substring search over-counts by exactly one.
-/// Verified against `typst-pdf` 0.15's actual output (via `pdfinfo`) for 1-page and 3-page
-/// documents; falls back to `1` if the scan somehow finds none, since a written PDF always has at
-/// least one page and reporting `0` would look like a bug rather than a heuristic's blind spot.
-fn count_pdf_pages(pdf_bytes: &[u8]) -> i64 {
-    let re = regex::bytes::Regex::new(r"/Type\s*/Page\b").expect("valid regex");
-    let count = re.find_iter(pdf_bytes).count() as i64;
-    count.max(1)
-}

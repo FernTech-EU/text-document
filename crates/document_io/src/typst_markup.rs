@@ -251,6 +251,25 @@ pub fn render_blocks_typst(store: &Store, blocks: &[Block], options: &PdfExportO
             // --- Normal block (paragraph / heading) ---
             let inline = render_inline_typst(store, block);
 
+            // Skip a block with no inline content: an empty paragraph would inject a stray blank
+            // (doubling the `\n\n` join) and an empty heading would emit a bare `= ` — a
+            // titleless heading in the output. None of the wraps below mean anything without
+            // content either.
+            if inline.is_empty() {
+                i += 1;
+                continue;
+            }
+
+            // Per-block RTL wraps the *inline* content, not the whole block, so a heading keeps
+            // its `= ` marker at the true block start — Typst only treats `=` as a heading there,
+            // and `#text(dir: rtl)[= H]` would bury the marker inside a text element and lose the
+            // heading. An RTL heading thus renders as `= #text(dir: rtl)[H]`.
+            let inline = if block.fmt_direction == Some(TextDirection::RightToLeft) {
+                format!("#text(dir: rtl)[{inline}]")
+            } else {
+                inline
+            };
+
             let mut content = if let Some(level) = block.fmt_heading_level {
                 let level = level.clamp(1, 6) as usize;
                 format!("{} {}", "=".repeat(level), inline)
@@ -264,9 +283,6 @@ pub fn render_blocks_typst(store: &Store, blocks: &[Block], options: &PdfExportO
                 content = format!(
                     "#[#set par(leading: {leading_em}em)\n{content}]"
                 );
-            }
-            if block.fmt_direction == Some(TextDirection::RightToLeft) {
-                content = format!("#text(dir: rtl)[{content}]");
             }
             if let Some(ref color) = block.fmt_background_color
                 && !color.is_empty()
@@ -646,7 +662,7 @@ mod tests {
             ..Default::default()
         };
         let markup = format!("{}{escaped}\n", typst_preamble(&options));
-        let pdf = crate::typst_compile::compile_typst_pdf(&markup, vec![TEST_FONT.to_vec()])
+        let (pdf, _pages) = crate::typst_compile::compile_typst_pdf(&markup, vec![TEST_FONT.to_vec()])
             .expect("adversarial-but-escaped prose must compile as plain text");
         assert!(pdf.starts_with(b"%PDF-"));
     }
@@ -669,7 +685,7 @@ mod tests {
             ..Default::default()
         };
         let markup = format!("{}Hello, world.\n", typst_preamble(&options));
-        let pdf = crate::typst_compile::compile_typst_pdf(&markup, vec![TEST_FONT.to_vec()])
+        let (pdf, _pages) = crate::typst_compile::compile_typst_pdf(&markup, vec![TEST_FONT.to_vec()])
             .expect("default preamble must compile");
         assert!(pdf.starts_with(b"%PDF-"));
     }
@@ -687,7 +703,7 @@ mod tests {
             ..Default::default()
         };
         let markup = format!("{}Bonjour le monde.\n", typst_preamble(&options));
-        let pdf = crate::typst_compile::compile_typst_pdf(&markup, vec![TEST_FONT.to_vec()])
+        let (pdf, _pages) = crate::typst_compile::compile_typst_pdf(&markup, vec![TEST_FONT.to_vec()])
             .expect("preamble with metadata must compile");
         assert!(pdf.starts_with(b"%PDF-"));
     }

@@ -13,16 +13,20 @@
 use anyhow::{Context, anyhow, bail};
 use typst::diag::{SourceDiagnostic, Warned};
 use typst::ecow::EcoVec;
+use typst::foundations::Bytes;
+use typst::text::Font;
 use typst_as_lib::TypstEngine;
 use typst_layout::PagedDocument;
 use typst_pdf::PdfOptions;
 
 /// Compile `markup` (a complete Typst source, used directly as the main/detached file) to PDF
-/// bytes, using only the font blobs in `fonts` — no system or `typst-kit` font search.
+/// bytes, using only the font blobs in `fonts` — no system or `typst-kit` font search. Returns
+/// the PDF bytes together with the laid-out **page count** (read straight off the paged
+/// document, so the caller needn't parse the PDF back to count pages).
 ///
 /// Returns a human-readable, possibly multi-line error on:
 /// - an empty `fonts` list (at least one embedded font is required to produce readable output);
-/// - a font blob that cannot be parsed as a font at all (see the pre-validation note below);
+/// - a font blob that cannot be parsed as a font at all (see the parse note below);
 /// - bad markup (a Typst compile error — unknown variable/function, syntax error, …);
 /// - a `typst_pdf::pdf` failure (rare — e.g. a requested PDF/A-standard conformance violation).
 ///
@@ -32,31 +36,33 @@ use typst_pdf::PdfOptions;
 /// than rejecting the export — rejecting would mean one unresolvable font family in a
 /// multi-language manuscript aborts the entire export, which is a worse failure mode than a
 /// visually-broken run of text the caller can notice and fix.
-pub fn compile_typst_pdf(markup: &str, fonts: Vec<Vec<u8>>) -> anyhow::Result<Vec<u8>> {
+pub fn compile_typst_pdf(markup: &str, fonts: Vec<Vec<u8>>) -> anyhow::Result<(Vec<u8>, usize)> {
     if fonts.is_empty() {
         bail!("no fonts supplied: at least one embedded font is required");
     }
 
-    // `TypstEngine::fonts()` accepts anything implementing `IntoFonts` (`&[u8]`/`Vec<u8>`/
-    // `Bytes`/`Font`); internally each blob goes through `typst::text::Font::iter`, which
-    // SILENTLY DROPS a blob it can't parse (an empty sub-iterator, no error signal at all — a
-    // font collection file can yield several `Font`s, a corrupt/non-font blob yields zero). Left
-    // unchecked, a bad font blob would simply vanish from the resulting PDF with no diagnostic
-    // anywhere — `Result::Ok` and missing glyphs. Pre-validate ourselves so that failure mode
-    // becomes a clear, attributable error instead.
-    for (i, bytes) in fonts.iter().enumerate() {
-        let n = typst::text::Font::iter(typst::foundations::Bytes::new(bytes.clone())).count();
-        if n == 0 {
+    // Parse each blob into faces ONCE. `typst::text::Font::iter` SILENTLY DROPS a blob it can't
+    // parse (an empty sub-iterator, no error signal at all — a font collection file yields
+    // several `Font`s, a corrupt/non-font blob yields zero). Were the raw `Vec<u8>`s handed to
+    // `TypstEngine::fonts()` it would re-run exactly this iteration internally *and* swallow that
+    // failure — `Result::Ok` with missing glyphs, no diagnostic anywhere. Collecting the faces
+    // here lets us both attribute a bad blob to a clear error and pass the already-parsed `Font`s
+    // straight to the engine (which accepts `Font` via `IntoFonts`), so nothing is parsed twice.
+    let mut faces: Vec<Font> = Vec::new();
+    for (i, bytes) in fonts.into_iter().enumerate() {
+        let len = bytes.len();
+        let parsed: Vec<Font> = Font::iter(Bytes::new(bytes)).collect();
+        if parsed.is_empty() {
             bail!(
-                "font #{i} ({} bytes) could not be parsed as a font (corrupt or unsupported format)",
-                bytes.len()
+                "font #{i} ({len} bytes) could not be parsed as a font (corrupt or unsupported format)"
             );
         }
+        faces.extend(parsed);
     }
 
     let engine = TypstEngine::builder()
         .main_file(markup.to_string())
-        .fonts(fonts)
+        .fonts(faces)
         .build();
 
     let Warned { output, warnings } = engine.compile::<PagedDocument>();
@@ -70,11 +76,16 @@ pub fn compile_typst_pdf(markup: &str, fonts: Vec<Vec<u8>>) -> anyhow::Result<Ve
         eprintln!("typst compile warnings:\n{}", render_diagnostics(&warnings));
     }
 
+    // The authoritative page count is the laid-out document's own — no need to re-parse the PDF.
+    let page_count = doc.pages().len();
+
     let options = PdfOptions::default();
 
-    typst_pdf::pdf(&doc, &options)
+    let pdf = typst_pdf::pdf(&doc, &options)
         .map_err(|diags| anyhow!(render_diagnostics(&diags)))
-        .context("typst_pdf::pdf failed")
+        .context("typst_pdf::pdf failed")?;
+
+    Ok((pdf, page_count))
 }
 
 /// Render a `.compile()` failure into a readable multi-line string, appending any warnings that
@@ -128,9 +139,10 @@ mod tests {
     #[test]
     fn compiles_trivial_markup_to_a_pdf() {
         let markup = "#set page(width: 10cm, height: 10cm)\nHello, world.";
-        let pdf = compile_typst_pdf(markup, vec![TEST_FONT.to_vec()]).expect("compiles");
+        let (pdf, pages) = compile_typst_pdf(markup, vec![TEST_FONT.to_vec()]).expect("compiles");
         assert!(pdf.starts_with(b"%PDF-"), "output must be a PDF");
         assert!(pdf.len() > 100, "a real PDF is not a handful of bytes");
+        assert_eq!(pages, 1, "one short line lays out on a single page");
     }
 
     #[test]
@@ -164,7 +176,7 @@ mod tests {
         // compiles (with fallback glyphs), which is the behaviour `compile_typst_pdf` relies on
         // rather than escalating to a hard error.
         let markup = "#set text(font: \"Totally Not A Real Font\")\nHello.";
-        let pdf = compile_typst_pdf(markup, vec![TEST_FONT.to_vec()]).expect("still compiles");
+        let (pdf, _) = compile_typst_pdf(markup, vec![TEST_FONT.to_vec()]).expect("still compiles");
         assert!(pdf.starts_with(b"%PDF-"));
     }
 }

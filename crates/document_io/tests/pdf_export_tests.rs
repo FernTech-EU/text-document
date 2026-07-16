@@ -92,9 +92,10 @@ fn pdf_from_djot(djot: &str, options: PdfExportOptions) -> Vec<u8> {
 }
 
 /// Count `/Type/Page` page-object dictionaries in raw PDF bytes — a word-boundary match so
-/// `/Type/Pages` (the tree root) is never miscounted as a page. Mirrors
-/// `export_pdf_uc::count_pdf_pages` (re-implemented here rather than exposed, since it is an
-/// internal detail of the use case, not part of the crate's public test surface).
+/// `/Type/Pages` (the tree root) is never miscounted as a page. This is an **independent**
+/// byte-level cross-check: the use case itself reports its page count from the laid-out
+/// `PagedDocument` (`pages.len()`), not from a byte scan, so these two paths agreeing is what
+/// this test set actually verifies.
 fn count_pdf_pages(bytes: &[u8]) -> usize {
     let re = regex::bytes::Regex::new(r"/Type\s*/Page\b").unwrap();
     re.find_iter(bytes).count()
@@ -176,6 +177,20 @@ fn mixed_ltr_and_rtl_blocks_compile_in_one_document() {
     let djot = "English prose first.\n\n{direction=rtl}\n\u{05e9}\u{05dc}\u{05d5}\u{05dd}\n\nMore English prose after.\n";
     let bytes = pdf_from_djot(djot, pdf_options());
     assert!(bytes.starts_with(b"%PDF-"));
+}
+
+#[test]
+fn rtl_heading_compiles() {
+    // An RTL heading must emit `= #text(dir: rtl)[..]` — the `=` marker at the block start with
+    // only the *inline* content direction-wrapped. The earlier `#text(dir: rtl)[= ..]` form
+    // buried the marker inside a text element; guard that the marker-first form is valid Typst
+    // and still compiles.
+    let djot = "{direction=rtl}\n# \u{05e9}\u{05dc}\u{05d5}\u{05dd} \u{05e2}\u{05d5}\u{05dc}\u{05dd}\n\nBody paragraph.\n";
+    let bytes = pdf_from_djot(djot, pdf_options());
+    assert!(
+        bytes.starts_with(b"%PDF-"),
+        "an RTL heading must compile with the marker kept at block start"
+    );
 }
 
 // --- (c) font failure fixture --------------------------------------------------
