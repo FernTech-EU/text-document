@@ -34,6 +34,7 @@ scraper = "0.26.0"
 ego-tree = "0.11.0"
 ropey = "1.6"
 jotdown = { version = "0.10", default-features = false }
+unicode-segmentation = { workspace = true }
 
 [dev-dependencies]
 proptest = "1"
