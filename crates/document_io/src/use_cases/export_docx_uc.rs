@@ -298,7 +298,56 @@ impl ExportDocxUseCase {
             };
         }
 
+        // Page geometry + base typography + running header, from the caller's options.
+        docx = self.apply_document_options(docx);
+
         Ok((docx, paragraph_count))
+    }
+
+    /// Apply the document-wide export options (page size, margins, default font/size, and an
+    /// optional page-number running header) onto the assembled `Docx`. A default
+    /// [`DocxExportOptions`] leaves the docx-rs built-in defaults untouched.
+    fn apply_document_options(&self, mut docx: docx_rs::Docx) -> docx_rs::Docx {
+        use docx_rs::*;
+        let o = &self.dto.options;
+
+        if let (Some(w), Some(h)) = (o.page_width_twips, o.page_height_twips) {
+            docx = docx.page_size(w, h);
+        }
+        if o.margin_top_twips.is_some()
+            || o.margin_bottom_twips.is_some()
+            || o.margin_left_twips.is_some()
+            || o.margin_right_twips.is_some()
+        {
+            // docx-rs's PageMargin defaults each edge to 1440 twips (1"), so an unset edge
+            // keeps that conventional default rather than collapsing to zero.
+            let mut m = PageMargin::new();
+            m = m.top(o.margin_top_twips.unwrap_or(1440));
+            m = m.bottom(o.margin_bottom_twips.unwrap_or(1440));
+            m = m.left(o.margin_left_twips.unwrap_or(1440));
+            m = m.right(o.margin_right_twips.unwrap_or(1440));
+            docx = docx.page_margin(m);
+        }
+        if let Some(family) = &o.font_family {
+            docx = docx.default_fonts(
+                RunFonts::new().ascii(family).hi_ansi(family).cs(family).east_asia(family),
+            );
+        }
+        if let Some(half_pt) = o.font_half_points {
+            docx = docx.default_size(half_pt);
+        }
+        if o.page_numbers {
+            let mut header_para = Paragraph::new().align(AlignmentType::Right);
+            if let Some(text) = &o.running_header {
+                if !text.trim().is_empty() {
+                    header_para =
+                        header_para.add_run(Run::new().add_text(format!("{}   ", text.trim())));
+                }
+            }
+            header_para = header_para.add_page_num(PageNum::new());
+            docx = docx.header(Header::new().add_paragraph(header_para));
+        }
+        docx
     }
 
     /// Build the document without any file I/O, using a no-op progress callback
@@ -452,6 +501,14 @@ impl ExportDocxUseCase {
         if let Some(alignment) = &block.fmt_alignment {
             paragraph = paragraph.align(map_alignment(alignment));
         }
+        // Per-block RTL → a paragraph-level `<w:bidi/>`. This is the only bidi primitive
+        // docx-rs exposes (no run-level `rtl`, no section-level `<w:bidi/>`), but it correctly
+        // right-orders a right-to-left paragraph — and it is applied to every paragraph
+        // (headings included), independent of the manuscript options, so a document that only
+        // mixes in a few RTL scenes still exports them correctly through plain `to_docx`.
+        if block.fmt_direction == Some(common::entities::TextDirection::RightToLeft) {
+            paragraph.property = paragraph.property.bidi(true);
+        }
 
         let is_task = matches!(
             block.fmt_marker,
@@ -500,13 +557,67 @@ impl ExportDocxUseCase {
                 }
             }
         } else {
-            // Plain paragraph.
-            if quote_indent > 0 {
-                paragraph = paragraph.indent(Some(quote_indent), None, None, None);
-            }
+            // Plain body paragraph: manuscript typography (line spacing, first-line indent,
+            // paragraph spacing, alignment) from the export options, over any blockquote indent.
+            paragraph = self.apply_body_style(paragraph, block, quote_indent);
         }
 
         Ok(add_inline_content(paragraph, &elements))
+    }
+
+    /// Apply the manuscript body-paragraph options to a plain paragraph. Each piece is applied
+    /// only when the corresponding option is set (and the block didn't already carry its own),
+    /// so a default [`DocxExportOptions`] leaves the paragraph exactly as plain `to_docx`
+    /// produced it — including keeping any blockquote left indent.
+    fn apply_body_style(
+        &self,
+        mut p: docx_rs::Paragraph,
+        block: &Block,
+        quote_indent: i32,
+    ) -> docx_rs::Paragraph {
+        use docx_rs::*;
+        let o = &self.dto.options;
+        let rtl = block.fmt_direction == Some(common::entities::TextDirection::RightToLeft);
+
+        // Combined line spacing: line height (unless the block set its own) + space-after.
+        let mut ls = LineSpacing::new();
+        let mut ls_used = false;
+        if block.fmt_line_height.is_none()
+            && let Some(line) = o.line_spacing_twips
+        {
+            ls = ls.line_rule(LineSpacingType::Auto).line(line);
+            ls_used = true;
+        }
+        if let Some(after) = o.paragraph_spacing_after_twips.filter(|&a| a > 0) {
+            ls = ls.after(after as u32);
+            ls_used = true;
+        }
+        if ls_used {
+            p = p.line_spacing(ls);
+        }
+
+        // Indent: any blockquote left indent + an optional first-line indent.
+        let first_line = o.first_line_indent_twips.filter(|&f| f > 0);
+        let left = (quote_indent > 0).then_some(quote_indent);
+        if left.is_some() || first_line.is_some() {
+            p = p.indent(left, first_line.map(SpecialIndentType::FirstLine), None, None);
+        }
+
+        // Alignment (only when the block didn't carry its own, and only when the options ask
+        // for it — a plain LTR export leaves the docx default so existing behaviour is intact).
+        if block.fmt_alignment.is_none() {
+            let align = if o.justify {
+                Some(AlignmentType::Justified)
+            } else if rtl {
+                Some(AlignmentType::Right)
+            } else {
+                None
+            };
+            if let Some(a) = align {
+                p = p.align(a);
+            }
+        }
+        p
     }
 
     fn render_table_docx(

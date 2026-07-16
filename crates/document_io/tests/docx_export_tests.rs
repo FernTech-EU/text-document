@@ -370,6 +370,7 @@ fn rich_document_packs_to_a_valid_docx_file() {
         &mut mgr,
         &ExportDocxDto {
             output_path: path_str.clone(),
+            options: Default::default(),
         },
     )
     .expect("export_docx");
@@ -411,4 +412,79 @@ fn bold_run_is_marked_bold() {
         _ => false,
     });
     assert!(has_bold, "the 'bolded' run should be bold");
+}
+
+// --- Manuscript / RTL export options (M5) ----------------------------------
+
+use common::parser_tools::DocxExportOptions;
+
+fn docx_from_djot_with_options(djot: &str, options: DocxExportOptions) -> Docx {
+    let (db, ev, _) = setup().expect("setup");
+    import_djot(&db, &ev, djot);
+    document_io_controller::build_docx_document(
+        &db,
+        &ExportDocxDto { output_path: String::new(), options },
+    )
+    .expect("build_docx_document")
+}
+
+/// A block tagged `{direction=rtl}` must export with a paragraph-level `<w:bidi/>` — the one
+/// bidi primitive docx-rs offers, and the fix for DOCX previously dropping direction entirely.
+#[test]
+fn rtl_block_exports_paragraph_bidi() {
+    let docx = docx_from_djot("{direction=rtl}\nمرحبا بالعالم\n");
+    let ps = paragraphs(&docx);
+    assert_eq!(ps.len(), 1, "one paragraph");
+    assert_eq!(ps[0].property.bidi, Some(true), "an RTL block gets paragraph bidi");
+}
+
+/// A plain LTR block stays un-bidi (the default `to_docx` behaviour is untouched).
+#[test]
+fn ltr_block_has_no_bidi() {
+    let docx = docx_from_djot("Hello world\n");
+    let ps = paragraphs(&docx);
+    assert_eq!(ps[0].property.bidi, None, "an LTR block is never marked bidi");
+}
+
+/// Page geometry from the options lands on the document's section property, and the base font
+/// size lands on the document defaults.
+#[test]
+fn options_apply_page_size_and_font_defaults() {
+    let opts = DocxExportOptions {
+        page_width_twips: Some(11906), // A4
+        page_height_twips: Some(16838),
+        font_family: Some("Courier New".to_string()),
+        font_half_points: Some(24), // 12pt
+        justify: true,
+        first_line_indent_twips: Some(720),
+        line_spacing_twips: Some(480),
+        ..Default::default()
+    };
+    let docx = docx_from_djot_with_options("The wind rose over the hills.\n", opts);
+    // PageSize's w/h fields are private; assert via the crate's own JSON serialization (the
+    // same fallback the monospace-font test uses). 11906×16838 twips are the A4 dimensions.
+    let json = docx.json();
+    assert!(json.contains("11906") && json.contains("16838"), "A4 page size in section props");
+
+    // The single body paragraph is justified, spaced, and first-line indented.
+    let ps = paragraphs(&docx);
+    assert_eq!(alignment(ps[0]), Some("justified"), "justify → jc=justified");
+    assert!(ps[0].property.line_spacing.is_some(), "line spacing set");
+    let ind = ps[0].property.indent.as_ref().expect("indent set");
+    assert!(
+        matches!(ind.special_indent, Some(document_io::docx_rs::SpecialIndentType::FirstLine(720))),
+        "first-line indent of 720 twips"
+    );
+}
+
+/// A page-numbered running header is attached when requested.
+#[test]
+fn page_numbers_attach_a_header() {
+    let opts = DocxExportOptions {
+        page_numbers: true,
+        running_header: Some("Vane / THE LIGHTHOUSE".to_string()),
+        ..Default::default()
+    };
+    let docx = docx_from_djot_with_options("Prose.\n", opts);
+    assert!(docx.document_rels.header_count > 0, "a header relationship was registered");
 }

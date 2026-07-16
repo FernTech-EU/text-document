@@ -346,9 +346,22 @@ impl TextDocument {
     ///
     /// This is a **long operation**. Returns a typed [`Operation`] handle.
     pub fn to_docx(&self, output_path: &str) -> Result<Operation<DocxExportResult>> {
+        self.to_docx_with_options(output_path, crate::DocxExportOptions::default())
+    }
+
+    /// As [`to_docx`](Self::to_docx), but with page geometry + base typography overrides — a
+    /// *manuscript* style (page size, margins, body font, line spacing, first-line indent,
+    /// alignment, and an optional page-number header). Per-block RTL is emitted automatically
+    /// from each block's own direction, independent of these options.
+    pub fn to_docx_with_options(
+        &self,
+        output_path: &str,
+        options: crate::DocxExportOptions,
+    ) -> Result<Operation<DocxExportResult>> {
         let inner = self.inner.lock();
         let dto = frontend::document_io::ExportDocxDto {
             output_path: output_path.into(),
+            options,
         };
         let op_id = document_io_commands::export_docx(&inner.ctx, &dto)?;
         Ok(Operation::new(

@@ -280,6 +280,7 @@ fn test_export_docx_simple() -> Result<()> {
         &mut long_op_manager,
         &ExportDocxDto {
             output_path: output_path.clone(),
+            options: Default::default(),
         },
     )?;
 
