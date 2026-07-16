@@ -73,16 +73,16 @@ fn main() {
         "{:>9}  {:>16}  {:>18}  {:>14}  {:>16}",
         "N",
         "append_line",
-        "append (held cur)",
-        "block_count",
-        "truncate_front"
+        "append_line FAST",
+        "truncate",
+        "truncate FAST"
     );
     row!(
         "{:>9}  {:>16}  {:>18}  {:>14}  {:>16}",
         "",
         "(per line)",
         "(per line)",
-        "(per call)",
+        "(20 lines)",
         "(20 lines)"
     );
     row!("{:-<92}", "");
@@ -150,13 +150,39 @@ fn main() {
                 .collect(),
         );
 
+        // ── the streaming fast path, for comparison ──
+        let fast_append = median(
+            (0..REPS)
+                .map(|_| {
+                    let doc = make_doc(n);
+                    let start = Instant::now();
+                    for _ in 0..APPEND_BATCH {
+                        doc.append_line(LINE).unwrap();
+                    }
+                    start.elapsed()
+                })
+                .collect(),
+        ) / APPEND_BATCH as u32;
+
+        let fast_truncate = median(
+            (0..REPS)
+                .map(|_| {
+                    let doc = make_doc(n);
+                    let start = Instant::now();
+                    doc.truncate_front(APPEND_BATCH).unwrap();
+                    start.elapsed()
+                })
+                .collect(),
+        );
+
+        std::hint::black_box((append_held, count));
         row!(
             "{:>9}  {:>16}  {:>18}  {:>14}  {:>16}",
             n,
             format!("{append:?}"),
-            format!("{append_held:?}"),
-            format!("{count:?}"),
-            format!("{truncate:?}")
+            format!("{fast_append:?}"),
+            format!("{truncate:?}"),
+            format!("{fast_truncate:?}")
         );
     }
 
