@@ -6,6 +6,8 @@ pub(crate) mod export_epub_uc;
 pub(crate) mod export_html_uc;
 pub(crate) mod export_latex_uc;
 pub(crate) mod export_markdown_uc;
+#[cfg(feature = "pdf")]
+pub(crate) mod export_pdf_uc;
 pub(crate) mod export_plain_text_uc;
 pub(crate) mod import_djot_uc;
 pub(crate) mod import_html_uc;

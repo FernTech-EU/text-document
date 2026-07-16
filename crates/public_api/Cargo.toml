@@ -33,6 +33,12 @@ proptest = "1"
 criterion = { version = "0.8.2", features = ["html_reports"] }
 insta = { version = "1.40", features = ["yaml", "redactions"] }
 
+[features]
+# PDF export (via embedded Typst) — forwards to `frontend`'s (and thence `document_io`'s) own
+# `pdf` feature. Off by default: no typst crates are pulled in unless a downstream consumer
+# opts in (e.g. `text-document = { ..., features = ["pdf"] }`).
+pdf = ["frontend/pdf"]
+
 [[bench]]
 name = "benchmarks"
 harness = false

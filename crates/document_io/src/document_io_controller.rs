@@ -9,6 +9,8 @@ use crate::ExportHtmlDto;
 use crate::ExportLatexDto;
 use crate::ExportLatexResultDto;
 use crate::ExportMarkdownDto;
+use crate::ExportPdfDto;
+use crate::ExportPdfResultDto;
 use crate::ExportPlainTextDto;
 use crate::ImportDjotDto;
 use crate::ImportDjotResultDto;
@@ -23,6 +25,8 @@ use crate::units_of_work::export_epub_uow::ExportEpubUnitOfWorkFactory;
 use crate::units_of_work::export_html_uow::ExportHtmlUnitOfWorkFactory;
 use crate::units_of_work::export_latex_uow::ExportLatexUnitOfWorkFactory;
 use crate::units_of_work::export_markdown_uow::ExportMarkdownUnitOfWorkFactory;
+#[cfg(feature = "pdf")]
+use crate::units_of_work::export_pdf_uow::ExportPdfUnitOfWorkFactory;
 use crate::units_of_work::export_plain_text_uow::ExportPlainTextUnitOfWorkFactory;
 use crate::units_of_work::import_djot_uow::ImportDjotUnitOfWorkFactory;
 use crate::units_of_work::import_html_uow::ImportHtmlUnitOfWorkFactory;
@@ -34,6 +38,8 @@ use crate::use_cases::export_epub_uc::ExportEpubUseCase;
 use crate::use_cases::export_html_uc::ExportHtmlUseCase;
 use crate::use_cases::export_latex_uc::ExportLatexUseCase;
 use crate::use_cases::export_markdown_uc::ExportMarkdownUseCase;
+#[cfg(feature = "pdf")]
+use crate::use_cases::export_pdf_uc::ExportPdfUseCase;
 use crate::use_cases::export_plain_text_uc::ExportPlainTextUseCase;
 use crate::use_cases::import_djot_uc::ImportDjotUseCase;
 use crate::use_cases::import_html_uc::ImportHtmlUseCase;
@@ -383,4 +389,96 @@ pub fn get_export_epub_result(
     let result_dto: ExportEpubResultDto = serde_json::from_str(&result_json.unwrap())?;
 
     Ok(Some(result_dto))
+}
+
+// ─── PDF export (via embedded Typst) — dual-cfg ────────────────────────────
+//
+// `export_pdf`/`get_export_pdf_progress`/`get_export_pdf_result` exist with the SAME signature
+// regardless of whether the `pdf` cargo feature is enabled on `text-document-io`. This is what
+// lets `frontend`'s command wrappers and `public_api`'s `to_pdf`/`to_pdf_with_options` call these
+// symbols unconditionally (no `#[cfg]` in that consumer code) — the feature only decides which
+// body is compiled: a real `LongOperation`-backed export, or an immediate "unsupported" error.
+// Cargo feature unification means any crate in the build graph enabling `pdf` turns it on
+// globally for that build, so a stable always-present API surface that fails at *runtime* is
+// strictly better here than two divergent source trees.
+
+#[cfg(feature = "pdf")]
+pub fn export_pdf(
+    db_context: &DbContext,
+    _event_hub: &Arc<EventHub>,
+    long_operation_manager: &mut LongOperationManager,
+    dto: &ExportPdfDto,
+) -> Result<String> {
+    let uow_context = ExportPdfUnitOfWorkFactory::new(db_context);
+    let uc = ExportPdfUseCase::new(Box::new(uow_context), dto);
+    let operation_id = long_operation_manager.start_operation(uc);
+    Ok(operation_id)
+}
+
+#[cfg(not(feature = "pdf"))]
+pub fn export_pdf(
+    _db_context: &DbContext,
+    _event_hub: &Arc<EventHub>,
+    _long_operation_manager: &mut LongOperationManager,
+    _dto: &ExportPdfDto,
+) -> Result<String> {
+    Err(anyhow::anyhow!(
+        "PDF export requires the `pdf` cargo feature on the `text-document-io` crate"
+    ))
+}
+
+/// Build the PDF bytes for `db_context` without writing a file.
+///
+/// This runs the exact same builder used by [`export_pdf`] but returns the compiled PDF bytes
+/// instead of writing them to disk, so callers (tests, notably) can inspect the produced document
+/// directly.
+#[cfg(feature = "pdf")]
+#[doc(hidden)]
+pub fn build_pdf_document(db_context: &DbContext, dto: &ExportPdfDto) -> Result<Vec<u8>> {
+    let uow_context = ExportPdfUnitOfWorkFactory::new(db_context);
+    let uc = ExportPdfUseCase::new(Box::new(uow_context), dto);
+    let (pdf_bytes, _page_count) = uc.build_document()?;
+    Ok(pdf_bytes)
+}
+
+#[cfg(feature = "pdf")]
+pub fn get_export_pdf_progress(
+    long_operation_manager: &LongOperationManager,
+    operation_id: &str,
+) -> Option<OperationProgress> {
+    long_operation_manager.get_operation_progress(operation_id)
+}
+
+#[cfg(not(feature = "pdf"))]
+pub fn get_export_pdf_progress(
+    _long_operation_manager: &LongOperationManager,
+    _operation_id: &str,
+) -> Option<OperationProgress> {
+    None
+}
+
+#[cfg(feature = "pdf")]
+pub fn get_export_pdf_result(
+    long_operation_manager: &LongOperationManager,
+    operation_id: &str,
+) -> Result<Option<ExportPdfResultDto>> {
+    // Get the operation result as a JSON string
+    let result_json = long_operation_manager.get_operation_result(operation_id);
+
+    // If there's no result, return None
+    if result_json.is_none() {
+        return Ok(None);
+    }
+    // Parse the JSON string into a ExportPdfResultDto
+    let result_dto: ExportPdfResultDto = serde_json::from_str(&result_json.unwrap())?;
+
+    Ok(Some(result_dto))
+}
+
+#[cfg(not(feature = "pdf"))]
+pub fn get_export_pdf_result(
+    _long_operation_manager: &LongOperationManager,
+    _operation_id: &str,
+) -> Result<Option<ExportPdfResultDto>> {
+    Ok(None)
 }

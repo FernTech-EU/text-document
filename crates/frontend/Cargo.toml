@@ -31,5 +31,10 @@ document_io = { workspace = true }
 document_search = { workspace = true }
 document_inspection = { workspace = true }
 
+[features]
+# PDF export (via embedded Typst) — forwards to `document_io`'s own `pdf` feature. Off by
+# default: no typst crates are pulled in unless a downstream consumer opts in.
+pdf = ["document_io/pdf"]
+
 [lints]
 workspace = true

@@ -6,9 +6,10 @@ use crate::app_context::AppContext;
 use anyhow::{Context, Result};
 use document_io::{
     ExportDjotDto, ExportDocxDto, ExportDocxResultDto, ExportEpubDto, ExportEpubResultDto,
-    ExportHtmlDto, ExportLatexDto, ExportLatexResultDto, ExportMarkdownDto, ExportPlainTextDto,
-    ImportDjotDto, ImportDjotResultDto, ImportHtmlDto, ImportHtmlResultDto, ImportMarkdownDto,
-    ImportMarkdownResultDto, ImportPlainTextDto, document_io_controller,
+    ExportHtmlDto, ExportLatexDto, ExportLatexResultDto, ExportMarkdownDto, ExportPdfDto,
+    ExportPdfResultDto, ExportPlainTextDto, ImportDjotDto, ImportDjotResultDto, ImportHtmlDto,
+    ImportHtmlResultDto, ImportMarkdownDto, ImportMarkdownResultDto, ImportPlainTextDto,
+    document_io_controller,
 };
 
 use common::long_operation::OperationProgress;
@@ -198,4 +199,35 @@ pub fn get_export_epub_result(
 ) -> Result<Option<ExportEpubResultDto>> {
     document_io_controller::get_export_epub_result(&ctx.long_operation_manager.lock(), operation_id)
         .context("getting export_epub result")
+}
+
+/// export_pdf (long operation).
+///
+/// Thin, **unconditional** wrapper — no `#[cfg(feature = "pdf")]` here. `document_io_controller`'s
+/// `export_pdf`/`get_export_pdf_progress`/`get_export_pdf_result` exist with the same signature
+/// whether or not `document_io`'s own `pdf` cargo feature is enabled (a real export, or an
+/// immediate "unsupported" error), so this wrapper — and every caller of it — never needs to know
+/// which.
+pub fn export_pdf(ctx: &AppContext, dto: &ExportPdfDto) -> Result<String> {
+    document_io_controller::export_pdf(
+        &ctx.db_context,
+        &ctx.event_hub,
+        &mut ctx.long_operation_manager.lock(),
+        dto,
+    )
+    .context("export_pdf")
+}
+
+/// Get the progress of a export_pdf operation
+pub fn get_export_pdf_progress(ctx: &AppContext, operation_id: &str) -> Option<OperationProgress> {
+    document_io_controller::get_export_pdf_progress(&ctx.long_operation_manager.lock(), operation_id)
+}
+
+/// Get the result of a export_pdf operation
+pub fn get_export_pdf_result(
+    ctx: &AppContext,
+    operation_id: &str,
+) -> Result<Option<ExportPdfResultDto>> {
+    document_io_controller::get_export_pdf_result(&ctx.long_operation_manager.lock(), operation_id)
+        .context("getting export_pdf result")
 }

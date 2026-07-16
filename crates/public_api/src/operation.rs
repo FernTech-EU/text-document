@@ -139,3 +139,10 @@ pub struct EpubExportResult {
     pub file_path: String,
     pub chapter_count: usize,
 }
+
+/// Result of a PDF export (`to_pdf`).
+#[derive(Debug, Clone)]
+pub struct PdfExportResult {
+    pub file_path: String,
+    pub page_count: usize,
+}

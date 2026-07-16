@@ -2,6 +2,10 @@
 pub mod document_io_controller;
 pub mod dtos;
 pub(crate) mod html_render;
+#[cfg(feature = "pdf")]
+pub(crate) mod typst_compile;
+#[cfg(feature = "pdf")]
+pub(crate) mod typst_markup;
 mod units_of_work;
 pub(crate) mod use_cases;
 

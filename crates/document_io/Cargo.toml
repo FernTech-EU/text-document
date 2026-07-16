@@ -27,10 +27,28 @@ regex = "1"
 docx-rs = "0.4"
 epub-builder = "0.8.3"
 
+# PDF export (via embedded Typst), behind the `pdf` feature — see [features] below.
+# Pinned exactly (`=x.y.z`): typst is pre-1.0 with breaking changes across 0.x bumps, and PDF
+# export is golden/snapshot-tested (byte-sensitive), so a bump must be a deliberate, reviewed
+# `cargo update -p <crate> --precise X.Y.Z` followed by fixture re-review, never an incidental
+# drift from a bare `cargo update`.
+typst = { version = "=0.15.0", optional = true }
+typst-layout = { version = "=0.15.0", optional = true }
+typst-pdf = { version = "=0.15.0", optional = true }
+typst-as-lib = { version = "=0.16.0", optional = true, default-features = false }
+
 [dev-dependencies]
 test_harness = { workspace = true }
 proptest = "1"
 zip = "6"
+
+[features]
+# Embedded Typst PDF export (`typst_compile.rs`/`typst_markup.rs`/`export_pdf_uc.rs`). Off by
+# default: zero typst crates are pulled into a plain `cargo build`/`cargo test`. Deliberately
+# does NOT enable typst-as-lib's `typst-kit-fonts`/`typst-kit-embed-fonts` — those would pull in
+# `typst-kit` + system font scanning + a bundled font corpus, unnecessary since callers always
+# supply their own font bytes via `PdfExportOptions::font_bytes`.
+pdf = ["dep:typst", "dep:typst-layout", "dep:typst-pdf", "dep:typst-as-lib"]
 
 [lints]
 workspace = true

@@ -39,6 +39,11 @@ pub enum DocumentError {
     #[error("{0}")]
     InvalidArgument(String),
 
+    /// The requested operation is not available in this build — e.g. [`crate::TextDocument::to_pdf`]
+    /// called against a `text-document` build that did not enable the `pdf` cargo feature.
+    #[error("{0}")]
+    Unsupported(String),
+
     /// Any other error propagated from the backend layers.
     #[error(transparent)]
     Internal(#[from] anyhow::Error),

@@ -22,7 +22,7 @@ use crate::flow::FormatChangeKind;
 use crate::inner::TextDocumentInner;
 use crate::operation::{
     DjotImportResult, DocxExportResult, EpubExportResult, HtmlImportResult, MarkdownImportResult,
-    Operation,
+    Operation, PdfExportResult,
 };
 use crate::{BlockFormat, BlockInfo, DocumentStats, FindMatch, FindOptions, ReplaceRange};
 
@@ -418,6 +418,70 @@ impl TextDocument {
                         })
                     })
             }),
+        ))
+    }
+
+    /// Export the entire document as a PDF file, using the given options (page geometry,
+    /// typography, embedded font bytes, base language/direction).
+    ///
+    /// This is a **long operation**. Returns a typed [`Operation`] handle.
+    ///
+    /// Requires the `pdf` cargo feature on `text-document` (which forwards to `frontend`'s and
+    /// `document_io`'s own `pdf` features). If it was not enabled at compile time, this returns
+    /// `Err(DocumentError::Unsupported(..))` immediately rather than attempting the export — no
+    /// `#[cfg]` is needed at the call site either way.
+    pub fn to_pdf(
+        &self,
+        output_path: &str,
+        options: crate::PdfExportOptions,
+    ) -> Result<Operation<PdfExportResult>> {
+        self.to_pdf_with_options(output_path, options)
+    }
+
+    /// As [`to_pdf`](Self::to_pdf) — the two are identical; `to_pdf` is the plain entry point,
+    /// `to_pdf_with_options` exists (like [`to_docx_with_options`](Self::to_docx_with_options)
+    /// and [`to_epub_with_options`](Self::to_epub_with_options)) so the naming stays consistent
+    /// across the three file-based exporters, all of which take a mandatory options struct.
+    #[cfg(feature = "pdf")]
+    pub fn to_pdf_with_options(
+        &self,
+        output_path: &str,
+        options: crate::PdfExportOptions,
+    ) -> Result<Operation<PdfExportResult>> {
+        let inner = self.inner.lock();
+        let dto = frontend::document_io::ExportPdfDto {
+            output_path: output_path.into(),
+            options,
+        };
+        let op_id = document_io_commands::export_pdf(&inner.ctx, &dto)?;
+        Ok(Operation::new(
+            op_id,
+            &inner.ctx,
+            Box::new(|ctx, id| {
+                document_io_commands::get_export_pdf_result(ctx, id)
+                    .ok()
+                    .flatten()
+                    .map(|r| {
+                        Ok(PdfExportResult {
+                            file_path: r.file_path,
+                            page_count: to_usize(r.page_count),
+                        })
+                    })
+            }),
+        ))
+    }
+
+    /// As [`to_pdf`](Self::to_pdf), when the `pdf` cargo feature was not enabled at compile
+    /// time — returns [`DocumentError::Unsupported`] immediately, without starting an operation
+    /// or touching the backend at all.
+    #[cfg(not(feature = "pdf"))]
+    pub fn to_pdf_with_options(
+        &self,
+        _output_path: &str,
+        _options: crate::PdfExportOptions,
+    ) -> Result<Operation<PdfExportResult>> {
+        Err(DocumentError::Unsupported(
+            "PDF export requires the `pdf` cargo feature on the `text-document` crate".into(),
         ))
     }
 
