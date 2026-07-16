@@ -47,5 +47,13 @@ harness = false
 name = "io_benchmarks"
 harness = false
 
+# Deterministic, dependency-free timing harness (plain `fn main()`), so the
+# streaming numbers are reproducible and bounded: criterion's iteration
+# auto-scaling would either grow the document under test without bound or spend
+# its budget on untimed rebuilds.
+[[bench]]
+name = "streaming"
+harness = false
+
 [lints]
 workspace = true
