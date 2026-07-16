@@ -35,6 +35,7 @@ mod fragment;
 mod highlight;
 mod inner;
 mod operation;
+mod streaming;
 mod text_block;
 mod text_frame;
 mod text_list;

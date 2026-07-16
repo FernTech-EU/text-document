@@ -53,6 +53,12 @@ pub(crate) struct TextDocumentInner {
     pub ctx: AppContext,
     pub event_client: EventHubClient,
     pub stack_id: u64,
+    /// Private undo stack for append-only streaming writes, created on first
+    /// use (see `streaming.rs`). The entity commands always push an undo
+    /// command — `None` resolves to stack 0 rather than opting out — so
+    /// streaming routes its writes here and clears them as it goes, leaving
+    /// `stack_id` (the user's real history) untouched.
+    pub streaming_stack_id: Option<u64>,
     #[allow(dead_code)] // will be used for entity tree access
     pub root_id: EntityId,
     pub document_id: EntityId,
@@ -384,6 +390,7 @@ impl TextDocumentInner {
             ctx,
             event_client,
             stack_id,
+            streaming_stack_id: None,
             root_id: root.id,
             document_id: doc.id,
             modified: false,
