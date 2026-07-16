@@ -25,10 +25,12 @@ chrono = { workspace = true }
 uuid = { workspace = true }
 regex = "1"
 docx-rs = "0.4"
+epub-builder = "0.8.3"
 
 [dev-dependencies]
 test_harness = { workspace = true }
 proptest = "1"
+zip = "6"
 
 [lints]
 workspace = true

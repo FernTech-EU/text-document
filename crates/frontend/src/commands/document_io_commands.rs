@@ -5,9 +5,9 @@
 use crate::app_context::AppContext;
 use anyhow::{Context, Result};
 use document_io::{
-    ExportDjotDto, ExportDocxDto, ExportDocxResultDto, ExportHtmlDto, ExportLatexDto,
-    ExportLatexResultDto, ExportMarkdownDto, ExportPlainTextDto, ImportDjotDto,
-    ImportDjotResultDto, ImportHtmlDto, ImportHtmlResultDto, ImportMarkdownDto,
+    ExportDjotDto, ExportDocxDto, ExportDocxResultDto, ExportEpubDto, ExportEpubResultDto,
+    ExportHtmlDto, ExportLatexDto, ExportLatexResultDto, ExportMarkdownDto, ExportPlainTextDto,
+    ImportDjotDto, ImportDjotResultDto, ImportHtmlDto, ImportHtmlResultDto, ImportMarkdownDto,
     ImportMarkdownResultDto, ImportPlainTextDto, document_io_controller,
 };
 
@@ -170,4 +170,32 @@ pub fn get_export_docx_result(
 ) -> Result<Option<ExportDocxResultDto>> {
     document_io_controller::get_export_docx_result(&ctx.long_operation_manager.lock(), operation_id)
         .context("getting export_docx result")
+}
+
+/// export_epub (long operation)
+pub fn export_epub(ctx: &AppContext, dto: &ExportEpubDto) -> Result<String> {
+    document_io_controller::export_epub(
+        &ctx.db_context,
+        &ctx.event_hub,
+        &mut ctx.long_operation_manager.lock(),
+        dto,
+    )
+    .context("export_epub")
+}
+
+/// Get the progress of a export_epub operation
+pub fn get_export_epub_progress(ctx: &AppContext, operation_id: &str) -> Option<OperationProgress> {
+    document_io_controller::get_export_epub_progress(
+        &ctx.long_operation_manager.lock(),
+        operation_id,
+    )
+}
+
+/// Get the result of a export_epub operation
+pub fn get_export_epub_result(
+    ctx: &AppContext,
+    operation_id: &str,
+) -> Result<Option<ExportEpubResultDto>> {
+    document_io_controller::get_export_epub_result(&ctx.long_operation_manager.lock(), operation_id)
+        .context("getting export_epub result")
 }

@@ -21,7 +21,8 @@ use crate::events::{self, DocumentEvent, Subscription};
 use crate::flow::FormatChangeKind;
 use crate::inner::TextDocumentInner;
 use crate::operation::{
-    DjotImportResult, DocxExportResult, HtmlImportResult, MarkdownImportResult, Operation,
+    DjotImportResult, DocxExportResult, EpubExportResult, HtmlImportResult, MarkdownImportResult,
+    Operation,
 };
 use crate::{BlockFormat, BlockInfo, DocumentStats, FindMatch, FindOptions, ReplaceRange};
 
@@ -375,6 +376,45 @@ impl TextDocument {
                         Ok(DocxExportResult {
                             file_path: r.file_path,
                             paragraph_count: to_usize(r.paragraph_count),
+                        })
+                    })
+            }),
+        ))
+    }
+
+    /// Export the entire document as an EPUB 3 file to a file path.
+    ///
+    /// This is a **long operation**. Returns a typed [`Operation`] handle.
+    pub fn to_epub(&self, output_path: &str) -> Result<Operation<EpubExportResult>> {
+        self.to_epub_with_options(output_path, crate::EpubExportOptions::default())
+    }
+
+    /// As [`to_epub`](Self::to_epub), but with book-level metadata (title, author, language,
+    /// reading direction). The document is split into chapters at the shallowest heading level
+    /// present (e.g. every top-level `# Chapter` heading) — see
+    /// [`EpubExportOptions`](crate::EpubExportOptions) for details.
+    pub fn to_epub_with_options(
+        &self,
+        output_path: &str,
+        options: crate::EpubExportOptions,
+    ) -> Result<Operation<EpubExportResult>> {
+        let inner = self.inner.lock();
+        let dto = frontend::document_io::ExportEpubDto {
+            output_path: output_path.into(),
+            options,
+        };
+        let op_id = document_io_commands::export_epub(&inner.ctx, &dto)?;
+        Ok(Operation::new(
+            op_id,
+            &inner.ctx,
+            Box::new(|ctx, id| {
+                document_io_commands::get_export_epub_result(ctx, id)
+                    .ok()
+                    .flatten()
+                    .map(|r| {
+                        Ok(EpubExportResult {
+                            file_path: r.file_path,
+                            chapter_count: to_usize(r.chapter_count),
                         })
                     })
             }),

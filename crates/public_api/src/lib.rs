@@ -45,8 +45,8 @@ pub use frontend::block::dtos::{Alignment, MarkerType};
 pub use frontend::block::dtos::{CharVerticalAlignment, InlineContent, UnderlineStyle};
 pub use frontend::common::format_runs::ReplaceFormatPolicy;
 pub use frontend::common::parser_tools::{
-    CountMethod, DjotExportOptions, DjotImportOptions, DocxExportOptions, TABLE_ANCHOR,
-    WordCharCounts, count, count_djot, djot_to_plain_text,
+    CountMethod, DjotExportOptions, DjotImportOptions, DocxExportOptions, EpubExportOptions,
+    TABLE_ANCHOR, WordCharCounts, count, count_djot, djot_to_plain_text,
 };
 
 /// The matcher, as a pure function over `&str` — no document, no store, no threads.
@@ -89,7 +89,9 @@ pub use highlight::{
     HighlightContext, HighlightFormat, HighlightMask, HighlightSpan, RangeHighlight, SessionId,
     SyntaxHighlighter,
 };
-pub use operation::{DocxExportResult, HtmlImportResult, MarkdownImportResult, Operation};
+pub use operation::{
+    DocxExportResult, EpubExportResult, HtmlImportResult, MarkdownImportResult, Operation,
+};
 
 // ── Layout engine API types ─────────────────────────────────────
 pub use flow::{

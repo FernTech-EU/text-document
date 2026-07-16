@@ -132,3 +132,10 @@ pub struct DocxExportResult {
     pub file_path: String,
     pub paragraph_count: usize,
 }
+
+/// Result of an EPUB export (`to_epub`).
+#[derive(Debug, Clone)]
+pub struct EpubExportResult {
+    pub file_path: String,
+    pub chapter_count: usize,
+}

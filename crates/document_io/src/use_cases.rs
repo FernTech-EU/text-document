@@ -2,6 +2,7 @@
 
 pub(crate) mod export_djot_uc;
 pub(crate) mod export_docx_uc;
+pub(crate) mod export_epub_uc;
 pub(crate) mod export_html_uc;
 pub(crate) mod export_latex_uc;
 pub(crate) mod export_markdown_uc;

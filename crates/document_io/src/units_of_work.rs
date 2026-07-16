@@ -2,6 +2,7 @@
 
 pub(crate) mod export_djot_uow;
 pub(crate) mod export_docx_uow;
+pub(crate) mod export_epub_uow;
 pub(crate) mod export_html_uow;
 pub(crate) mod export_latex_uow;
 pub(crate) mod export_markdown_uow;

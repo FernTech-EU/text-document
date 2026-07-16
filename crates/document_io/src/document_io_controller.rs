@@ -3,6 +3,8 @@
 use crate::ExportDjotDto;
 use crate::ExportDocxDto;
 use crate::ExportDocxResultDto;
+use crate::ExportEpubDto;
+use crate::ExportEpubResultDto;
 use crate::ExportHtmlDto;
 use crate::ExportLatexDto;
 use crate::ExportLatexResultDto;
@@ -17,6 +19,7 @@ use crate::ImportMarkdownResultDto;
 use crate::ImportPlainTextDto;
 use crate::units_of_work::export_djot_uow::ExportDjotUnitOfWorkFactory;
 use crate::units_of_work::export_docx_uow::ExportDocxUnitOfWorkFactory;
+use crate::units_of_work::export_epub_uow::ExportEpubUnitOfWorkFactory;
 use crate::units_of_work::export_html_uow::ExportHtmlUnitOfWorkFactory;
 use crate::units_of_work::export_latex_uow::ExportLatexUnitOfWorkFactory;
 use crate::units_of_work::export_markdown_uow::ExportMarkdownUnitOfWorkFactory;
@@ -27,6 +30,7 @@ use crate::units_of_work::import_markdown_uow::ImportMarkdownUnitOfWorkFactory;
 use crate::units_of_work::import_plain_text_uow::ImportPlainTextUnitOfWorkFactory;
 use crate::use_cases::export_djot_uc::ExportDjotUseCase;
 use crate::use_cases::export_docx_uc::ExportDocxUseCase;
+use crate::use_cases::export_epub_uc::ExportEpubUseCase;
 use crate::use_cases::export_html_uc::ExportHtmlUseCase;
 use crate::use_cases::export_latex_uc::ExportLatexUseCase;
 use crate::use_cases::export_markdown_uc::ExportMarkdownUseCase;
@@ -328,6 +332,55 @@ pub fn get_export_docx_result(
     }
     // Parse the JSON string into a ExportDocxResultDto
     let result_dto: ExportDocxResultDto = serde_json::from_str(&result_json.unwrap())?;
+
+    Ok(Some(result_dto))
+}
+
+pub fn export_epub(
+    db_context: &DbContext,
+    _event_hub: &Arc<EventHub>,
+    long_operation_manager: &mut LongOperationManager,
+    dto: &ExportEpubDto,
+) -> Result<String> {
+    let uow_context = ExportEpubUnitOfWorkFactory::new(db_context);
+    let uc = ExportEpubUseCase::new(Box::new(uow_context), dto);
+    let operation_id = long_operation_manager.start_operation(uc);
+    Ok(operation_id)
+}
+
+/// Build the packaged EPUB bytes for `db_context` without writing a file.
+///
+/// This runs the exact same builder used by [`export_epub`] but returns the assembled `.epub`
+/// zip archive as bytes instead of writing it to disk, so callers (tests, notably) can inspect
+/// the produced package directly — e.g. with the `zip` crate.
+#[doc(hidden)]
+pub fn build_epub_document(db_context: &DbContext, dto: &ExportEpubDto) -> Result<Vec<u8>> {
+    let uow_context = ExportEpubUnitOfWorkFactory::new(db_context);
+    let uc = ExportEpubUseCase::new(Box::new(uow_context), dto);
+    let (epub_bytes, _chapter_count) = uc.build_document()?;
+    Ok(epub_bytes)
+}
+
+pub fn get_export_epub_progress(
+    long_operation_manager: &LongOperationManager,
+    operation_id: &str,
+) -> Option<OperationProgress> {
+    long_operation_manager.get_operation_progress(operation_id)
+}
+
+pub fn get_export_epub_result(
+    long_operation_manager: &LongOperationManager,
+    operation_id: &str,
+) -> Result<Option<ExportEpubResultDto>> {
+    // Get the operation result as a JSON string
+    let result_json = long_operation_manager.get_operation_result(operation_id);
+
+    // If there's no result, return None
+    if result_json.is_none() {
+        return Ok(None);
+    }
+    // Parse the JSON string into a ExportEpubResultDto
+    let result_dto: ExportEpubResultDto = serde_json::from_str(&result_json.unwrap())?;
 
     Ok(Some(result_dto))
 }
