@@ -285,6 +285,59 @@ impl TextDocument {
         ))
     }
 
+    /// Replace the entire document with djot markup, **synchronously**, on the
+    /// calling thread. Clears undo history.
+    ///
+    /// This is the right call for *loading* a document's initial content — the
+    /// case where the caller is going to block for the result anyway.
+    /// [`set_djot`](Self::set_djot) starts a long operation: it spawns a thread,
+    /// and the caller then blocks in [`Operation::wait`] until that thread
+    /// publishes. That round trip is pure overhead when there is no frame loop to
+    /// keep responsive, and it does not shrink with the input — an *empty*
+    /// document costs the same thread spawn and hand-off as a full one. Loading N
+    /// documents in a loop paid it N times.
+    ///
+    /// Prefer [`set_djot`](Self::set_djot) when the import is genuinely long and
+    /// the caller must stay responsive (it reports progress and can be
+    /// cancelled); prefer this when the caller just wants the content in.
+    ///
+    /// Observationally equivalent to `set_djot(..).wait()` — same import, same
+    /// `DocumentReset`, same cache/block bookkeeping — except that, having no
+    /// operation, it emits no `LongOperation*` events and cannot be cancelled.
+    pub fn set_djot_sync(&self, djot: &str) -> Result<DjotImportResult> {
+        self.set_djot_sync_with_options(djot, DjotImportOptions::default())
+    }
+
+    /// As [`set_djot_sync`](Self::set_djot_sync), selecting which optional block
+    /// attributes are applied via `options`.
+    pub fn set_djot_sync_with_options(
+        &self,
+        djot: &str,
+        options: DjotImportOptions,
+    ) -> Result<DjotImportResult> {
+        let (queued, block_count) = {
+            let mut inner = self.inner.lock();
+            inner.invalidate_text_cache();
+            let dto = frontend::document_io::ImportDjotDto {
+                djot_text: djot.into(),
+                options,
+            };
+            let result = document_io_commands::import_djot_sync(&inner.ctx, &dto)?;
+            // The same settling the async path performs when its operation
+            // completes (see `subscribe_long_operation_events`), done inline here
+            // because there is no completion event to hang it off.
+            inner.queue_event(DocumentEvent::DocumentReset);
+            inner.check_block_count_changed();
+            inner.reset_cached_child_order();
+            (inner.take_queued_events(), result.block_count)
+        };
+        // Dispatch outside the lock — a subscriber is free to call back in.
+        crate::inner::dispatch_queued_events(queued);
+        Ok(DjotImportResult {
+            block_count: to_usize(block_count),
+        })
+    }
+
     /// Export the entire document as djot markup.
     pub fn to_djot(&self) -> Result<String> {
         self.to_djot_with_options(DjotExportOptions::default())
