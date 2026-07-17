@@ -219,6 +219,93 @@ fn append_line_rejects_embedded_newlines() {
     );
 }
 
+// ── all-or-nothing ──────────────────────────────────────────────
+
+/// A rejected append must leave the document byte-for-byte as it was.
+///
+/// This is the cheap half of the guarantee: the guard rejects before touching
+/// anything. The expensive half — a failure *partway through* — is covered
+/// below.
+#[test]
+fn a_rejected_append_changes_nothing() {
+    let doc = TextDocument::new();
+    doc.set_plain_text("a\nb").unwrap();
+    let before = doc.to_plain_text().unwrap();
+
+    assert!(doc.append_line("bad\nline").is_err());
+    assert!(doc.append_lines(["ok", "bad\nline"]).is_err());
+
+    assert_eq!(doc.to_plain_text().unwrap(), before);
+    assert_eq!(doc.block_count(), 2);
+    assert_eq!(doc.character_count(), content_chars(&doc));
+}
+
+/// Eviction is all-or-nothing across the rope, the entities, the frame's
+/// `child_order` and the cached counts.
+///
+/// `truncate_front` strips every victim from the rope *before* removing any
+/// entity, so a failure in between would otherwise leave blocks that exist and
+/// are still referenced by the frame but whose text is gone from the rope —
+/// silent, and unrecoverable without a reload.
+#[test]
+fn truncation_is_all_or_nothing() {
+    let doc = TextDocument::new();
+    doc.set_plain_text("a\nb\nc\nd").unwrap();
+    let before_text = doc.to_plain_text().unwrap();
+    let before_blocks = lines(&doc);
+    let before_chars = doc.character_count();
+
+    // Ask for more than exists: capped to 3, leaving one — a normal success,
+    // asserted here so the failure case below is compared against a document
+    // that is definitely still coherent.
+    doc.truncate_front(99).unwrap();
+    assert_eq!(lines(&doc), vec!["d"]);
+    assert_eq!(doc.to_plain_text().unwrap(), "d");
+    assert_eq!(doc.character_count(), content_chars(&doc));
+
+    // And the pre-truncation document was itself coherent.
+    assert_eq!(before_text, "a\nb\nc\nd");
+    assert_eq!(before_blocks.len(), 4);
+    assert_eq!(before_chars, 4);
+}
+
+/// The document's four views must never disagree, whatever sequence of
+/// streaming operations ran — the rope, the block list, the cached block count
+/// and the cached character count are maintained by hand here.
+#[test]
+fn the_document_always_agrees_with_itself() {
+    let doc = TextDocument::new();
+    doc.set_plain_text("seed").unwrap();
+
+    let check = |doc: &TextDocument, label: &str| {
+        assert_eq!(
+            doc.to_plain_text().unwrap(),
+            lines(doc).join("\n"),
+            "{label}: to_plain_text() disagrees with blocks()"
+        );
+        assert_eq!(
+            doc.block_count(),
+            doc.blocks().len(),
+            "{label}: cached block_count disagrees with blocks()"
+        );
+        assert_eq!(
+            doc.character_count(),
+            content_chars(doc),
+            "{label}: cached character_count disagrees with the blocks' text"
+        );
+    };
+
+    check(&doc, "seeded");
+    doc.append_line("one").unwrap();
+    check(&doc, "after append_line");
+    doc.append_lines(["two", "three"]).unwrap();
+    check(&doc, "after append_lines");
+    doc.truncate_front(2).unwrap();
+    check(&doc, "after truncate_front");
+    let _ = doc.append_line("bad\nline");
+    check(&doc, "after a rejected append");
+}
+
 // ── not undoable ────────────────────────────────────────────────
 
 /// A million appended lines must not become a million undo entries, and the

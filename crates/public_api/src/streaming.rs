@@ -61,6 +61,28 @@
 //! (the rope and the block index stay coherent), but it is not the intended
 //! shape: these are for buffers whose content arrives from elsewhere.
 //!
+//! # All-or-nothing
+//!
+//! Every entry point here is atomic: it either lands completely or leaves the
+//! document exactly as it was. That needs saying because it does not come for
+//! free. These paths hand-maintain four things that must agree — the rope, the
+//! block offset index, the frame's `child_order`, and the document's cached
+//! counts — across several fallible calls, and the unit-of-work layer that
+//! normally guarantees that is precisely what they bypass for speed. Without
+//! care, any early `?` would leave text in the rope that no block owns, or a
+//! block the frame never references, or counts describing a document that no
+//! longer exists — none of which surfaces as an error, only as a document that
+//! quietly disagrees with itself.
+//!
+//! So each operation takes a savepoint first and rolls back on any failure,
+//! including a panic. A savepoint is a whole-store snapshot, but a cheap one:
+//! the rope is persistent and the entity tables are `im::HashMap`s, so it is
+//! pointer copies, not a deep clone.
+//!
+//! Note that a rolled-back append still consumes the entity ids it allocated —
+//! the store's counters are deliberately not rewound — so ids may show gaps.
+//! Nothing depends on them being contiguous.
+//!
 //! # This is still O(N) — know the ceiling before using it
 //!
 //! Measured, appending one line (`docs/streaming-baseline.md`):
@@ -93,6 +115,8 @@
 //! Reaching O(1) means `child_order` no longer being an N-element `Vec` cloned
 //! per write. That reshapes a core entity the whole engine and its property tests
 //! depend on, and is deliberately out of scope here.
+
+use std::sync::Arc;
 
 use frontend::block::dtos::CreateBlockDto;
 use frontend::commands::{block_commands, document_commands, frame_commands, undo_redo_commands};
@@ -146,8 +170,12 @@ impl TextDocument {
             ));
         }
 
+        // Everything below either all lands or none of it does.
+        let atomic = Atomic::begin(&inner);
         let appended = append_one(&mut inner, frame_id, text)?;
         let new_count = commit_counts(&mut inner, 1, text.chars().count() as i64)?;
+        atomic.commit();
+
         finish(&mut inner, appended.edit_pos, appended.chars_added, 1);
 
         inner.queue_event(DocumentEvent::BlockCountChanged(new_count));
@@ -196,6 +224,10 @@ impl TextDocument {
             ));
         }
 
+        // The batch is one unit: a line failing halfway would otherwise leave
+        // its predecessors appended with the document's counts never updated,
+        // since those are written once at the end.
+        let atomic = Atomic::begin(&inner);
         let mut edit_pos = None;
         let mut chars_added = 0usize;
         for line in &lines {
@@ -208,6 +240,8 @@ impl TextDocument {
 
         let chars: i64 = lines.iter().map(|l| l.chars().count() as i64).sum();
         let new_count = commit_counts(&mut inner, lines.len() as i64, chars)?;
+        atomic.commit();
+
         finish(&mut inner, edit_pos, chars_added, lines.len());
 
         inner.queue_event(DocumentEvent::BlockCountChanged(new_count));
@@ -255,22 +289,34 @@ impl TextDocument {
             let take = n.min(block_ids.len().saturating_sub(1));
             let victims: Vec<EntityId> = block_ids.into_iter().take(take).collect();
 
-            let store = inner.ctx.db_context.get_store();
-            let chars: i64 = victims
-                .iter()
-                .filter_map(|id| frontend::commands::block_commands::get_block(&inner.ctx, id).ok())
-                .flatten()
-                .map(|b| {
-                    let entity: common::entities::Block = b.into();
-                    common::database::rope_helpers::block_char_length(&entity, store)
-                })
-                .sum();
+            // Every victim's length must be counted, so a lookup that fails is
+            // an error rather than a silent zero: swallowing it would subtract
+            // too little from `character_count`, and since all later deltas are
+            // relative, the document's count would stay wrong forever with
+            // nothing reporting it.
+            let mut chars: i64 = 0;
+            for id in &victims {
+                let block = block_commands::get_block(&inner.ctx, id)?.ok_or_else(|| {
+                    DocumentError::InvalidArgument(format!(
+                        "block {id} is referenced by the frame but does not exist"
+                    ))
+                })?;
+                let entity: common::entities::Block = block.into();
+                let store = inner.ctx.db_context.get_store();
+                chars += common::database::rope_helpers::block_char_length(&entity, store);
+            }
             (victims, chars)
         };
 
         if victims.is_empty() {
             return Ok(0);
         }
+
+        // Everything below either all lands or none of it does. Without this,
+        // a failure partway through the entity loop would leave the rope
+        // already stripped of victims whose blocks still exist and are still
+        // referenced by the frame.
+        let atomic = Atomic::begin(&inner);
 
         // Unmirror from the rope first: `rope_remove_block` resolves each block
         // through the offset index, which the entity must still exist for.
@@ -304,6 +350,8 @@ impl TextDocument {
 
         let removed = victims.len();
         let new_count = commit_counts(&mut inner, -(removed as i64), -chars_removed)?;
+        atomic.commit();
+
         undo_redo_commands::clear_stack(&inner.ctx, stack);
 
         // Everything shifts down by what was cut off the front.
@@ -352,6 +400,63 @@ fn streaming_stack(inner: &mut TextDocumentInner) -> u64 {
     let id = undo_redo_commands::create_new_stack(&inner.ctx);
     inner.streaming_stack_id = Some(id);
     id
+}
+
+/// All-or-nothing around a streaming mutation.
+///
+/// These paths hand-maintain four things that must agree — the rope, the block
+/// offset index, the frame's `child_order`, and the document's cached counts —
+/// across several fallible calls. The ordinary editing path gets that
+/// consistency from the unit-of-work layer; taking the shortcut past it takes
+/// the shortcut past its atomicity too, so every early `?` would otherwise be a
+/// chance to leave the four disagreeing: text in the rope that no block owns, a
+/// block absent from `child_order`, counts describing a document that no longer
+/// exists.
+///
+/// A savepoint is a whole-store snapshot, but a cheap one — the rope is a
+/// persistent structure and the entity tables are `im::HashMap`s, so it is
+/// pointer-copies rather than a deep clone. Restoring it undoes everything
+/// since, the inner commands' own writes included, because each savepoint is an
+/// independent snapshot rather than a stack position.
+///
+/// Deliberately not `Transaction`, which is the same savepoint plus an
+/// O(N) `recompute_all_frame_byte_ranges` on commit — a cost this path exists
+/// to avoid, and one the inner commands' own transactions already pay.
+///
+/// Rolls back on drop unless [`commit`](Self::commit) ran, so an early `?` — or
+/// a panic — cannot leave the document half-written.
+struct Atomic {
+    /// Owned rather than borrowed: holding a reference would borrow the
+    /// document's interior for the guard's whole lifetime, which is exactly the
+    /// span in which the work needs `&mut` access to it.
+    store: Arc<common::database::Store>,
+    savepoint: Option<u64>,
+}
+
+impl Atomic {
+    fn begin(inner: &TextDocumentInner) -> Self {
+        let store = Arc::clone(inner.ctx.db_context.get_store());
+        let savepoint = Some(store.create_savepoint());
+        Self { store, savepoint }
+    }
+
+    /// Keep the mutations and drop the snapshot.
+    fn commit(mut self) {
+        if let Some(sp) = self.savepoint.take() {
+            self.store.discard_savepoint(sp);
+        }
+    }
+}
+
+impl Drop for Atomic {
+    fn drop(&mut self) {
+        // Still holding the savepoint means `commit` never ran: the operation
+        // left early, so put the document back exactly as it was.
+        if let Some(sp) = self.savepoint.take() {
+            self.store.restore_savepoint(sp);
+            self.store.discard_savepoint(sp);
+        }
+    }
 }
 
 /// What one appended line did to the document, as the caller's bookkeeping
