@@ -28,22 +28,71 @@
 //! tail plus an O(1) amortized `push_block` — nothing shifts, because appending
 //! at the end shifts nothing).
 //!
-//! # Not editing
+//! # Not undoable — and not an oversight
 //!
-//! These are *not* undoable and deliberately so: a million appended lines must
-//! not become a million undo entries, and clearing the shared stack per line
-//! would destroy the user's real history. The entity writes are therefore routed
-//! through a private throwaway stack that is cleared as they go, leaving the
-//! document's own undo stack untouched. Interleaving these with ordinary editing
-//! on the same document is not meaningful; they are for buffers whose content
-//! arrives from elsewhere.
+//! **Nothing in this module participates in undo/redo.** An appended or evicted
+//! line cannot be brought back with [`TextDocument::undo`], does not appear on
+//! the undo stack, and does not affect [`TextDocument::can_undo`].
 //!
-//! # Residual cost
+//! That is deliberate on both counts. A million streamed lines must not become a
+//! million undo entries — the stack is unbounded, so that is a leak, not a
+//! feature. And the alternative escape hatch the rest of the crate uses for
+//! non-undoable work (perform, then `clear_stack`, as `set_plain_text` does)
+//! would throw away the *user's* history every time a line arrived from a
+//! background thread.
 //!
-//! `Frame.child_order` is a `Vec<i64>`, so appending clones it — an O(N) memcpy
-//! (tens of microseconds at 100 k lines). Small against the 15.9 ms it replaces,
-//! but genuinely not O(1); removing it would mean reshaping a core entity that
-//! the whole engine and its property tests depend on.
+//! So the entity writes are routed through a private stack of their own, cleared
+//! as they go. Note that passing `None` as the stack id would not have achieved
+//! this: `add_command_to_stack` resolves `None` to stack 0 rather than skipping,
+//! so it is not an opt-out.
+//!
+//! Consequences worth being deliberate about:
+//!
+//! * **The document's own undo stack is untouched.** A user's edits stay
+//!   undoable across any amount of streaming, and undo will never surface or
+//!   swallow a streamed line. This is covered by a test.
+//! * **Streaming is not reversible.** Content that arrived from elsewhere is not
+//!   the user's to undo; if a caller needs to drop it, that is
+//!   [`truncate_front`](TextDocument::truncate_front), not undo.
+//! * **`modified` is still set**, and change events are still emitted, so views
+//!   and dirty-tracking behave normally.
+//!
+//! Mixing streaming with ordinary editing on one document works and is tested
+//! (the rope and the block index stay coherent), but it is not the intended
+//! shape: these are for buffers whose content arrives from elsewhere.
+//!
+//! # This is still O(N) — know the ceiling before using it
+//!
+//! Measured, appending one line (`docs/streaming-baseline.md`):
+//!
+//! | lines in document | ordinary editing path | this |
+//! |---|---|---|
+//! | 1 000 | 986 µs | 174 µs |
+//! | 10 000 | 28.1 ms | 2.90 ms |
+//!
+//! Roughly 10× cheaper — but 174 µs → 2.90 ms is 16.7× for 10× the document, so
+//! **this is still O(N), not O(1)**. It moves the ceiling; it does not remove it.
+//! Around 10 000 lines an append costs ~2.9 ms (~345 lines/second), which suits
+//! an application's own event log. It does not suit `tail -f` of a large file:
+//! at 100 000 lines the cost extrapolates to ~29 ms per line. Cap the buffer
+//! accordingly, and evict with [`truncate_front`](TextDocument::truncate_front).
+//!
+//! `truncate_front` is barely better than the ordinary path (1.19× at 10 000)
+//! and is *slower* below a few thousand lines, because the ordinary path makes a
+//! single bulk `delete_text` call where this makes one entity removal per evicted
+//! block. It exists for the coherence of the streaming API — appending without
+//! being able to evict is useless — not because it is fast.
+//!
+//! The rope is not the reason. `rope_append_block` is O(log n) as intended; the
+//! residual is the generic entity-update path. `UndoableUpdateUseCase::
+//! execute_multi` fetches the old entity for undo and stashes it on every write,
+//! so each `update_frame` clones the `Frame` — its whole `child_order: Vec<i64>`
+//! included — several times over. Every appended line therefore touches the
+//! entire `child_order`, whatever the rope does.
+//!
+//! Reaching O(1) means `child_order` no longer being an N-element `Vec` cloned
+//! per write. That reshapes a core entity the whole engine and its property tests
+//! depend on, and is deliberately out of scope here.
 
 use frontend::block::dtos::CreateBlockDto;
 use frontend::commands::{block_commands, document_commands, frame_commands, undo_redo_commands};
@@ -121,6 +170,8 @@ impl TextDocument {
     /// prefer this.
     ///
     /// No line may contain `\n`.
+    ///
+    /// **Not undoable**, by design — see the module docs.
     pub fn append_lines<I, S>(&self, lines: I) -> Result<usize>
     where
         I: IntoIterator<Item = S>,

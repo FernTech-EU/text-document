@@ -190,6 +190,26 @@ fn appending_leaves_the_undo_stack_alone() {
     );
 }
 
+/// The documented contract: streaming is not reversible. On a document with no
+/// prior edits, appending must leave nothing to undo at all — if it did, a
+/// viewer tailing output would be handing the user an "undo" that rips lines
+/// back out of a log they never wrote.
+#[test]
+fn appending_alone_leaves_nothing_to_undo() {
+    let doc = TextDocument::new();
+    doc.set_plain_text("first").unwrap();
+    assert!(!doc.can_undo(), "precondition: a fresh document has no history");
+
+    doc.append_line("streamed").unwrap();
+    doc.append_lines(["more", "and more"]).unwrap();
+    doc.truncate_front(1).unwrap();
+
+    assert!(
+        !doc.can_undo(),
+        "streaming must not put anything on the undo stack"
+    );
+}
+
 #[test]
 fn truncating_leaves_the_undo_stack_alone() {
     let doc = TextDocument::new();
