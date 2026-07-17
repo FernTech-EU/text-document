@@ -362,6 +362,7 @@ impl TextBlock {
             crate::highlight::SnapshotHighlights {
                 kind: inner.highlight_kind,
                 mask: &crate::highlight::HighlightMask::ALL,
+                suppress_paint: false,
             },
         )
         .unwrap_or_else(|| BlockSnapshot {
@@ -483,6 +484,7 @@ pub(crate) fn build_fragments(inner: &TextDocumentInner, block_id: u64) -> Vec<F
         crate::highlight::SnapshotHighlights {
             kind: inner.highlight_kind,
             mask: &crate::highlight::HighlightMask::ALL,
+            suppress_paint: false,
         },
     )
 }
@@ -994,7 +996,9 @@ pub(crate) fn build_block_snapshot_with_position_and_parent(
     // above). Metric / none: empty (highlights merged into fragments, or none). A "without
     // highlights" (empty-mask) snapshot resolves to `kind == None`, so this is empty
     // regardless of the live sessions.
-    let paint_highlights = if hl.kind == crate::highlight::HighlighterKind::PaintOnly {
+    let paint_highlights = if hl.kind == crate::highlight::HighlighterKind::PaintOnly
+        && !hl.suppress_paint
+    {
         let spans = crate::highlight::merged_spans_for_block(inner, block_id as usize, hl.mask);
         crate::highlight::extract_paint_spans(&spans, length)
     } else {

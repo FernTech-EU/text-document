@@ -261,6 +261,15 @@ impl HighlightMask {
 pub(crate) struct SnapshotHighlights<'a> {
     pub kind: HighlighterKind,
     pub mask: &'a HighlightMask,
+    /// Skip the paint-only overlay (`paint_highlights`) entirely: fragments are
+    /// still split for metric sessions, but no `extract_paint_spans` runs. For
+    /// consumers that read only the fragments/geometry and discard the visual
+    /// overlay — the accessibility tree above all — this drops the whole
+    /// paint-span computation, which is O(spans) per block (superlinear when a
+    /// block carries thousands of ranges, e.g. a spell-checked Lorem scene).
+    /// The produced `fragments` are byte-identical to a normal snapshot; only
+    /// `paint_highlights` differs (always empty here).
+    pub suppress_paint: bool,
 }
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -716,20 +725,54 @@ pub(crate) fn extract_paint_spans(
     boundaries.sort_unstable();
     boundaries.dedup();
 
+    // Sweep the boundaries left→right, maintaining the set of spans active in the
+    // current window in ORIGINAL-INDEX order (a `BTreeSet` of indices). This
+    // replaces the former O(boundaries × spans) rescan — which re-filtered every
+    // span at every boundary and went quadratic on a block carrying thousands of
+    // ranges (a spell-checked Lorem paragraph, where every window still walked all
+    // ~m ranges) — with O(m log m + Σ|active|). The emitted spans are byte-identical:
+    // `BTreeSet` iterates indices ascending, the same order the old
+    // `spans.iter().filter()` produced, so `merge_overlapping_highlights` sees the
+    // same (last-wins) sequence. Each span is inserted and removed exactly once as
+    // the two monotonic pointers advance.
+    let n = spans.len();
+    let mut by_start: Vec<usize> = (0..n).collect();
+    by_start.sort_by_key(|&i| spans[i].start);
+    let mut by_end: Vec<usize> = (0..n).collect();
+    by_end.sort_by_key(|&i| spans[i].start.saturating_add(spans[i].length));
+
+    let mut active: std::collections::BTreeSet<usize> = std::collections::BTreeSet::new();
+    let mut ps = 0usize; // next span to activate (ordered by start)
+    let mut pe = 0usize; // next span to deactivate (ordered by end)
+    let mut scratch: Vec<&HighlightSpan> = Vec::new();
+
     let mut result = Vec::new();
     for w in boundaries.windows(2) {
         let (sub_start, sub_end) = (w[0], w[1]);
         if sub_end <= sub_start {
             continue;
         }
-        let active: Vec<&HighlightSpan> = spans
-            .iter()
-            .filter(|s| s.start < sub_end && s.start + s.length > sub_start)
-            .collect();
+        // A span is active in [sub_start, sub_end) iff start <= sub_start < end.
+        // Activate every span that has started by the left edge, then deactivate
+        // every span that has ended by it — add-before-remove so a zero-length
+        // span (start == end == sub_start) is excluded, matching the old strict
+        // `end > sub_start` test.
+        while ps < n && spans[by_start[ps]].start <= sub_start {
+            active.insert(by_start[ps]);
+            ps += 1;
+        }
+        while pe < n
+            && spans[by_end[pe]].start.saturating_add(spans[by_end[pe]].length) <= sub_start
+        {
+            active.remove(&by_end[pe]);
+            pe += 1;
+        }
         if active.is_empty() {
             continue;
         }
-        let merged = merge_overlapping_highlights(&active);
+        scratch.clear();
+        scratch.extend(active.iter().map(|&i| &spans[i]));
+        let merged = merge_overlapping_highlights(&scratch);
         if merged.foreground_color.is_none()
             && merged.background_color.is_none()
             && merged.underline_color.is_none()
@@ -1196,6 +1239,138 @@ impl TextDocumentInner {
             .unwrap_or_else(|| positions[0].0 as usize);
 
         self.rehighlight_from_block(target_bid);
+    }
+}
+
+#[cfg(test)]
+mod paint_span_tests {
+    use super::*;
+
+    /// The previous O(boundaries × spans) implementation, kept verbatim as the
+    /// oracle the sweep must reproduce byte-for-byte.
+    fn extract_paint_spans_reference(
+        spans: &[HighlightSpan],
+        block_len: usize,
+    ) -> Vec<crate::flow::PaintHighlightSpan> {
+        if spans.is_empty() || block_len == 0 {
+            return Vec::new();
+        }
+        let mut boundaries = vec![0usize, block_len];
+        for s in spans {
+            let end = s.start.saturating_add(s.length);
+            if s.start > 0 && s.start < block_len {
+                boundaries.push(s.start);
+            }
+            if end > 0 && end < block_len {
+                boundaries.push(end);
+            }
+        }
+        boundaries.sort_unstable();
+        boundaries.dedup();
+        let mut result = Vec::new();
+        for w in boundaries.windows(2) {
+            let (sub_start, sub_end) = (w[0], w[1]);
+            if sub_end <= sub_start {
+                continue;
+            }
+            let active: Vec<&HighlightSpan> = spans
+                .iter()
+                .filter(|s| s.start < sub_end && s.start + s.length > sub_start)
+                .collect();
+            if active.is_empty() {
+                continue;
+            }
+            let merged = merge_overlapping_highlights(&active);
+            if merged.foreground_color.is_none()
+                && merged.background_color.is_none()
+                && merged.underline_color.is_none()
+                && merged.underline_style.is_none()
+                && merged.font_underline.is_none()
+                && merged.font_overline.is_none()
+                && merged.font_strikeout.is_none()
+            {
+                continue;
+            }
+            result.push(crate::flow::PaintHighlightSpan {
+                start: sub_start,
+                length: sub_end - sub_start,
+                foreground_color: merged.foreground_color,
+                background_color: merged.background_color,
+                underline_color: merged.underline_color,
+                underline_style: merged.underline_style,
+                font_underline: merged.font_underline,
+                font_overline: merged.font_overline,
+                font_strikeout: merged.font_strikeout,
+            });
+        }
+        result
+    }
+
+    /// A span whose single paint field is keyed by `k`, so that last-wins merging
+    /// across overlaps produces observably different output when the active-set
+    /// ORDER is wrong — the property most at risk in the rewrite.
+    fn span(start: usize, length: usize, k: usize) -> HighlightSpan {
+        let c = |v: usize| crate::Color { red: v as u8, green: (v >> 8) as u8, blue: 7, alpha: 255 };
+        let format = match k % 4 {
+            0 => HighlightFormat { background_color: Some(c(k)), ..Default::default() },
+            1 => HighlightFormat { foreground_color: Some(c(k)), ..Default::default() },
+            2 => HighlightFormat { underline_color: Some(c(k)), ..Default::default() },
+            // No paint field: must be dropped by both implementations.
+            _ => HighlightFormat { font_bold: Some(true), ..Default::default() },
+        };
+        HighlightSpan { start, length, format }
+    }
+
+    #[test]
+    fn sweep_matches_reference_on_edge_cases() {
+        let cases: Vec<(Vec<HighlightSpan>, usize)> = vec![
+            (vec![], 10),
+            (vec![span(0, 4, 0)], 0),           // empty block
+            (vec![span(0, 5, 0)], 10),          // single
+            (vec![span(0, 3, 0), span(5, 3, 1)], 10),   // disjoint
+            (vec![span(2, 5, 0), span(4, 5, 1)], 12),   // overlap: later wins in [4,7)
+            (vec![span(0, 10, 0), span(3, 2, 1)], 10),  // nested
+            (vec![span(0, 3, 0), span(3, 3, 1)], 10),   // adjacent (touch, no overlap)
+            (vec![span(4, 0, 0)], 10),          // zero-length → nothing
+            (vec![span(0, 4, 3)], 10),          // no paint field → dropped
+            (vec![span(8, 5, 0)], 10),          // spills past block_len
+            (vec![span(12, 3, 0)], 10),         // entirely past block_len
+            (vec![span(0, 4, 0), span(0, 4, 1), span(0, 4, 2)], 10), // coincident, order matters
+        ];
+        for (i, (spans, len)) in cases.iter().enumerate() {
+            assert_eq!(
+                extract_paint_spans(spans, *len),
+                extract_paint_spans_reference(spans, *len),
+                "edge case {i}: spans={spans:?} block_len={len}"
+            );
+        }
+    }
+
+    #[test]
+    fn sweep_matches_reference_randomized() {
+        // Deterministic LCG — no rng dependency, reproducible across runs.
+        let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut next = |bound: usize| -> usize {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((state >> 33) as usize) % bound.max(1)
+        };
+        for trial in 0..2000 {
+            let block_len = 1 + next(40);
+            let m = next(14); // 0..13 spans, a mix of overlap densities
+            let mut spans = Vec::with_capacity(m);
+            for k in 0..m {
+                let start = next(block_len + 4); // sometimes at/past the end
+                let length = next(block_len + 2); // sometimes zero, sometimes spilling over
+                spans.push(span(start, length, trial + k));
+            }
+            assert_eq!(
+                extract_paint_spans(&spans, block_len),
+                extract_paint_spans_reference(&spans, block_len),
+                "trial {trial}: spans={spans:?} block_len={block_len}"
+            );
+        }
     }
 }
 

@@ -792,6 +792,7 @@ impl TextDocument {
         let hl = crate::highlight::SnapshotHighlights {
             kind: inner.highlights.effective_kind(mask),
             mask,
+            suppress_paint: false,
         };
         let main_frame_id = get_main_frame_id(&inner);
         let store = inner.ctx.db_context.get_store();
@@ -983,6 +984,34 @@ impl TextDocument {
         let hl = crate::highlight::SnapshotHighlights {
             kind: inner.highlights.effective_kind(mask),
             mask,
+            suppress_paint: false,
+        };
+        let elements = crate::text_frame::build_flow_snapshot(&inner, main_frame_id, hl);
+        crate::flow::FlowSnapshot { elements }
+    }
+
+    /// Snapshot the main flow like [`snapshot_flow_masked`](Self::snapshot_flow_masked),
+    /// but **without computing the paint-only overlay** (`paint_highlights` is
+    /// empty on every block). Fragments are identical — metric sessions still
+    /// split them — so a consumer that reads only the fragments and their
+    /// geometry gets the exact same tree, minus the `extract_paint_spans` work.
+    ///
+    /// This is the accessibility path's snapshot: the AT tree reads fragments,
+    /// never the paint overlay, so paying to compute a per-block paint span for
+    /// each of a spell-checker's tens of thousands of ranges is pure waste (it
+    /// dominated the a11y rebuild on a large mis-dictionaried document). Render
+    /// and layout keep using [`snapshot_flow_masked`](Self::snapshot_flow_masked),
+    /// which they must — they draw the overlay.
+    pub fn snapshot_flow_masked_no_paint(
+        &self,
+        mask: &crate::highlight::HighlightMask,
+    ) -> crate::flow::FlowSnapshot {
+        let inner = self.inner.lock();
+        let main_frame_id = get_main_frame_id(&inner);
+        let hl = crate::highlight::SnapshotHighlights {
+            kind: inner.highlights.effective_kind(mask),
+            mask,
+            suppress_paint: true,
         };
         let elements = crate::text_frame::build_flow_snapshot(&inner, main_frame_id, hl);
         crate::flow::FlowSnapshot { elements }

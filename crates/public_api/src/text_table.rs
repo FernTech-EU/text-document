@@ -100,6 +100,7 @@ impl TextTable {
             crate::highlight::SnapshotHighlights {
                 kind: inner.highlight_kind,
                 mask: &crate::highlight::HighlightMask::ALL,
+                suppress_paint: false,
             },
         )
         .unwrap_or_else(|| TableSnapshot {
@@ -241,6 +242,7 @@ impl TextTableCell {
                 crate::highlight::SnapshotHighlights {
                     kind: inner.highlight_kind,
                     mask: &crate::highlight::HighlightMask::ALL,
+                    suppress_paint: false,
                 },
             ),
             None => Vec::new(),

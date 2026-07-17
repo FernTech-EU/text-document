@@ -65,6 +65,7 @@ impl TextFrame {
             crate::highlight::SnapshotHighlights {
                 kind: inner.highlight_kind,
                 mask: &crate::highlight::HighlightMask::ALL,
+                suppress_paint: false,
             },
         );
         FrameSnapshot {
