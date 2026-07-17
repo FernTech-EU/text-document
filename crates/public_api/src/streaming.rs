@@ -146,9 +146,9 @@ impl TextDocument {
             ));
         }
 
-        let edit_pos = append_one(&mut inner, frame_id, text)?;
+        let appended = append_one(&mut inner, frame_id, text)?;
         let new_count = commit_counts(&mut inner, 1, text.chars().count() as i64)?;
-        finish(&mut inner, edit_pos, 0, text.chars().count() + 1);
+        finish(&mut inner, appended.edit_pos, appended.chars_added, 1);
 
         inner.queue_event(DocumentEvent::BlockCountChanged(new_count));
         // A pure tail append: the new element lands at the end of the flow, so
@@ -196,20 +196,19 @@ impl TextDocument {
             ));
         }
 
-        let first_edit_pos = {
-            let mut first = None;
-            let mut chars_added = 0usize;
-            for line in &lines {
-                let pos = append_one(&mut inner, frame_id, line)?;
-                first.get_or_insert(pos);
-                chars_added += line.chars().count() + 1;
-            }
-            (first.unwrap_or(0), chars_added)
-        };
+        let mut edit_pos = None;
+        let mut chars_added = 0usize;
+        for line in &lines {
+            let appended = append_one(&mut inner, frame_id, line)?;
+            // The batch's edit starts where its first line did.
+            edit_pos.get_or_insert(appended.edit_pos);
+            chars_added += appended.chars_added;
+        }
+        let edit_pos = edit_pos.unwrap_or(0);
 
         let chars: i64 = lines.iter().map(|l| l.chars().count() as i64).sum();
         let new_count = commit_counts(&mut inner, lines.len() as i64, chars)?;
-        finish(&mut inner, first_edit_pos.0, 0, first_edit_pos.1);
+        finish(&mut inner, edit_pos, chars_added, lines.len());
 
         inner.queue_event(DocumentEvent::BlockCountChanged(new_count));
         inner.queue_event(DocumentEvent::FlowElementsInserted {
@@ -308,6 +307,7 @@ impl TextDocument {
         undo_redo_commands::clear_stack(&inner.ctx, stack);
 
         // Everything shifts down by what was cut off the front.
+        inner.invalidate_text_cache();
         inner.adjust_cursors(0, chars_removed as usize + removed, 0);
         inner.modified = true;
         inner.queue_event(DocumentEvent::ContentsChanged {
@@ -354,10 +354,39 @@ fn streaming_stack(inner: &mut TextDocumentInner) -> u64 {
     id
 }
 
+/// What one appended line did to the document, as the caller's bookkeeping
+/// needs to describe it.
+struct Appended {
+    /// Document position the insertion began at.
+    edit_pos: usize,
+    /// Characters inserted there — the text, plus the separator when one was
+    /// needed. Not derivable from the text alone, which is the whole reason
+    /// this is reported rather than recomputed.
+    chars_added: usize,
+}
+
 /// Create one block, mirror it into the rope at the tail, and reference it from
-/// the frame. Returns the document position the new content starts at.
-fn append_one(inner: &mut TextDocumentInner, frame_id: EntityId, text: &str) -> Result<usize> {
+/// the frame.
+fn append_one(inner: &mut TextDocumentInner, frame_id: EntityId, text: &str) -> Result<Appended> {
     let stack = streaming_stack(inner);
+
+    // Read the frame *before* creating the block: the generic create path adds
+    // the block to the junction table but not to `child_order`, so this sees
+    // exactly the blocks that already existed.
+    let frame = frame_commands::get_frame(&inner.ctx, &frame_id)?
+        .ok_or_else(|| DocumentError::InvalidArgument("main frame missing".into()))?;
+
+    // Blocks after the first in a frame are separated by a `\n` sentinel, and
+    // `rope_append_block` does not add one itself.
+    //
+    // The condition is "does the frame already hold a block", NOT "is the rope
+    // non-empty". A freshly created document already holds one *empty* block,
+    // registered at byte 0, with an empty rope — so keying off the rope would
+    // skip the separator and register the new block at byte 0 as well, leaving
+    // two blocks at the same offset with no `\n` between them. That is not a
+    // hypothetical: `TextDocument::new()` followed by `append_line` is the most
+    // direct way to use this API.
+    let needs_boundary = frame.child_order.iter().any(|entry| *entry > 0);
 
     let block = block_commands::create_block(
         &inner.ctx,
@@ -367,29 +396,28 @@ fn append_one(inner: &mut TextDocumentInner, frame_id: EntityId, text: &str) -> 
         -1,
     )?;
 
-    // Mirror into the rope. The generic create path does not touch it, which is
-    // why `initialize` does the same thing for the document's first block.
-    let edit_pos = {
+    let appended = {
         let store = inner.ctx.db_context.get_store();
-        let was_empty = store.rope.read().len_bytes() == 0;
-        if !was_empty {
-            // Blocks after the first in a frame are separated by a `\n`
-            // sentinel; `rope_append_block` does not add one itself.
+        // Where the insertion begins — captured before it, so it covers the
+        // separator too when one is written.
+        let edit_pos = store.rope.read().len_chars();
+        if needs_boundary {
             common::database::rope_helpers::rope_insert_block_boundary(store);
         }
-        let byte_start = common::database::rope_helpers::rope_append_block(store, block.id, text);
-        store.rope.read().byte_to_char(byte_start as usize)
+        common::database::rope_helpers::rope_append_block(store, block.id, text);
+        Appended {
+            edit_pos,
+            chars_added: text.chars().count() + usize::from(needs_boundary),
+        }
     };
 
     // The generic create path adds the block to the junction table but not to
     // `child_order`, which is what `flow()` reads — `initialize` notes the same.
-    let frame = frame_commands::get_frame(&inner.ctx, &frame_id)?
-        .ok_or_else(|| DocumentError::InvalidArgument("main frame missing".into()))?;
     let mut update: UpdateFrameDto = frame.into();
     update.child_order.push(block.id as i64);
     frame_commands::update_frame(&inner.ctx, Some(stack), &update)?;
 
-    Ok(edit_pos)
+    Ok(appended)
 }
 
 /// Apply deltas to the document's cached counts, returning the new block count.
@@ -410,18 +438,27 @@ fn commit_counts(
 }
 
 /// Post-append bookkeeping shared by the append entry points.
-fn finish(inner: &mut TextDocumentInner, edit_pos: usize, removed: usize, added: usize) {
+///
+/// `blocks_affected` is passed rather than assumed: a batch adds as many blocks
+/// as it has lines, and consumers size work off that number.
+fn finish(inner: &mut TextDocumentInner, edit_pos: usize, added: usize, blocks_affected: usize) {
     let stack = streaming_stack(inner);
     // Discard the throwaway history: these writes are not undoable, and letting
     // it grow would leak a command per appended line.
     undo_redo_commands::clear_stack(&inner.ctx, stack);
 
-    inner.adjust_cursors(edit_pos, removed, added);
+    // The document's text just changed, so the lazily-built plain-text cache no
+    // longer describes it. Every ordinary edit clears this; bypassing the
+    // editing path means bypassing that too, and a stale cache is silent —
+    // `blocks()` reads the live document while `to_plain_text()` keeps serving
+    // whatever the text was when it was last asked.
+    inner.invalidate_text_cache();
+    inner.adjust_cursors(edit_pos, 0, added);
     inner.modified = true;
     inner.queue_event(DocumentEvent::ContentsChanged {
         position: edit_pos,
-        chars_removed: removed,
+        chars_removed: 0,
         chars_added: added,
-        blocks_affected: 1,
+        blocks_affected,
     });
 }

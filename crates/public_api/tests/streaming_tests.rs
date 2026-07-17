@@ -122,6 +122,64 @@ fn editing_still_works_after_appending() {
     assert_eq!(lines(&doc), vec!["first", "second more"]);
 }
 
+/// Appending to a brand-new document — the most direct way to use this API, and
+/// the case every other test here masks by calling `set_plain_text` first.
+///
+/// A fresh document already holds one empty block registered at byte 0, with an
+/// empty rope. Keying the `\n` separator off "is the rope empty" therefore
+/// skipped it and registered the appended block at byte 0 as well: two blocks at
+/// one offset, `to_plain_text()` losing the boundary, and `block_count()`
+/// disagreeing with `blocks()`.
+#[test]
+fn append_to_a_fresh_document_keeps_the_rope_and_blocks_in_step() {
+    let doc = TextDocument::new();
+    // Deliberately no set_plain_text.
+    doc.append_line("alpha").unwrap();
+
+    assert_eq!(
+        lines(&doc),
+        vec!["", "alpha"],
+        "a fresh document is one empty line; appending adds a second"
+    );
+    assert_eq!(
+        doc.to_plain_text().unwrap(),
+        "\nalpha",
+        "the block separator must be in the rope — without it the two blocks \
+         share a byte offset"
+    );
+    assert_eq!(
+        doc.blocks().len(),
+        2,
+        "blocks() and the rope must describe the same document"
+    );
+}
+
+/// The same shortcut, taken by the batch entry point.
+#[test]
+fn append_lines_to_a_fresh_document_keeps_the_rope_and_blocks_in_step() {
+    let doc = TextDocument::new();
+    doc.append_lines(["alpha", "beta"]).unwrap();
+
+    assert_eq!(lines(&doc), vec!["", "alpha", "beta"]);
+    assert_eq!(doc.to_plain_text().unwrap(), "\nalpha\nbeta");
+}
+
+/// Every appended line must be reachable through the rope, including on a
+/// document that was never seeded — a desynchronized index resolves positions
+/// into the wrong block rather than failing.
+#[test]
+fn appended_lines_are_addressable_on_a_fresh_document() {
+    let doc = TextDocument::new();
+    doc.append_line("alpha").unwrap();
+    doc.append_line("beta").unwrap();
+
+    let last = doc.block_by_number(2).unwrap();
+    assert_eq!(last.text(), "beta");
+    let cursor = doc.cursor_at(last.position());
+    assert_eq!(cursor.block_number(), 2);
+    assert_eq!(cursor.position_in_block(), 0);
+}
+
 #[test]
 fn append_lines_batches() {
     let doc = TextDocument::new();
@@ -338,6 +396,149 @@ fn append_reports_a_tail_insertion() {
         seen.iter()
             .any(|e| matches!(e, DocumentEvent::BlockCountChanged(2))),
         "expected BlockCountChanged(2), got {seen:?}"
+    );
+}
+
+/// `to_plain_text()` is served from a lazily-built cache that every ordinary
+/// edit clears. Streaming bypasses the editing path, so it must clear it too —
+/// otherwise a caller that read the text *before* streaming keeps being served
+/// the old text forever, while `blocks()` reports the new one.
+///
+/// The order matters: reading first is what populates the cache, so a test that
+/// only reads afterwards cannot see this.
+#[test]
+fn reading_the_text_before_streaming_does_not_freeze_it() {
+    let doc = TextDocument::new();
+    doc.set_plain_text("first").unwrap();
+
+    // Populate the cache.
+    assert_eq!(doc.to_plain_text().unwrap(), "first");
+
+    doc.append_line("second").unwrap();
+    assert_eq!(
+        doc.to_plain_text().unwrap(),
+        "first\nsecond",
+        "appended text must be visible to a caller that had already read the \
+         document once"
+    );
+
+    doc.append_lines(["third", "fourth"]).unwrap();
+    assert_eq!(doc.to_plain_text().unwrap(), "first\nsecond\nthird\nfourth");
+
+    doc.truncate_front(2).unwrap();
+    assert_eq!(
+        doc.to_plain_text().unwrap(),
+        "third\nfourth",
+        "eviction must be visible too"
+    );
+}
+
+/// The two views of the document must never disagree, whatever order they are
+/// read in.
+#[test]
+fn plain_text_and_blocks_agree_after_streaming() {
+    let doc = TextDocument::new();
+    doc.set_plain_text("first").unwrap();
+    let _ = doc.to_plain_text().unwrap();
+
+    doc.append_line("second").unwrap();
+
+    assert_eq!(
+        doc.to_plain_text().unwrap(),
+        lines(&doc).join("\n"),
+        "to_plain_text() and blocks() must describe the same document"
+    );
+}
+
+/// A batch adds as many blocks as it has lines, and consumers size work off
+/// `blocks_affected` — a hardcoded 1 makes a view process a third of a
+/// three-line batch.
+#[test]
+fn a_batch_reports_every_block_it_added() {
+    let doc = TextDocument::new();
+    doc.set_plain_text("first").unwrap();
+    let _ = doc.poll_events();
+
+    doc.append_lines(["a", "b", "c"]).unwrap();
+
+    let changed = doc
+        .poll_events()
+        .into_iter()
+        .find_map(|e| match e {
+            DocumentEvent::ContentsChanged {
+                blocks_affected, ..
+            } => Some(blocks_affected),
+            _ => None,
+        })
+        .expect("a batch must report a content change");
+    assert_eq!(changed, 3, "three lines added means three blocks affected");
+}
+
+/// `chars_added` must describe what was actually inserted. It cannot be derived
+/// from the text alone: the separator is only written when the frame already
+/// held a block, so a fresh document's first append adds one character fewer.
+#[test]
+fn chars_added_counts_the_separator_only_when_one_was_written() {
+    // Fresh document: a separator IS needed (it already holds an empty block).
+    let fresh = TextDocument::new();
+    let _ = fresh.poll_events();
+    fresh.append_line("alpha").unwrap();
+    let with_sep = first_chars_added(&fresh);
+    assert_eq!(
+        with_sep, 6,
+        "\"alpha\" plus the separator that joins it to the empty first block"
+    );
+
+    // And the reported span must match the text the rope actually gained.
+    assert_eq!(
+        fresh.to_plain_text().unwrap().chars().count(),
+        with_sep,
+        "chars_added must equal what the document actually gained"
+    );
+}
+
+fn first_chars_added(doc: &TextDocument) -> usize {
+    doc.poll_events()
+        .into_iter()
+        .find_map(|e| match e {
+            DocumentEvent::ContentsChanged { chars_added, .. } => Some(chars_added),
+            _ => None,
+        })
+        .expect("expected a content change")
+}
+
+/// The reported edit position must be where the insertion actually began — the
+/// separator included, since that is part of what was inserted.
+#[test]
+fn the_reported_edit_position_covers_the_separator() {
+    let doc = TextDocument::new();
+    doc.set_plain_text("first").unwrap();
+    let before = doc.to_plain_text().unwrap().chars().count();
+    let _ = doc.poll_events();
+
+    doc.append_line("second").unwrap();
+
+    let (pos, added) = doc
+        .poll_events()
+        .into_iter()
+        .find_map(|e| match e {
+            DocumentEvent::ContentsChanged {
+                position,
+                chars_added,
+                ..
+            } => Some((position, chars_added)),
+            _ => None,
+        })
+        .expect("expected a content change");
+
+    assert_eq!(
+        pos, before,
+        "the insert begins at the old end of the document"
+    );
+    assert_eq!(
+        pos + added,
+        doc.to_plain_text().unwrap().chars().count(),
+        "position + chars_added must land exactly at the new end"
     );
 }
 
