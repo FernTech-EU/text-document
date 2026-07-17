@@ -198,7 +198,10 @@ fn appending_leaves_the_undo_stack_alone() {
 fn appending_alone_leaves_nothing_to_undo() {
     let doc = TextDocument::new();
     doc.set_plain_text("first").unwrap();
-    assert!(!doc.can_undo(), "precondition: a fresh document has no history");
+    assert!(
+        !doc.can_undo(),
+        "precondition: a fresh document has no history"
+    );
 
     doc.append_line("streamed").unwrap();
     doc.append_lines(["more", "and more"]).unwrap();
