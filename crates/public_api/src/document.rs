@@ -1542,7 +1542,12 @@ impl TextDocument {
         let (ok, queued) = {
             let mut inner = self.inner.lock();
             let prev_kind = inner.highlight_kind;
-            let ok = inner.highlights.set_ranges(id, ranges);
+            // The block layout the ranges are bucketed against — cheap (ids + positions, no
+            // block text) and computed before the mutable borrow of `highlights`. This is what
+            // lets `merged_spans_for_block` look up only a block's own ranges instead of
+            // scanning the whole vector per block.
+            let block_positions = crate::highlight::ordered_block_positions(&inner);
+            let ok = inner.highlights.set_ranges(id, ranges, &block_positions);
             if ok {
                 inner.recompute_highlight_kind();
                 Self::queue_highlight_changed(&mut inner, 0, 0, prev_kind);

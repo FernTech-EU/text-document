@@ -443,3 +443,187 @@ fn set_session_ranges_rejects_a_syntax_session() {
     assert!(!doc.set_session_ranges(text_document::SessionId(9999), vec![]));
     let _ = first_block_id(&doc);
 }
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// The per-block range index (B2-M1) + cached kind (B2-M2).
+//
+// The index makes a snapshot O(ranges-in-block) per block instead of O(all-ranges); these pin
+// that it changes only the *speed*, not the sliced output. The load-bearing test is the
+// differential one: it re-derives the expected per-block spans by the naive full-scan the index
+// replaced, and asserts the real snapshot matches it over many shapes.
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+/// Every block's `(absolute position, text)` from a snapshot — the geometry the naive reference
+/// slices against, read straight off the public snapshot.
+fn block_geometry(doc: &TextDocument) -> Vec<(usize, usize)> {
+    doc.snapshot_flow_masked(&HighlightMask::all())
+        .elements
+        .iter()
+        .filter_map(|e| match e {
+            FlowElementSnapshot::Block(b) => Some((b.position, b.text.chars().count())),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Every block's paint spans (block-relative), in document order — the real, indexed output.
+fn all_block_spans(doc: &TextDocument) -> Vec<Vec<PaintHighlightSpan>> {
+    doc.snapshot_flow_masked(&HighlightMask::all())
+        .elements
+        .iter()
+        .filter_map(|e| match e {
+            FlowElementSnapshot::Block(b) => Some(b.paint_highlights.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The **naive reference**, as a merge-invariant coverage set: for every block, the set of
+/// block-relative character positions that *any* range paints — computed by the full-scan clip
+/// the index replaced. Coverage (not raw spans) is the right invariant because the real snapshot
+/// runs the spans through `extract_paint_spans`, which merges overlapping/identical spans; the
+/// index must not change *which characters* end up painted, and that is exactly what this
+/// compares. (Format merging is orthogonal and covered by the other tests in this file.)
+fn naive_painted_chars(geom: &[(usize, usize)], ranges: &[RangeHighlight]) -> Vec<Vec<usize>> {
+    geom.iter()
+        .map(|&(abs_start, len)| {
+            let block_end = abs_start + len;
+            let mut covered = std::collections::BTreeSet::new();
+            for r in ranges {
+                let lo = r.start.max(abs_start);
+                let hi = r.start.saturating_add(r.length).min(block_end);
+                for c in lo..hi {
+                    covered.insert(c - abs_start);
+                }
+            }
+            covered.into_iter().collect()
+        })
+        .collect()
+}
+
+/// The characters the real, indexed snapshot paints per block (block-relative), as a set.
+fn actual_painted_chars(doc: &TextDocument) -> Vec<Vec<usize>> {
+    all_block_spans(doc)
+        .iter()
+        .map(|spans| {
+            let mut covered = std::collections::BTreeSet::new();
+            for s in spans {
+                for c in s.start..s.start + s.length {
+                    covered.insert(c);
+                }
+            }
+            covered.into_iter().collect()
+        })
+        .collect()
+}
+
+fn assert_matches_naive(doc: &TextDocument, ranges: &[RangeHighlight]) {
+    let geom = block_geometry(doc);
+    assert_eq!(
+        actual_painted_chars(doc),
+        naive_painted_chars(&geom, ranges),
+        "the indexed slicing must paint exactly the characters the naive full-scan does, \
+         ranges={ranges:?}"
+    );
+}
+
+/// Differential, the load-bearing test: over a multi-block document (text paragraphs
+/// interleaved with the empty blocks a blank line makes), the indexed slicing equals the naive
+/// full-scan for a *sweep* of absolute ranges — every start across the document, several
+/// lengths including zero, block-crossing, and past-the-end. Sweeping offsets rather than
+/// hand-picking them keeps the test independent of the exact block structure and covers the
+/// boundary-straddle / zero-length / out-of-range / cross-block cases together.
+#[test]
+fn indexed_slicing_matches_the_naive_scan_over_many_shapes() {
+    let doc = new_doc("alpha\n\nbravo\n\ncharlie\n\ndelta\n\necho\n\nfoxtrot");
+    let s = doc.add_range_session();
+    let geom = block_geometry(&doc);
+    let doc_end = geom.last().map(|&(p, l)| p + l).unwrap();
+
+    // Single-range sweep: every start 0..=doc_end+2, with a spread of lengths.
+    for start in 0..=doc_end + 2 {
+        for &length in &[0usize, 1, 3, 7, doc_end + 100] {
+            let shape = vec![RangeHighlight { start, length, format: bg(GREEN) }];
+            assert!(doc.set_session_ranges(s, shape.clone()));
+            assert_matches_naive(&doc, &shape);
+        }
+    }
+
+    // Multi-range shapes: several ranges at once, including two touching and one covering all.
+    let multi: Vec<Vec<RangeHighlight>> = vec![
+        vec![
+            RangeHighlight { start: 0, length: 2, format: bg(GREEN) },
+            RangeHighlight { start: 3, length: 2, format: bg(RED) },
+        ],
+        vec![
+            RangeHighlight { start: geom[2].0, length: geom[2].1, format: bg(BLUE) },
+            RangeHighlight { start: 0, length: doc_end + 50, format: bg(RED) },
+        ],
+    ];
+    for shape in multi {
+        assert!(doc.set_session_ranges(s, shape.clone()));
+        assert_matches_naive(&doc, &shape);
+    }
+}
+
+/// **Missing vs. stale (the index's one new failure shape).** After a push, a structural edit
+/// that lands *entirely after* every flagged range — appending a paragraph — moves no flagged
+/// range's absolute offset, so the spell producer would issue no new push. The already-flagged
+/// blocks must still render correctly (their geometry is unchanged), and the brand-new block,
+/// absent from the index, must render nothing (rather than a wrong span) until the next push.
+#[test]
+fn a_downstream_edit_without_a_push_keeps_early_blocks_correct_and_the_new_block_empty() {
+    let doc = new_doc("alpha\n\nbravo");
+    let s = doc.add_range_session();
+    // Flag "alpha" (block 0) only.
+    assert!(doc.set_session_ranges(
+        s,
+        vec![RangeHighlight { start: 0, length: 5, format: bg(GREEN) }]
+    ));
+    let before = all_block_spans(&doc);
+    assert_eq!(before[0].len(), 1, "alpha flagged");
+    assert_eq!(before[0][0].length, 5);
+    assert!(before[1].is_empty(), "bravo not flagged");
+
+    // Append a whole new paragraph at the very end — downstream of the only flagged range, so a
+    // real producer's caret-filtered set would be byte-identical and it would NOT re-push.
+    let geom = block_geometry(&doc);
+    let end = geom.last().map(|&(p, l)| p + l).unwrap();
+    doc.cursor_at(end).insert_text("\n\ngamma").unwrap();
+
+    let after = all_block_spans(&doc);
+    assert_eq!(after[0].len(), 1, "alpha's squiggle survives an unrelated downstream edit");
+    assert_eq!(after[0][0].start, 0);
+    assert_eq!(after[0][0].length, 5);
+    assert!(after.len() >= 3, "the new paragraph exists as its own block");
+    assert!(
+        after.last().unwrap().is_empty(),
+        "the freshly-created block is absent from the index → it shows nothing (missing, not a \
+         stale span) until the next push"
+    );
+}
+
+/// A push against a document whose blocks all shifted forward re-buckets correctly: after
+/// prepending text, flagging by fresh absolute offsets lands the span in the right block.
+#[test]
+fn a_push_after_an_edit_buckets_against_the_new_layout() {
+    let doc = new_doc("alpha\n\nbravo");
+    let s = doc.add_range_session();
+    // Prepend to block 0 so every later block's absolute start shifts.
+    doc.cursor_at(0).insert_text("XX ").unwrap(); // "XX alpha\n\nbravo"
+
+    let geom = block_geometry(&doc);
+    // Flag "bravo" (the LAST block; a blank line leaves an empty block between it and block 0)
+    // at its NEW absolute start.
+    let bravo = geom.last().unwrap().0;
+    assert!(doc.set_session_ranges(
+        s,
+        vec![RangeHighlight { start: bravo, length: 5, format: bg(RED) }]
+    ));
+    let spans = all_block_spans(&doc);
+    assert!(spans[0].is_empty(), "block 0 (alpha) has no flag");
+    let last = spans.last().unwrap();
+    assert_eq!(last.len(), 1, "bravo flagged in its shifted block");
+    assert_eq!(last[0].start, 0, "at block-relative 0");
+    assert_eq!(last[0].length, 5);
+}

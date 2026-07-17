@@ -287,9 +287,31 @@ pub(crate) struct SyntaxSession {
 }
 
 /// A **range session**: absolute-offset ranges, set wholesale by the host and sliced to
-/// per-block spans on demand. No callback, no cascade — used for find and (later) spell.
+/// per-block spans on demand. No callback, no cascade — used for find and spell.
+///
+/// The ranges carry a **per-block index** and a **cached kind**, both built once by
+/// [`set_ranges`](HighlightRegistry::set_ranges) from the document's block layout at push time.
+/// They replace two per-query full scans of the whole range vector that made a snapshot
+/// O(blocks × ranges): a spell-check of a Lorem-Ipsum-dense document flags one range per word
+/// (tens of thousands of them), and *every* block used to walk *all* of them.
 pub(crate) struct RangeSession {
     pub ranges: Vec<RangeHighlight>,
+    /// `block_id → indices into `ranges` that overlap that block`, at the block layout of the
+    /// last push. A block **absent** from the map has no ranges for this session.
+    ///
+    /// Freshness: the ranges' absolute offsets and this index are a matched snapshot of one
+    /// push. If the document is edited *without* a following push, both go stale together — the
+    /// same window the un-indexed code already had (it, too, clipped last-push absolute ranges
+    /// against fresh geometry). The one new shape is **missing vs. stale**: a block *created*
+    /// since the last push has no key here, so it shows nothing (rather than a stale span) until
+    /// the next push rebuilds the index. For the spell producer a structural edit re-tokenises
+    /// and re-pushes on the next frame, closing the window; a brand-new empty block has nothing
+    /// to flag anyway.
+    block_index: HashMap<usize, Vec<u32>>,
+    /// The session's [`HighlighterKind`], computed in the same pass as `block_index` so
+    /// [`effective_kind`](HighlightRegistry::effective_kind) is O(1) per session instead of a
+    /// full range scan on every snapshot root.
+    kind: HighlighterKind,
 }
 
 /// The two session shapes.
@@ -344,18 +366,30 @@ impl HighlightRegistry {
         let id = self.alloc_id();
         self.sessions.push(Session {
             id,
-            body: SessionBody::Range(RangeSession { ranges: Vec::new() }),
+            body: SessionBody::Range(RangeSession {
+                ranges: Vec::new(),
+                block_index: HashMap::new(),
+                kind: HighlighterKind::None,
+            }),
         });
         id
     }
 
-    /// Replace a range session's ranges. Returns `false` if `id` is not a range session (or
-    /// does not exist) — a caller handing ranges to a syntax session is a bug, not a silent
-    /// no-op to swallow.
-    pub(crate) fn set_ranges(&mut self, id: SessionId, ranges: Vec<RangeHighlight>) -> bool {
+    /// Replace a range session's ranges, building its per-block index and cached kind from the
+    /// document's `block_positions` (each `(block_id, absolute_char_start)`, sorted by start).
+    /// Returns `false` if `id` is not a range session (or does not exist) — a caller handing
+    /// ranges to a syntax session is a bug, not a silent no-op to swallow.
+    pub(crate) fn set_ranges(
+        &mut self,
+        id: SessionId,
+        ranges: Vec<RangeHighlight>,
+        block_positions: &[(u64, usize)],
+    ) -> bool {
         for s in &mut self.sessions {
             if s.id == id {
                 if let SessionBody::Range(r) = &mut s.body {
+                    r.kind = compute_range_kind(&ranges);
+                    r.block_index = build_block_index(&ranges, block_positions);
                     r.ranges = ranges;
                     return true;
                 }
@@ -465,10 +499,12 @@ fn syntax_session_kind(s: &SyntaxSession) -> HighlighterKind {
     }
 }
 
-/// The kind of one range session, from its ranges' formats.
-fn range_session_kind(s: &RangeSession) -> HighlighterKind {
+/// The kind a set of ranges implies, from their formats. Computed **once** at
+/// [`set_ranges`](HighlightRegistry::set_ranges) time and cached on the [`RangeSession`], so
+/// [`effective_kind`](HighlightRegistry::effective_kind) never rescans the whole vector.
+fn compute_range_kind(ranges: &[RangeHighlight]) -> HighlighterKind {
     let mut any = false;
-    for r in &s.ranges {
+    for r in ranges {
         if format_touches_metrics(&r.format) {
             return HighlighterKind::Metric;
         }
@@ -479,6 +515,52 @@ fn range_session_kind(s: &RangeSession) -> HighlighterKind {
     } else {
         HighlighterKind::None
     }
+}
+
+/// Bucket each range into every block it overlaps, from the document's block layout at push
+/// time (`block_positions` = each `(block_id, absolute_char_start)`, **sorted by start**).
+///
+/// A block spans `[start_i, start_{i+1})` in absolute char space (the last runs to `MAX`); a
+/// range is bucketed into a block when their half-open spans intersect. Almost always that is a
+/// single block — the spell/find producers emit ranges within one paragraph — but a range that
+/// happens to straddle a boundary is added to **every** block it touches, so the per-block clip
+/// downstream sees it in each, exactly as the old full scan did.
+fn build_block_index(
+    ranges: &[RangeHighlight],
+    block_positions: &[(u64, usize)],
+) -> HashMap<usize, Vec<u32>> {
+    let mut index: HashMap<usize, Vec<u32>> = HashMap::new();
+    if block_positions.is_empty() {
+        return index;
+    }
+    for (ri, r) in ranges.iter().enumerate() {
+        let r_end = r.start.saturating_add(r.length); // exclusive
+        // The block containing `r.start`: the last block whose start <= r.start.
+        let mut bi = match block_positions.binary_search_by_key(&r.start, |&(_, p)| p) {
+            Ok(i) => i,
+            Err(i) => i.saturating_sub(1),
+        };
+        // Walk forward over every block the range still overlaps.
+        while bi < block_positions.len() {
+            let b_start = block_positions[bi].1;
+            if b_start >= r_end {
+                break; // this block (and all later ones) start past the range
+            }
+            let b_end = block_positions
+                .get(bi + 1)
+                .map(|&(_, p)| p)
+                .unwrap_or(usize::MAX);
+            // Half-open intersection [b_start, b_end) ∩ [r.start, r_end).
+            if r.start < b_end && b_start < r_end {
+                index
+                    .entry(block_positions[bi].0 as usize)
+                    .or_default()
+                    .push(ri as u32);
+            }
+            bi += 1;
+        }
+    }
+    index
 }
 
 impl HighlightRegistry {
@@ -497,7 +579,7 @@ impl HighlightRegistry {
             }
             let k = match &s.body {
                 SessionBody::Syntax(syn) => syntax_session_kind(syn),
-                SessionBody::Range(r) => range_session_kind(r),
+                SessionBody::Range(r) => r.kind, // cached at set_ranges — no rescan
             };
             kind = kind.join(k);
             if kind == HighlighterKind::Metric {
@@ -867,7 +949,7 @@ fn ordered_block_ids(inner: &TextDocumentInner) -> Vec<(u64, String)> {
 /// Every block's id + absolute char start (`document_position`), sorted — **without**
 /// materializing any block text. This is the cheap sibling of [`ordered_block_ids`]; the
 /// double full-document scan it exists to prevent is described on [`TextDocumentInner::rehighlight_affected`].
-fn ordered_block_positions(inner: &TextDocumentInner) -> Vec<(u64, usize)> {
+pub(crate) fn ordered_block_positions(inner: &TextDocumentInner) -> Vec<(u64, usize)> {
     let mut blocks = block_commands::get_all_block(&inner.ctx).unwrap_or_default();
     let store = inner.ctx.db_context.get_store();
     crate::inner::refresh_block_positions(&mut blocks, store);
@@ -925,15 +1007,19 @@ pub(crate) fn merged_spans_for_block(
                 }
             }
             SessionBody::Range(r) => {
-                if r.ranges.is_empty() {
+                // Only the ranges the index says touch this block — O(ranges-in-block), not
+                // O(all-ranges). A block absent from the index (empty bucket) contributes
+                // nothing; see [`RangeSession::block_index`] on the missing-vs-stale window.
+                let Some(indices) = r.block_index.get(&block_id) else {
                     continue;
-                }
+                };
                 let (abs_start, len) = *geom.get_or_insert_with(|| block_geometry(inner, block_id));
                 let block_end = abs_start + len;
-                for rng in &r.ranges {
-                    // Saturating: a range session's offsets come from the host (a future
-                    // externally-driven spell-checker included), so a wild `start + length`
-                    // must clamp, not overflow-panic in debug / wrap in release.
+                for &ri in indices {
+                    let rng = &r.ranges[ri as usize];
+                    // Saturating: a range session's offsets come from the host (an externally
+                    // driven spell-checker included), so a wild `start + length` must clamp, not
+                    // overflow-panic in debug / wrap in release.
                     let lo = rng.start.max(abs_start);
                     let hi = rng.start.saturating_add(rng.length).min(block_end);
                     if lo < hi {
@@ -1110,5 +1196,127 @@ impl TextDocumentInner {
             .unwrap_or_else(|| positions[0].0 as usize);
 
         self.rehighlight_from_block(target_bid);
+    }
+}
+
+#[cfg(test)]
+mod index_tests {
+    use super::*;
+
+    fn paint(start: usize, length: usize) -> RangeHighlight {
+        RangeHighlight {
+            start,
+            length,
+            format: HighlightFormat {
+                background_color: Some(crate::Color { red: 255, green: 0, blue: 0, alpha: 255 }),
+                ..Default::default()
+            },
+        }
+    }
+
+    fn metric(start: usize, length: usize) -> RangeHighlight {
+        RangeHighlight {
+            start,
+            length,
+            format: HighlightFormat { font_bold: Some(true), ..Default::default() },
+        }
+    }
+
+    // ── compute_range_kind (B2-M2): the cached kind matches the old per-range classification ──
+
+    #[test]
+    fn kind_is_none_when_nothing_paints() {
+        assert_eq!(compute_range_kind(&[]), HighlighterKind::None);
+        // A zero-length paint range colours nothing → None.
+        assert_eq!(compute_range_kind(&[paint(3, 0)]), HighlighterKind::None);
+    }
+
+    #[test]
+    fn kind_is_paint_only_for_a_background_range() {
+        assert_eq!(compute_range_kind(&[paint(0, 4)]), HighlighterKind::PaintOnly);
+    }
+
+    #[test]
+    fn kind_is_metric_when_any_range_touches_metrics() {
+        // One metric range among paint ones lifts the whole session to Metric (a bold run
+        // reshapes, so the view must take the reshape path).
+        assert_eq!(
+            compute_range_kind(&[paint(0, 2), metric(4, 3), paint(8, 1)]),
+            HighlighterKind::Metric
+        );
+    }
+
+    #[test]
+    fn set_ranges_caches_the_kind_read_back_by_effective_kind() {
+        let mut reg = HighlightRegistry::default();
+        let id = reg.add_range();
+        let positions = [(0u64, 0usize)];
+        assert_eq!(reg.effective_kind(&HighlightMask::all()), HighlighterKind::None);
+
+        reg.set_ranges(id, vec![paint(0, 5)], &positions);
+        assert_eq!(reg.effective_kind(&HighlightMask::all()), HighlighterKind::PaintOnly);
+
+        reg.set_ranges(id, vec![metric(0, 5)], &positions);
+        assert_eq!(
+            reg.effective_kind(&HighlightMask::all()),
+            HighlighterKind::Metric,
+            "the cached kind updates on every push"
+        );
+    }
+
+    // ── build_block_index: bucketing ──
+
+    /// Blocks at 0, 10, 20 (each 10 wide). Ranges land in the block(s) they overlap.
+    fn three_blocks() -> Vec<(u64, usize)> {
+        vec![(100, 0), (101, 10), (102, 20)]
+    }
+
+    fn bucket(index: &std::collections::HashMap<usize, Vec<u32>>, block: usize) -> Vec<u32> {
+        index.get(&block).cloned().unwrap_or_default()
+    }
+
+    #[test]
+    fn a_range_lands_only_in_its_own_block() {
+        let idx = build_block_index(&[paint(12, 3)], &three_blocks());
+        assert_eq!(bucket(&idx, 101), vec![0], "12..15 is inside block 101 [10,20)");
+        assert!(bucket(&idx, 100).is_empty());
+        assert!(bucket(&idx, 102).is_empty());
+    }
+
+    #[test]
+    fn a_straddling_range_lands_in_every_block_it_touches() {
+        // 8..22 spans blocks 100 [0,10), 101 [10,20), 102 [20,∞).
+        let idx = build_block_index(&[paint(8, 14)], &three_blocks());
+        assert_eq!(bucket(&idx, 100), vec![0]);
+        assert_eq!(bucket(&idx, 101), vec![0]);
+        assert_eq!(bucket(&idx, 102), vec![0]);
+    }
+
+    #[test]
+    fn a_zero_length_range_buckets_into_its_block_but_paints_nothing() {
+        // A degenerate zero-length range still buckets into the block that contains its point
+        // (here 101), which is harmless: the per-block clip drops it (lo == hi), so it paints
+        // nothing — proven end-to-end by the coverage differential in the integration tests.
+        // It must not scatter into other blocks.
+        let idx = build_block_index(&[paint(12, 0)], &three_blocks());
+        assert_eq!(bucket(&idx, 101), vec![0]);
+        assert!(bucket(&idx, 100).is_empty());
+        assert!(bucket(&idx, 102).is_empty());
+    }
+
+    #[test]
+    fn an_out_of_range_start_is_bucketed_into_the_last_block_only_if_it_overlaps() {
+        // start far past the end: only the last (unbounded) block could contain it, and it does
+        // — the last block runs to usize::MAX — so it buckets there. That is harmless: the
+        // per-block clip against real geometry drops it (start > block_end).
+        let idx = build_block_index(&[paint(9999, 3)], &three_blocks());
+        assert_eq!(bucket(&idx, 102), vec![0], "the unbounded last block is the only candidate");
+        assert!(bucket(&idx, 100).is_empty());
+        assert!(bucket(&idx, 101).is_empty());
+    }
+
+    #[test]
+    fn empty_positions_yields_an_empty_index() {
+        assert!(build_block_index(&[paint(0, 5)], &[]).is_empty());
     }
 }
