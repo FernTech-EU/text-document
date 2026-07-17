@@ -187,6 +187,13 @@ impl TextDocument {
             flow_index: new_count - 1,
             count: 1,
         });
+
+        // Notify `on_change` subscribers, like every other mutation — the poll
+        // path alone would leave callback-based observers (a reactive view) blind
+        // to appends. Dispatch outside the lock: a callback may re-enter.
+        let queued = inner.take_queued_events();
+        drop(inner);
+        crate::inner::dispatch_queued_events(queued);
         Ok(new_count)
     }
 
@@ -249,6 +256,12 @@ impl TextDocument {
             flow_index: new_count - lines.len(),
             count: lines.len(),
         });
+
+        // Dispatch to `on_change` subscribers (outside the lock — a callback may
+        // re-enter), the same as an ordinary edit.
+        let queued = inner.take_queued_events();
+        drop(inner);
+        crate::inner::dispatch_queued_events(queued);
         Ok(new_count)
     }
 
@@ -369,6 +382,12 @@ impl TextDocument {
             flow_index: 0,
             count: removed,
         });
+
+        // Dispatch to `on_change` subscribers (outside the lock — a callback may
+        // re-enter), the same as an ordinary edit.
+        let queued = inner.take_queued_events();
+        drop(inner);
+        crate::inner::dispatch_queued_events(queued);
         Ok(removed)
     }
 }

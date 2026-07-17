@@ -649,3 +649,60 @@ fn truncation_reports_a_front_removal() {
         "expected a front removal of 2, got {seen:?}"
     );
 }
+
+// ── on_change delivery ──────────────────────────────────────────
+
+/// Streaming appends must reach `on_change` subscribers, not only the
+/// `poll_events` path — a reactive view (the `LogView` in Bastyde) drives its
+/// updates off a callback, and before the dispatch was wired it saw nothing at
+/// all while `block_count()` grew underneath it.
+#[test]
+fn appends_notify_on_change_subscribers() {
+    use std::sync::{Arc, Mutex};
+
+    let doc = TextDocument::new();
+    let seen: Arc<Mutex<Vec<DocumentEvent>>> = Arc::new(Mutex::new(Vec::new()));
+    let sink = seen.clone();
+    let _sub = doc.on_change(move |e| sink.lock().unwrap().push(e));
+
+    doc.append_line("one").unwrap();
+    doc.append_lines(["two", "three"]).unwrap();
+
+    let got = seen.lock().unwrap();
+    assert!(
+        got.iter()
+            .any(|e| matches!(e, DocumentEvent::BlockCountChanged(_))),
+        "append must fire a BlockCountChanged to on_change, got {got:?}"
+    );
+    assert!(
+        got.iter()
+            .any(|e| matches!(e, DocumentEvent::FlowElementsInserted { .. })),
+        "append must fire a FlowElementsInserted to on_change, got {got:?}"
+    );
+}
+
+/// Front-truncation likewise reaches `on_change`.
+#[test]
+fn truncation_notifies_on_change_subscribers() {
+    use std::sync::{Arc, Mutex};
+
+    let doc = TextDocument::new();
+    doc.set_plain_text("a\nb\nc\nd").unwrap();
+    let seen: Arc<Mutex<Vec<DocumentEvent>>> = Arc::new(Mutex::new(Vec::new()));
+    let sink = seen.clone();
+    let _sub = doc.on_change(move |e| sink.lock().unwrap().push(e));
+
+    doc.truncate_front(2).unwrap();
+
+    let got = seen.lock().unwrap();
+    assert!(
+        got.iter().any(|e| matches!(
+            e,
+            DocumentEvent::FlowElementsRemoved {
+                flow_index: 0,
+                count: 2
+            }
+        )),
+        "truncate_front must fire a FlowElementsRemoved to on_change, got {got:?}"
+    );
+}
