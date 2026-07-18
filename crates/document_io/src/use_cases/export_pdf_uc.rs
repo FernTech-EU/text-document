@@ -83,7 +83,11 @@ impl LongOperation for ExportPdfUseCase {
         let uow = self.uow_factory.create();
         uow.begin_transaction()?;
 
-        let build_result = self.build_markup(&*uow, progress_callback.as_ref(), Some(cancel_flag.as_ref()));
+        let build_result = self.build_markup(
+            &*uow,
+            progress_callback.as_ref(),
+            Some(cancel_flag.as_ref()),
+        );
 
         uow.end_transaction()?;
 
@@ -217,7 +221,11 @@ impl ExportPdfUseCase {
             let pct = 10.0 + (frame_idx as f32 / total_frames as f32) * 70.0;
             progress_callback(OperationProgress::new(
                 pct,
-                Some(format!("Processing frame {}/{}", frame_idx + 1, total_frames)),
+                Some(format!(
+                    "Processing frame {}/{}",
+                    frame_idx + 1,
+                    total_frames
+                )),
             ));
         }
 
@@ -273,7 +281,11 @@ impl ExportPdfUseCase {
         let mut blocks: Vec<Block> = blocks_opt.into_iter().flatten().collect();
         blocks.sort_by_key(|b| b.document_position);
 
-        Ok(render_blocks_typst(&uow.store(), &blocks, &self.dto.options))
+        Ok(render_blocks_typst(
+            &uow.store(),
+            &blocks,
+            &self.dto.options,
+        ))
     }
 
     /// Walk `child_order` entries: positive values are block IDs, negative values are negated
@@ -301,7 +313,8 @@ impl ExportPdfUseCase {
                 // Negative: negated sub-frame ID
                 // First, flush any accumulated blocks
                 if !pending_blocks.is_empty() {
-                    let typst = render_blocks_typst(&uow.store(), &pending_blocks, &self.dto.options);
+                    let typst =
+                        render_blocks_typst(&uow.store(), &pending_blocks, &self.dto.options);
                     if !typst.is_empty() {
                         parts.push(typst);
                     }
@@ -355,4 +368,3 @@ fn check_cancelled(cancel_flag: Option<&AtomicBool>) -> Result<()> {
     }
     Ok(())
 }
-

@@ -1,6 +1,6 @@
 //! Pure word/character counting over `&str` — no document, no store, no threads.
 //!
-//! Mirrors [`djot_to_plain_text`](crate::parser_tools::content_parser::djot_to_plain_text)
+//! Mirrors [`djot_to_plain_text`]
 //! and the search matcher's shape: a cheap primitive over `&str` with the *policy*
 //! (which counting method) passed in as a parameter, so a host app can count a manuscript
 //! of thousands of scenes without importing each one into a document.
@@ -65,7 +65,11 @@ pub fn count(text: &str, method: CountMethod) -> WordCharCounts {
             cjk + non_cjk_words
         }
     };
-    WordCharCounts { words, chars_with_spaces, chars_without_spaces }
+    WordCharCounts {
+        words,
+        chars_with_spaces,
+        chars_without_spaces,
+    }
 }
 
 /// Extract prose from Djot source, then count. The two-step (strip then count) is kept
@@ -73,7 +77,10 @@ pub fn count(text: &str, method: CountMethod) -> WordCharCounts {
 /// sentinel, single-`\n` block joins) and fusing the parse-and-count into one AST walk is
 /// the easiest way to accidentally create a third, silently-diverging "what is the text".
 pub fn count_djot(djot: &str, method: CountMethod) -> WordCharCounts {
-    count(&djot_to_plain_text(djot, &DjotImportOptions::default()), method)
+    count(
+        &djot_to_plain_text(djot, &DjotImportOptions::default()),
+        method,
+    )
 }
 
 /// Han ideographs (incl. common extensions & compatibility) and Japanese kana. Excludes
@@ -97,7 +104,11 @@ mod tests {
 
     #[test]
     fn empty_and_whitespace_only() {
-        for m in [CountMethod::WhitespaceSplit, CountMethod::UnicodeWords, CountMethod::CjkHybrid] {
+        for m in [
+            CountMethod::WhitespaceSplit,
+            CountMethod::UnicodeWords,
+            CountMethod::CjkHybrid,
+        ] {
             assert_eq!(count("", m).words, 0);
             assert_eq!(count("   \n\t ", m).words, 0);
         }
@@ -126,7 +137,11 @@ mod tests {
     #[test]
     fn char_counts_ignore_method() {
         let text = "one two";
-        for m in [CountMethod::WhitespaceSplit, CountMethod::UnicodeWords, CountMethod::CjkHybrid] {
+        for m in [
+            CountMethod::WhitespaceSplit,
+            CountMethod::UnicodeWords,
+            CountMethod::CjkHybrid,
+        ] {
             let c = count(text, m);
             assert_eq!(c.chars_with_spaces, 7);
             assert_eq!(c.chars_without_spaces, 6);
@@ -164,7 +179,11 @@ mod tests {
     fn count_djot_matches_count_over_extracted_plain_text() {
         let djot = "# Title\n\nA *bold* word and some prose.";
         let plain = djot_to_plain_text(djot, &DjotImportOptions::default());
-        for m in [CountMethod::WhitespaceSplit, CountMethod::UnicodeWords, CountMethod::CjkHybrid] {
+        for m in [
+            CountMethod::WhitespaceSplit,
+            CountMethod::UnicodeWords,
+            CountMethod::CjkHybrid,
+        ] {
             assert_eq!(count_djot(djot, m), count(&plain, m));
         }
     }

@@ -543,7 +543,11 @@ fn indexed_slicing_matches_the_naive_scan_over_many_shapes() {
     // Single-range sweep: every start 0..=doc_end+2, with a spread of lengths.
     for start in 0..=doc_end + 2 {
         for &length in &[0usize, 1, 3, 7, doc_end + 100] {
-            let shape = vec![RangeHighlight { start, length, format: bg(GREEN) }];
+            let shape = vec![RangeHighlight {
+                start,
+                length,
+                format: bg(GREEN),
+            }];
             assert!(doc.set_session_ranges(s, shape.clone()));
             assert_matches_naive(&doc, &shape);
         }
@@ -552,12 +556,28 @@ fn indexed_slicing_matches_the_naive_scan_over_many_shapes() {
     // Multi-range shapes: several ranges at once, including two touching and one covering all.
     let multi: Vec<Vec<RangeHighlight>> = vec![
         vec![
-            RangeHighlight { start: 0, length: 2, format: bg(GREEN) },
-            RangeHighlight { start: 3, length: 2, format: bg(RED) },
+            RangeHighlight {
+                start: 0,
+                length: 2,
+                format: bg(GREEN),
+            },
+            RangeHighlight {
+                start: 3,
+                length: 2,
+                format: bg(RED),
+            },
         ],
         vec![
-            RangeHighlight { start: geom[2].0, length: geom[2].1, format: bg(BLUE) },
-            RangeHighlight { start: 0, length: doc_end + 50, format: bg(RED) },
+            RangeHighlight {
+                start: geom[2].0,
+                length: geom[2].1,
+                format: bg(BLUE),
+            },
+            RangeHighlight {
+                start: 0,
+                length: doc_end + 50,
+                format: bg(RED),
+            },
         ],
     ];
     for shape in multi {
@@ -578,7 +598,11 @@ fn a_downstream_edit_without_a_push_keeps_early_blocks_correct_and_the_new_block
     // Flag "alpha" (block 0) only.
     assert!(doc.set_session_ranges(
         s,
-        vec![RangeHighlight { start: 0, length: 5, format: bg(GREEN) }]
+        vec![RangeHighlight {
+            start: 0,
+            length: 5,
+            format: bg(GREEN)
+        }]
     ));
     let before = all_block_spans(&doc);
     assert_eq!(before[0].len(), 1, "alpha flagged");
@@ -592,10 +616,17 @@ fn a_downstream_edit_without_a_push_keeps_early_blocks_correct_and_the_new_block
     doc.cursor_at(end).insert_text("\n\ngamma").unwrap();
 
     let after = all_block_spans(&doc);
-    assert_eq!(after[0].len(), 1, "alpha's squiggle survives an unrelated downstream edit");
+    assert_eq!(
+        after[0].len(),
+        1,
+        "alpha's squiggle survives an unrelated downstream edit"
+    );
     assert_eq!(after[0][0].start, 0);
     assert_eq!(after[0][0].length, 5);
-    assert!(after.len() >= 3, "the new paragraph exists as its own block");
+    assert!(
+        after.len() >= 3,
+        "the new paragraph exists as its own block"
+    );
     assert!(
         after.last().unwrap().is_empty(),
         "the freshly-created block is absent from the index → it shows nothing (missing, not a \
@@ -618,7 +649,11 @@ fn a_push_after_an_edit_buckets_against_the_new_layout() {
     let bravo = geom.last().unwrap().0;
     assert!(doc.set_session_ranges(
         s,
-        vec![RangeHighlight { start: bravo, length: 5, format: bg(RED) }]
+        vec![RangeHighlight {
+            start: bravo,
+            length: 5,
+            format: bg(RED)
+        }]
     ));
     let spans = all_block_spans(&doc);
     assert!(spans[0].is_empty(), "block 0 (alpha) has no flag");

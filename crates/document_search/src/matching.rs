@@ -25,12 +25,12 @@
 //!
 //! ## And a match must not begin or end inside a letter
 //!
-//! Because one source char can fold to several ([`Folded`]), a substring of the folded text
+//! Because one source char can fold to several (`Folded`), a substring of the folded text
 //! is not necessarily a substring of anything the writer typed. `Straße` folds to
 //! `strasse`, so a naive scan finds `s` in the middle of the `ß`. There is no source range
 //! to report for half a letter, and replacing it would produce mojibake. Every match is
 //! therefore checked against the index map and **rejected unless it begins and ends on a
-//! source-char boundary** — see [`Folded::to_source_match`].
+//! source-char boundary** — see `Folded::to_source_match`.
 
 use std::cmp::Ordering;
 use std::sync::OnceLock;

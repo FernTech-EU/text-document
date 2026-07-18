@@ -220,7 +220,10 @@ pub fn export_pdf(ctx: &AppContext, dto: &ExportPdfDto) -> Result<String> {
 
 /// Get the progress of a export_pdf operation
 pub fn get_export_pdf_progress(ctx: &AppContext, operation_id: &str) -> Option<OperationProgress> {
-    document_io_controller::get_export_pdf_progress(&ctx.long_operation_manager.lock(), operation_id)
+    document_io_controller::get_export_pdf_progress(
+        &ctx.long_operation_manager.lock(),
+        operation_id,
+    )
 }
 
 /// Get the result of a export_pdf operation

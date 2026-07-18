@@ -60,7 +60,10 @@ fn sync_reports_the_same_block_count_as_async() {
         let async_doc = TextDocument::new();
         let async_count = async_doc.set_djot(src).unwrap().wait().unwrap().block_count;
 
-        assert_eq!(sync_count, async_count, "block_count divergence for {src:?}");
+        assert_eq!(
+            sync_count, async_count,
+            "block_count divergence for {src:?}"
+        );
     }
 }
 

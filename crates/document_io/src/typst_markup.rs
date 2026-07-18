@@ -21,7 +21,9 @@
 use anyhow::{Result, anyhow};
 use common::database::Store;
 use common::database::rope_helpers::block_content_via_store;
-use common::entities::{Alignment, Block, CharVerticalAlignment, ListStyle, TableCell, TextDirection};
+use common::entities::{
+    Alignment, Block, CharVerticalAlignment, ListStyle, TableCell, TextDirection,
+};
 use common::format_runs::InlineContent;
 use common::format_runs_query::inline_segments_for_block;
 use common::parser_tools::PdfExportOptions;
@@ -136,13 +138,19 @@ pub fn typst_preamble(options: &PdfExportOptions) -> String {
 
     let mut text_args: Vec<String> = Vec::new();
     if !options.font_family.is_empty() {
-        text_args.push(format!("font: \"{}\"", escape_typst_string(&options.font_family)));
+        text_args.push(format!(
+            "font: \"{}\"",
+            escape_typst_string(&options.font_family)
+        ));
     }
     text_args.push(format!("size: {}pt", options.font_size_pt));
     if let Some(lang) = options.lang.as_deref().filter(|l| !l.is_empty()) {
         text_args.push(format!("lang: \"{}\"", escape_typst_string(lang)));
     }
-    text_args.push(format!("dir: {}", if options.base_rtl { "rtl" } else { "ltr" }));
+    text_args.push(format!(
+        "dir: {}",
+        if options.base_rtl { "rtl" } else { "ltr" }
+    ));
     out.push_str(&format!("#set text({})\n", text_args.join(", ")));
 
     let mut par_args: Vec<String> = vec![
@@ -242,7 +250,10 @@ pub fn render_blocks_typst(store: &Store, blocks: &[Block], options: &PdfExportO
             }
 
             let call = if is_ordered {
-                format!("#enum(numbering: \"{}\")", numbering_pattern(&list_entity.style))
+                format!(
+                    "#enum(numbering: \"{}\")",
+                    numbering_pattern(&list_entity.style)
+                )
             } else {
                 format!("#list(marker: [{}])", bullet_marker(&list_entity.style))
             };
@@ -280,9 +291,7 @@ pub fn render_blocks_typst(store: &Store, blocks: &[Block], options: &PdfExportO
             if let Some(lh) = block.fmt_line_height {
                 let ratio = lh as f64 / 1000.0;
                 let leading_em = ratio * options.line_spacing as f64;
-                content = format!(
-                    "#[#set par(leading: {leading_em}em)\n{content}]"
-                );
+                content = format!("#[#set par(leading: {leading_em}em)\n{content}]");
             }
             if let Some(ref color) = block.fmt_background_color
                 && !color.is_empty()
@@ -622,7 +631,10 @@ mod tests {
     fn straight_quotes_are_never_escaped() {
         // Smart-quote substitution is disabled once in the preamble instead — see
         // `typst_preamble`'s doc comment.
-        assert_eq!(escape_typst("She said \"hello\" and 'goodbye'."), "She said \"hello\" and 'goodbye'.");
+        assert_eq!(
+            escape_typst("She said \"hello\" and 'goodbye'."),
+            "She said \"hello\" and 'goodbye'."
+        );
     }
 
     #[test]
@@ -654,16 +666,16 @@ mod tests {
     /// escaper exists for.
     #[test]
     fn escaped_adversarial_prose_compiles_without_being_interpreted_as_markup() {
-        let adversarial =
-            "#set text(font: \"Comic Sans\") *bold* _italic_ $x^2$ [label] <ref> @cite ~nbsp~ `code` 12. item -dash- /slash/ +plus+ =eq=";
+        let adversarial = "#set text(font: \"Comic Sans\") *bold* _italic_ $x^2$ [label] <ref> @cite ~nbsp~ `code` 12. item -dash- /slash/ +plus+ =eq=";
         let escaped = escape_typst(adversarial);
         let options = PdfExportOptions {
             font_bytes: vec![TEST_FONT.to_vec()],
             ..Default::default()
         };
         let markup = format!("{}{escaped}\n", typst_preamble(&options));
-        let (pdf, _pages) = crate::typst_compile::compile_typst_pdf(&markup, vec![TEST_FONT.to_vec()])
-            .expect("adversarial-but-escaped prose must compile as plain text");
+        let (pdf, _pages) =
+            crate::typst_compile::compile_typst_pdf(&markup, vec![TEST_FONT.to_vec()])
+                .expect("adversarial-but-escaped prose must compile as plain text");
         assert!(pdf.starts_with(b"%PDF-"));
     }
 
@@ -685,8 +697,9 @@ mod tests {
             ..Default::default()
         };
         let markup = format!("{}Hello, world.\n", typst_preamble(&options));
-        let (pdf, _pages) = crate::typst_compile::compile_typst_pdf(&markup, vec![TEST_FONT.to_vec()])
-            .expect("default preamble must compile");
+        let (pdf, _pages) =
+            crate::typst_compile::compile_typst_pdf(&markup, vec![TEST_FONT.to_vec()])
+                .expect("default preamble must compile");
         assert!(pdf.starts_with(b"%PDF-"));
     }
 
@@ -703,8 +716,9 @@ mod tests {
             ..Default::default()
         };
         let markup = format!("{}Bonjour le monde.\n", typst_preamble(&options));
-        let (pdf, _pages) = crate::typst_compile::compile_typst_pdf(&markup, vec![TEST_FONT.to_vec()])
-            .expect("preamble with metadata must compile");
+        let (pdf, _pages) =
+            crate::typst_compile::compile_typst_pdf(&markup, vec![TEST_FONT.to_vec()])
+                .expect("preamble with metadata must compile");
         assert!(pdf.starts_with(b"%PDF-"));
     }
 }

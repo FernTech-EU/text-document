@@ -972,7 +972,7 @@ impl TextDocument {
     /// The generalization of the plain / without-highlights pair: `all()` shows every session,
     /// `none()` shows none, and `only([...])` shows a chosen set — which is how two panes over
     /// one shared document carry different find sessions. The effective
-    /// [`HighlighterKind`](crate::highlight) is resolved **once here**, at the snapshot root,
+    /// `HighlighterKind` is resolved **once here**, at the snapshot root,
     /// and threaded down, so a view showing only paint-only sessions never pays the reshape
     /// path for a metric session it does not show.
     pub fn snapshot_flow_masked(
@@ -1043,7 +1043,7 @@ impl TextDocument {
     /// Replace occurrences. Returns the number of replacements. Undoable.
     ///
     /// `options` carries both how to find the text and — via
-    /// [`ReplaceOptions::format_policy`] — what the replacement wears where it
+    /// [`crate::ReplaceOptions::format_policy`] — what the replacement wears where it
     /// overwrites formatted prose. The default drops the formatting under the replaced
     /// range, which is fine for plain text and destructive for a rename that lands on a
     /// partly-bold name; pass a different policy when that matters.
@@ -1522,7 +1522,7 @@ impl TextDocument {
     }
 
     /// Register a **syntax session** — a [`SyntaxHighlighter`](crate::SyntaxHighlighter)
-    /// callback with its own per-block state cascade — and return its [`SessionId`].
+    /// callback with its own per-block state cascade — and return its [`crate::SessionId`].
     ///
     /// Unlike [`set_syntax_highlighter`](Self::set_syntax_highlighter), this **adds** rather
     /// than replaces: a document can carry a syntax highlighter and a spell-checker at once,
@@ -1547,7 +1547,7 @@ impl TextDocument {
 
     /// Register an empty **range session** — absolute-offset ranges set with
     /// [`set_session_ranges`](Self::set_session_ranges), the shape used for search and (later)
-    /// an externally-driven spell-checker. Returns its [`SessionId`].
+    /// an externally-driven spell-checker. Returns its [`crate::SessionId`].
     ///
     /// A view's own find session is a range session it alone admits; that is how two panes
     /// over one document highlight different queries.
@@ -1558,7 +1558,7 @@ impl TextDocument {
     }
 
     /// Replace the ranges of a range session (absolute char offsets, the space
-    /// [`FindMatch`](crate::FindMatch) reports in). Returns `false` if `id` is not a range
+    /// [`FindMatch`] reports in). Returns `false` if `id` is not a range
     /// session.
     ///
     /// Fires a highlight-changed event so live views showing this session re-snapshot — the

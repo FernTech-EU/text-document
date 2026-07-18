@@ -9,3 +9,9 @@ als = "als"
 lits = "lits"
 ths = "ths"
 wrold = "wrold"
+# EPUB Open Packaging Format (content.opf)
+opf = "opf"
+# Arabic letter names (teh marbuta) in Unicode folding tables
+teh = "teh"
+# "mis-" prefix in hyphenated compounds
+mis = "mis"

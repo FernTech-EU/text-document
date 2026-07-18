@@ -996,14 +996,13 @@ pub(crate) fn build_block_snapshot_with_position_and_parent(
     // above). Metric / none: empty (highlights merged into fragments, or none). A "without
     // highlights" (empty-mask) snapshot resolves to `kind == None`, so this is empty
     // regardless of the live sessions.
-    let paint_highlights = if hl.kind == crate::highlight::HighlighterKind::PaintOnly
-        && !hl.suppress_paint
-    {
-        let spans = crate::highlight::merged_spans_for_block(inner, block_id as usize, hl.mask);
-        crate::highlight::extract_paint_spans(&spans, length)
-    } else {
-        Vec::new()
-    };
+    let paint_highlights =
+        if hl.kind == crate::highlight::HighlighterKind::PaintOnly && !hl.suppress_paint {
+            let spans = crate::highlight::merged_spans_for_block(inner, block_id as usize, hl.mask);
+            crate::highlight::extract_paint_spans(&spans, length)
+        } else {
+            Vec::new()
+        };
 
     Some(BlockSnapshot {
         block_id: block_id as usize,

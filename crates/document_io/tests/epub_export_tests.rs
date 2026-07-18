@@ -173,10 +173,13 @@ fn epub_chapter_xhtml_is_well_formed() {
 
 #[test]
 fn epub_with_no_headings_is_a_single_chapter() {
-    let bytes = epub_from_djot("Just a plain paragraph, no headings at all.", EpubExportOptions {
-        title: "My Book".to_string(),
-        ..Default::default()
-    });
+    let bytes = epub_from_djot(
+        "Just a plain paragraph, no headings at all.",
+        EpubExportOptions {
+            title: "My Book".to_string(),
+            ..Default::default()
+        },
+    );
     let names = zip_entry_names(&bytes);
     let chapters: Vec<&String> = names
         .iter()
@@ -247,10 +250,7 @@ fn epub_metadata_title_author_lang_land_in_the_opf() {
         opf.contains("<dc:title>The Lighthouse</dc:title>"),
         "title in OPF, got:\n{opf}"
     );
-    assert!(
-        opf.contains("Ann Vane"),
-        "author in OPF, got:\n{opf}"
-    );
+    assert!(opf.contains("Ann Vane"), "author in OPF, got:\n{opf}");
     assert!(opf.contains(">fr<"), "language in OPF, got:\n{opf}");
 
     // The generator meta tag lives in the nav document, not content.opf.
@@ -347,7 +347,8 @@ fn rich_document_packs_to_a_valid_epub_file_on_disk() {
 
     let bytes = std::fs::read(&path).expect("output file exists");
     assert!(!bytes.is_empty());
-    let archive = zip::ZipArchive::new(Cursor::new(&bytes[..])).expect("packed epub must be a valid zip");
+    let archive =
+        zip::ZipArchive::new(Cursor::new(&bytes[..])).expect("packed epub must be a valid zip");
     assert!(archive.file_names().any(|n| n == "mimetype"));
 
     let _ = std::fs::remove_file(&path);

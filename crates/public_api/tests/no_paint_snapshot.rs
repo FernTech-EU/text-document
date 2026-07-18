@@ -18,15 +18,28 @@ fn no_paint_snapshot_keeps_fragments_and_drops_the_overlay() {
     let session = doc.add_range_session();
     let fmt = HighlightFormat {
         underline_style: Some(UnderlineStyle::SpellCheckUnderline),
-        underline_color: Some(Color { red: 220, green: 50, blue: 50, alpha: 255 }),
+        underline_color: Some(Color {
+            red: 220,
+            green: 50,
+            blue: 50,
+            alpha: 255,
+        }),
         ..Default::default()
     };
     // Two misspelled words, in different blocks, so both blocks carry an overlay.
     doc.set_session_ranges(
         session,
         vec![
-            RangeHighlight { start: 4, length: 5, format: fmt.clone() }, // "quikc"
-            RangeHighlight { start: 21, length: 5, format: fmt.clone() }, // "jumpd"
+            RangeHighlight {
+                start: 4,
+                length: 5,
+                format: fmt.clone(),
+            }, // "quikc"
+            RangeHighlight {
+                start: 21,
+                length: 5,
+                format: fmt.clone(),
+            }, // "jumpd"
         ],
     );
 

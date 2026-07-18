@@ -31,7 +31,12 @@ fn big_doc() -> TextDocument {
 /// One flagged range per word across the whole document — the Lorem-Ipsum-vs-English case.
 fn one_range_per_word(doc: &TextDocument) -> Vec<RangeHighlight> {
     let fmt = HighlightFormat {
-        background_color: Some(Color { red: 255, green: 0, blue: 0, alpha: 255 }),
+        background_color: Some(Color {
+            red: 255,
+            green: 0,
+            blue: 0,
+            alpha: 255,
+        }),
         ..Default::default()
     };
     let mut out = Vec::new();
@@ -42,7 +47,11 @@ fn one_range_per_word(doc: &TextDocument) -> Vec<RangeHighlight> {
             for word in b.text.split(' ') {
                 let len = word.chars().count();
                 if len > 0 {
-                    out.push(RangeHighlight { start: base + off, length: len, format: fmt.clone() });
+                    out.push(RangeHighlight {
+                        start: base + off,
+                        length: len,
+                        format: fmt.clone(),
+                    });
                 }
                 off += len + 1; // + the space
             }
@@ -65,7 +74,11 @@ fn a_full_snapshot_does_not_scale_with_document_range_count() {
     let doc = big_doc();
     let session = doc.add_range_session();
     let ranges = one_range_per_word(&doc);
-    assert!(ranges.len() > 10_000, "expected a dense document, got {} ranges", ranges.len());
+    assert!(
+        ranges.len() > 10_000,
+        "expected a dense document, got {} ranges",
+        ranges.len()
+    );
 
     // Baseline: no ranges.
     doc.set_session_ranges(session, Vec::new());
@@ -144,7 +157,10 @@ fn building_the_index_at_push_is_cheaper_than_a_snapshot() {
         doc.set_session_ranges(session, ranges.clone());
     });
 
-    println!("index build: push={push:.2}ms  snapshot={snapshot:.2}ms  ({} ranges)", ranges.len());
+    println!(
+        "index build: push={push:.2}ms  snapshot={snapshot:.2}ms  ({} ranges)",
+        ranges.len()
+    );
     assert!(
         push < snapshot * 2.0,
         "building the index on a push must not dwarf a snapshot; push={push:.2}ms vs \

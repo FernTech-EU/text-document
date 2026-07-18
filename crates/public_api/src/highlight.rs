@@ -186,7 +186,7 @@ pub struct RangeHighlight {
 /// Two panes over one shared document can carry different find queries, so "which highlights
 /// to show" is a property of the *view*, not the document. A snapshot is built under a mask;
 /// only the sessions the mask admits contribute spans, and the effective
-/// [`HighlighterKind`](enum@HighlighterKind) is the join over just those.
+/// `HighlighterKind` is the join over just those.
 ///
 /// The default ([`HighlightMask::all`]) shows every session — the behaviour of the old
 /// `snapshot_flow()`. [`HighlightMask::none`] shows none — the old
@@ -762,7 +762,10 @@ pub(crate) fn extract_paint_spans(
             ps += 1;
         }
         while pe < n
-            && spans[by_end[pe]].start.saturating_add(spans[by_end[pe]].length) <= sub_start
+            && spans[by_end[pe]]
+                .start
+                .saturating_add(spans[by_end[pe]].length)
+                <= sub_start
         {
             active.remove(&by_end[pe]);
             pe += 1;
@@ -1310,31 +1313,52 @@ mod paint_span_tests {
     /// across overlaps produces observably different output when the active-set
     /// ORDER is wrong — the property most at risk in the rewrite.
     fn span(start: usize, length: usize, k: usize) -> HighlightSpan {
-        let c = |v: usize| crate::Color { red: v as u8, green: (v >> 8) as u8, blue: 7, alpha: 255 };
-        let format = match k % 4 {
-            0 => HighlightFormat { background_color: Some(c(k)), ..Default::default() },
-            1 => HighlightFormat { foreground_color: Some(c(k)), ..Default::default() },
-            2 => HighlightFormat { underline_color: Some(c(k)), ..Default::default() },
-            // No paint field: must be dropped by both implementations.
-            _ => HighlightFormat { font_bold: Some(true), ..Default::default() },
+        let c = |v: usize| crate::Color {
+            red: v as u8,
+            green: (v >> 8) as u8,
+            blue: 7,
+            alpha: 255,
         };
-        HighlightSpan { start, length, format }
+        let format = match k % 4 {
+            0 => HighlightFormat {
+                background_color: Some(c(k)),
+                ..Default::default()
+            },
+            1 => HighlightFormat {
+                foreground_color: Some(c(k)),
+                ..Default::default()
+            },
+            2 => HighlightFormat {
+                underline_color: Some(c(k)),
+                ..Default::default()
+            },
+            // No paint field: must be dropped by both implementations.
+            _ => HighlightFormat {
+                font_bold: Some(true),
+                ..Default::default()
+            },
+        };
+        HighlightSpan {
+            start,
+            length,
+            format,
+        }
     }
 
     #[test]
     fn sweep_matches_reference_on_edge_cases() {
         let cases: Vec<(Vec<HighlightSpan>, usize)> = vec![
             (vec![], 10),
-            (vec![span(0, 4, 0)], 0),           // empty block
-            (vec![span(0, 5, 0)], 10),          // single
-            (vec![span(0, 3, 0), span(5, 3, 1)], 10),   // disjoint
-            (vec![span(2, 5, 0), span(4, 5, 1)], 12),   // overlap: later wins in [4,7)
-            (vec![span(0, 10, 0), span(3, 2, 1)], 10),  // nested
-            (vec![span(0, 3, 0), span(3, 3, 1)], 10),   // adjacent (touch, no overlap)
-            (vec![span(4, 0, 0)], 10),          // zero-length → nothing
-            (vec![span(0, 4, 3)], 10),          // no paint field → dropped
-            (vec![span(8, 5, 0)], 10),          // spills past block_len
-            (vec![span(12, 3, 0)], 10),         // entirely past block_len
+            (vec![span(0, 4, 0)], 0),                  // empty block
+            (vec![span(0, 5, 0)], 10),                 // single
+            (vec![span(0, 3, 0), span(5, 3, 1)], 10),  // disjoint
+            (vec![span(2, 5, 0), span(4, 5, 1)], 12),  // overlap: later wins in [4,7)
+            (vec![span(0, 10, 0), span(3, 2, 1)], 10), // nested
+            (vec![span(0, 3, 0), span(3, 3, 1)], 10),  // adjacent (touch, no overlap)
+            (vec![span(4, 0, 0)], 10),                 // zero-length → nothing
+            (vec![span(0, 4, 3)], 10),                 // no paint field → dropped
+            (vec![span(8, 5, 0)], 10),                 // spills past block_len
+            (vec![span(12, 3, 0)], 10),                // entirely past block_len
             (vec![span(0, 4, 0), span(0, 4, 1), span(0, 4, 2)], 10), // coincident, order matters
         ];
         for (i, (spans, len)) in cases.iter().enumerate() {
@@ -1383,7 +1407,12 @@ mod index_tests {
             start,
             length,
             format: HighlightFormat {
-                background_color: Some(crate::Color { red: 255, green: 0, blue: 0, alpha: 255 }),
+                background_color: Some(crate::Color {
+                    red: 255,
+                    green: 0,
+                    blue: 0,
+                    alpha: 255,
+                }),
                 ..Default::default()
             },
         }
@@ -1393,7 +1422,10 @@ mod index_tests {
         RangeHighlight {
             start,
             length,
-            format: HighlightFormat { font_bold: Some(true), ..Default::default() },
+            format: HighlightFormat {
+                font_bold: Some(true),
+                ..Default::default()
+            },
         }
     }
 
@@ -1408,7 +1440,10 @@ mod index_tests {
 
     #[test]
     fn kind_is_paint_only_for_a_background_range() {
-        assert_eq!(compute_range_kind(&[paint(0, 4)]), HighlighterKind::PaintOnly);
+        assert_eq!(
+            compute_range_kind(&[paint(0, 4)]),
+            HighlighterKind::PaintOnly
+        );
     }
 
     #[test]
@@ -1426,10 +1461,16 @@ mod index_tests {
         let mut reg = HighlightRegistry::default();
         let id = reg.add_range();
         let positions = [(0u64, 0usize)];
-        assert_eq!(reg.effective_kind(&HighlightMask::all()), HighlighterKind::None);
+        assert_eq!(
+            reg.effective_kind(&HighlightMask::all()),
+            HighlighterKind::None
+        );
 
         reg.set_ranges(id, vec![paint(0, 5)], &positions);
-        assert_eq!(reg.effective_kind(&HighlightMask::all()), HighlighterKind::PaintOnly);
+        assert_eq!(
+            reg.effective_kind(&HighlightMask::all()),
+            HighlighterKind::PaintOnly
+        );
 
         reg.set_ranges(id, vec![metric(0, 5)], &positions);
         assert_eq!(
@@ -1453,7 +1494,11 @@ mod index_tests {
     #[test]
     fn a_range_lands_only_in_its_own_block() {
         let idx = build_block_index(&[paint(12, 3)], &three_blocks());
-        assert_eq!(bucket(&idx, 101), vec![0], "12..15 is inside block 101 [10,20)");
+        assert_eq!(
+            bucket(&idx, 101),
+            vec![0],
+            "12..15 is inside block 101 [10,20)"
+        );
         assert!(bucket(&idx, 100).is_empty());
         assert!(bucket(&idx, 102).is_empty());
     }
@@ -1485,7 +1530,11 @@ mod index_tests {
         // — the last block runs to usize::MAX — so it buckets there. That is harmless: the
         // per-block clip against real geometry drops it (start > block_end).
         let idx = build_block_index(&[paint(9999, 3)], &three_blocks());
-        assert_eq!(bucket(&idx, 102), vec![0], "the unbounded last block is the only candidate");
+        assert_eq!(
+            bucket(&idx, 102),
+            vec![0],
+            "the unbounded last block is the only candidate"
+        );
         assert!(bucket(&idx, 100).is_empty());
         assert!(bucket(&idx, 101).is_empty());
     }

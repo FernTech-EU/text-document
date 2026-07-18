@@ -306,7 +306,7 @@ impl ExportDocxUseCase {
 
     /// Apply the document-wide export options (page size, margins, default font/size, and an
     /// optional page-number running header) onto the assembled `Docx`. A default
-    /// [`DocxExportOptions`] leaves the docx-rs built-in defaults untouched.
+    /// [`common::parser_tools::DocxExportOptions`] leaves the docx-rs built-in defaults untouched.
     fn apply_document_options(&self, mut docx: docx_rs::Docx) -> docx_rs::Docx {
         use docx_rs::*;
         let o = &self.dto.options;
@@ -330,7 +330,11 @@ impl ExportDocxUseCase {
         }
         if let Some(family) = &o.font_family {
             docx = docx.default_fonts(
-                RunFonts::new().ascii(family).hi_ansi(family).cs(family).east_asia(family),
+                RunFonts::new()
+                    .ascii(family)
+                    .hi_ansi(family)
+                    .cs(family)
+                    .east_asia(family),
             );
         }
         if let Some(half_pt) = o.font_half_points {
@@ -338,11 +342,11 @@ impl ExportDocxUseCase {
         }
         if o.page_numbers {
             let mut header_para = Paragraph::new().align(AlignmentType::Right);
-            if let Some(text) = &o.running_header {
-                if !text.trim().is_empty() {
-                    header_para =
-                        header_para.add_run(Run::new().add_text(format!("{}   ", text.trim())));
-                }
+            if let Some(text) = &o.running_header
+                && !text.trim().is_empty()
+            {
+                header_para =
+                    header_para.add_run(Run::new().add_text(format!("{}   ", text.trim())));
             }
             header_para = header_para.add_page_num(PageNum::new());
             docx = docx.header(Header::new().add_paragraph(header_para));
@@ -567,7 +571,7 @@ impl ExportDocxUseCase {
 
     /// Apply the manuscript body-paragraph options to a plain paragraph. Each piece is applied
     /// only when the corresponding option is set (and the block didn't already carry its own),
-    /// so a default [`DocxExportOptions`] leaves the paragraph exactly as plain `to_docx`
+    /// so a default [`common::parser_tools::DocxExportOptions`] leaves the paragraph exactly as plain `to_docx`
     /// produced it — including keeping any blockquote left indent.
     fn apply_body_style(
         &self,
@@ -600,7 +604,12 @@ impl ExportDocxUseCase {
         let first_line = o.first_line_indent_twips.filter(|&f| f > 0);
         let left = (quote_indent > 0).then_some(quote_indent);
         if left.is_some() || first_line.is_some() {
-            p = p.indent(left, first_line.map(SpecialIndentType::FirstLine), None, None);
+            p = p.indent(
+                left,
+                first_line.map(SpecialIndentType::FirstLine),
+                None,
+                None,
+            );
         }
 
         // Alignment (only when the block didn't carry its own, and only when the options ask

@@ -91,7 +91,10 @@ pub fn compile_typst_pdf(markup: &str, fonts: Vec<Vec<u8>>) -> anyhow::Result<(V
 /// Render a `.compile()` failure into a readable multi-line string, appending any warnings that
 /// preceded the fatal error (a warning can be a clue to why the error happened, e.g. "unknown
 /// font family" right before an unrelated-looking layout error).
-fn render_compile_error(err: typst_as_lib::TypstAsLibError, warnings: &EcoVec<SourceDiagnostic>) -> String {
+fn render_compile_error(
+    err: typst_as_lib::TypstAsLibError,
+    warnings: &EcoVec<SourceDiagnostic>,
+) -> String {
     use typst_as_lib::TypstAsLibError as E;
     match err {
         // The actual Typst compile diagnostics (bad markup): parse errors, unknown
@@ -164,10 +167,7 @@ mod tests {
     fn bad_markup_reports_a_readable_diagnostic() {
         let err =
             compile_typst_pdf("#foo_bar_does_not_exist()", vec![TEST_FONT.to_vec()]).unwrap_err();
-        assert!(
-            err.to_string().contains("unknown variable"),
-            "got: {err}"
-        );
+        assert!(err.to_string().contains("unknown variable"), "got: {err}");
     }
 
     #[test]

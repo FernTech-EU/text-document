@@ -123,7 +123,10 @@ fn plain_prose_fixture_exports_a_valid_pdf() {
 
 #[test]
 fn plain_paragraph_exports_a_valid_pdf() {
-    let bytes = pdf_from_djot("Just a plain paragraph, no formatting at all.", pdf_options());
+    let bytes = pdf_from_djot(
+        "Just a plain paragraph, no formatting at all.",
+        pdf_options(),
+    );
     assert!(bytes.starts_with(b"%PDF-"));
     assert!(count_pdf_pages(&bytes) >= 1);
 }
@@ -153,7 +156,8 @@ fn code_block_compiles_and_does_not_interpret_its_own_content_as_markup() {
 
 #[test]
 fn rtl_hebrew_fixture_compiles() {
-    let djot = "{direction=rtl}\n\u{05e9}\u{05dc}\u{05d5}\u{05dd} \u{05e2}\u{05d5}\u{05dc}\u{05dd}\n";
+    let djot =
+        "{direction=rtl}\n\u{05e9}\u{05dc}\u{05d5}\u{05dd} \u{05e2}\u{05d5}\u{05dc}\u{05dd}\n";
     let bytes = pdf_from_djot(djot, pdf_options());
     assert!(
         bytes.starts_with(b"%PDF-"),
@@ -163,8 +167,7 @@ fn rtl_hebrew_fixture_compiles() {
 
 #[test]
 fn rtl_arabic_fixture_compiles() {
-    let djot =
-        "{direction=rtl}\n\u{0645}\u{0631}\u{062d}\u{0628}\u{0627} \u{0628}\u{0627}\u{0644}\u{0639}\u{0627}\u{0644}\u{0645}\n";
+    let djot = "{direction=rtl}\n\u{0645}\u{0631}\u{062d}\u{0628}\u{0627} \u{0628}\u{0627}\u{0644}\u{0639}\u{0627}\u{0644}\u{0645}\n";
     let bytes = pdf_from_djot(djot, pdf_options());
     assert!(
         bytes.starts_with(b"%PDF-"),
@@ -299,7 +302,10 @@ fn rich_document_writes_a_real_pdf_file_to_disk() {
 
     let bytes = std::fs::read(&path).expect("output file exists");
     assert!(!bytes.is_empty());
-    assert!(bytes.starts_with(b"%PDF-"), "the written file is a real PDF");
+    assert!(
+        bytes.starts_with(b"%PDF-"),
+        "the written file is a real PDF"
+    );
     assert_eq!(count_pdf_pages(&bytes) as i64, result.page_count);
 
     let _ = std::fs::remove_file(&path);

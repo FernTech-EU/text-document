@@ -8,7 +8,7 @@
 //! rather than leaving them unset.
 //!
 //! **Font bytes are supplied by the caller, not looked up here.** `text-document` has no font
-//! file access or font-selection policy of its own (see [`font_bytes`](Self::font_bytes)) — the
+//! file access or font-selection policy of its own (see [`font_bytes`](PdfExportOptions::font_bytes)) — the
 //! caller (e.g. Skribisto's compiler, which owns the bundled OFL fonts and the writer's chosen
 //! family) hands over raw TTF/OTF blobs, which are passed straight to the embedded Typst
 //! compiler's in-memory font book. No system/typst-kit font search ever runs.
@@ -39,7 +39,7 @@ pub struct PdfExportOptions {
     /// `font:` argument entirely, letting Typst fall back to its own built-in default face.
     pub font_family: String,
     /// Raw TTF/OTF font blobs, handed directly to the embedded Typst compiler's `.fonts(..)`.
-    /// At least one entry is required for [`crate::typst_compile::compile_typst_pdf`] to
+    /// At least one entry is required for `document_io::typst_compile::compile_typst_pdf` to
     /// succeed; this struct itself does not enforce that (`Default` is an empty list).
     pub font_bytes: Vec<Vec<u8>>,
     /// Body font size, in points.
