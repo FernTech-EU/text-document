@@ -637,6 +637,16 @@ fn render_block_attrs(block: &Block, options: &DjotExportOptions) -> String {
     {
         pairs.push(format!("background_color={}", djot_attr_value(bg)));
     }
+    if options.top_margin
+        && let Some(tm) = block.fmt_top_margin
+    {
+        pairs.push(format!("top_margin={tm}"));
+    }
+    if options.text_indent
+        && let Some(ti) = block.fmt_text_indent
+    {
+        pairs.push(format!("text_indent={ti}"));
+    }
 
     if pairs.is_empty() {
         String::new()

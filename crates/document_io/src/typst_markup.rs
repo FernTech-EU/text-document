@@ -293,6 +293,20 @@ pub fn render_blocks_typst(store: &Store, blocks: &[Block], options: &PdfExportO
                 let leading_em = ratio * options.line_spacing as f64;
                 content = format!("#[#set par(leading: {leading_em}em)\n{content}]");
             }
+            // `fmt_text_indent` / `fmt_top_margin` are in the model's own unit —
+            // logical (CSS) pixels at 96 dpi — so convert to Typst's physical
+            // units: 96 px = 1 in = 25.4 mm = 72 pt. Each scopes an override of
+            // the document-wide `#set par(first-line-indent:)` / block spacing,
+            // which is how a scene break suppresses the following paragraph's
+            // indent (`text_indent=0`) and opens a gap above it.
+            if let Some(ti) = block.fmt_text_indent {
+                let mm = ti as f64 * 25.4 / 96.0;
+                content = format!("#[#set par(first-line-indent: {mm:.3}mm)\n{content}]");
+            }
+            if let Some(tm) = block.fmt_top_margin.filter(|&t| t > 0) {
+                let pt = tm as f64 * 72.0 / 96.0;
+                content = format!("#block(above: {pt:.2}pt)[{content}]");
+            }
             if let Some(ref color) = block.fmt_background_color
                 && !color.is_empty()
             {

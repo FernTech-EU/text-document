@@ -300,6 +300,38 @@ fn heading_alignment_round_trips() {
 }
 
 #[test]
+fn spacing_attributes_round_trip() {
+    // A scene break sets these on the paragraph that follows it, so they must
+    // survive the save/load cycle intact.
+    let dj = fixpoint("{top_margin=24 text_indent=0}\nAfter the break.");
+    assert_contains(&dj, "top_margin=24");
+    assert_contains(&dj, "text_indent=0");
+    assert_contains(&dj, "After the break.");
+}
+
+#[test]
+fn a_zero_text_indent_survives_rather_than_vanishing() {
+    // `text_indent=0` is meaningful ("explicitly no indent") and must not be
+    // dropped as if it were absent — a falsy-value round-trip bug here would
+    // silently restore the document-wide indent on every reload.
+    let dj = fixpoint("{text_indent=0}\nFlush left.");
+    assert_contains(&dj, "text_indent=0");
+}
+
+#[test]
+fn spacing_attributes_combine_with_direction_on_one_block() {
+    // An RTL scene whose first paragraph follows a blank-line break carries both
+    // `direction` and the spacing pair. They must land on the SAME block, in one
+    // attribute line, not clobber each other.
+    let dj = fixpoint("{direction=rtl top_margin=24 text_indent=0}\nنص عربي.");
+    assert_contains(&dj, "direction=rtl");
+    assert_contains(&dj, "top_margin=24");
+    assert_contains(&dj, "text_indent=0");
+    let attr_lines = dj.lines().filter(|l| l.trim_start().starts_with('{')).count();
+    assert_eq!(attr_lines, 1, "attributes must share one line:\n{dj}");
+}
+
+#[test]
 fn block_attributes_survive_inside_blockquote() {
     let dj = fixpoint("> {alignment=center}\n> Quoted and centered.");
     assert_contains(&dj, "alignment=center");

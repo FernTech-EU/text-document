@@ -126,6 +126,22 @@ const INDENT_STEP_TWIPS: i32 = 720;
 /// sits in the gutter and the text aligns, in twips.
 const HANGING_TWIPS: i32 = 360;
 
+/// Twips per logical pixel. `Block::fmt_top_margin` / `fmt_text_indent` are in
+/// the document model's own unit — logical (CSS) pixels at 96 dpi, matching the
+/// editor's layout engine — so 1440/96 = 15 twips per px.
+const TWIPS_PER_PX: i64 = 15;
+
+/// Convert a block's logical-pixel spacing to twips, clamped.
+///
+/// These values come from a `{key=value}` block attribute in the document, so
+/// they are file-controlled and may be absurd. Doing the arithmetic in `i64` and
+/// clamping at the end is what keeps a huge value from wrapping through `i32`
+/// into a negative — and then into an enormous `u32` — instead of saturating.
+fn px_to_twips(px: i64) -> i32 {
+    px.saturating_mul(TWIPS_PER_PX)
+        .clamp(0, i32::MAX as i64) as i32
+}
+
 /// Light-grey fill behind code blocks, as an `RRGGBB` hex string.
 const CODE_BLOCK_FILL: &str = "F5F5F5";
 
@@ -596,12 +612,25 @@ impl ExportDocxUseCase {
             ls = ls.after(after as u32);
             ls_used = true;
         }
+        // A block's own space-above, e.g. the gap a blank-line scene break puts
+        // before the paragraph that follows it. Stacks with the document-wide
+        // space-after of the previous paragraph rather than replacing it.
+        if let Some(before) = block.fmt_top_margin.filter(|&t| t > 0) {
+            ls = ls.before(px_to_twips(before) as u32);
+            ls_used = true;
+        }
         if ls_used {
             p = p.line_spacing(ls);
         }
 
-        // Indent: any blockquote left indent + an optional first-line indent.
-        let first_line = o.first_line_indent_twips.filter(|&f| f > 0);
+        // Indent: any blockquote left indent + a first-line indent. A block that
+        // carries its own `fmt_text_indent` overrides the document-wide default,
+        // which is how a scene break suppresses the indent on the next paragraph
+        // (`text_indent=0`) exactly as print typography expects.
+        let first_line = match block.fmt_text_indent {
+            Some(ti) => (ti > 0).then(|| px_to_twips(ti)),
+            None => o.first_line_indent_twips.filter(|&f| f > 0),
+        };
         let left = (quote_indent > 0).then_some(quote_indent);
         if left.is_some() || first_line.is_some() {
             p = p.indent(

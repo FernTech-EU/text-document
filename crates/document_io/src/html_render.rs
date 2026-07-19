@@ -124,6 +124,16 @@ pub fn render_blocks_html(store: &Store, blocks: &[Block]) -> String {
             if let Some(ref c) = block.fmt_background_color {
                 styles.push(format!("background-color: {}", c));
             }
+            // The model's unit for these two is the logical (CSS) pixel, so they
+            // map straight across. A scene break emits `text_indent=0` on the
+            // paragraph that follows it, which must win over any stylesheet
+            // first-line indent — hence emitting it even when zero.
+            if let Some(tm) = block.fmt_top_margin {
+                styles.push(format!("margin-top: {tm}px"));
+            }
+            if let Some(ti) = block.fmt_text_indent {
+                styles.push(format!("text-indent: {ti}px"));
+            }
             let style_attr = if styles.is_empty() {
                 String::new()
             } else {

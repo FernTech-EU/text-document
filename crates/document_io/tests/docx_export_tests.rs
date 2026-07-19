@@ -11,6 +11,7 @@ extern crate text_document_io as document_io;
 use common::long_operation::{LongOperationManager, OperationStatus};
 use document_io::docx_rs::{
     AlignmentType, DocumentChild, Docx, HyperlinkData, Paragraph, ParagraphChild, RunChild,
+    SpecialIndentType,
 };
 use document_io::{ExportDocxDto, ImportDjotDto, document_io_controller};
 use test_harness::{EventHub, setup};
@@ -127,6 +128,27 @@ fn numbering_id(p: &Paragraph) -> Option<usize> {
 fn left_indent(p: &Paragraph) -> Option<i32> {
     p.property.indent.as_ref().and_then(|i| i.start)
 }
+
+/// The paragraph's first-line indent in twips, if it has one.
+fn first_line_indent(p: &Paragraph) -> Option<i32> {
+    match p.property.indent.as_ref()?.special_indent {
+        Some(SpecialIndentType::FirstLine(v)) => Some(v),
+        _ => None,
+    }
+}
+
+/// The paragraph's space-above in twips, if it has one. `LineSpacing`'s fields
+/// are private to docx-rs, but it derives `Serialize`, so read it back through
+/// serde rather than reaching into the crate's internals.
+fn space_before(p: &Paragraph) -> Option<u32> {
+    let ls = p.property.line_spacing.as_ref()?;
+    serde_json::to_value(ls)
+        .ok()?
+        .get("before")?
+        .as_u64()
+        .map(|v| v as u32)
+}
+
 
 /// First paragraph whose visible text contains `needle`.
 fn para_containing<'a>(docx: &'a Docx, needle: &str) -> &'a Paragraph {
@@ -509,5 +531,40 @@ fn page_numbers_attach_a_header() {
     assert!(
         docx.document_rels.header_count > 0,
         "a header relationship was registered"
+    );
+}
+
+// --- per-block spacing overrides (what a scene break needs) ----------------
+
+#[test]
+fn a_blocks_own_text_indent_overrides_the_document_wide_one() {
+    // A scene break suppresses the indent on the paragraph that follows it by
+    // setting `text_indent=0`; every other paragraph keeps the preset's indent.
+    let options = DocxExportOptions {
+        first_line_indent_twips: Some(720),
+        ..Default::default()
+    };
+    let docx = docx_from_djot_with_options("Indented paragraph.\n\n{text_indent=0}\nFlush paragraph.", options);
+    assert_eq!(
+        first_line_indent(para_containing(&docx, "Indented paragraph.")),
+        Some(720),
+        "an ordinary paragraph keeps the document-wide first-line indent"
+    );
+    assert_eq!(
+        first_line_indent(para_containing(&docx, "Flush paragraph.")),
+        None,
+        "text_indent=0 must suppress the indent, not inherit it"
+    );
+}
+
+#[test]
+fn a_blocks_own_top_margin_becomes_space_before() {
+    // 24 logical px × 15 twips/px = 360 twips.
+    let docx = docx_from_djot_with_options("Before.\n\n{top_margin=24}\nAfter.", DocxExportOptions::default());
+    assert_eq!(space_before(para_containing(&docx, "After.")), Some(360));
+    assert_eq!(
+        space_before(para_containing(&docx, "Before.")),
+        None,
+        "a paragraph without the attribute gets no space-above"
     );
 }

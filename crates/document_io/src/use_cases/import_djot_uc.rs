@@ -225,6 +225,8 @@ fn import_parsed_elements(
                     fmt_non_breakable_lines: parsed_block.non_breakable_lines,
                     fmt_direction: parsed_block.direction.clone(),
                     fmt_background_color: parsed_block.background_color.clone(),
+                    fmt_top_margin: parsed_block.top_margin,
+                    fmt_text_indent: parsed_block.text_indent,
                     ..Block::default()
                 };
 

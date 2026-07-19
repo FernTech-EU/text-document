@@ -69,6 +69,8 @@ impl ParsedElement {
                                 direction: None,
                                 background_color: None,
                                 alignment: None,
+                                top_margin: None,
+                                text_indent: None,
                             });
                         }
                     }
@@ -95,6 +97,8 @@ impl ParsedElement {
                 direction: None,
                 background_color: None,
                 alignment: None,
+                top_margin: None,
+                text_indent: None,
             });
         }
         blocks
@@ -127,6 +131,14 @@ pub struct ParsedBlock {
     /// Paragraph alignment (djot `{alignment=left|right|center|justify}`). Maps
     /// to `Block.fmt_alignment`. `None` when no alignment attribute is present.
     pub alignment: Option<Alignment>,
+    /// This block's own space-above (djot `{top_margin=<int>}`). Maps to
+    /// `Block.fmt_top_margin` and overrides the document-wide paragraph
+    /// spacing for this block alone. `None` when absent.
+    pub top_margin: Option<i64>,
+    /// This block's own first-line indent (djot `{text_indent=<int>}`). Maps to
+    /// `Block.fmt_text_indent` and overrides the document-wide first-line
+    /// indent for this block alone. `None` when absent.
+    pub text_indent: Option<i64>,
 }
 
 impl ParsedBlock {
@@ -142,6 +154,8 @@ impl ParsedBlock {
             && self.direction.is_none()
             && self.background_color.is_none()
             && self.alignment.is_none()
+            && self.top_margin.is_none()
+            && self.text_indent.is_none()
     }
 }
 
@@ -206,6 +220,8 @@ pub fn parse_markdown(markdown: &str) -> Vec<ParsedElement> {
                         direction: None,
                         background_color: None,
                         alignment: None,
+                        top_margin: None,
+                        text_indent: None,
                     }));
                 }
                 in_block = false;
@@ -233,6 +249,8 @@ pub fn parse_markdown(markdown: &str) -> Vec<ParsedElement> {
                     direction: None,
                     background_color: None,
                     alignment: None,
+                    top_margin: None,
+                    text_indent: None,
                 }));
                 in_block = false;
             }
@@ -267,6 +285,8 @@ pub fn parse_markdown(markdown: &str) -> Vec<ParsedElement> {
                         direction: None,
                         background_color: None,
                         alignment: None,
+                        top_margin: None,
+                        text_indent: None,
                     }));
                 }
                 in_block = true;
@@ -297,6 +317,8 @@ pub fn parse_markdown(markdown: &str) -> Vec<ParsedElement> {
                         direction: None,
                         background_color: None,
                         alignment: None,
+                        top_margin: None,
+                        text_indent: None,
                     }));
                 }
                 in_block = false;
@@ -335,6 +357,8 @@ pub fn parse_markdown(markdown: &str) -> Vec<ParsedElement> {
                     direction: None,
                     background_color: None,
                     alignment: None,
+                    top_margin: None,
+                    text_indent: None,
                 }));
                 in_block = false;
                 is_code_block = false;
@@ -484,6 +508,8 @@ pub fn parse_markdown(markdown: &str) -> Vec<ParsedElement> {
                     direction: None,
                     background_color: None,
                     alignment: None,
+                    top_margin: None,
+                    text_indent: None,
                 }));
             }
             Event::Start(Tag::BlockQuote(_)) => {
@@ -514,6 +540,8 @@ pub fn parse_markdown(markdown: &str) -> Vec<ParsedElement> {
             direction: None,
             background_color: None,
             alignment: None,
+            top_margin: None,
+            text_indent: None,
         }));
     }
 
@@ -538,6 +566,8 @@ pub fn parse_markdown(markdown: &str) -> Vec<ParsedElement> {
             direction: None,
             background_color: None,
             alignment: None,
+            top_margin: None,
+            text_indent: None,
         }));
     }
 
@@ -874,6 +904,8 @@ pub fn parse_html_elements(html: &str) -> Vec<ParsedElement> {
                         direction: None,
                         background_color: None,
                         alignment: None,
+                        top_margin: None,
+                        text_indent: None,
                     }));
                     return;
                 }
@@ -938,6 +970,8 @@ pub fn parse_html_elements(html: &str) -> Vec<ParsedElement> {
                             direction: css.direction,
                             background_color: css.background_color,
                             alignment: None,
+                            top_margin: None,
+                            text_indent: None,
                         }));
                     }
                     // Append nested block elements after the parent block
@@ -1001,6 +1035,8 @@ pub fn parse_html_elements(html: &str) -> Vec<ParsedElement> {
                         direction: None,
                         background_color: None,
                         alignment: None,
+                        top_margin: None,
+                        text_indent: None,
                     }));
                 }
             }
@@ -1160,6 +1196,8 @@ pub fn parse_html_elements(html: &str) -> Vec<ParsedElement> {
             direction: None,
             background_color: None,
             alignment: None,
+            top_margin: None,
+            text_indent: None,
         }));
     }
 
@@ -1184,6 +1222,8 @@ pub fn parse_html_elements(html: &str) -> Vec<ParsedElement> {
             direction: None,
             background_color: None,
             alignment: None,
+            top_margin: None,
+            text_indent: None,
         }));
     }
 
@@ -1317,6 +1357,8 @@ struct DjotBlockStyle {
     non_breakable_lines: Option<bool>,
     direction: Option<TextDirection>,
     background_color: Option<String>,
+    top_margin: Option<i64>,
+    text_indent: Option<i64>,
 }
 
 impl DjotBlockStyle {
@@ -1338,6 +1380,12 @@ impl DjotBlockStyle {
         }
         if other.background_color.is_some() {
             self.background_color = other.background_color;
+        }
+        if other.top_margin.is_some() {
+            self.top_margin = other.top_margin;
+        }
+        if other.text_indent.is_some() {
+            self.text_indent = other.text_indent;
         }
     }
 }
@@ -1388,6 +1436,16 @@ fn block_attrs_to_style(attrs: &jotdown::Attributes, opts: &DjotImportOptions) -
     {
         style.background_color = Some(v.to_string());
     }
+    if opts.top_margin
+        && let Some(v) = attrs.get_value("top_margin")
+    {
+        style.top_margin = v.to_string().parse::<i64>().ok();
+    }
+    if opts.text_indent
+        && let Some(v) = attrs.get_value("text_indent")
+    {
+        style.text_indent = v.to_string().parse::<i64>().ok();
+    }
 
     style
 }
@@ -1425,6 +1483,8 @@ fn djot_push_block(
         direction: style.direction,
         background_color: style.background_color,
         alignment: style.alignment,
+        top_margin: style.top_margin,
+        text_indent: style.text_indent,
     }));
 }
 
@@ -2452,6 +2512,38 @@ mod djot_tests {
         assert_eq!(b[0].direction, Some(TextDirection::RightToLeft));
         assert_eq!(b[0].non_breakable_lines, Some(true));
         assert_eq!(b[0].background_color, Some("#ff0000".to_string()));
+    }
+
+    #[test]
+    fn spacing_block_attributes_parse_into_block() {
+        // `top_margin` / `text_indent` let one block override the document-wide
+        // paragraph spacing and first-line indent — what a scene break needs for
+        // the paragraph that follows it.
+        let b = blocks("{top_margin=24 text_indent=0}\nhello");
+        assert_eq!(b.len(), 1);
+        assert_eq!(b[0].top_margin, Some(24));
+        assert_eq!(b[0].text_indent, Some(0));
+    }
+
+    #[test]
+    fn a_zero_text_indent_is_distinct_from_an_absent_one() {
+        // The whole point of the attribute: `Some(0)` means "explicitly no
+        // indent", which must not collapse to `None` ("use the document
+        // default") — otherwise a scene break could not suppress the indent.
+        let explicit = blocks("{text_indent=0}\nhello");
+        let absent = blocks("hello");
+        assert_eq!(explicit[0].text_indent, Some(0));
+        assert_eq!(absent[0].text_indent, None);
+        assert!(!explicit[0].is_inline_only());
+        assert!(absent[0].is_inline_only());
+    }
+
+    #[test]
+    fn spacing_block_attributes_respect_import_options() {
+        let src = "{top_margin=24 text_indent=0}\nhello";
+        let b = ParsedElement::flatten_to_blocks(parse_djot(src, &DjotImportOptions::none()));
+        assert_eq!(b[0].top_margin, None);
+        assert_eq!(b[0].text_indent, None);
     }
 
     #[test]

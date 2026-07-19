@@ -310,3 +310,38 @@ fn rich_document_writes_a_real_pdf_file_to_disk() {
 
     let _ = std::fs::remove_file(&path);
 }
+
+// --- per-block spacing overrides (what a scene break needs) ----------------
+
+#[test]
+fn per_block_spacing_overrides_compile() {
+    // The Typst wraps for `top_margin` / `text_indent` are hand-written markup,
+    // so the real risk is emitting something Typst cannot parse. Compiling is
+    // the assertion: malformed markup fails here rather than at a user's export.
+    let djot = "Ordinary indented paragraph.\n\n\
+                {top_margin=24 text_indent=0}\nThe paragraph after a scene break.";
+    let bytes = pdf_from_djot(djot, pdf_options());
+    assert!(bytes.starts_with(b"%PDF-"));
+    assert!(count_pdf_pages(&bytes) >= 1);
+}
+
+#[test]
+fn per_block_spacing_compiles_alongside_a_document_wide_indent() {
+    // The block override has to coexist with `#set par(first-line-indent: ..)`
+    // from the preamble — that combination is what a real manuscript export hits.
+    let mut options = pdf_options();
+    options.first_line_indent_mm = Some(5.0);
+    options.paragraph_spacing_pt = Some(6.0);
+    let djot = "First paragraph.\n\n{text_indent=0}\nFlush after the break.";
+    let bytes = pdf_from_djot(djot, options);
+    assert!(bytes.starts_with(b"%PDF-"));
+}
+
+#[test]
+fn per_block_spacing_compiles_together_with_rtl_and_alignment() {
+    // An RTL scene whose first paragraph follows a blank-line break stacks
+    // direction + alignment + both spacing wraps on one block.
+    let djot = "{direction=rtl alignment=center top_margin=24 text_indent=0}\nنص عربي بعد الفاصل.";
+    let bytes = pdf_from_djot(djot, pdf_options());
+    assert!(bytes.starts_with(b"%PDF-"));
+}

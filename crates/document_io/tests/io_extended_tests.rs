@@ -445,3 +445,48 @@ fn test_export_latex_heading() -> Result<()> {
 
     Ok(())
 }
+
+// ─── Per-block spacing overrides (what a scene break needs) ─────────
+
+/// Import `djot` into a fresh document and return the exported HTML.
+fn html_from_djot(djot: &str) -> Result<String> {
+    let (db_context, event_hub, _) = setup()?;
+    let mut mgr = LongOperationManager::new();
+    let op_id = document_io_controller::import_djot(
+        &db_context,
+        &event_hub,
+        &mut mgr,
+        &ImportDjotDto {
+            djot_text: djot.to_string(),
+            options: Default::default(),
+        },
+    )?;
+    wait_for_long_operation(&mgr, &op_id);
+    Ok(document_io_controller::export_html(&db_context, &event_hub)?.html_text)
+}
+
+#[test]
+fn test_export_html_emits_per_block_spacing() -> Result<()> {
+    // The model's unit for these is the logical (CSS) pixel, so they map across
+    // unchanged. EPUB shares this renderer, so it is covered by the same code.
+    let html = html_from_djot("{top_margin=24 text_indent=0}\nAfter the break.")?;
+    assert!(
+        html.contains("margin-top: 24px"),
+        "expected margin-top in:\n{html}"
+    );
+    assert!(
+        html.contains("text-indent: 0px"),
+        "expected text-indent in:\n{html}"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_export_html_omits_spacing_when_absent() -> Result<()> {
+    // A paragraph with no override must not gain the properties at all, or it
+    // would defeat any stylesheet the ebook applies.
+    let html = html_from_djot("An ordinary paragraph.")?;
+    assert!(!html.contains("margin-top"), "unexpected margin-top:\n{html}");
+    assert!(!html.contains("text-indent"), "unexpected text-indent:\n{html}");
+    Ok(())
+}

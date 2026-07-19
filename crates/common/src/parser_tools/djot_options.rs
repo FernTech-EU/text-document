@@ -35,6 +35,12 @@ pub struct DjotImportOptions {
     pub non_breakable_lines: bool,
     /// Apply block background color from `{background_color="<value>"}`.
     pub background_color: bool,
+    /// Apply the block's own space-above from `{top_margin=<int>}`, overriding
+    /// the document-wide paragraph spacing for that one block.
+    pub top_margin: bool,
+    /// Apply the block's own first-line indent from `{text_indent=<int>}`,
+    /// overriding the document-wide first-line indent for that one block.
+    pub text_indent: bool,
 }
 
 impl DjotImportOptions {
@@ -46,6 +52,8 @@ impl DjotImportOptions {
             direction: true,
             non_breakable_lines: true,
             background_color: true,
+            top_margin: true,
+            text_indent: true,
         }
     }
 
@@ -58,6 +66,8 @@ impl DjotImportOptions {
             direction: false,
             non_breakable_lines: false,
             background_color: false,
+            top_margin: false,
+            text_indent: false,
         }
     }
 }
@@ -83,6 +93,10 @@ pub struct DjotExportOptions {
     pub non_breakable_lines: bool,
     /// Emit block background color as `{background_color=…}`.
     pub background_color: bool,
+    /// Emit the block's own space-above as `{top_margin=…}`.
+    pub top_margin: bool,
+    /// Emit the block's own first-line indent as `{text_indent=…}`.
+    pub text_indent: bool,
 }
 
 impl DjotExportOptions {
@@ -94,6 +108,8 @@ impl DjotExportOptions {
             direction: true,
             non_breakable_lines: true,
             background_color: true,
+            top_margin: true,
+            text_indent: true,
         }
     }
 
@@ -106,6 +122,8 @@ impl DjotExportOptions {
             direction: false,
             non_breakable_lines: false,
             background_color: false,
+            top_margin: false,
+            text_indent: false,
         }
     }
 }
