@@ -1,0 +1,44 @@
+# cargo-audit configuration. See https://github.com/rustsec/rustsec/tree/main/cargo-audit
+#
+# `cargo audit` scans Cargo.lock, which lists *every* resolved crate — including
+# dependencies of optional features that no default build ever compiles. The entries
+# below are advisories that resolve to such crates and are not reachable from this
+# workspace. Each needs a re-check whenever the typst pin in
+# `crates/document_io/Cargo.toml` is bumped.
+
+[advisories]
+ignore = [
+    # RUSTSEC-2026-0194 — quick-xml: quadratic run time checking a start tag for
+    #   duplicate attribute names.
+    # RUSTSEC-2026-0195 — quick-xml: unbounded namespace-declaration allocation in
+    #   `NsReader` enables memory-exhaustion DoS.
+    #
+    # Both resolve to quick-xml 0.38.4 on this path:
+    #   text-document-io --(optional `pdf` feature)--> typst -> typst-library
+    #     -> hayagriva -> citationberg -> quick-xml 0.38.4
+    #
+    # Not fixable here, and not reachable:
+    #
+    # 1. No fix exists upstream. Both advisories require quick-xml >=0.41.0.
+    #    citationberg 0.7.0 — the latest release — still depends on quick-xml ^0.38,
+    #    so the bump has to land in citationberg first. `cargo update --precise 0.41.0`
+    #    is rejected by the resolver.
+    #
+    # 2. The `pdf` feature is off by default, so a plain `cargo build` / `cargo test`
+    #    pulls in zero typst crates and therefore no quick-xml at all.
+    #
+    # 3. Even with `pdf` enabled, quick-xml is only reached through citationberg's CSL
+    #    (Citation Style Language) XML parsing, which typst invokes solely for
+    #    `#bibliography(...)`. PDF export never emits that call: `typst_markup.rs`
+    #    generates the markup itself and routes all document text through
+    #    `escape_typst`, which escapes `#` to `\#` (see the
+    #    `escapes_every_special_character` and
+    #    `escaped_adversarial_prose_compiles_without_being_interpreted_as_markup`
+    #    tests). Document content cannot inject a typst function call, so no
+    #    attacker-controlled bytes ever reach a quick-xml reader.
+    #
+    # Re-evaluate — and drop these entries — once citationberg ships quick-xml >=0.41,
+    # or if PDF export ever gains bibliography support or stops escaping user content.
+    "RUSTSEC-2026-0194",
+    "RUSTSEC-2026-0195",
+]
