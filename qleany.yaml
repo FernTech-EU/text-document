@@ -1064,6 +1064,12 @@ features:
             - name: right_margin
               type: integer
               optional: true
+            # First-line indent in pixels. Shifts only the first wrapped line of
+            # the block right by this much; subsequent lines stay flush with the
+            # block's left margin. Mirrors `Block.fmt_text_indent`.
+            - name: text_indent
+              type: integer
+              optional: true
 
       - name: set_frame_format
         undoable: true
