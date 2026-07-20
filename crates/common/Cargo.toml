@@ -29,7 +29,7 @@ serde_json = "1.0"
 chrono = { workspace = true }
 uuid = { workspace = true }
 log = "0.4"
-pulldown-cmark = "0.13.1"
+pulldown-cmark = "0.13.3"
 scraper = "0.26.0"
 ego-tree = "0.11.0"
 ropey = "1.6"
