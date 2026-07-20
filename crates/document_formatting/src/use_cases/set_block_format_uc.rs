@@ -46,6 +46,13 @@ fn marker_to_entity(m: &crate::dtos::MarkerType) -> common::entities::MarkerType
     }
 }
 
+fn direction_to_entity(d: &crate::dtos::TextDirection) -> common::entities::TextDirection {
+    match d {
+        crate::dtos::TextDirection::LeftToRight => common::entities::TextDirection::LeftToRight,
+        crate::dtos::TextDirection::RightToLeft => common::entities::TextDirection::RightToLeft,
+    }
+}
+
 fn execute_set_block_format(
     uow: &mut Box<dyn SetBlockFormatUnitOfWorkTrait>,
     dto: &SetBlockFormatDto,
@@ -121,7 +128,7 @@ fn execute_set_block_format(
                 updated.fmt_non_breakable_lines = Some(v);
             }
             if let Some(ref d) = dto.direction {
-                updated.fmt_direction = Some(d.clone());
+                updated.fmt_direction = Some(direction_to_entity(d));
             }
             if let Some(ref c) = dto.background_color {
                 updated.fmt_background_color = Some(c.clone());

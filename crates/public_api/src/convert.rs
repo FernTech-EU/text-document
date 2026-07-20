@@ -199,6 +199,26 @@ fn alignment_to_dto(v: &crate::Alignment) -> fmt_dto::Alignment {
     }
 }
 
+fn direction_to_dto(v: &crate::TextDirection) -> fmt_dto::TextDirection {
+    match v {
+        crate::TextDirection::LeftToRight => fmt_dto::TextDirection::LeftToRight,
+        crate::TextDirection::RightToLeft => fmt_dto::TextDirection::RightToLeft,
+    }
+}
+
+fn list_style_to_dto(v: &crate::ListStyle) -> fmt_dto::ListStyle {
+    match v {
+        crate::ListStyle::Disc => fmt_dto::ListStyle::Disc,
+        crate::ListStyle::Circle => fmt_dto::ListStyle::Circle,
+        crate::ListStyle::Square => fmt_dto::ListStyle::Square,
+        crate::ListStyle::Decimal => fmt_dto::ListStyle::Decimal,
+        crate::ListStyle::LowerAlpha => fmt_dto::ListStyle::LowerAlpha,
+        crate::ListStyle::UpperAlpha => fmt_dto::ListStyle::UpperAlpha,
+        crate::ListStyle::LowerRoman => fmt_dto::ListStyle::LowerRoman,
+        crate::ListStyle::UpperRoman => fmt_dto::ListStyle::UpperRoman,
+    }
+}
+
 fn marker_to_dto(v: &crate::MarkerType) -> fmt_dto::MarkerType {
     match v {
         crate::MarkerType::NoMarker => fmt_dto::MarkerType::NoMarker,
@@ -305,7 +325,7 @@ impl BlockFormat {
             marker: self.marker.as_ref().map(marker_to_dto),
             line_height: self.line_height.map(|v| (v * 1000.0) as i64),
             non_breakable_lines: self.non_breakable_lines,
-            direction: self.direction.clone(),
+            direction: self.direction.as_ref().map(direction_to_dto),
             background_color: self.background_color.clone(),
             is_code_block: self.is_code_block,
             code_language: self.code_language.clone(),
@@ -380,7 +400,7 @@ impl ListFormat {
     ) -> frontend::document_formatting::SetListFormatDto {
         frontend::document_formatting::SetListFormatDto {
             list_id: to_i64(list_id),
-            style: self.style.clone(),
+            style: self.style.as_ref().map(list_style_to_dto),
             indent: self.indent.map(|v| v as i64),
             prefix: self.prefix.clone(),
             suffix: self.suffix.clone(),

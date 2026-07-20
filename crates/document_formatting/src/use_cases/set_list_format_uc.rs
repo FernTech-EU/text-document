@@ -21,6 +21,19 @@ pub trait SetListFormatUnitOfWorkFactoryTrait: Send + Sync {
 #[macros::uow_action(entity = "List", action = "Update")]
 pub trait SetListFormatUnitOfWorkTrait: CommandUnitOfWork {}
 
+fn style_to_entity(s: &crate::dtos::ListStyle) -> common::entities::ListStyle {
+    match s {
+        crate::dtos::ListStyle::Disc => common::entities::ListStyle::Disc,
+        crate::dtos::ListStyle::Circle => common::entities::ListStyle::Circle,
+        crate::dtos::ListStyle::Square => common::entities::ListStyle::Square,
+        crate::dtos::ListStyle::Decimal => common::entities::ListStyle::Decimal,
+        crate::dtos::ListStyle::LowerAlpha => common::entities::ListStyle::LowerAlpha,
+        crate::dtos::ListStyle::UpperAlpha => common::entities::ListStyle::UpperAlpha,
+        crate::dtos::ListStyle::LowerRoman => common::entities::ListStyle::LowerRoman,
+        crate::dtos::ListStyle::UpperRoman => common::entities::ListStyle::UpperRoman,
+    }
+}
+
 fn execute_set_list_format(
     uow: &mut Box<dyn SetListFormatUnitOfWorkTrait>,
     dto: &SetListFormatDto,
@@ -50,7 +63,7 @@ fn execute_set_list_format(
     // Set list format fields -- None means preserve existing value.
     let mut updated = list.clone();
     if let Some(ref s) = dto.style {
-        updated.style = s.clone();
+        updated.style = style_to_entity(s);
     }
     if let Some(v) = dto.indent {
         updated.indent = v;
