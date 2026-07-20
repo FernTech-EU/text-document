@@ -252,6 +252,10 @@ impl TextFormat {
             font_italic: self.font_italic,
             font_underline: self.font_underline,
             font_strikeout: self.font_strikeout,
+            vertical_alignment: self
+                .vertical_alignment
+                .as_ref()
+                .map(vertical_alignment_to_dto),
         }
     }
 }

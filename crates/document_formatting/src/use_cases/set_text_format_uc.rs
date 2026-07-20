@@ -63,7 +63,12 @@ fn underline_style_to_entity(s: &crate::dtos::UnderlineStyle) -> common::entitie
     }
 }
 
-fn vertical_alignment_to_entity(
+/// DTO enum → entity enum. Shared with `merge_text_format_uc`, which carries
+/// the same field: a mapping table, not business logic, so sharing it does not
+/// make one use case depend on another. It lives here because `lib.rs` and
+/// `use_cases.rs` are both generated and a shared module would mean hand-editing
+/// a third generated file.
+pub(crate) fn vertical_alignment_to_entity(
     v: &crate::dtos::CharVerticalAlignment,
 ) -> common::entities::CharVerticalAlignment {
     match v {

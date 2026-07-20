@@ -990,6 +990,19 @@ features:
             - name: font_strikeout
               type: boolean
               optional: true
+            # Superscript / subscript. Present on SetTextFormatDto since the
+            # beginning, but merge_char_format is the path every toolbar takes,
+            # so without it here `apply_text_format` accepted a vertical
+            # alignment and silently discarded it.
+            - name: vertical_alignment
+              type: enum
+              enum_name: CharVerticalAlignment
+              optional: true
+              enum_values:
+                - Normal
+                - SuperScript
+                - SubScript
+                - Middle
 
       - name: set_block_format
         undoable: true

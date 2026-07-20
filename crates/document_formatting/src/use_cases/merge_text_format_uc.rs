@@ -61,6 +61,10 @@ fn merge_dto(base: &CharacterFormat, dto: &MergeTextFormatDto) -> CharacterForma
     if let Some(v) = dto.font_strikeout {
         out.font_strikeout = Some(v);
     }
+    if let Some(ref v) = dto.vertical_alignment {
+        out.vertical_alignment =
+            Some(crate::use_cases::set_text_format_uc::vertical_alignment_to_entity(v));
+    }
     out
 }
 

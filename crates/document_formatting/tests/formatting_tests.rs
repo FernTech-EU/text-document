@@ -390,6 +390,7 @@ fn test_merge_text_format_preserves_other_fields() -> Result<()> {
             font_italic: Some(true),
             font_underline: Some(true),
             font_strikeout: None,
+            vertical_alignment: None,
         },
     )?;
 
@@ -467,6 +468,7 @@ fn test_merge_text_format_undo() -> Result<()> {
             font_italic: Some(true),
             font_underline: Some(false),
             font_strikeout: None,
+            vertical_alignment: None,
         },
     )?;
 

@@ -105,6 +105,7 @@ fn test_merge_text_format_on_list_blocks() -> Result<()> {
             font_italic: None,
             font_underline: None,
             font_strikeout: None,
+            vertical_alignment: None,
         },
     )?;
 
@@ -166,6 +167,7 @@ fn test_merge_text_format_partial_split_preserves_fields() -> Result<()> {
             font_italic: Some(true),
             font_underline: None,
             font_strikeout: None,
+            vertical_alignment: None,
         },
     )?;
 
@@ -224,6 +226,7 @@ fn test_merge_text_format_undo_redo() -> Result<()> {
             font_italic: None,
             font_underline: None,
             font_strikeout: None,
+            vertical_alignment: None,
         },
     )?;
 
@@ -247,6 +250,96 @@ fn test_merge_text_format_undo_redo() -> Result<()> {
         get_bold(&db)?,
         Some(true),
         "After redo merge, bold should be true"
+    );
+    Ok(())
+}
+
+/// The merge path is what every formatting toolbar goes through, and until
+/// `vertical_alignment` was carried here a caller could ask for superscript,
+/// get `Ok(())` back, and find nothing had changed — the field was dropped at
+/// the DTO boundary. Set-then-read is the whole point of the field existing.
+#[test]
+fn test_merge_text_format_carries_vertical_alignment() -> Result<()> {
+    let (db, hub, mut urm) = setup_with_text("E=mc2")?;
+
+    document_formatting_controller::merge_text_format(
+        &db,
+        &hub,
+        &mut urm,
+        None,
+        &MergeTextFormatDto {
+            position: 4,
+            anchor: 5,
+            vertical_alignment: Some(CharVerticalAlignment::SuperScript),
+            ..Default::default()
+        },
+    )?;
+
+    let block_ids = get_block_ids(&db)?;
+    let read = |db: &DbContext| -> Result<Vec<Option<common::entities::CharVerticalAlignment>>> {
+        let elements = test_harness::synth_block_elements(db, block_ids[0])?;
+        Ok(elements
+            .iter()
+            .map(|e| e.fmt_vertical_alignment.clone())
+            .collect())
+    };
+
+    assert!(
+        read(&db)?
+            .iter()
+            .any(|v| *v == Some(common::entities::CharVerticalAlignment::SuperScript)),
+        "the merged run must carry SuperScript, not silently drop it"
+    );
+
+    urm.undo(None)?;
+    assert!(
+        read(&db)?
+            .iter()
+            .all(|v| *v != Some(common::entities::CharVerticalAlignment::SuperScript)),
+        "undo must take the superscript back off"
+    );
+    Ok(())
+}
+
+/// A merge that says nothing about vertical alignment must leave it alone —
+/// the same "None means don't change" contract every other field in this DTO
+/// honours. Without this, toggling bold would quietly reset a superscript.
+#[test]
+fn test_merge_text_format_preserves_existing_vertical_alignment() -> Result<()> {
+    let (db, hub, mut urm) = setup_with_text("E=mc2")?;
+
+    document_formatting_controller::merge_text_format(
+        &db,
+        &hub,
+        &mut urm,
+        None,
+        &MergeTextFormatDto {
+            position: 4,
+            anchor: 5,
+            vertical_alignment: Some(CharVerticalAlignment::SuperScript),
+            ..Default::default()
+        },
+    )?;
+    document_formatting_controller::merge_text_format(
+        &db,
+        &hub,
+        &mut urm,
+        None,
+        &MergeTextFormatDto {
+            position: 4,
+            anchor: 5,
+            font_bold: Some(true),
+            ..Default::default()
+        },
+    )?;
+
+    let block_ids = get_block_ids(&db)?;
+    let elements = test_harness::synth_block_elements(&db, block_ids[0])?;
+    assert!(
+        elements.iter().any(|e| e.fmt_vertical_alignment
+            == Some(common::entities::CharVerticalAlignment::SuperScript)
+            && e.fmt_font_bold == Some(true)),
+        "bolding a superscript run must keep it superscript"
     );
     Ok(())
 }
