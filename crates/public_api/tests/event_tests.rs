@@ -67,6 +67,37 @@ fn modified_flag() {
 }
 
 #[test]
+fn content_revision_bumps_once_per_edit_and_ignores_non_content_events() {
+    let doc = new_doc_with_text("Hello");
+    let start = doc.content_revision();
+
+    let cursor = doc.cursor_at(5);
+    cursor.insert_text(" world").unwrap();
+    assert_eq!(
+        doc.content_revision(),
+        start + 1,
+        "one content edit must bump the counter by exactly one"
+    );
+
+    // A non-content event (ModificationChanged, via set_modified) must not
+    // move the counter — it exists specifically to answer "was there a
+    // content edit", not "was there any event at all".
+    doc.set_modified(false);
+    assert_eq!(
+        doc.content_revision(),
+        start + 1,
+        "a modified-flag-only event must not bump content_revision"
+    );
+
+    cursor.insert_text("!").unwrap();
+    assert_eq!(
+        doc.content_revision(),
+        start + 2,
+        "a second edit must bump the counter again"
+    );
+}
+
+#[test]
 fn on_change_callback_fires() {
     use std::sync::{Arc, Mutex};
 

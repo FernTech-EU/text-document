@@ -1366,6 +1366,20 @@ impl TextDocument {
         crate::inner::dispatch_queued_events(queued);
     }
 
+    /// A monotonic counter, bumped once per [`DocumentEvent::ContentsChanged`]
+    /// queued so far. Starts at `0`.
+    ///
+    /// Lets a caller answer "was this notification caused by exactly the
+    /// most recent edit, with nothing else having happened since" precisely
+    /// — snapshot the value when acting on a notification, and compare it
+    /// against the current value later. This is deliberately *not* the same
+    /// as [`is_modified`](Self::is_modified) (a flag, not a count) or the
+    /// undo stack's depth (which does not grow when consecutive compatible
+    /// edits merge into one entry — e.g. fast consecutive typing).
+    pub fn content_revision(&self) -> u64 {
+        self.inner.lock().content_revision
+    }
+
     // ── Document properties ──────────────────────────────────
 
     /// Get the document title.

@@ -63,6 +63,14 @@ pub(crate) struct TextDocumentInner {
     pub root_id: EntityId,
     pub document_id: EntityId,
     pub modified: bool,
+    /// Bumped once for every queued [`DocumentEvent::ContentsChanged`] — a
+    /// cheap, monotonic "was this notification caused by exactly one edit,
+    /// and nothing since" token. Unlike `modified` (a flag) or a
+    /// millisecond-resolution `updated_at` timestamp, this can never
+    /// collide between two edits and never merges the way the undo stack
+    /// does when consecutive compatible commands coalesce. Read via
+    /// [`TextDocument::content_revision`](crate::TextDocument::content_revision).
+    pub content_revision: u64,
 
     // Cursor tracking
     pub cursors: Vec<Weak<Mutex<CursorData>>>,
@@ -155,6 +163,9 @@ impl TextDocumentInner {
     /// Events are collected while the lock is held, then dispatched
     /// after the lock is released via [`dispatch_queued_events`].
     pub fn queue_event(&mut self, event: DocumentEvent) {
+        if matches!(event, DocumentEvent::ContentsChanged { .. }) {
+            self.content_revision = self.content_revision.wrapping_add(1);
+        }
         self.pending_events.push(event);
     }
 
@@ -394,6 +405,7 @@ impl TextDocumentInner {
             root_id: root.id,
             document_id: doc.id,
             modified: false,
+            content_revision: 0,
             cursors: Vec::new(),
             pending_events: Vec::new(),
             callbacks: Vec::new(),
