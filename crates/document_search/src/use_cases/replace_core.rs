@@ -21,14 +21,9 @@
 
 use anyhow::Result;
 use common::database::Store;
-use common::database::rope_helpers::{
-    block_char_length, block_content_via_store, rope_delete_in_block, rope_insert_in_block,
-};
+use common::database::rope_helpers::{block_char_length, replace_in_block};
 use common::entities::Block;
-use common::format_runs::{
-    ReplaceFormatPolicy, check_well_formed, logical_offset_to_byte, shift_images_for_delete,
-    shift_images_for_insert, shift_runs_for_replace,
-};
+use common::format_runs::ReplaceFormatPolicy;
 
 /// One range the caller wants replaced, in **char** offsets into the document's text.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -127,9 +122,10 @@ fn resolve_in_block(
 
 /// Apply one edit to a block, in the store, and hand back the block to persist.
 ///
-/// Deliberately takes no unit of work: everything here is store-level (the block's text
-/// lives in the rope, its formatting in `format_runs`, its images in `block_images`), so
-/// the caller's UoW only has to persist the returned `Block`.
+/// Thin wrapper around the shared [`replace_in_block`] primitive — this crate's own char-offset
+/// planning (`resolve_in_block`, `plan`) hands off to it rather than duplicating the run/image/
+/// rope splice, which used to live here before `document_editing`'s interactive replace path
+/// needed the same policy choice.
 ///
 /// `policy` decides what the replacement wears where it overwrites formatted prose — see
 /// [`ReplaceFormatPolicy`]. The default reproduces the historical behaviour exactly.
@@ -141,50 +137,14 @@ pub(crate) fn apply_in_block(
     replacement: &str,
     policy: ReplaceFormatPolicy,
 ) -> Result<Block> {
-    let images_before = store
-        .block_images
-        .read()
-        .get(&block.id)
-        .cloned()
-        .unwrap_or_default();
-    let block_text = block_content_via_store(block, store);
-
-    let byte_start = logical_offset_to_byte(&block_text, &images_before, char_start as i64);
-    let byte_end = logical_offset_to_byte(&block_text, &images_before, char_end as i64);
-
-    let mut new_plain = String::with_capacity(
-        block_text.len() - (byte_end - byte_start) as usize + replacement.len(),
-    );
-    new_plain.push_str(&block_text[..byte_start as usize]);
-    new_plain.push_str(replacement);
-    new_plain.push_str(&block_text[byte_end as usize..]);
-
-    let inserted_byte_len = replacement.len() as u32;
-
-    // Format runs under an explicit policy, and then CHECK the result rather than assert it:
-    // `debug_assert_well_formed` is compiled out of release, so a malformed run list produced
-    // in a shipped build went entirely undetected — and autosave wrote it to the writer's
-    // file seconds later. A replace that would corrupt a block's formatting fails loudly.
-    {
-        let mut runs_map = store.format_runs.write();
-        let runs = runs_map.entry(block.id).or_default();
-        shift_runs_for_replace(runs, byte_start, byte_end, inserted_byte_len, policy)?;
-        check_well_formed(runs, new_plain.len())?;
-    }
-    {
-        let mut images_map = store.block_images.write();
-        let images = images_map.entry(block.id).or_default();
-        shift_images_for_delete(images, byte_start, byte_end);
-        shift_images_for_insert(images, byte_start, inserted_byte_len);
-    }
-
-    // Mirror the in-block splice into the global rope.
-    rope_delete_in_block(store, block.id, byte_start, byte_end);
-    rope_insert_in_block(store, block.id, byte_start, replacement);
-
-    let mut updated = block.clone();
-    updated.updated_at = chrono::Utc::now();
-    Ok(updated)
+    Ok(replace_in_block(
+        store,
+        block,
+        char_start as i64,
+        char_end as i64,
+        replacement,
+        policy,
+    )?)
 }
 
 /// Re-derive every block's `document_position` after a set of length-changing edits, and

@@ -381,6 +381,7 @@ fn test_get_text_at_position_spans_into_table_cell() -> Result<()> {
         &mut undo_redo_manager,
         None,
         &InsertTextDto {
+            format_policy: Default::default(),
             position: 3,
             anchor: 3,
             text: "ab".to_string(),

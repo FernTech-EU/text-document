@@ -4,8 +4,8 @@ use crate::InsertTextResultDto;
 use anyhow::{Result, anyhow};
 use common::database::CommandUnitOfWork;
 use common::database::rope_helpers::{
-    block_char_length, block_content_via_store, find_block_at_char_position, rope_delete_in_block,
-    rope_insert_in_block,
+    block_char_length, block_content_via_store, find_block_at_char_position, replace_in_block,
+    rope_delete_in_block, rope_insert_in_block,
 };
 use common::direct_access::document::document_repository::DocumentRelationshipField;
 use common::direct_access::frame::frame_repository::FrameRelationshipField;
@@ -14,7 +14,7 @@ use common::direct_access::table::TableRelationshipField;
 use common::entities::{Block, Document, Frame, Root, TableCell};
 use common::format_runs::{
     FormatRun, ImageAnchor, debug_assert_well_formed, logical_offset_to_byte,
-    shift_images_for_delete, shift_images_for_insert, shift_runs_for_delete, shift_runs_for_insert,
+    shift_images_for_insert, shift_runs_for_insert,
 };
 
 use common::types::{EntityId, ROOT_ENTITY_ID};
@@ -65,66 +65,6 @@ enum InsertTextUndo {
     SelectionReplacement(common::snapshot::EntityTreeSnapshot),
 }
 
-/// Delete a logical character range `[start_offset..end_offset)` inside a
-/// single block. Mutates `block.plain_text`, `block_char_length(&block, &store)`,
-/// `format_runs[block.id]`, and `block_images[block.id]` consistently.
-/// Returns the count of logical positions removed (text chars + images).
-fn delete_range_in_block(
-    uow: &mut Box<dyn InsertTextUnitOfWorkTrait>,
-    block: &Block,
-    start_offset: i64,
-    end_offset: i64,
-) -> Result<i64> {
-    if end_offset <= start_offset {
-        return Ok(0);
-    }
-
-    let store = uow.store();
-    let images_before = store
-        .block_images
-        .read()
-        .get(&block.id)
-        .cloned()
-        .unwrap_or_default();
-
-    let block_text = block_content_via_store(block, &store);
-    let byte_start = logical_offset_to_byte(&block_text, &images_before, start_offset);
-    let byte_end = logical_offset_to_byte(&block_text, &images_before, end_offset);
-
-    let removed_text_chars = block_text[byte_start as usize..byte_end as usize]
-        .chars()
-        .count() as i64;
-
-    let mut new_plain = String::with_capacity(block_text.len() - (byte_end - byte_start) as usize);
-    new_plain.push_str(&block_text[..byte_start as usize]);
-    new_plain.push_str(&block_text[byte_end as usize..]);
-
-    // Mutate format_runs.
-    {
-        let mut runs_map = store.format_runs.write();
-        let runs = runs_map.entry(block.id).or_default();
-        shift_runs_for_delete(runs, byte_start, byte_end);
-        debug_assert_well_formed(runs, new_plain.len());
-    }
-
-    // Mutate block_images and capture how many were removed.
-    let images_removed = {
-        let mut images_map = store.block_images.write();
-        let images = images_map.entry(block.id).or_default();
-        shift_images_for_delete(images, byte_start, byte_end) as i64
-    };
-
-    rope_delete_in_block(&store, block.id, byte_start, byte_end);
-
-    let positions_removed = removed_text_chars + images_removed;
-
-    let mut updated_block = block.clone();
-    updated_block.updated_at = chrono::Utc::now();
-    uow.update_block(&updated_block)?;
-
-    Ok(positions_removed)
-}
-
 fn execute_insert_with_selection(
     uow: &mut Box<dyn InsertTextUnitOfWorkTrait>,
     dto: &InsertTextDto,
@@ -167,7 +107,6 @@ fn execute_insert_with_selection(
 
     let sel_start = std::cmp::min(dto.position, dto.anchor);
     let sel_end = std::cmp::max(dto.position, dto.anchor);
-    let position = sel_start;
 
     let (sel_block, sel_block_idx, sel_start_offset) =
         super::editing_helpers::find_block_at_position(&blocks, sel_start, &uow.store())?;
@@ -181,71 +120,35 @@ fn execute_insert_with_selection(
         ));
     }
 
-    let chars_removed = delete_range_in_block(uow, &sel_block, sel_start_offset, sel_end_offset)?;
+    // Delete-then-insert used to be two separate splices (find the block, delete the
+    // selection, update positions, re-fetch, re-find the block, insert). `replace_in_block`
+    // does both in one call — via `shift_runs_for_replace`, which chooses what the
+    // replacement wears from `dto.format_policy` (`ReplaceFormatPolicy::InheritPreceding`
+    // reproduces the old two-step composition byte for byte, so every existing caller that
+    // never sets this field sees no behaviour change).
+    let chars_removed = sel_end_offset - sel_start_offset;
+    let inserted_char_len = dto.text.chars().count() as i64;
+    let net_delta = inserted_char_len - chars_removed;
 
-    document.character_count -= chars_removed;
+    let updated_block = replace_in_block(
+        &uow.store(),
+        &sel_block,
+        sel_start_offset,
+        sel_end_offset,
+        &dto.text,
+        dto.format_policy,
+    )
+    .map_err(|e| anyhow!("selection replacement would corrupt block formatting: {e}"))?;
+    uow.update_block(&updated_block)?;
+
+    document.character_count += net_delta;
     document.updated_at = chrono::Utc::now();
     uow.update_document(&document)?;
 
-    let mut to_update = Vec::new();
+    let mut blocks_to_update = Vec::new();
     for b in &blocks[(sel_block_idx + 1)..] {
         let mut ub = b.clone();
-        ub.document_position -= chars_removed;
-        ub.updated_at = chrono::Utc::now();
-        to_update.push(ub);
-    }
-    if !to_update.is_empty() {
-        uow.update_block_multi(&to_update)?;
-    }
-
-    let blocks_opt = uow.get_block_multi(&all_block_ids)?;
-    blocks = blocks_opt.into_iter().flatten().collect();
-    blocks.sort_by_key(|b| b.document_position);
-    document = uow
-        .get_document(&doc_id)?
-        .ok_or_else(|| anyhow!("Document not found"))?;
-
-    let (block, block_idx, offset) =
-        super::editing_helpers::find_block_at_position(&blocks, position, &uow.store())?;
-
-    let store = uow.store();
-    let images = store
-        .block_images
-        .read()
-        .get(&block.id)
-        .cloned()
-        .unwrap_or_default();
-    let block_text = block_content_via_store(&block, &store);
-    let byte_offset = logical_offset_to_byte(&block_text, &images, offset);
-    let inserted_byte_len = dto.text.len() as u32;
-    let inserted_char_len = dto.text.chars().count() as i64;
-
-    let mut new_plain = block_text.clone();
-    new_plain.insert_str(byte_offset as usize, &dto.text);
-
-    let mut updated_block = block.clone();
-    updated_block.updated_at = chrono::Utc::now();
-    uow.update_block(&updated_block)?;
-
-    {
-        let mut runs_map = store.format_runs.write();
-        let runs = runs_map.entry(block.id).or_default();
-        shift_runs_for_insert(runs, byte_offset, inserted_byte_len);
-        debug_assert_well_formed(runs, new_plain.len());
-    }
-    {
-        let mut images_map = store.block_images.write();
-        if let Some(images) = images_map.get_mut(&block.id) {
-            shift_images_for_insert(images, byte_offset, inserted_byte_len);
-        }
-    }
-
-    rope_insert_in_block(&store, block.id, byte_offset, &dto.text);
-
-    let mut blocks_to_update: Vec<Block> = Vec::new();
-    for b in &blocks[(block_idx + 1)..] {
-        let mut ub = b.clone();
-        ub.document_position += inserted_char_len;
+        ub.document_position += net_delta;
         ub.updated_at = chrono::Utc::now();
         blocks_to_update.push(ub);
     }
@@ -253,14 +156,9 @@ fn execute_insert_with_selection(
         uow.update_block_multi(&blocks_to_update)?;
     }
 
-    let mut updated_doc = document.clone();
-    updated_doc.character_count += inserted_char_len;
-    updated_doc.updated_at = chrono::Utc::now();
-    uow.update_document(&updated_doc)?;
-
     Ok((
         InsertTextResultDto {
-            new_position: block.document_position + offset + inserted_char_len,
+            new_position: sel_block.document_position + sel_start_offset + inserted_char_len,
             blocks_affected: 1,
         },
         InsertTextUndo::SelectionReplacement(snapshot),

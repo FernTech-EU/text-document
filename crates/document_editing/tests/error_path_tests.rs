@@ -20,6 +20,7 @@ fn test_insert_text_empty_string_is_noop() -> Result<()> {
         &mut urm,
         None,
         &InsertTextDto {
+            format_policy: Default::default(),
             position: 3,
             anchor: 3,
             text: "".to_string(),
@@ -44,6 +45,7 @@ fn test_insert_text_at_beyond_document_end_clamps() -> Result<()> {
         &mut urm,
         None,
         &InsertTextDto {
+            format_policy: Default::default(),
             position: 999,
             anchor: 999,
             text: "!".to_string(),

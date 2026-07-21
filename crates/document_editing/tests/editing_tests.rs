@@ -56,6 +56,7 @@ fn test_insert_text_at_beginning() -> Result<()> {
         &mut undo_redo_manager,
         None,
         &InsertTextDto {
+            format_policy: Default::default(),
             position: 0,
             anchor: 0,
             text: "Say ".to_string(),
@@ -81,6 +82,7 @@ fn test_insert_text_at_end() -> Result<()> {
         &mut undo_redo_manager,
         None,
         &InsertTextDto {
+            format_policy: Default::default(),
             position: 5,
             anchor: 5,
             text: " World".to_string(),
@@ -105,6 +107,7 @@ fn test_insert_text_in_middle() -> Result<()> {
         &mut undo_redo_manager,
         None,
         &InsertTextDto {
+            format_policy: Default::default(),
             position: 2,
             anchor: 2,
             text: "l".to_string(),
@@ -212,6 +215,7 @@ fn test_insert_text_unicode() -> Result<()> {
         &mut undo_redo_manager,
         None,
         &InsertTextDto {
+            format_policy: Default::default(),
             position: 4, // after "café" (4 chars, not 5 bytes)
             anchor: 4,
             text: " latte".to_string(),
@@ -238,6 +242,7 @@ fn test_insert_text_replaces_selection() -> Result<()> {
         &mut undo_redo_manager,
         None,
         &InsertTextDto {
+            format_policy: Default::default(),
             position: 6,
             anchor: 11,
             text: "Rust".to_string(),
@@ -387,6 +392,7 @@ fn test_insert_text_updates_stats() -> Result<()> {
         &mut undo_redo_manager,
         None,
         &InsertTextDto {
+            format_policy: Default::default(),
             position: 2,
             anchor: 2,
             text: " there".to_string(),
@@ -412,6 +418,7 @@ fn test_insert_text_undo() -> Result<()> {
         &mut undo_redo_manager,
         None,
         &InsertTextDto {
+            format_policy: Default::default(),
             position: 5,
             anchor: 5,
             text: " World".to_string(),
@@ -499,6 +506,7 @@ fn test_insert_text_merge_consecutive_chars() -> Result<()> {
         &mut undo_redo_manager,
         None,
         &InsertTextDto {
+            format_policy: Default::default(),
             position: 5,
             anchor: 5,
             text: "a".to_string(),
@@ -510,6 +518,7 @@ fn test_insert_text_merge_consecutive_chars() -> Result<()> {
         &mut undo_redo_manager,
         None,
         &InsertTextDto {
+            format_policy: Default::default(),
             position: 6,
             anchor: 6,
             text: "b".to_string(),
@@ -521,6 +530,7 @@ fn test_insert_text_merge_consecutive_chars() -> Result<()> {
         &mut undo_redo_manager,
         None,
         &InsertTextDto {
+            format_policy: Default::default(),
             position: 7,
             anchor: 7,
             text: "c".to_string(),
@@ -553,6 +563,7 @@ fn test_insert_text_merge_undo_redo() -> Result<()> {
             &mut undo_redo_manager,
             None,
             &InsertTextDto {
+                format_policy: Default::default(),
                 position: 5 + i as i64,
                 anchor: 5 + i as i64,
                 text: ch.to_string(),
@@ -585,6 +596,7 @@ fn test_insert_text_no_merge_non_contiguous() -> Result<()> {
         &mut undo_redo_manager,
         None,
         &InsertTextDto {
+            format_policy: Default::default(),
             position: 5,
             anchor: 5,
             text: "a".to_string(),
@@ -598,6 +610,7 @@ fn test_insert_text_no_merge_non_contiguous() -> Result<()> {
         &mut undo_redo_manager,
         None,
         &InsertTextDto {
+            format_policy: Default::default(),
             position: 0,
             anchor: 0,
             text: "b".to_string(),
@@ -630,6 +643,7 @@ fn test_insert_text_no_merge_with_selection() -> Result<()> {
         &mut undo_redo_manager,
         None,
         &InsertTextDto {
+            format_policy: Default::default(),
             position: 5,
             anchor: 5,
             text: "a".to_string(),
@@ -643,6 +657,7 @@ fn test_insert_text_no_merge_with_selection() -> Result<()> {
         &mut undo_redo_manager,
         None,
         &InsertTextDto {
+            format_policy: Default::default(),
             position: 5,
             anchor: 6,
             text: "b".to_string(),
@@ -667,6 +682,7 @@ fn test_insert_text_merge_word_boundary() -> Result<()> {
         &mut undo_redo_manager,
         None,
         &InsertTextDto {
+            format_policy: Default::default(),
             position: 5,
             anchor: 5,
             text: "a".to_string(),
@@ -678,6 +694,7 @@ fn test_insert_text_merge_word_boundary() -> Result<()> {
         &mut undo_redo_manager,
         None,
         &InsertTextDto {
+            format_policy: Default::default(),
             position: 6,
             anchor: 6,
             text: "b".to_string(),
@@ -691,6 +708,7 @@ fn test_insert_text_merge_word_boundary() -> Result<()> {
         &mut undo_redo_manager,
         None,
         &InsertTextDto {
+            format_policy: Default::default(),
             position: 7,
             anchor: 7,
             text: " ".to_string(),
@@ -704,6 +722,7 @@ fn test_insert_text_merge_word_boundary() -> Result<()> {
         &mut undo_redo_manager,
         None,
         &InsertTextDto {
+            format_policy: Default::default(),
             position: 8,
             anchor: 8,
             text: "c".to_string(),
@@ -737,6 +756,7 @@ fn test_insert_text_merge_max_length() -> Result<()> {
         &mut undo_redo_manager,
         None,
         &InsertTextDto {
+            format_policy: Default::default(),
             position: 0,
             anchor: 0,
             text: long_text.clone(),
@@ -750,6 +770,7 @@ fn test_insert_text_merge_max_length() -> Result<()> {
         &mut undo_redo_manager,
         None,
         &InsertTextDto {
+            format_policy: Default::default(),
             position: 200,
             anchor: 200,
             text: "y".to_string(),
@@ -773,6 +794,7 @@ fn test_insert_text_no_merge_after_delete() -> Result<()> {
         &mut undo_redo_manager,
         None,
         &InsertTextDto {
+            format_policy: Default::default(),
             position: 5,
             anchor: 5,
             text: "a".to_string(),
@@ -799,6 +821,7 @@ fn test_insert_text_no_merge_after_delete() -> Result<()> {
         &mut undo_redo_manager,
         None,
         &InsertTextDto {
+            format_policy: Default::default(),
             position: 5,
             anchor: 5,
             text: "b".to_string(),
@@ -823,6 +846,7 @@ fn test_insert_text_merge_punctuation_boundary() -> Result<()> {
         &mut undo_redo_manager,
         None,
         &InsertTextDto {
+            format_policy: Default::default(),
             position: 5,
             anchor: 5,
             text: "a".to_string(),
@@ -834,6 +858,7 @@ fn test_insert_text_merge_punctuation_boundary() -> Result<()> {
         &mut undo_redo_manager,
         None,
         &InsertTextDto {
+            format_policy: Default::default(),
             position: 6,
             anchor: 6,
             text: ".".to_string(),
@@ -850,6 +875,7 @@ fn test_insert_text_merge_punctuation_boundary() -> Result<()> {
         &mut undo_redo_manager,
         None,
         &InsertTextDto {
+            format_policy: Default::default(),
             position: 7,
             anchor: 7,
             text: "b".to_string(),

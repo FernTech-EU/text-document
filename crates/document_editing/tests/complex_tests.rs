@@ -540,6 +540,7 @@ fn test_full_editing_session() -> Result<()> {
         &mut urm,
         None,
         &InsertTextDto {
+            format_policy: Default::default(),
             position: 5,
             anchor: 5,
             text: " here".to_string(),
@@ -566,6 +567,7 @@ fn test_full_editing_session() -> Result<()> {
         &mut urm,
         None,
         &InsertTextDto {
+            format_policy: Default::default(),
             position: block_result.new_position,
             anchor: block_result.new_position,
             text: "Second line".to_string(),

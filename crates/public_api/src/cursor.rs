@@ -181,6 +181,98 @@ impl TextCursor {
         Ok(result.text)
     }
 
+    /// Up to `max_len` characters of plain text immediately preceding the cursor position,
+    /// bounded and read directly from the store — the same fast block lookup
+    /// [`char_format`](Self::char_format) uses, never materializing the whole document the
+    /// way [`selected_text`](Self::selected_text)'s
+    /// `document_inspection_commands::get_text_at_position` does internally. Block
+    /// boundaries appear as `'\n'`. Returns fewer than `max_len` characters near the start of
+    /// the document.
+    ///
+    /// Falls back to the (correct, but O(document size)) slow path for documents containing
+    /// tables or unmirrored sub-frames, where the fast rope-index lookup doesn't apply — see
+    /// [`common::database::rope_helpers::find_block_at_char_position`]'s own doc comment for
+    /// exactly which documents that is.
+    pub fn text_before(&self, max_len: usize) -> Result<String> {
+        if max_len == 0 {
+            return Ok(String::new());
+        }
+        let pos = self.position();
+        let inner = self.doc.lock();
+        let store = inner.ctx.db_context.get_store();
+
+        // One O(log n) probe decides whether the fast path even applies to this document —
+        // same gate `find_block_at_char_position` itself uses (tables / unmirrored
+        // sub-frames disqualify it). Cheaper to check once up front than to discover it mid
+        // walk.
+        if pos > 0 && common::database::rope_helpers::find_block_at_char_position(store, 0).is_none()
+        {
+            let dto = frontend::document_inspection::GetTextAtPositionDto {
+                position: 0,
+                length: to_i64(pos),
+            };
+            let result = document_inspection_commands::get_text_at_position(&inner.ctx, &dto)?;
+            let full = result.text;
+            let total = full.chars().count();
+            let skip = total.saturating_sub(max_len);
+            return Ok(full.chars().skip(skip).collect());
+        }
+
+        let mut pieces: Vec<String> = Vec::new();
+        let mut remaining = max_len;
+        let mut end_pos = pos;
+
+        while remaining > 0 && end_pos > 0 {
+            let query = (end_pos - 1) as i64;
+            // `find_block_at_char_position` returns the *previous*-block answer at a
+            // boundary (char_in_block == the block's own length), which is exactly the
+            // convention this backward walk needs — unlike `get_block_at_position`'s command,
+            // which deliberately advances to the *next* block at a boundary for its own
+            // (forward/click-mapping) callers.
+            let Some((block_id, char_in_block, block_char_start)) =
+                common::database::rope_helpers::find_block_at_char_position(store, query)
+            else {
+                // A table or sub-frame appeared partway through the walk (shouldn't happen
+                // given the up-front check above, but the primitive's contract only promises
+                // this per-call, not for the whole document) — stop rather than guess.
+                break;
+            };
+            let block_dto = frontend::commands::block_commands::get_block(&inner.ctx, &block_id)?
+                .ok_or_else(|| DocumentError::NotFound("block not found".into()))?;
+            let entity: common::entities::Block = block_dto.into();
+            let block_text = common::database::rope_helpers::block_content_via_store(&entity, store);
+            let block_len = block_text.chars().count() as i64;
+            let block_char_start = block_char_start as usize;
+
+            if char_in_block == block_len {
+                // `query` landed exactly on this (non-empty) block's own trailing separator.
+                pieces.push("\n".to_string());
+                remaining -= 1;
+                if remaining == 0 {
+                    break;
+                }
+                let take = remaining.min(block_len as usize);
+                let local_start = block_len as usize - take;
+                let slice: String = block_text.chars().skip(local_start).take(take).collect();
+                pieces.push(slice);
+                remaining -= take;
+                end_pos = block_char_start + local_start;
+            } else {
+                // `query` is a real character at local index `char_in_block`.
+                let available = char_in_block as usize + 1;
+                let take = remaining.min(available);
+                let local_start = available - take;
+                let slice: String = block_text.chars().skip(local_start).take(take).collect();
+                pieces.push(slice);
+                remaining -= take;
+                end_pos = block_char_start + local_start;
+            }
+        }
+
+        pieces.reverse();
+        Ok(pieces.concat())
+    }
+
     /// Collapse the selection by moving anchor to position.
     pub fn clear_selection(&self) {
         let mut d = self.data.lock();
@@ -393,6 +485,7 @@ impl TextCursor {
 
         // Try direct insert first (handles same-block selection and no-selection cases)
         let dto = frontend::document_editing::InsertTextDto {
+            format_policy: Default::default(),
             position: to_i64(pos),
             anchor: to_i64(anchor),
             text: text.into(),
@@ -422,6 +515,94 @@ impl TextCursor {
                     let del_pos = to_usize(del_result.new_position);
 
                     let ins_dto = frontend::document_editing::InsertTextDto {
+                        format_policy: Default::default(),
+                        position: to_i64(del_pos),
+                        anchor: to_i64(del_pos),
+                        text: text.into(),
+                    };
+                    let ins_result = document_editing_commands::insert_text(
+                        &inner.ctx,
+                        Some(inner.stack_id),
+                        &ins_dto,
+                    )?;
+
+                    undo_redo_commands::end_composite(&inner.ctx);
+                    ins_result
+                }
+                Err(e) => return Err(e.into()),
+            };
+
+            let edit_pos = pos.min(anchor);
+            let removed = pos.max(anchor) - edit_pos;
+            self.finish_edit_ext(
+                &mut inner,
+                edit_pos,
+                removed,
+                to_usize(result.new_position),
+                to_usize(result.blocks_affected),
+                false,
+            )
+        };
+        crate::inner::dispatch_queued_events(queued);
+        Ok(())
+    }
+
+    /// Replace `[start, end)` with `text`, choosing what the replacement wears where it
+    /// overwrites formatted text — see [`crate::ReplaceFormatPolicy`]. Lands as one atomic
+    /// edit (one undo entry), with the cursor left at the end of the inserted text.
+    ///
+    /// The counterpart to [`insert_text`](Self::insert_text) for callers that must *choose*
+    /// the replacement's formatting rather than inherit whatever precedes the range — a
+    /// spell-check correction picked from a context menu, an autocorrect, a
+    /// replace-this-occurrence action. `start`/`end` may be given in either order.
+    ///
+    /// A range crossing a block boundary falls back to composing delete + insert as a single
+    /// undo unit, exactly like [`insert_text`](Self::insert_text)'s existing cross-block
+    /// fallback — `format_policy` only has meaning within one block, since
+    /// [`crate::ReplaceFormatPolicy`] operates on a single block's format runs.
+    pub fn replace(
+        &self,
+        start: usize,
+        end: usize,
+        text: &str,
+        policy: crate::ReplaceFormatPolicy,
+    ) -> Result<()> {
+        let (pos, anchor) = (start, end);
+
+        let dto = frontend::document_editing::InsertTextDto {
+            format_policy: policy,
+            position: to_i64(pos),
+            anchor: to_i64(anchor),
+            text: text.into(),
+        };
+
+        let queued = {
+            let mut inner = self.doc.lock();
+            let result = match document_editing_commands::insert_text(
+                &inner.ctx,
+                Some(inner.stack_id),
+                &dto,
+            ) {
+                Ok(r) => r,
+                Err(_) if pos != anchor => {
+                    // Cross-block selection: compose delete + insert as a single undo unit,
+                    // same as insert_text. format_policy is dropped here — it has no
+                    // single-block meaning across a boundary.
+                    undo_redo_commands::begin_composite(&inner.ctx, Some(inner.stack_id));
+
+                    let del_dto = frontend::document_editing::DeleteTextDto {
+                        position: to_i64(pos),
+                        anchor: to_i64(anchor),
+                    };
+                    let del_result = document_editing_commands::delete_text(
+                        &inner.ctx,
+                        Some(inner.stack_id),
+                        &del_dto,
+                    )?;
+                    let del_pos = to_usize(del_result.new_position);
+
+                    let ins_dto = frontend::document_editing::InsertTextDto {
+                        format_policy: Default::default(),
                         position: to_i64(del_pos),
                         anchor: to_i64(del_pos),
                         text: text.into(),
