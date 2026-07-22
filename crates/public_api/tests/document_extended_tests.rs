@@ -208,6 +208,82 @@ fn set_block_format_direction_rtl() {
 }
 
 #[test]
+fn clearing_a_block_direction_returns_it_to_automatic() {
+    let doc = new_doc("Hello");
+    let c = doc.cursor();
+
+    c.set_block_format(&BlockFormat {
+        direction: Some(TextDirection::RightToLeft),
+        ..Default::default()
+    })
+    .unwrap();
+    assert_eq!(
+        c.block_format().unwrap().direction,
+        Some(TextDirection::RightToLeft)
+    );
+
+    // Every other field merges, so `direction: None` alone means "leave
+    // it alone" and cannot undo the line above. `clear_direction` is the
+    // only way back to automatic detection.
+    c.set_block_format(&BlockFormat::default()).unwrap();
+    assert_eq!(
+        c.block_format().unwrap().direction,
+        Some(TextDirection::RightToLeft),
+        "a bare default must not silently clear the direction"
+    );
+
+    c.set_block_format(&BlockFormat {
+        clear_direction: true,
+        ..Default::default()
+    })
+    .unwrap();
+    assert_eq!(c.block_format().unwrap().direction, None);
+}
+
+#[test]
+fn clearing_a_block_direction_wins_over_setting_one() {
+    let doc = new_doc("Hello");
+    let c = doc.cursor();
+    c.set_block_format(&BlockFormat {
+        direction: Some(TextDirection::RightToLeft),
+        clear_direction: true,
+        ..Default::default()
+    })
+    .unwrap();
+    assert_eq!(
+        c.block_format().unwrap().direction,
+        None,
+        "clear_direction is documented to take precedence"
+    );
+}
+
+#[test]
+fn clearing_a_block_direction_leaves_other_properties_alone() {
+    let doc = new_doc("Hello");
+    let c = doc.cursor();
+    c.set_block_format(&BlockFormat {
+        direction: Some(TextDirection::RightToLeft),
+        heading_level: Some(2),
+        ..Default::default()
+    })
+    .unwrap();
+
+    c.set_block_format(&BlockFormat {
+        clear_direction: true,
+        ..Default::default()
+    })
+    .unwrap();
+
+    let read = c.block_format().unwrap();
+    assert_eq!(read.direction, None);
+    assert_eq!(
+        read.heading_level,
+        Some(2),
+        "clearing the direction must not disturb the rest of the format"
+    );
+}
+
+#[test]
 fn set_block_format_background_color() {
     let doc = new_doc("Hello");
     let c = doc.cursor();

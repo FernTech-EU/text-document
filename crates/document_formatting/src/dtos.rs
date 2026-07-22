@@ -66,6 +66,14 @@ pub struct SetBlockFormatDto {
     pub line_height: Option<i64>,
     pub non_breakable_lines: Option<bool>,
     pub direction: Option<TextDirection>,
+    /// Unset the block's stored direction, handing the paragraph back to
+    /// the bidi algorithm's first-strong-character detection.
+    ///
+    /// Every other field here *merges* — `None` means "leave this
+    /// property alone" — so there is otherwise no way to express
+    /// "remove the direction I set earlier", only "set a different one".
+    /// Takes precedence over `direction` when both are given.
+    pub clear_direction: bool,
     pub background_color: Option<String>,
     pub is_code_block: Option<bool>,
     pub code_language: Option<String>,

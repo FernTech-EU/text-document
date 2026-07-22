@@ -202,6 +202,13 @@ pub struct BlockFormat {
     pub line_height: Option<f32>,
     pub non_breakable_lines: Option<bool>,
     pub direction: Option<TextDirection>,
+    /// Unset the block's direction rather than setting one.
+    ///
+    /// Every other field merges (`None` = "don't change this"), so this
+    /// is the only way to take a paragraph back to automatic direction
+    /// detection once a direction has been stored. Wins over
+    /// `direction` if both are set.
+    pub clear_direction: bool,
     pub background_color: Option<String>,
     pub is_code_block: Option<bool>,
     pub code_language: Option<String>,

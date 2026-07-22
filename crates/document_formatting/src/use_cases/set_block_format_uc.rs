@@ -127,7 +127,9 @@ fn execute_set_block_format(
             if let Some(v) = dto.non_breakable_lines {
                 updated.fmt_non_breakable_lines = Some(v);
             }
-            if let Some(ref d) = dto.direction {
+            if dto.clear_direction {
+                updated.fmt_direction = None;
+            } else if let Some(ref d) = dto.direction {
                 updated.fmt_direction = Some(direction_to_entity(d));
             }
             if let Some(ref c) = dto.background_color {

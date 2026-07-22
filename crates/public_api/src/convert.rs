@@ -326,6 +326,7 @@ impl BlockFormat {
             line_height: self.line_height.map(|v| (v * 1000.0) as i64),
             non_breakable_lines: self.non_breakable_lines,
             direction: self.direction.as_ref().map(direction_to_dto),
+            clear_direction: self.clear_direction,
             background_color: self.background_color.clone(),
             is_code_block: self.is_code_block,
             code_language: self.code_language.clone(),
@@ -356,6 +357,8 @@ impl From<&frontend::block::dtos::BlockDto> for BlockFormat {
             line_height: b.fmt_line_height.map(|v| v as f32 / 1000.0),
             non_breakable_lines: b.fmt_non_breakable_lines,
             direction: b.fmt_direction.clone(),
+            // Reading a block never asks to clear anything.
+            clear_direction: false,
             background_color: b.fmt_background_color.clone(),
             is_code_block: b.fmt_is_code_block,
             code_language: b.fmt_code_language.clone(),
