@@ -486,7 +486,13 @@ fn test_export_html_omits_spacing_when_absent() -> Result<()> {
     // A paragraph with no override must not gain the properties at all, or it
     // would defeat any stylesheet the ebook applies.
     let html = html_from_djot("An ordinary paragraph.")?;
-    assert!(!html.contains("margin-top"), "unexpected margin-top:\n{html}");
-    assert!(!html.contains("text-indent"), "unexpected text-indent:\n{html}");
+    assert!(
+        !html.contains("margin-top"),
+        "unexpected margin-top:\n{html}"
+    );
+    assert!(
+        !html.contains("text-indent"),
+        "unexpected text-indent:\n{html}"
+    );
     Ok(())
 }

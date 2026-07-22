@@ -138,8 +138,7 @@ const TWIPS_PER_PX: i64 = 15;
 /// clamping at the end is what keeps a huge value from wrapping through `i32`
 /// into a negative — and then into an enormous `u32` — instead of saturating.
 fn px_to_twips(px: i64) -> i32 {
-    px.saturating_mul(TWIPS_PER_PX)
-        .clamp(0, i32::MAX as i64) as i32
+    px.saturating_mul(TWIPS_PER_PX).clamp(0, i32::MAX as i64) as i32
 }
 
 /// Light-grey fill behind code blocks, as an `RRGGBB` hex string.

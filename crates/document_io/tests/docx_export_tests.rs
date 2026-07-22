@@ -149,7 +149,6 @@ fn space_before(p: &Paragraph) -> Option<u32> {
         .map(|v| v as u32)
 }
 
-
 /// First paragraph whose visible text contains `needle`.
 fn para_containing<'a>(docx: &'a Docx, needle: &str) -> &'a Paragraph {
     paragraphs(docx)
@@ -544,7 +543,10 @@ fn a_blocks_own_text_indent_overrides_the_document_wide_one() {
         first_line_indent_twips: Some(720),
         ..Default::default()
     };
-    let docx = docx_from_djot_with_options("Indented paragraph.\n\n{text_indent=0}\nFlush paragraph.", options);
+    let docx = docx_from_djot_with_options(
+        "Indented paragraph.\n\n{text_indent=0}\nFlush paragraph.",
+        options,
+    );
     assert_eq!(
         first_line_indent(para_containing(&docx, "Indented paragraph.")),
         Some(720),
@@ -560,7 +562,10 @@ fn a_blocks_own_text_indent_overrides_the_document_wide_one() {
 #[test]
 fn a_blocks_own_top_margin_becomes_space_before() {
     // 24 logical px × 15 twips/px = 360 twips.
-    let docx = docx_from_djot_with_options("Before.\n\n{top_margin=24}\nAfter.", DocxExportOptions::default());
+    let docx = docx_from_djot_with_options(
+        "Before.\n\n{top_margin=24}\nAfter.",
+        DocxExportOptions::default(),
+    );
     assert_eq!(space_before(para_containing(&docx, "After.")), Some(360));
     assert_eq!(
         space_before(para_containing(&docx, "Before.")),

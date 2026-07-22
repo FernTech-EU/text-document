@@ -327,7 +327,10 @@ fn spacing_attributes_combine_with_direction_on_one_block() {
     assert_contains(&dj, "direction=rtl");
     assert_contains(&dj, "top_margin=24");
     assert_contains(&dj, "text_indent=0");
-    let attr_lines = dj.lines().filter(|l| l.trim_start().starts_with('{')).count();
+    let attr_lines = dj
+        .lines()
+        .filter(|l| l.trim_start().starts_with('{'))
+        .count();
     assert_eq!(attr_lines, 1, "attributes must share one line:\n{dj}");
 }
 
