@@ -703,6 +703,48 @@ impl TextDocument {
         Ok(BlockInfo::from(&result))
     }
 
+    /// The sentence containing `position`, as absolute char offsets `(start, end)` — the
+    /// granularity between [`word`](TextCursor::select) and [`block_at`](Self::block_at).
+    ///
+    /// `content_locale` is a BCP-47-ish tag (`"en"`, `"en-US"`, `"pt_BR"`) naming the language
+    /// the text is written in. It selects the sentence tailoring for that language —
+    /// abbreviations that do not end a sentence, French spaced guillemets, the Greek question
+    /// mark. Pass it **fresh on every call**, like [`FindOptions::language`](crate::FindOptions):
+    /// only the caller knows what language the text is in, and it is not document state.
+    /// `None`, or a language with no tailoring, falls back to plain UAX #29.
+    ///
+    /// A sentence never crosses a block: a paragraph break always ends one. Returns `None` when
+    /// the block holds no sentence to point at (empty, or whitespace only). Trailing whitespace
+    /// is trimmed off the end, so the range covers the sentence and not the gap after it.
+    ///
+    /// The trailing edge is inclusive of the caret: a `position` at the very end of the block
+    /// resolves to the last sentence rather than to nothing.
+    pub fn sentence_at(&self, position: usize, content_locale: Option<&str>) -> Option<(usize, usize)> {
+        let inner = self.inner.lock();
+        let block_dto = frontend::document_inspection::GetBlockAtPositionDto {
+            position: to_i64(position),
+        };
+        let block =
+            document_inspection_commands::get_block_at_position(&inner.ctx, &block_dto).ok()?;
+        let block_start = to_usize(block.block_start);
+        let block_length = to_usize(block.block_length);
+        if block_length == 0 {
+            return None;
+        }
+        let text_dto = frontend::document_inspection::GetTextAtPositionDto {
+            position: to_i64(block_start),
+            length: to_i64(block_length),
+        };
+        let text = document_inspection_commands::get_text_at_position(&inner.ctx, &text_dto)
+            .ok()?
+            .text;
+        drop(inner);
+
+        let offset = position.saturating_sub(block_start);
+        let (start, end) = crate::sentence::sentence_bounds(&text, offset, content_locale)?;
+        Some((block_start + start, block_start + end))
+    }
+
     /// Get the block format at a position.
     pub fn block_format_at(&self, position: usize) -> Result<BlockFormat> {
         let inner = self.inner.lock();
@@ -1540,17 +1582,27 @@ impl TextDocument {
     ///
     /// Unlike [`set_syntax_highlighter`](Self::set_syntax_highlighter), this **adds** rather
     /// than replaces: a document can carry a syntax highlighter and a spell-checker at once,
-    /// each a session, merged in registration order (a later session's field wins). Sessions
-    /// remain visible only in views whose [`HighlightMask`](crate::highlight::HighlightMask)
-    /// admits them.
+    /// each a session, merged in `(priority, registration)` order (a later session's field
+    /// wins). Sessions remain visible only in views whose
+    /// [`HighlightMask`](crate::highlight::HighlightMask) admits them.
     pub fn add_syntax_session(
         &self,
         highlighter: Arc<dyn crate::SyntaxHighlighter>,
     ) -> crate::highlight::SessionId {
+        self.add_syntax_session_with_priority(highlighter, 0)
+    }
+
+    /// [`add_syntax_session`](Self::add_syntax_session) at an explicit merge priority — see
+    /// [`add_range_session_with_priority`](Self::add_range_session_with_priority).
+    pub fn add_syntax_session_with_priority(
+        &self,
+        highlighter: Arc<dyn crate::SyntaxHighlighter>,
+        priority: i32,
+    ) -> crate::highlight::SessionId {
         let (id, queued) = {
             let mut inner = self.inner.lock();
             let prev_kind = inner.highlight_kind;
-            let id = inner.highlights.add_syntax(highlighter);
+            let id = inner.highlights.add_syntax(highlighter, priority);
             inner.rehighlight_all();
             Self::queue_highlight_changed(&mut inner, 0, 0, prev_kind);
             (id, inner.take_queued_events())
@@ -1566,8 +1618,22 @@ impl TextDocument {
     /// A view's own find session is a range session it alone admits; that is how two panes
     /// over one document highlight different queries.
     pub fn add_range_session(&self) -> crate::highlight::SessionId {
+        self.add_range_session_with_priority(0)
+    }
+
+    /// [`add_range_session`](Self::add_range_session) at an explicit **merge priority**.
+    ///
+    /// Where two sessions format the same character, the higher priority wins field by field;
+    /// equal priorities fall back to registration order, which is what every session gets by
+    /// default (`0`).
+    ///
+    /// Reach for this when a layer must reliably lose — an ambient background band that every
+    /// find match and spell squiggle should paint over. Registration order cannot express that:
+    /// a per-view layer is registered when its view appears, so whether it lands before or
+    /// after the find session depends on the order the user happened to open things in.
+    pub fn add_range_session_with_priority(&self, priority: i32) -> crate::highlight::SessionId {
         let mut inner = self.inner.lock();
-        inner.highlights.add_range()
+        inner.highlights.add_range(priority)
         // No repaint: an empty range session shows nothing until its ranges are set.
     }
 
@@ -1590,12 +1656,14 @@ impl TextDocument {
             // lets `merged_spans_for_block` look up only a block's own ranges instead of
             // scanning the whole vector per block.
             let block_positions = crate::highlight::ordered_block_positions(&inner);
-            let ok = inner.highlights.set_ranges(id, ranges, &block_positions);
-            if ok {
+            let changed = inner.highlights.set_ranges(id, ranges, &block_positions);
+            if let Some((position, length)) = changed {
                 inner.recompute_highlight_kind();
-                Self::queue_highlight_changed(&mut inner, 0, 0, prev_kind);
+                // The real extent, not `0, 0`: a view can then recolor just the block it covers
+                // rather than re-snapshotting the whole document on every caret move.
+                Self::queue_highlight_changed(&mut inner, position, length, prev_kind);
             }
-            (ok, inner.take_queued_events())
+            (changed.is_some(), inner.take_queued_events())
         };
         crate::inner::dispatch_queued_events(queued);
         ok
@@ -1661,9 +1729,13 @@ impl TextDocument {
     ///   [`DocumentEvent::FormatChanged`] (full relayout, caret/scroll
     ///   preserved).
     ///
-    /// `position` / `length` are advisory: the editor's recolor path
-    /// re-derives the whole snapshot, so callers pass `0, 0` (whole-document)
-    /// today.
+    /// `position` / `length` name the extent that changed, so a live view can
+    /// recolor just the blocks it covers instead of re-deriving the whole
+    /// snapshot. **A `length` of `0` means "unknown — assume the whole
+    /// document"**, which is what the genuinely document-wide operations pass
+    /// (installing or retiring a highlighter, a full rehighlight). Only
+    /// [`set_session_ranges`](Self::set_session_ranges) reports a real extent,
+    /// its before/after range sets giving an exact answer.
     fn queue_highlight_changed(
         inner: &mut TextDocumentInner,
         position: usize,

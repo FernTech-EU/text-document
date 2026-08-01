@@ -35,6 +35,7 @@ mod fragment;
 mod highlight;
 mod inner;
 mod operation;
+mod sentence;
 mod streaming;
 mod text_block;
 mod text_frame;
@@ -281,12 +282,27 @@ pub enum MoveOperation {
     Right,
     WordLeft,
     WordRight,
+    /// The start of the sentence the cursor is in. Already there → the previous sentence's
+    /// start, so repeating it walks backwards.
+    StartOfSentence,
+    /// The end of the sentence the cursor is in, at its terminator rather than at the space
+    /// after it. Already there → the next sentence's end.
+    EndOfSentence,
+    /// The start of the previous sentence — [`StartOfSentence`](Self::StartOfSentence) applied
+    /// from just before the current one.
+    PreviousSentence,
+    /// The start of the next sentence.
+    NextSentence,
 }
 
 /// Quick-select a region around the cursor.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SelectionType {
     WordUnderCursor,
+    /// The sentence the cursor is in, tailored to the cursor's
+    /// [`content_locale`](crate::TextCursor::set_content_locale). Trailing whitespace is
+    /// excluded, so the selection ends at the terminator.
+    SentenceUnderCursor,
     LineUnderCursor,
     BlockUnderCursor,
     Document,

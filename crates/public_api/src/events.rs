@@ -40,9 +40,16 @@ pub enum DocumentEvent {
     /// (`fragments`) is unchanged, so the layout engine can recolor the
     /// cached layout without reshaping or reflowing.
     ///
-    /// `position` / `length` are document-absolute character offsets. For
-    /// whole-document rehighlights both are 0; for single-block
-    /// rehighlights they bound the affected block.
+    /// `position` / `length` are document-absolute character offsets bounding
+    /// the extent that changed, so a view may recolor just the blocks they
+    /// cover rather than re-snapshotting the whole document.
+    ///
+    /// **A `length` of `0` means "unknown — assume the whole document"**, and
+    /// is what the genuinely document-wide operations send: installing or
+    /// retiring a highlighter, and a full rehighlight. `set_session_ranges`
+    /// knows its own before/after ranges and reports their union exactly.
+    /// A receiver that does not care may keep treating every one of these as
+    /// whole-document; that is the safe reading of both cases.
     HighlightPaintChanged { position: usize, length: usize },
 
     /// Block count changed. Carries the new count.

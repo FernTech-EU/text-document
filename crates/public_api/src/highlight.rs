@@ -329,16 +329,25 @@ pub(crate) enum SessionBody {
     Range(RangeSession),
 }
 
-/// One registered session with its stable id.
+/// One registered session with its stable id and merge priority.
 pub(crate) struct Session {
     pub id: SessionId,
+    /// Where this session sits in the merge order — see [`HighlightRegistry::sessions`].
+    pub priority: i32,
     pub body: SessionBody,
 }
 
-/// Every highlight session on the document, in **registration order** — which is the merge
-/// order: when two sessions format the same character, the later-registered one wins, field
+/// Every highlight session on the document, sorted by **`(priority, id)`** — which is the merge
+/// order: when two sessions format the same character, the one later in this vector wins, field
 /// by field (see [`merge_overlapping_highlights`]). Replaces the old single
 /// `Option<HighlightData>` slot.
+///
+/// Priority defaults to `0`, where the order degenerates to registration order — the behaviour
+/// every existing caller had. It exists because registration order alone is not something a
+/// layer can rely on: an editor that attaches a background layer when its *view* is created
+/// registers after or before a find session purely according to which the user opened first, so
+/// "the find match paints over the ambient band" would hold in one window and not in the next.
+/// A layer that must lose declares a negative priority and stops caring when it was added.
 #[derive(Default)]
 pub(crate) struct HighlightRegistry {
     pub sessions: Vec<Session>,
@@ -357,55 +366,85 @@ impl HighlightRegistry {
         id
     }
 
+    /// Insert a session at its place in the `(priority, id)` order.
+    ///
+    /// Ids only ever increase, so appending within a priority band keeps the tie-break right;
+    /// the search finds the first session that outranks `priority` and inserts before it. One
+    /// insertion point for both session kinds is what keeps every downstream iteration —
+    /// span collection and the kind join alike — priority-ordered for free.
+    fn insert_session(&mut self, id: SessionId, priority: i32, body: SessionBody) {
+        let at = self
+            .sessions
+            .iter()
+            .position(|s| s.priority > priority)
+            .unwrap_or(self.sessions.len());
+        self.sessions.insert(at, Session { id, priority, body });
+    }
+
     /// Register a syntax session (empty cache; the caller rehighlights).
-    pub(crate) fn add_syntax(&mut self, highlighter: Arc<dyn SyntaxHighlighter>) -> SessionId {
+    pub(crate) fn add_syntax(
+        &mut self,
+        highlighter: Arc<dyn SyntaxHighlighter>,
+        priority: i32,
+    ) -> SessionId {
         let id = self.alloc_id();
-        self.sessions.push(Session {
+        self.insert_session(
             id,
-            body: SessionBody::Syntax(SyntaxSession {
+            priority,
+            SessionBody::Syntax(SyntaxSession {
                 highlighter,
                 blocks: HashMap::new(),
             }),
-        });
+        );
         id
     }
 
     /// Register an empty range session.
-    pub(crate) fn add_range(&mut self) -> SessionId {
+    pub(crate) fn add_range(&mut self, priority: i32) -> SessionId {
         let id = self.alloc_id();
-        self.sessions.push(Session {
+        self.insert_session(
             id,
-            body: SessionBody::Range(RangeSession {
+            priority,
+            SessionBody::Range(RangeSession {
                 ranges: Vec::new(),
                 block_index: HashMap::new(),
                 kind: HighlighterKind::None,
             }),
-        });
+        );
         id
     }
 
     /// Replace a range session's ranges, building its per-block index and cached kind from the
     /// document's `block_positions` (each `(block_id, absolute_char_start)`, sorted by start).
-    /// Returns `false` if `id` is not a range session (or does not exist) — a caller handing
-    /// ranges to a syntax session is a bug, not a silent no-op to swallow.
+    ///
+    /// Returns the **extent that changed** — `(position, length)` spanning both the ranges that
+    /// went away and the ones that arrived — or `None` if `id` is not a range session (or does
+    /// not exist); a caller handing ranges to a syntax session is a bug, not a silent no-op to
+    /// swallow. `Some((_, 0))` means nothing at all changed.
+    ///
+    /// The extent is what lets a live view recolor just the affected block instead of
+    /// re-snapshotting the whole document on every push. It is the **union of the two sets**
+    /// rather than a precise diff: computing it costs one pass over vectors this function
+    /// already walks, and a caret-driven layer's before/after ranges are adjacent anyway.
     pub(crate) fn set_ranges(
         &mut self,
         id: SessionId,
         ranges: Vec<RangeHighlight>,
         block_positions: &[(u64, usize)],
-    ) -> bool {
+    ) -> Option<(usize, usize)> {
         for s in &mut self.sessions {
             if s.id == id {
-                if let SessionBody::Range(r) = &mut s.body {
-                    r.kind = compute_range_kind(&ranges);
-                    r.block_index = build_block_index(&ranges, block_positions);
-                    r.ranges = ranges;
-                    return true;
-                }
-                return false;
+                let SessionBody::Range(r) = &mut s.body else {
+                    return None;
+                };
+                let extent = changed_extent(&r.ranges, &ranges);
+                r.kind = compute_range_kind(&ranges);
+                r.block_index = build_block_index(&ranges, block_positions);
+                r.ranges = ranges;
+                return Some(extent);
             }
         }
-        false
+        None
     }
 
     /// Retire a session. Returns whether it existed.
@@ -424,7 +463,9 @@ impl HighlightRegistry {
             self.remove(id);
         }
         if let Some(hl) = highlighter {
-            self.shim = Some(self.add_syntax(hl));
+            // The classic single-highlighter shim keeps the default band, so installing one
+            // behaves exactly as it did before priorities existed.
+            self.shim = Some(self.add_syntax(hl, 0));
         }
     }
 
@@ -505,6 +546,52 @@ fn syntax_session_kind(s: &SyntaxSession) -> HighlighterKind {
         HighlighterKind::PaintOnly
     } else {
         HighlighterKind::None
+    }
+}
+
+/// The span of document affected by replacing `old` with `new`, as `(position, length)`.
+///
+/// Ranges identical in both sets contribute nothing — that is what makes a caret-driven layer
+/// cheap: re-pushing an unchanged set reports a zero length, and a caret that moved one
+/// sentence reports only the two sentences involved.
+///
+/// A zero length means "nothing changed", never "the whole document" — an empty-to-empty push
+/// really does affect nothing.
+///
+/// **Linear, by design.** This runs inside every `set_ranges`, and a spell-checked scene pushes
+/// tens of thousands of ranges on each edit, so comparing the sets by membership (quadratic)
+/// would cost more than the snapshot it exists to avoid — `range_index_perf` pins exactly that.
+/// Instead it skips the identical head and tail element-wise and covers only the window
+/// between them. Every producer builds its ranges in document order, so that window is tight;
+/// were one ever to reorder them, the result would merely be *wider* than necessary, which
+/// costs a larger recolor and never a wrong one.
+fn changed_extent(old: &[RangeHighlight], new: &[RangeHighlight]) -> (usize, usize) {
+    let common = old.len().min(new.len());
+
+    let mut head = 0;
+    while head < common && old[head] == new[head] {
+        head += 1;
+    }
+    if head == old.len() && head == new.len() {
+        return (0, 0);
+    }
+    let mut tail = 0;
+    while tail < common - head && old[old.len() - 1 - tail] == new[new.len() - 1 - tail] {
+        tail += 1;
+    }
+
+    let (mut lo, mut hi) = (usize::MAX, 0usize);
+    for r in old[head..old.len() - tail]
+        .iter()
+        .chain(&new[head..new.len() - tail])
+    {
+        lo = lo.min(r.start);
+        hi = hi.max(r.start + r.length);
+    }
+    if lo == usize::MAX {
+        (0, 0)
+    } else {
+        (lo, hi - lo)
     }
 }
 
@@ -1459,7 +1546,7 @@ mod index_tests {
     #[test]
     fn set_ranges_caches_the_kind_read_back_by_effective_kind() {
         let mut reg = HighlightRegistry::default();
-        let id = reg.add_range();
+        let id = reg.add_range(0);
         let positions = [(0u64, 0usize)];
         assert_eq!(
             reg.effective_kind(&HighlightMask::all()),
@@ -1478,6 +1565,47 @@ mod index_tests {
             HighlighterKind::Metric,
             "the cached kind updates on every push"
         );
+    }
+
+    // ── changed_extent: what a push actually touched ──
+
+    /// Re-pushing an identical set touched nothing, so a view has nothing to recolor. This is
+    /// the case that matters most: a caret-driven layer re-pushes constantly.
+    #[test]
+    fn an_unchanged_push_reports_an_empty_extent() {
+        let set = [paint(10, 5), paint(30, 5)];
+        assert_eq!(changed_extent(&set, &set), (0, 0));
+        assert_eq!(changed_extent(&[], &[]), (0, 0));
+    }
+
+    /// A caret moving from one sentence to the next reports only the span covering both, so the
+    /// recolor stays local instead of falling back to the whole document.
+    #[test]
+    fn a_moved_range_reports_the_span_covering_both_positions() {
+        // 10..15 gone, 20..25 arrived → 10..25.
+        assert_eq!(changed_extent(&[paint(10, 5)], &[paint(20, 5)]), (10, 15));
+    }
+
+    #[test]
+    fn adding_or_clearing_reports_just_that_range() {
+        assert_eq!(changed_extent(&[], &[paint(7, 3)]), (7, 3));
+        assert_eq!(changed_extent(&[paint(7, 3)], &[]), (7, 3));
+    }
+
+    /// Ranges that survive the push contribute nothing, so a find session that keeps most of
+    /// its matches reports only the ones that actually moved.
+    #[test]
+    fn unchanged_ranges_are_excluded_from_the_extent() {
+        let old = [paint(0, 2), paint(50, 2)];
+        let new = [paint(0, 2), paint(60, 2)];
+        assert_eq!(changed_extent(&old, &new), (50, 12), "only the moved one");
+    }
+
+    /// A format change at the same offsets — what a theme switch does — still reports the range,
+    /// because `RangeHighlight` compares its format too.
+    #[test]
+    fn a_format_only_change_still_reports_its_range() {
+        assert_eq!(changed_extent(&[paint(4, 6)], &[metric(4, 6)]), (4, 6));
     }
 
     // ── build_block_index: bucketing ──

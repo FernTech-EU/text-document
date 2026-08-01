@@ -53,9 +53,9 @@ pub struct TextCursor {
 
 impl Clone for TextCursor {
     fn clone(&self) -> Self {
-        let (position, anchor) = {
+        let (position, anchor, content_locale) = {
             let d = self.data.lock();
-            (d.position, d.anchor)
+            (d.position, d.anchor, d.content_locale.clone())
         };
         let data = {
             let mut inner = self.doc.lock();
@@ -63,6 +63,8 @@ impl Clone for TextCursor {
                 position,
                 anchor,
                 cell_selection_override: None,
+                // A clone reads the same text as its original, so it inherits the language.
+                content_locale,
             }));
             inner.cursors.push(Arc::downgrade(&data));
             data
@@ -205,7 +207,8 @@ impl TextCursor {
         // same gate `find_block_at_char_position` itself uses (tables / unmirrored
         // sub-frames disqualify it). Cheaper to check once up front than to discover it mid
         // walk.
-        if pos > 0 && common::database::rope_helpers::find_block_at_char_position(store, 0).is_none()
+        if pos > 0
+            && common::database::rope_helpers::find_block_at_char_position(store, 0).is_none()
         {
             let dto = frontend::document_inspection::GetTextAtPositionDto {
                 position: 0,
@@ -240,7 +243,8 @@ impl TextCursor {
             let block_dto = frontend::commands::block_commands::get_block(&inner.ctx, &block_id)?
                 .ok_or_else(|| DocumentError::NotFound("block not found".into()))?;
             let entity: common::entities::Block = block_dto.into();
-            let block_text = common::database::rope_helpers::block_content_via_store(&entity, store);
+            let block_text =
+                common::database::rope_helpers::block_content_via_store(&entity, store);
             let block_len = block_text.chars().count() as i64;
             let block_char_start = block_char_start as usize;
 
@@ -474,7 +478,32 @@ impl TextCursor {
                 d.position = word_end;
                 d.cell_selection_override = None;
             }
+            SelectionType::SentenceUnderCursor => {
+                let pos = self.position();
+                // A block with nothing to point at leaves the cursor where it was, the same way
+                // `WordUnderCursor` collapses to `(pos, pos)` off a word.
+                if let Some((start, end)) = self.find_sentence_boundaries(pos) {
+                    let mut d = self.data.lock();
+                    d.anchor = start;
+                    d.position = end;
+                    d.cell_selection_override = None;
+                }
+            }
         }
+    }
+
+    /// The language this cursor reads its text as, for the sentence operations. A BCP-47-ish
+    /// tag (`"en"`, `"fr-FR"`); `None` — the default — means untailored UAX #29.
+    ///
+    /// See [`CursorData::content_locale`](crate::inner::CursorData) for why this is cursor
+    /// state rather than an argument.
+    pub fn set_content_locale(&self, locale: Option<&str>) {
+        self.data.lock().content_locale = locale.map(str::to_string);
+    }
+
+    /// The language set by [`set_content_locale`](Self::set_content_locale).
+    pub fn content_locale(&self) -> Option<String> {
+        self.data.lock().content_locale.clone()
     }
 
     // ── Text editing ─────────────────────────────────────────
@@ -2718,6 +2747,70 @@ impl TextCursor {
                     0
                 }
             }
+            MoveOperation::StartOfSentence | MoveOperation::PreviousSentence => {
+                let mut cur = pos;
+                for _ in 0..n.max(1) {
+                    let start = match self.find_sentence_boundaries(cur) {
+                        Some((start, _)) => start,
+                        None => break,
+                    };
+                    // Already at the start (or `PreviousSentence`, which always steps): resolve
+                    // again from just before it to reach the sentence before this one.
+                    if start < cur && op == MoveOperation::StartOfSentence {
+                        cur = start;
+                    } else if cur > 0 {
+                        match self.find_sentence_boundaries(cur - 1) {
+                            Some((prev, _)) if prev < cur => cur = prev,
+                            // Nothing but whitespace behind: fall back to the block edge rather
+                            // than stalling, so a repeated keystroke still makes progress.
+                            _ => cur = cur.saturating_sub(1),
+                        }
+                    } else {
+                        break;
+                    }
+                }
+                cur
+            }
+            MoveOperation::EndOfSentence => {
+                let mut cur = pos;
+                for _ in 0..n.max(1) {
+                    let end = match self.find_sentence_boundaries(cur) {
+                        Some((_, end)) => end,
+                        None => break,
+                    };
+                    if end > cur {
+                        cur = end;
+                    } else {
+                        match self.find_sentence_boundaries(cur + 1) {
+                            Some((_, next)) if next > cur => cur = next,
+                            _ => break,
+                        }
+                    }
+                }
+                cur
+            }
+            MoveOperation::NextSentence => {
+                let mut cur = pos;
+                for _ in 0..n.max(1) {
+                    // Step past this sentence's end, then take the start of whatever follows —
+                    // which skips the whitespace between them.
+                    let end = match self.find_sentence_boundaries(cur) {
+                        Some((_, end)) => end,
+                        None => break,
+                    };
+                    match self.find_sentence_boundaries(end + 1) {
+                        Some((start, _)) if start > cur => cur = start,
+                        _ => {
+                            if end > cur {
+                                cur = end;
+                            } else {
+                                break;
+                            }
+                        }
+                    }
+                }
+                cur
+            }
             MoveOperation::Up | MoveOperation::Down => {
                 // Up/Down are visual operations that depend on line wrapping.
                 // Without layout info, treat as PreviousBlock/NextBlock.
@@ -2963,6 +3056,39 @@ impl TextCursor {
         }
 
         (pos, pos)
+    }
+
+    /// The sentence boundaries around `pos`, as absolute char offsets, in this cursor's
+    /// [`content_locale`](Self::content_locale). `None` when the block holds no sentence.
+    ///
+    /// Block-scoped like [`find_word_boundaries`](Self::find_word_boundaries) — the whole point
+    /// of a paragraph break is that it ends a sentence.
+    fn find_sentence_boundaries(&self, pos: usize) -> Option<(usize, usize)> {
+        let locale = self.data.lock().content_locale.clone();
+
+        let inner = self.doc.lock();
+        let block_dto = frontend::document_inspection::GetBlockAtPositionDto {
+            position: to_i64(pos),
+        };
+        let block_info =
+            document_inspection_commands::get_block_at_position(&inner.ctx, &block_dto).ok()?;
+        let block_start = to_usize(block_info.block_start);
+        let block_length = to_usize(block_info.block_length);
+        if block_length == 0 {
+            return None;
+        }
+        let dto = frontend::document_inspection::GetTextAtPositionDto {
+            position: to_i64(block_start),
+            length: to_i64(block_length),
+        };
+        let text = document_inspection_commands::get_text_at_position(&inner.ctx, &dto)
+            .ok()?
+            .text;
+        drop(inner);
+
+        let offset = pos.saturating_sub(block_start);
+        let (start, end) = crate::sentence::sentence_bounds(&text, offset, locale.as_deref())?;
+        Some((block_start + start, block_start + end))
     }
 }
 

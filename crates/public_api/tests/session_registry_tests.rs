@@ -662,3 +662,89 @@ fn a_push_after_an_edit_buckets_against_the_new_layout() {
     assert_eq!(last[0].start, 0, "at block-relative 0");
     assert_eq!(last[0].length, 5);
 }
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// Merge priority
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+const LOW: Color = Color { red: 255, green: 254, blue: 235, alpha: 255 };
+const HIGH: Color = Color { red: 255, green: 140, blue: 0, alpha: 255 };
+
+/// The background colour covering `at`, merged across every session.
+fn background_at(doc: &TextDocument, at: usize) -> Option<Color> {
+    masked_paint_spans(doc, &HighlightMask::all())
+        .into_iter()
+        .filter(|s| at >= s.start && at < s.start + s.length)
+        .next_back()
+        .and_then(|s| s.background_color)
+}
+
+/// **The point of priorities.** Registration order cannot express "this layer always loses":
+/// a per-view band is registered when its view appears, so it lands before or after the find
+/// session according to which the user opened first. A negative priority settles it in both
+/// orders — and only the second of these two would pass without one.
+#[test]
+fn a_low_priority_session_loses_whichever_order_it_was_registered_in() {
+    for band_first in [true, false] {
+        let doc = new_doc("hello world");
+        let (band, normal) = if band_first {
+            let b = doc.add_range_session_with_priority(-100);
+            (b, doc.add_range_session())
+        } else {
+            let n = doc.add_range_session();
+            (doc.add_range_session_with_priority(-100), n)
+        };
+        doc.set_session_ranges(band, vec![RangeHighlight { start: 0, length: 11, format: bg(LOW) }]);
+        doc.set_session_ranges(normal, vec![RangeHighlight { start: 0, length: 5, format: bg(HIGH) }]);
+
+        assert_eq!(
+            background_at(&doc, 2),
+            Some(HIGH),
+            "the normal-priority session must win the overlap (band registered first: {band_first})"
+        );
+        assert_eq!(
+            background_at(&doc, 8),
+            Some(LOW),
+            "and the band still shows where nothing overlaps it"
+        );
+    }
+}
+
+/// Equal priorities keep the documented registration-order behaviour, so every existing caller
+/// is unaffected.
+#[test]
+fn equal_priorities_still_merge_in_registration_order() {
+    let doc = new_doc("hello world");
+    let first = doc.add_range_session();
+    let second = doc.add_range_session();
+    doc.set_session_ranges(first, vec![RangeHighlight { start: 0, length: 11, format: bg(LOW) }]);
+    doc.set_session_ranges(second, vec![RangeHighlight { start: 0, length: 5, format: bg(HIGH) }]);
+    assert_eq!(background_at(&doc, 2), Some(HIGH), "later registration wins");
+}
+
+/// A higher priority wins even when registered first — the ordering is by priority, not merely
+/// a way to push things to the back.
+#[test]
+fn a_high_priority_session_wins_even_when_registered_first() {
+    let doc = new_doc("hello world");
+    let high = doc.add_range_session_with_priority(50);
+    let normal = doc.add_range_session();
+    doc.set_session_ranges(high, vec![RangeHighlight { start: 0, length: 5, format: bg(HIGH) }]);
+    doc.set_session_ranges(normal, vec![RangeHighlight { start: 0, length: 11, format: bg(LOW) }]);
+    assert_eq!(background_at(&doc, 2), Some(HIGH));
+}
+
+/// Priority orders the merge; it must not affect which sessions a mask admits.
+#[test]
+fn priority_does_not_disturb_masking() {
+    let doc = new_doc("hello world");
+    let band = doc.add_range_session_with_priority(-100);
+    let other = doc.add_range_session();
+    doc.set_session_ranges(band, vec![RangeHighlight { start: 0, length: 11, format: bg(LOW) }]);
+    doc.set_session_ranges(other, vec![RangeHighlight { start: 0, length: 5, format: bg(HIGH) }]);
+
+    let only_band = masked_paint_spans(&doc, &HighlightMask::only([band]));
+    assert_eq!(only_band.len(), 1);
+    assert_eq!(only_band[0].background_color, Some(LOW));
+    assert!(masked_paint_spans(&doc, &HighlightMask::none()).is_empty());
+}

@@ -40,6 +40,17 @@ pub(crate) struct CursorData {
     /// When set, overrides the computed `SelectionKind` to force cell selection.
     /// Cleared whenever position or anchor changes via normal editing/movement.
     pub cell_selection_override: Option<crate::flow::CellRange>,
+    /// The language this cursor reads its text as, for the sentence operations
+    /// ([`SelectionType::SentenceUnderCursor`](crate::SelectionType) and the sentence
+    /// [`MoveOperation`](crate::MoveOperation)s). A BCP-47-ish tag; `None` means untailored
+    /// UAX #29.
+    ///
+    /// Transient, per-cursor and non-persisted, like `cell_selection_override` beside it: it
+    /// never reaches an entity, an undo command or an export. The enum-driven `select` /
+    /// `move_position` have nowhere to take a locale argument, so it is set once on the cursor
+    /// instead — [`TextDocument::sentence_at`](crate::TextDocument::sentence_at) takes the same
+    /// value per call for callers that would rather not hold a cursor at all.
+    pub content_locale: Option<String>,
 }
 
 /// Callback entry for document event subscriptions.
@@ -152,6 +163,7 @@ impl TextDocumentInner {
         let data = Arc::new(Mutex::new(CursorData {
             position,
             anchor: position,
+            content_locale: None,
             cell_selection_override: None,
         }));
         self.cursors.push(Arc::downgrade(&data));
