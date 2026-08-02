@@ -5,7 +5,7 @@ extern crate text_document_formatting as document_formatting;
 use anyhow::Result;
 
 use document_formatting::document_formatting_controller;
-use document_formatting::{Alignment, MarkerType, SetBlockFormatDto};
+use document_formatting::{Alignment, MarkerType, SetBlockFormatDto, TextDirection};
 
 use test_harness::{
     FrameRelationshipField, block_controller, create_list, frame_controller, get_block_ids,
@@ -30,7 +30,8 @@ fn test_set_block_format_all_fields() -> Result<()> {
             marker: Some(MarkerType::Checked),
             line_height: Some(150),
             non_breakable_lines: Some(true),
-            direction: Some(common::entities::TextDirection::RightToLeft),
+            direction: Some(TextDirection::RightToLeft),
+            clear_direction: false,
             background_color: Some("#ff0000".into()),
             is_code_block: Some(true),
             code_language: Some("rust".into()),

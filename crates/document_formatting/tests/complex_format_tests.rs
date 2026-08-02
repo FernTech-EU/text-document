@@ -7,10 +7,7 @@ use anyhow::Result;
 use common::format_runs::InlineContent;
 
 use document_formatting::document_formatting_controller;
-use document_formatting::{
-    Alignment, CellVerticalAlignment, SetBlockFormatDto, SetFrameFormatDto, SetListFormatDto,
-    SetTableCellFormatDto, SetTableFormatDto, SetTextFormatDto,
-};
+use document_formatting::{Alignment, CellVerticalAlignment, ListStyle, SetBlockFormatDto, SetFrameFormatDto, SetListFormatDto, SetTableCellFormatDto, SetTableFormatDto, SetTextFormatDto, TextDirection};
 
 use test_harness::{
     block_controller, create_list, export_text, frame_controller, get_all_block_ids, get_block_ids,
@@ -53,7 +50,7 @@ fn test_mixed_list_block_and_text_formatting() -> Result<()> {
         None,
         &SetListFormatDto {
             list_id: list_result.list_id as i64,
-            style: Some(common::entities::ListStyle::UpperAlpha),
+            style: Some(ListStyle::UpperAlpha),
             indent: Some(2),
             prefix: None,
             suffix: Some(".".into()),
@@ -331,7 +328,7 @@ fn test_mixed_table_and_list_same_document_formatting() -> Result<()> {
         None,
         &SetListFormatDto {
             list_id: list_id as i64,
-            style: Some(common::entities::ListStyle::Circle),
+            style: Some(ListStyle::Circle),
             indent: Some(1),
             prefix: Some("- ".into()),
             suffix: None,
@@ -476,7 +473,8 @@ fn test_format_blocks_across_multiple_frames() -> Result<()> {
         &SetBlockFormatDto {
             position: min_pos,
             anchor: max_end,
-            direction: Some(common::entities::TextDirection::RightToLeft),
+            direction: Some(TextDirection::RightToLeft),
+            clear_direction: false,
             ..Default::default()
         },
     )?;

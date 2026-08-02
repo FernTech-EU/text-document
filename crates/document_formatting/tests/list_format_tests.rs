@@ -4,7 +4,7 @@ extern crate text_document_formatting as document_formatting;
 
 use anyhow::Result;
 
-use document_formatting::SetListFormatDto;
+use document_formatting::{ListStyle, SetListFormatDto};
 use document_formatting::document_formatting_controller;
 
 use test_harness::{create_list, list_controller, setup_with_text};
@@ -32,7 +32,7 @@ fn test_set_list_format_change_style() -> Result<()> {
         None,
         &SetListFormatDto {
             list_id: list_id as i64,
-            style: Some(common::entities::ListStyle::Decimal),
+            style: Some(ListStyle::Decimal),
             indent: None,
             prefix: None,
             suffix: None,
@@ -57,7 +57,7 @@ fn test_set_list_format_all_fields() -> Result<()> {
         None,
         &SetListFormatDto {
             list_id: list_id as i64,
-            style: Some(common::entities::ListStyle::UpperRoman),
+            style: Some(ListStyle::UpperRoman),
             indent: Some(3),
             prefix: Some("(".into()),
             suffix: Some(")".into()),
@@ -134,7 +134,7 @@ fn test_set_list_format_undo_redo() -> Result<()> {
         None,
         &SetListFormatDto {
             list_id: list_id as i64,
-            style: Some(common::entities::ListStyle::LowerAlpha),
+            style: Some(ListStyle::LowerAlpha),
             indent: Some(4),
             prefix: Some(">> ".into()),
             suffix: None,
