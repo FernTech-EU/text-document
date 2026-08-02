@@ -1,9 +1,19 @@
 //! Sentence boundaries — the granularity between a word and a block.
 //!
-//! [`TextDocument::sentence_at`](crate::TextDocument::sentence_at) and
-//! [`SelectionType::SentenceUnderCursor`](crate::SelectionType) rest on this module. Like
-//! `find_word_boundaries` and `SelectionType::BlockUnderCursor`, a sentence is **block-scoped**:
-//! a paragraph break always ends a sentence, so the search never leaves the caret's block.
+//! `TextDocument::sentence_at` and `SelectionType::SentenceUnderCursor` rest on this module.
+//! Like `find_word_boundaries` and `SelectionType::BlockUnderCursor`, a sentence is
+//! **block-scoped**: a paragraph break always ends a sentence, so the search never leaves the
+//! caret's block.
+//!
+//! Both queries here are pure functions over `&str` — no document, no store, no threads — for
+//! the same reason [`crate::document_search::matching`] is: a host app measuring sentence
+//! length across a whole manuscript cannot afford to build a document per scene just to ask
+//! how long its sentences are, and an app that rolled its own splitter would disagree with
+//! this crate's caret navigation about where a sentence ends.
+//!
+//! [`sentence_bounds`] answers "which sentence contains this offset" (the caret's question);
+//! [`sentences`] answers "what are all the sentences" (the statistics question). Both are
+//! built on the same boundary pass, so they cannot drift apart.
 //!
 //! ## Why UAX #29 alone is not enough
 //!
@@ -408,11 +418,100 @@ fn extra_terminator_breaks(text: &str, profile: &Profile) -> Vec<usize> {
 /// `char_offset` may sit at the very end of `text`, which resolves to the last sentence — the
 /// caret is *after* the final character, exactly as `find_word_boundaries` treats the end of
 /// the last word.
-pub(crate) fn sentence_bounds(
+pub fn sentence_bounds(
     text: &str,
     char_offset: usize,
     locale: Option<&str>,
 ) -> Option<(usize, usize)> {
+    let char_breaks = char_breaks(text, locale)?;
+
+    let total = *char_breaks.last()?;
+    let offset = char_offset.min(total);
+    let idx = char_breaks
+        .windows(2)
+        .position(|w| offset >= w[0] && offset < w[1])
+        // A caret at the very end belongs to the final sentence.
+        .unwrap_or(char_breaks.len().saturating_sub(2));
+    let (start, end) = (*char_breaks.get(idx)?, *char_breaks.get(idx + 1)?);
+
+    trim_trailing_whitespace(text, start, end)
+}
+
+/// One sentence of a text: the slice itself, and where it sits as **char** offsets.
+///
+/// Both fields describe the same span — `text` is `char_range` already sliced out. They are
+/// paired rather than left to the caller because a statistics caller wants the substring (to
+/// count words in it) while a highlighting caller wants the range, and recovering one from the
+/// other means a fresh O(n) char→byte walk per sentence.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Sentence<'a> {
+    pub text: &'a str,
+    pub char_range: std::ops::Range<usize>,
+}
+
+/// Every sentence of `text`, in order, with the same boundary rules
+/// [`sentence_bounds`] applies — trailing whitespace trimmed, whitespace-only
+/// segments dropped.
+///
+/// This is the batch form of [`sentence_bounds`], for callers measuring a whole
+/// text rather than locating one caret. Asking `sentence_bounds` at every offset
+/// instead would re-run the boundary pass per character.
+///
+/// Empty when `text` holds no sentence (empty, or whitespace only).
+pub fn sentences<'a>(text: &'a str, locale: Option<&str>) -> Vec<Sentence<'a>> {
+    let Some(char_breaks) = char_breaks(text, locale) else {
+        return Vec::new();
+    };
+
+    // char offset → byte offset in ONE pass, for the same reason the char_breaks pass itself
+    // is one pass: slicing each sentence with `.chars().skip(n)` would be quadratic.
+    let mut byte_at: Vec<usize> = Vec::with_capacity(char_breaks.len());
+    let mut next = 0usize;
+    let mut chars = 0usize;
+    for (byte, _) in text.char_indices() {
+        while next < char_breaks.len() && char_breaks[next] == chars {
+            byte_at.push(byte);
+            next += 1;
+        }
+        chars += 1;
+    }
+    while next < char_breaks.len() {
+        byte_at.push(text.len());
+        next += 1;
+    }
+
+    let mut out = Vec::with_capacity(char_breaks.len().saturating_sub(1));
+    for i in 0..char_breaks.len().saturating_sub(1) {
+        let (start, end) = (char_breaks[i], char_breaks[i + 1]);
+        // Whitespace-only segments trim to nothing and are not sentences.
+        let Some((start, trimmed_end)) = trim_trailing_whitespace(text, start, end) else {
+            continue;
+        };
+        // `trim_trailing_whitespace` only ever pulls `end` back, so the byte offset of the
+        // trimmed end is the byte offset of `end` minus the bytes of the trimmed chars.
+        let byte_start = byte_at[i];
+        let byte_end = if trimmed_end == end {
+            byte_at[i + 1]
+        } else {
+            let mut b = byte_at[i + 1];
+            let mut back = end - trimmed_end;
+            while back > 0 {
+                b -= text[..b].chars().next_back().map_or(0, char::len_utf8);
+                back -= 1;
+            }
+            b
+        };
+        out.push(Sentence { text: &text[byte_start..byte_end], char_range: start..trimmed_end });
+    }
+    out
+}
+
+/// The sentence boundaries of `text` as **char** offsets, bracketed by `0` and the text's char
+/// length so every sentence is a `[i, i+1)` window over the returned list.
+///
+/// `None` when `text` is empty. Both public queries build on this, which is what keeps them
+/// from ever disagreeing about where a sentence ends.
+fn char_breaks(text: &str, locale: Option<&str>) -> Option<Vec<usize>> {
     if text.is_empty() {
         return None;
     }
@@ -465,16 +564,7 @@ pub(crate) fn sentence_bounds(
         next += 1;
     }
 
-    let total = chars;
-    let offset = char_offset.min(total);
-    let idx = char_breaks
-        .windows(2)
-        .position(|w| offset >= w[0] && offset < w[1])
-        // A caret at the very end belongs to the final sentence.
-        .unwrap_or(char_breaks.len().saturating_sub(2));
-    let (start, end) = (*char_breaks.get(idx)?, *char_breaks.get(idx + 1)?);
-
-    trim_trailing_whitespace(text, start, end)
+    Some(char_breaks)
 }
 
 /// Pull `end` back over any trailing whitespace, so the returned range covers the sentence and
@@ -832,5 +922,109 @@ mod tests {
         assert_eq!(text.len(), 15, "multi-byte on purpose");
         assert_eq!(sentence_bounds(text, 0, Some("fr")), Some((0, 4)));
         assert_eq!(sentence_bounds(text, 5, Some("fr")), Some((5, 9)));
+    }
+
+    // ── the batch query ──
+
+    /// Every fixture the caret-stepping tests above use, run through both queries. This is
+    /// the guarantee that matters: a statistics caller and a caret caller must never disagree
+    /// about where a sentence ends, and the only way to keep that true as the tailoring rules
+    /// evolve is to check it on the same corpus both are specified against.
+    #[test]
+    fn the_batch_query_agrees_with_the_caret_query_everywhere() {
+        let corpus: &[(&str, Option<&str>)] = &[
+            ("Mr. Smith went home. He was tired.", Some("en-US")),
+            ("M. Dupont est parti. Il était tard.", Some("fr-FR")),
+            ("Dr. Ayşe geldi. Sonra gitti.", Some("tr")),
+            ("Vino el Sr. García. Se sentó.", Some("es")),
+            ("Ήρθε ο κ. Παπαδόπουλος. Κάθισε.", Some("el")),
+            ("« Vraiment ? » Elle partit.", Some("fr-FR")),
+            ("Ένα ερώτημα; Και μια απάντηση.", Some("el")),
+            ("\"Come,\" she said. He left.", Some("en")),
+            ("He left. \"Come,\" she said.", Some("en")),
+            ("z.B. gestern war es kalt. Heute nicht.", Some("de")),
+            ("One two three.", Some("en")),
+            ("Ééé. Ààà.", Some("fr")),
+            ("Just the one", Some("en")),
+            ("First! Second? Third.", Some("en")),
+            ("No locale profile at all. Second one.", Some("xx")),
+            ("", Some("en")),
+            ("   ", Some("en")),
+        ];
+        for (text, locale) in corpus {
+            let batch: Vec<String> =
+                sentences(text, *locale).into_iter().map(|s| s.text.to_string()).collect();
+            assert_eq!(batch, split(text, *locale), "disagreement on {text:?} ({locale:?})");
+        }
+    }
+
+    /// `text` and `char_range` must describe the same span — the struct pairs them precisely
+    /// so a caller can use either without re-deriving the other.
+    #[test]
+    fn the_slice_and_the_range_describe_the_same_span() {
+        let text = "Ééé les uns. Ààà les autres. Fin.";
+        for s in sentences(text, Some("fr")) {
+            let by_range: String =
+                text.chars().skip(s.char_range.start).take(s.char_range.len()).collect();
+            assert_eq!(s.text, by_range, "slice and range disagree for {s:?}");
+        }
+    }
+
+    #[test]
+    fn a_text_with_no_sentence_yields_none() {
+        assert!(sentences("", Some("en")).is_empty());
+        assert!(sentences("   \n\t ", Some("en")).is_empty());
+    }
+
+    /// Trailing whitespace is trimmed per sentence, so a word count over the slices does not
+    /// pick up the gap between them, and the ranges stay adjacent-but-not-overlapping.
+    #[test]
+    fn batch_sentences_are_trimmed_and_ordered() {
+        let out = sentences("One.   Two.   Three.", Some("en"));
+        assert_eq!(
+            out.iter().map(|s| s.text).collect::<Vec<_>>(),
+            ["One.", "Two.", "Three."]
+        );
+        for pair in out.windows(2) {
+            assert!(
+                pair[0].char_range.end <= pair[1].char_range.start,
+                "ranges must not overlap: {:?} then {:?}",
+                pair[0],
+                pair[1]
+            );
+        }
+    }
+
+    // ── documented limitations ──
+    //
+    // These pin behaviour that is *wrong* but deliberately not fixed here: correcting them
+    // changes already-shipped caret navigation, which is separate work. They exist so the
+    // gap is visible to a statistics caller, which — unlike a caret — has no human watching
+    // each boundary land.
+
+    /// A literal ellipsis never ends a sentence, so an ellipsis-heavy passage reads as one
+    /// very long sentence. UAX #29 treats `…` as `SContinue`, not a terminator.
+    #[test]
+    fn documented_limitation_a_literal_ellipsis_does_not_split() {
+        assert_eq!(
+            sentences("He hesitated… She waited…", Some("en")).len(),
+            1,
+            "known gap: U+2026 is SContinue under UAX #29, so this reads as one sentence"
+        );
+    }
+
+    /// French em-dash dialogue has no closing mark, so a turn boundary is invisible to
+    /// UAX #29 and two speakers' turns merge into one sentence.
+    #[test]
+    fn documented_limitation_french_em_dash_dialogue_turns_merge() {
+        let turns = "— Tu viens ?\n— Non.";
+        // Block-scoped splitting still breaks on the newline; within one line it would not.
+        let one_line = "— Tu viens ? — Non, dit-il.";
+        assert_eq!(
+            sentences(one_line, Some("fr-FR")).len(),
+            1,
+            "known gap: an em-dash turn has no closing mark for the splitter to see"
+        );
+        assert!(sentences(turns, Some("fr-FR")).len() >= 2, "a newline still separates turns");
     }
 }

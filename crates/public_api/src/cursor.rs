@@ -3087,7 +3087,7 @@ impl TextCursor {
         drop(inner);
 
         let offset = pos.saturating_sub(block_start);
-        let (start, end) = crate::sentence::sentence_bounds(&text, offset, locale.as_deref())?;
+        let (start, end) = frontend::common::parser_tools::sentence_bounds(&text, offset, locale.as_deref())?;
         Some((block_start + start, block_start + end))
     }
 }

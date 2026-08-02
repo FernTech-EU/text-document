@@ -741,7 +741,7 @@ impl TextDocument {
         drop(inner);
 
         let offset = position.saturating_sub(block_start);
-        let (start, end) = crate::sentence::sentence_bounds(&text, offset, content_locale)?;
+        let (start, end) = frontend::common::parser_tools::sentence_bounds(&text, offset, content_locale)?;
         Some((block_start + start, block_start + end))
     }
 

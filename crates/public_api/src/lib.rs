@@ -35,7 +35,7 @@ mod fragment;
 mod highlight;
 mod inner;
 mod operation;
-mod sentence;
+
 mod streaming;
 mod text_block;
 mod text_frame;
@@ -48,7 +48,8 @@ pub use frontend::block::dtos::{CharVerticalAlignment, InlineContent, UnderlineS
 pub use frontend::common::format_runs::ReplaceFormatPolicy;
 pub use frontend::common::parser_tools::{
     CountMethod, DjotExportOptions, DjotImportOptions, DocxExportOptions, EpubExportOptions,
-    PdfExportOptions, TABLE_ANCHOR, WordCharCounts, count, count_djot, djot_to_plain_text,
+    PdfExportOptions, Sentence, TABLE_ANCHOR, WordCharCounts, count, count_djot,
+    djot_to_plain_text, sentence_bounds, sentences,
 };
 
 /// The matcher, as a pure function over `&str` — no document, no store, no threads.
