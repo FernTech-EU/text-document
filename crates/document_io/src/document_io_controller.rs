@@ -82,9 +82,22 @@ pub fn export_plain_text(
     db_context: &DbContext,
     event_hub: &Arc<EventHub>,
 ) -> Result<ExportPlainTextDto> {
+    export_plain_text_with(db_context, event_hub, false)
+}
+
+/// [`export_plain_text`], with blockquoted blocks indented for a written-out `.txt` file.
+///
+/// Separate entry point rather than a flag on the default one, because the default one's
+/// output is load-bearing: it is pinned to the document's addressable text, so indenting
+/// it would move every search offset inside a quote.
+pub fn export_plain_text_with(
+    db_context: &DbContext,
+    event_hub: &Arc<EventHub>,
+    quote_indent: bool,
+) -> Result<ExportPlainTextDto> {
     let uow_context = ExportPlainTextUnitOfWorkFactory::new(db_context);
     let mut uc = ExportPlainTextUseCase::new(Box::new(uow_context));
-    let return_dto = uc.execute()?;
+    let return_dto = uc.execute(quote_indent)?;
     // Notify that the handling manifest has been loaded
     event_hub.send_event(Event {
         origin: Origin::DocumentIo(ExportPlainText),

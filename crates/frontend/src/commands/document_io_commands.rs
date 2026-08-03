@@ -25,6 +25,13 @@ pub fn export_plain_text(ctx: &AppContext) -> Result<ExportPlainTextDto> {
         .context("export_plain_text")
 }
 
+/// [`export_plain_text`] with blockquotes indented — for writing a `.txt` file, not for
+/// anything that computes offsets against the result.
+pub fn export_plain_text_indented(ctx: &AppContext) -> Result<ExportPlainTextDto> {
+    document_io_controller::export_plain_text_with(&ctx.db_context, &ctx.event_hub, true)
+        .context("export_plain_text_indented")
+}
+
 /// import_markdown (long operation)
 pub fn import_markdown(ctx: &AppContext, dto: &ImportMarkdownDto) -> Result<String> {
     document_io_controller::import_markdown(

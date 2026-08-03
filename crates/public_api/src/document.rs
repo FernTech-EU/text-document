@@ -212,6 +212,22 @@ impl TextDocument {
         Ok(inner.plain_text()?.to_string())
     }
 
+    /// [`to_plain_text`](Self::to_plain_text) for writing an actual `.txt` file: quoted
+    /// blocks are indented four spaces per blockquote level, so an epigraph or a block
+    /// quotation still reads as set-off matter in a format with no markup to say so.
+    ///
+    /// **Not** interchangeable with [`to_plain_text`](Self::to_plain_text), and not cached.
+    /// That one is pinned character-for-character to the document's addressable text — the
+    /// text [`find_all`](Self::find_all) and [`replace_text`](Self::replace_text) compute
+    /// offsets against — so indenting it would shift every offset inside a quote and
+    /// desynchronise search from the document. Use this only for output nobody addresses
+    /// back into the document.
+    pub fn to_plain_text_indented(&self) -> Result<String> {
+        let inner = self.inner.lock();
+        let dto = document_io_commands::export_plain_text_indented(&inner.ctx)?;
+        Ok(dto.plain_text)
+    }
+
     /// Replace the entire document with Markdown. Clears undo history.
     ///
     /// This is a **long operation**. Returns a typed [`Operation`] handle.

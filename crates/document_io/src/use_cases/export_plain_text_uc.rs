@@ -5,6 +5,60 @@ use common::database::QueryUnitOfWork;
 use common::database::rope_helpers::{block_content_via_store, rope_flat_text_if_simple};
 use common::entities::{Block, Document, Frame, Root};
 use common::types::{EntityId, ROOT_ENTITY_ID};
+use std::collections::HashMap;
+
+/// One level of blockquote indentation in the plain-text export.
+///
+/// Four spaces, the plain-text convention a `.txt` manuscript uses for quoted matter
+/// (Shunn sets block quotations in from both margins; only the left one survives a
+/// format with no margins to speak of). Deliberately not `"> "`: that is Markdown's
+/// marker, and this export is the one that promises no markup at all.
+const QUOTE_INDENT: &str = "    ";
+
+/// How many blockquote frames enclose `frame_id`, walking up `parent_frame`.
+///
+/// A frame whose parent chain is broken (a parent missing from the document's own frame
+/// list, which should not happen) stops the walk rather than looping or failing: an
+/// under-indented line is a cosmetic loss, and this export must not be the thing that
+/// refuses to produce a file.
+fn blockquote_depth(frame_id: EntityId, frames: &HashMap<EntityId, Frame>) -> usize {
+    let mut depth = 0;
+    let mut current = Some(frame_id);
+    // Bounded by the frame count: a cycle would otherwise hang the export, and this runs
+    // on data that has been through an importer.
+    let mut guard = frames.len() + 1;
+    while let Some(id) = current {
+        if guard == 0 {
+            break;
+        }
+        guard -= 1;
+        let Some(frame) = frames.get(&id) else { break };
+        if frame.fmt_is_blockquote == Some(true) {
+            depth += 1;
+        }
+        current = frame.parent_frame;
+    }
+    depth
+}
+
+/// Indent every non-empty line of `text` by `depth` levels.
+///
+/// Blank lines are left bare on purpose — indenting one would emit trailing whitespace,
+/// which is invisible in the editor, survives into the exported file, and is exactly the
+/// kind of thing a diff of two exports trips over.
+fn indent_quoted(text: &str, depth: usize) -> String {
+    let prefix = QUOTE_INDENT.repeat(depth);
+    text.split('\n')
+        .map(|line| {
+            if line.trim().is_empty() {
+                line.to_string()
+            } else {
+                format!("{prefix}{line}")
+            }
+        })
+        .collect::<Vec<String>>()
+        .join("\n")
+}
 
 pub trait ExportPlainTextUnitOfWorkFactoryTrait: Send + Sync {
     fn create(&self) -> Box<dyn ExportPlainTextUnitOfWorkTrait>;
@@ -28,7 +82,16 @@ impl ExportPlainTextUseCase {
         ExportPlainTextUseCase { uow_factory }
     }
 
-    pub fn execute(&mut self) -> Result<ExportPlainTextDto> {
+    /// `quote_indent` opts into indenting blockquoted blocks — off for the plain export.
+    ///
+    /// It has to be opt-in. `to_plain_text()` is pinned character-for-character to the
+    /// document's own addressable text (bar table anchors), which is what `find_all` and
+    /// `replace_text` compute offsets against; indenting it unconditionally shifts every
+    /// offset inside a quote and silently desynchronises search from the document.
+    /// `plain_text_order_tests::the_human_view_is_the_addressable_view_minus_its_anchors`
+    /// is the test that says so. Presentation indentation is a *file export* concern, so
+    /// only the caller writing a `.txt` file asks for it.
+    pub fn execute(&mut self, quote_indent: bool) -> Result<ExportPlainTextDto> {
         let uow = self.uow_factory.create();
         uow.begin_transaction()?;
 
@@ -82,12 +145,36 @@ impl ExportPlainTextUseCase {
         // globally comparable reading-order key ACROSS frame boundaries, not a per-frame one.
         // This is exactly what `find_all` already does to build the text it searches, and why
         // search and this export used to disagree about where a blockquote sat.
+        // Frames are also what tells a quoted block from an ordinary one: a blockquote's
+        // prose lives in its own Frame, flagged `fmt_is_blockquote`. Nothing below the
+        // frame layer records it, so the depth has to be resolved here, before the blocks
+        // are pooled and the frame they came from is forgotten.
+        let mut frames_by_id: HashMap<EntityId, Frame> = HashMap::new();
+        if quote_indent {
+            for frame_id in &frame_ids {
+                if let Some(frame) = uow.get_frame(frame_id)? {
+                    frames_by_id.insert(*frame_id, frame);
+                }
+            }
+        }
+
         let mut all_block_ids: Vec<EntityId> = Vec::new();
+        let mut quote_depth: HashMap<EntityId, usize> = HashMap::new();
         for frame_id in &frame_ids {
-            all_block_ids.extend(uow.get_frame_relationship(
+            let depth = if quote_indent {
+                blockquote_depth(*frame_id, &frames_by_id)
+            } else {
+                0
+            };
+            for block_id in uow.get_frame_relationship(
                 frame_id,
                 &common::direct_access::frame::FrameRelationshipField::Blocks,
-            )?);
+            )? {
+                if depth > 0 {
+                    quote_depth.insert(block_id, depth);
+                }
+                all_block_ids.push(block_id);
+            }
         }
 
         let mut blocks: Vec<Block> = uow
@@ -99,7 +186,13 @@ impl ExportPlainTextUseCase {
 
         let plain_text = blocks
             .iter()
-            .map(|block| block_content_via_store(block, &store))
+            .map(|block| {
+                let text = block_content_via_store(block, &store);
+                match quote_depth.get(&block.id) {
+                    Some(&depth) => indent_quoted(&text, depth),
+                    None => text,
+                }
+            })
             .collect::<Vec<String>>()
             .join("\n");
 

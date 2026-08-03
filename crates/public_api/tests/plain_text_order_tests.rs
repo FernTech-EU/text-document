@@ -113,3 +113,63 @@ fn the_human_view_is_the_addressable_view_minus_its_anchors() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// The indented export — the one sanctioned way to differ from the addressable view
+// ---------------------------------------------------------------------------
+
+fn plain_indented(djot: &str) -> String {
+    let doc = TextDocument::new();
+    doc.set_djot(djot).unwrap().wait().unwrap();
+    doc.to_plain_text_indented().unwrap()
+}
+
+/// `.txt` has no markup to say "this is set-off matter", so the export indents quoted
+/// blocks instead — four spaces per level. This is what makes an epigraph still read as a
+/// quotation in a plain-text manuscript rather than dissolving into the body.
+#[test]
+fn the_indented_export_sets_quoted_blocks_in() {
+    assert_eq!(plain_indented("> a0\n\na"), "    a0\na");
+    assert_eq!(
+        plain_indented("p1\n\n> q1\n\np2"),
+        "p1\n    q1\np2",
+        "only the quoted block moves; the surrounding prose stays flush"
+    );
+}
+
+/// Depth is per enclosing blockquote, so a quote inside a quote is indented twice.
+#[test]
+fn the_indented_export_nests() {
+    assert_eq!(plain_indented("> > deep"), "        deep");
+}
+
+/// The whole reason indentation is a separate method: `to_plain_text()` is pinned to the
+/// document's addressable text, so it must stay flush no matter what the indented one does.
+/// If these two ever agree on a quoted document, the offsets `find_all`/`replace_text`
+/// hand out have silently moved.
+#[test]
+fn the_plain_export_stays_flush_so_offsets_survive() {
+    for src in ["> a0\n\na", "p1\n\n> q1\n\np2\n\n> q2", "> > deep"] {
+        let flush = plain(src);
+        assert!(
+            !flush.lines().any(|l| l.starts_with(' ')),
+            "to_plain_text() must not indent {src:?}, it is the addressable view: {flush:?}"
+        );
+        assert_ne!(
+            flush,
+            plain_indented(src),
+            "the indented export must actually differ for {src:?}, or it is doing nothing"
+        );
+    }
+}
+
+/// An epigraph as Skribisto writes one: quotation, blank line, attribution — all inside one
+/// blockquote, so all of it indents together and the attribution cannot drift out of the
+/// quote it belongs to.
+#[test]
+fn an_epigraph_indents_as_one_unit_attribution_included() {
+    assert_eq!(
+        plain_indented("> The sea is a going.\n>\n> — Anon.\n\nThe first paragraph."),
+        "    The sea is a going.\n    — Anon.\nThe first paragraph."
+    );
+}
