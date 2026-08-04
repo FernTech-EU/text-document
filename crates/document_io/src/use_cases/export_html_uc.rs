@@ -3,7 +3,9 @@ use crate::ExportHtmlDto;
 use crate::html_render;
 use anyhow::{Result, anyhow};
 use common::database::QueryUnitOfWork;
-use common::entities::{Block, Document, Frame, List, Root, Table, TableCell};
+use common::entities::{
+    Block, Document, Frame, List, Root, SemanticRole, Table, TableCell,
+};
 use common::types::{EntityId, ROOT_ENTITY_ID};
 use std::collections::HashSet;
 
@@ -191,7 +193,21 @@ impl ExportHtmlUseCase {
                         // Recursively render the blockquote frame content
                         let inner = self.render_frame_html(uow, &sub_frame_id, cell_frame_ids)?;
                         if !inner.is_empty() {
-                            parts.push(format!("<blockquote>{}</blockquote>", inner));
+                            // A blockquote standing in for something a format can name
+                            // gets said so. `epub:type` is the EPUB Structural Semantics
+                            // vocabulary; `role` is DPUB-ARIA, and both are needed —
+                            // `epub:type` alone reaches no assistive technology, which is
+                            // the whole point of marking it.
+                            let semantics = match &sf.fmt_semantic_role {
+                                Some(SemanticRole::Epigraph) => {
+                                    r#" epub:type="epigraph" role="doc-epigraph""#
+                                }
+                                None => "",
+                            };
+                            parts.push(format!(
+                                "<blockquote{}>{}</blockquote>",
+                                semantics, inner
+                            ));
                         }
                     } else {
                         // Non-blockquote sub-frame: render normally

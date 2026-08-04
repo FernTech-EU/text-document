@@ -366,6 +366,7 @@ fn execute_insert_table(
         fmt_border: None,
         fmt_position: None,
         fmt_is_blockquote: None,
+        fmt_semantic_role: None,
         table: Some(created_table.id),
         byte_range: (0, 0),
     };

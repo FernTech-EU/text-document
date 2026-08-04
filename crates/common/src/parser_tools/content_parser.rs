@@ -1,4 +1,4 @@
-use crate::entities::{Alignment, ListStyle, MarkerType, TextDirection};
+use crate::entities::{Alignment, ListStyle, MarkerType, SemanticRole, TextDirection};
 use crate::parser_tools::djot_options::DjotImportOptions;
 
 /// A parsed inline span with formatting info
@@ -71,6 +71,7 @@ impl ParsedElement {
                                 alignment: None,
                                 top_margin: None,
                                 text_indent: None,
+                                semantic_role: None,
                             });
                         }
                     }
@@ -99,6 +100,7 @@ impl ParsedElement {
                 alignment: None,
                 top_margin: None,
                 text_indent: None,
+                semantic_role: None,
             });
         }
         blocks
@@ -139,6 +141,10 @@ pub struct ParsedBlock {
     /// `Block.fmt_text_indent` and overrides the document-wide first-line
     /// indent for this block alone. `None` when absent.
     pub text_indent: Option<i64>,
+    /// The enclosing blockquote's semantic role (djot `{semantic_role=epigraph}`),
+    /// written on the quote's first block because block attributes are the only channel
+    /// djot offers. The importer lifts it onto the `Frame`, where it belongs.
+    pub semantic_role: Option<SemanticRole>,
 }
 
 impl ParsedBlock {
@@ -222,6 +228,7 @@ pub fn parse_markdown(markdown: &str) -> Vec<ParsedElement> {
                         alignment: None,
                         top_margin: None,
                         text_indent: None,
+                        semantic_role: None,
                     }));
                 }
                 in_block = false;
@@ -251,6 +258,7 @@ pub fn parse_markdown(markdown: &str) -> Vec<ParsedElement> {
                     alignment: None,
                     top_margin: None,
                     text_indent: None,
+                    semantic_role: None,
                 }));
                 in_block = false;
             }
@@ -287,6 +295,7 @@ pub fn parse_markdown(markdown: &str) -> Vec<ParsedElement> {
                         alignment: None,
                         top_margin: None,
                         text_indent: None,
+                        semantic_role: None,
                     }));
                 }
                 in_block = true;
@@ -319,6 +328,7 @@ pub fn parse_markdown(markdown: &str) -> Vec<ParsedElement> {
                         alignment: None,
                         top_margin: None,
                         text_indent: None,
+                        semantic_role: None,
                     }));
                 }
                 in_block = false;
@@ -359,6 +369,7 @@ pub fn parse_markdown(markdown: &str) -> Vec<ParsedElement> {
                     alignment: None,
                     top_margin: None,
                     text_indent: None,
+                    semantic_role: None,
                 }));
                 in_block = false;
                 is_code_block = false;
@@ -510,6 +521,7 @@ pub fn parse_markdown(markdown: &str) -> Vec<ParsedElement> {
                     alignment: None,
                     top_margin: None,
                     text_indent: None,
+                    semantic_role: None,
                 }));
             }
             Event::Start(Tag::BlockQuote(_)) => {
@@ -542,6 +554,7 @@ pub fn parse_markdown(markdown: &str) -> Vec<ParsedElement> {
             alignment: None,
             top_margin: None,
             text_indent: None,
+            semantic_role: None,
         }));
     }
 
@@ -568,6 +581,7 @@ pub fn parse_markdown(markdown: &str) -> Vec<ParsedElement> {
             alignment: None,
             top_margin: None,
             text_indent: None,
+            semantic_role: None,
         }));
     }
 
@@ -906,6 +920,7 @@ pub fn parse_html_elements(html: &str) -> Vec<ParsedElement> {
                         alignment: None,
                         top_margin: None,
                         text_indent: None,
+                        semantic_role: None,
                     }));
                     return;
                 }
@@ -972,6 +987,7 @@ pub fn parse_html_elements(html: &str) -> Vec<ParsedElement> {
                             alignment: None,
                             top_margin: None,
                             text_indent: None,
+                            semantic_role: None,
                         }));
                     }
                     // Append nested block elements after the parent block
@@ -1037,6 +1053,7 @@ pub fn parse_html_elements(html: &str) -> Vec<ParsedElement> {
                         alignment: None,
                         top_margin: None,
                         text_indent: None,
+                        semantic_role: None,
                     }));
                 }
             }
@@ -1198,6 +1215,7 @@ pub fn parse_html_elements(html: &str) -> Vec<ParsedElement> {
             alignment: None,
             top_margin: None,
             text_indent: None,
+            semantic_role: None,
         }));
     }
 
@@ -1224,6 +1242,7 @@ pub fn parse_html_elements(html: &str) -> Vec<ParsedElement> {
             alignment: None,
             top_margin: None,
             text_indent: None,
+            semantic_role: None,
         }));
     }
 
@@ -1359,6 +1378,7 @@ struct DjotBlockStyle {
     background_color: Option<String>,
     top_margin: Option<i64>,
     text_indent: Option<i64>,
+    semantic_role: Option<SemanticRole>,
 }
 
 impl DjotBlockStyle {
@@ -1386,6 +1406,9 @@ impl DjotBlockStyle {
         }
         if other.text_indent.is_some() {
             self.text_indent = other.text_indent;
+        }
+        if other.semantic_role.is_some() {
+            self.semantic_role = other.semantic_role.clone();
         }
     }
 }
@@ -1446,6 +1469,17 @@ fn block_attrs_to_style(attrs: &jotdown::Attributes, opts: &DjotImportOptions) -
     {
         style.text_indent = v.to_string().parse::<i64>().ok();
     }
+    if opts.semantic_role
+        && let Some(v) = attrs.get_value("semantic_role")
+    {
+        style.semantic_role = match v.to_string().as_str() {
+            "epigraph" => Some(SemanticRole::Epigraph),
+            // An unknown role is dropped, not guessed at — the same way an unknown
+            // alignment value above is. A future role read by an older build then
+            // degrades to a plain blockquote, which is what it looks like anyway.
+            _ => None,
+        };
+    }
 
     style
 }
@@ -1485,6 +1519,7 @@ fn djot_push_block(
         alignment: style.alignment,
         top_margin: style.top_margin,
         text_indent: style.text_indent,
+        semantic_role: style.semantic_role.clone(),
     }));
 }
 

@@ -621,6 +621,7 @@ fn insert_table_fragment(
             fmt_border: None,
             fmt_position: None,
             fmt_is_blockquote: None,
+            fmt_semantic_role: None,
             table: Some(created_table.id),
             byte_range: (0, 0),
         };
@@ -1268,6 +1269,7 @@ fn insert_mixed_fragment(
                     fmt_border: None,
                     fmt_position: None,
                     fmt_is_blockquote: None,
+                    fmt_semantic_role: None,
                     table: Some(created_table.id),
                     byte_range: (0, 0),
                 };

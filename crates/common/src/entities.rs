@@ -83,6 +83,10 @@ pub struct Frame {
     pub fmt_border: Option<i64>,
     pub fmt_position: Option<FramePosition>,
     pub fmt_is_blockquote: Option<bool>,
+    /// What this frame *is*, when a blockquote stands in for something a format can
+    /// name semantically (an epigraph). `None` for an ordinary quotation.
+    #[serde(default)]
+    pub fmt_semantic_role: Option<SemanticRole>,
     pub table: Option<EntityId>,
     /// Rope byte range occupied by this frame's contents. Plan §1.6
     /// invariant: all blocks in `Frame.blocks` have byte ranges
@@ -104,6 +108,11 @@ pub enum FramePosition {
     InFlow,
     FloatLeft,
     FloatRight,
+}
+#[derive(Serialize, Deserialize, Default, Clone, Debug, PartialEq, Eq)]
+pub enum SemanticRole {
+    #[default]
+    Epigraph,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]

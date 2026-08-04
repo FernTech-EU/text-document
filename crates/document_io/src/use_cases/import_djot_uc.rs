@@ -204,6 +204,24 @@ fn import_parsed_elements(
                     &mut list_grouper,
                 )?;
 
+                // The role is written on the quote's first block — block attributes are
+                // djot's only channel — but it describes the blockquote. Lift it onto the
+                // frame the transition above just opened, which is where every writer
+                // looks for it. Only inside a quote: on a bare paragraph the attribute
+                // names nothing, so it is dropped rather than applied to the body frame.
+                if let Some(role) = &parsed_block.semantic_role
+                    && parsed_block.blockquote_depth > 0
+                {
+                    let frame_id = frame_stack.last().unwrap().frame_id;
+                    if let Some(mut frame) = uow.get_frame(&frame_id)?
+                        && frame.fmt_is_blockquote == Some(true)
+                        && frame.fmt_semantic_role.is_none()
+                    {
+                        frame.fmt_semantic_role = Some(role.clone());
+                        uow.update_frame(&frame)?;
+                    }
+                }
+
                 let (plain_text, format_runs) =
                     format_runs_from_spans(&parsed_block.spans, parsed_block.is_code_block);
                 let line_len = plain_text.chars().count() as i64;

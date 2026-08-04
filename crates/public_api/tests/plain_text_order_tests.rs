@@ -173,3 +173,56 @@ fn an_epigraph_indents_as_one_unit_attribution_included() {
         "    The sea is a going.\n    — Anon.\nThe first paragraph."
     );
 }
+
+// ---------------------------------------------------------------------------
+// The semantic role — what lets a format say "epigraph" rather than "quotation"
+// ---------------------------------------------------------------------------
+
+const EPIGRAPH_DJOT: &str = "> {semantic_role=epigraph}\n> The sea is a going.\n>\n> {alignment=right}\n> — Anon.";
+
+fn doc_of(djot: &str) -> TextDocument {
+    let doc = TextDocument::new();
+    doc.set_djot(djot).unwrap().wait().unwrap();
+    doc
+}
+
+/// The role survives djot → model → djot. Without this the marker is write-only and a
+/// project saved and reloaded loses every epigraph's semantics.
+#[test]
+fn the_semantic_role_round_trips_through_djot() {
+    let out = doc_of(EPIGRAPH_DJOT).to_djot().unwrap();
+    assert!(
+        out.contains("semantic_role=epigraph"),
+        "the role must be written back: {out}"
+    );
+}
+
+/// HTML and EPUB carry both the EPUB Structural Semantics type and the DPUB-ARIA role.
+/// Both are required: `epub:type` alone reaches no assistive technology, which is the
+/// entire reason for marking it.
+#[test]
+fn an_epigraph_is_marked_up_semantically_in_html() {
+    let html = doc_of(EPIGRAPH_DJOT).to_html().unwrap();
+    assert!(html.contains(r#"epub:type="epigraph""#), "{html}");
+    assert!(html.contains(r#"role="doc-epigraph""#), "{html}");
+}
+
+/// An ordinary quotation must NOT be claimed as an epigraph — the marker has to mean
+/// something, and a writer's quoted letter is not front matter.
+#[test]
+fn a_plain_quotation_is_not_marked_as_an_epigraph() {
+    let html = doc_of("> Just a quotation.").to_html().unwrap();
+    assert!(html.contains("<blockquote>"), "still a blockquote: {html}");
+    assert!(!html.contains("epigraph"), "but not an epigraph: {html}");
+}
+
+/// An unknown role from a future version degrades to a plain blockquote rather than
+/// failing the parse — the same way an unknown alignment value does.
+#[test]
+fn an_unknown_semantic_role_degrades_to_a_plain_quotation() {
+    let html = doc_of("> {semantic_role=colophon}\n> From the future.")
+        .to_html()
+        .unwrap();
+    assert!(html.contains("<blockquote>"), "{html}");
+    assert!(!html.contains("colophon"), "{html}");
+}

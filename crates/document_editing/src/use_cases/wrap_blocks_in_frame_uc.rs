@@ -142,6 +142,7 @@ fn execute_wrap_blocks_in_frame(
         fmt_border: dto.border,
         fmt_position: dto.position.clone(),
         fmt_is_blockquote: dto.is_blockquote,
+        fmt_semantic_role: None,
         table: None,
         byte_range: (0, 0),
     };

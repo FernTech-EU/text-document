@@ -140,6 +140,7 @@ fn execute_insert_frame(
         fmt_border: None,
         fmt_position: None,
         fmt_is_blockquote: None,
+        fmt_semantic_role: None,
         table: None,
         byte_range: (0, 0),
     };

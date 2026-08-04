@@ -5,7 +5,7 @@ use common::database::QueryUnitOfWork;
 use common::database::rope_helpers::block_content_via_store;
 use common::entities::{
     Alignment, Block, CharVerticalAlignment, Document, Frame, List, ListStyle, MarkerType, Root,
-    Table, TableCell, TextDirection,
+    SemanticRole, Table, TableCell, TextDirection,
 };
 use common::format_runs::{InlineContent, InlineSegment};
 use common::parser_tools::DjotExportOptions;
@@ -151,6 +151,10 @@ impl ExportDjotUseCase {
         let mut result = String::new();
         let mut ordered_list_counter: i64 = 0;
         let mut current_list_id: Option<EntityId> = None;
+        // The frame's semantic role rides its first block and is then spent — a second
+        // `{semantic_role=…}` further down would re-open the same claim on a paragraph
+        // that is only a continuation of the quote.
+        let mut first_block_role = frame.fmt_semantic_role.as_ref();
 
         // Every block/sub-frame is separated by a blank line. Djot renders the
         // resulting lists "loose", but the model does not distinguish
@@ -171,6 +175,7 @@ impl ExportDjotUseCase {
                             uow,
                             b,
                             quote_prefix,
+                            first_block_role.take(),
                             &mut ordered_list_counter,
                             &mut current_list_id,
                             options,
@@ -250,6 +255,7 @@ impl ExportDjotUseCase {
                     uow,
                     block,
                     quote_prefix,
+                    first_block_role.take(),
                     &mut ordered_list_counter,
                     &mut current_list_id,
                     options,
@@ -271,6 +277,7 @@ impl ExportDjotUseCase {
         uow: &dyn ExportDjotUnitOfWorkTrait,
         block: &Block,
         quote_prefix: &str,
+        frame_role: Option<&SemanticRole>,
         ordered_list_counter: &mut i64,
         current_list_id: &mut Option<EntityId>,
         options: &DjotExportOptions,
@@ -343,7 +350,7 @@ impl ExportDjotUseCase {
         // Build the block line. Standalone paragraphs and headings may carry a
         // leading `{key=value}` djot block-attribute line for the optional
         // block-style attributes; list items and code blocks do not.
-        let attr_line = render_block_attrs(block, options);
+        let attr_line = render_block_attrs(block, frame_role, options);
         let block_line = if let Some(level) = block.fmt_heading_level {
             let prefix = "#".repeat(level as usize);
             let head = format!("{}{} {}", quote_prefix, prefix, inline_md);
@@ -599,8 +606,24 @@ fn prefix_lines(text: &str, prefix: &str) -> String {
 /// Returns an empty string when the block carries none of the selected
 /// attributes. Keys are the model field names so the importer reads them back
 /// verbatim, making the model→djot→model round-trip a fixpoint.
-fn render_block_attrs(block: &Block, options: &DjotExportOptions) -> String {
+fn render_block_attrs(
+    block: &Block,
+    frame_role: Option<&SemanticRole>,
+    options: &DjotExportOptions,
+) -> String {
     let mut pairs: Vec<String> = Vec::new();
+
+    // The enclosing blockquote's role, written on its first block — djot block attributes
+    // are the only channel, and the importer lifts it back onto the frame. Emitted first
+    // so the pair reads as what it describes before the paragraph's own styling.
+    if options.semantic_role
+        && let Some(role) = frame_role
+    {
+        let v = match role {
+            SemanticRole::Epigraph => "epigraph",
+        };
+        pairs.push(format!("semantic_role={v}"));
+    }
 
     if options.alignment
         && let Some(alignment) = &block.fmt_alignment

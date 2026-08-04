@@ -138,6 +138,7 @@ fn execute_unwrap_block_from_frame(
             fmt_border: owner.fmt_border,
             fmt_position: owner.fmt_position.clone(),
             fmt_is_blockquote: owner.fmt_is_blockquote,
+            fmt_semantic_role: owner.fmt_semantic_role.clone(),
             table: None,
             byte_range: (0, 0),
         };

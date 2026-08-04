@@ -10,7 +10,9 @@ use crate::html_render;
 use anyhow::{Result, anyhow};
 use common::database::QueryUnitOfWork;
 use common::database::Store;
-use common::entities::{Block, Document, Frame, List, Root, Table, TableCell};
+use common::entities::{
+    Block, Document, Frame, List, Root, SemanticRole, Table, TableCell,
+};
 use common::long_operation::{LongOperation, OperationProgress};
 use common::parser_tools::EpubExportOptions;
 use common::types::{EntityId, ROOT_ENTITY_ID};
@@ -327,9 +329,19 @@ impl ExportEpubUseCase {
                         self.render_frame_units(uow, &sub_frame_id, cell_frame_ids, &mut inner)?;
                         let inner_html: String = inner.into_iter().map(|u| u.html).collect();
                         if !inner_html.is_empty() {
+                            // EPUB is the format that can actually say what this is:
+                            // `epub:type` from the Structural Semantics vocabulary, plus
+                            // the DPUB-ARIA `role`, because `epub:type` on its own reaches
+                            // no assistive technology.
+                            let semantics = match &sf.fmt_semantic_role {
+                                Some(SemanticRole::Epigraph) => {
+                                    r#" epub:type="epigraph" role="doc-epigraph""#
+                                }
+                                None => "",
+                            };
                             out.push(RenderUnit::content(format!(
-                                "<blockquote>{}</blockquote>",
-                                inner_html
+                                "<blockquote{}>{}</blockquote>",
+                                semantics, inner_html
                             )));
                         }
                     } else {
@@ -488,12 +500,16 @@ fn split_into_chapters(units: Vec<RenderUnit>, options: &EpubExportOptions) -> V
 /// Wrap one chapter's rendered body HTML in a complete, valid XHTML document — required by the
 /// EPUB container format (each content document must be well-formed XML, unlike the loose HTML
 /// the `html_render` fragments were designed to sit inside as part of a larger `<body>`).
+/// The `epub` namespace is declared on every document, not only the ones that use it.
+/// `epub:type` is an undeclared prefix without it — invalid XML, which an EPUB validator
+/// rejects outright, so a semantic marker emitted into a document missing the declaration
+/// would be strictly worse than emitting nothing at all.
 fn wrap_xhtml(title: &str, lang: &str, rtl: bool, body_html: &str) -> String {
     let dir_attr = if rtl { " dir=\"rtl\"" } else { "" };
     format!(
         "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n\
          <!DOCTYPE html>\n\
-         <html xmlns=\"http://www.w3.org/1999/xhtml\" xml:lang=\"{lang}\" lang=\"{lang}\"{dir_attr}>\n\
+         <html xmlns=\"http://www.w3.org/1999/xhtml\" xmlns:epub=\"http://www.idpf.org/2007/ops\" xml:lang=\"{lang}\" lang=\"{lang}\"{dir_attr}>\n\
          <head><meta charset=\"utf-8\"/><title>{title}</title></head><body>{body}</body></html>",
         lang = lang,
         dir_attr = dir_attr,

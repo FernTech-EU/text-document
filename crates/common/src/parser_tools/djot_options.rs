@@ -41,6 +41,11 @@ pub struct DjotImportOptions {
     /// Apply the block's own first-line indent from `{text_indent=<int>}`,
     /// overriding the document-wide first-line indent for that one block.
     pub text_indent: bool,
+    /// Carry the frame's semantic role from `{semantic_role=epigraph}`. Unlike its
+    /// neighbours this one describes the enclosing **blockquote**, not the paragraph it
+    /// is written on: it rides the quote's first block because that is the only channel
+    /// djot block attributes have, and the importer moves it onto the frame.
+    pub semantic_role: bool,
 }
 
 impl DjotImportOptions {
@@ -54,6 +59,7 @@ impl DjotImportOptions {
             background_color: true,
             top_margin: true,
             text_indent: true,
+            semantic_role: true,
         }
     }
 
@@ -68,6 +74,7 @@ impl DjotImportOptions {
             background_color: false,
             top_margin: false,
             text_indent: false,
+            semantic_role: false,
         }
     }
 }
@@ -97,6 +104,9 @@ pub struct DjotExportOptions {
     pub top_margin: bool,
     /// Emit the block's own first-line indent as `{text_indent=…}`.
     pub text_indent: bool,
+    /// Emit the enclosing blockquote's semantic role as `{semantic_role=…}` on the
+    /// quote's first block, so the model→djot→model round trip stays a fixpoint.
+    pub semantic_role: bool,
 }
 
 impl DjotExportOptions {
@@ -110,6 +120,7 @@ impl DjotExportOptions {
             background_color: true,
             top_margin: true,
             text_indent: true,
+            semantic_role: true,
         }
     }
 
@@ -124,6 +135,7 @@ impl DjotExportOptions {
             background_color: false,
             top_margin: false,
             text_indent: false,
+            semantic_role: false,
         }
     }
 }

@@ -15,7 +15,9 @@ use crate::typst_compile::compile_typst_pdf;
 use crate::typst_markup::{render_blocks_typst, render_table_typst, typst_preamble};
 use anyhow::{Result, anyhow};
 use common::database::QueryUnitOfWork;
-use common::entities::{Block, Document, Frame, List, Root, Table, TableCell};
+use common::entities::{
+    Alignment, Block, Document, Frame, List, Root, SemanticRole, Table, TableCell,
+};
 use common::long_operation::{LongOperation, OperationProgress};
 use common::types::{EntityId, ROOT_ENTITY_ID};
 use std::collections::HashSet;
@@ -288,6 +290,49 @@ impl ExportPdfUseCase {
         ))
     }
 
+    /// An epigraph's body and its attribution, rendered separately, or `None` when the
+    /// quote has no attribution line to lift out.
+    ///
+    /// The attribution is the trailing right-aligned block — the convention the editor
+    /// writes and every other writer already renders on. Nothing extra is recorded to
+    /// mark it, because the alignment the author gave the line already says which it is.
+    /// `None` when there is no such trailing block (a bare quotation with no source), so
+    /// the caller falls back to an ordinary `#quote` rather than inventing an empty
+    /// attribution.
+    fn split_epigraph_typst(
+        &self,
+        uow: &dyn ExportPdfUnitOfWorkTrait,
+        frame: &Frame,
+        _cell_frame_ids: &HashSet<EntityId>,
+    ) -> Result<Option<(String, String)>> {
+        let mut blocks: Vec<Block> = Vec::new();
+        for &entry in &frame.child_order {
+            if entry > 0
+                && let Some(block) = uow.get_block(&(entry as u64))?
+            {
+                blocks.push(block);
+            }
+        }
+        // A single block is the quotation itself; there is nothing to attribute to.
+        if blocks.len() < 2 {
+            return Ok(None);
+        }
+        let last_is_attribution = blocks
+            .last()
+            .is_some_and(|b| b.fmt_alignment == Some(Alignment::Right));
+        if !last_is_attribution {
+            return Ok(None);
+        }
+        let attribution_block = blocks.pop().expect("checked non-empty above");
+        let body = render_blocks_typst(&uow.store(), &blocks, &self.dto.options);
+        let attribution = render_blocks_typst(
+            &uow.store(),
+            std::slice::from_ref(&attribution_block),
+            &self.dto.options,
+        );
+        Ok(Some((body, attribution)))
+    }
+
     /// Walk `child_order` entries: positive values are block IDs, negative values are negated
     /// sub-frame IDs. Mirrors `export_html_uc::render_frame_by_child_order`. A blockquote
     /// sub-frame is wrapped in `#quote(block: true)[...]` — the Typst analogue of LaTeX's
@@ -331,6 +376,19 @@ impl ExportPdfUseCase {
                 let sub_frame = uow.get_frame(&sub_frame_id)?;
                 if let Some(ref sf) = sub_frame {
                     if sf.fmt_is_blockquote == Some(true) {
+                        // An epigraph uses Typst's own attribution slot rather than
+                        // letting the source line fall through as one more paragraph:
+                        // `quote` then sets it the way a quotation's attribution is set,
+                        // and a reader's tooling can tell the two apart.
+                        if sf.fmt_semantic_role == Some(SemanticRole::Epigraph)
+                            && let Some((body, attribution)) =
+                                self.split_epigraph_typst(uow, sf, cell_frame_ids)?
+                        {
+                            parts.push(format!(
+                                "#quote(block: true, attribution: [{attribution}])[{body}]"
+                            ));
+                            continue;
+                        }
                         // Recursively render the blockquote frame content
                         let inner = self.render_frame_typst(uow, &sub_frame_id, cell_frame_ids)?;
                         if !inner.is_empty() {

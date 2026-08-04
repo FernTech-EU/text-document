@@ -6,7 +6,7 @@ use common::database::QueryUnitOfWork;
 use common::database::rope_helpers::block_content_via_store;
 use common::entities::{
     Alignment, Block, Document, Frame, List, ListStyle, MarkerType, Root, Table, TableCell,
-};
+ SemanticRole};
 use common::format_runs::{InlineContent, InlineSegment};
 use common::long_operation::LongOperation;
 use common::types::{EntityId, ROOT_ENTITY_ID};
@@ -121,6 +121,11 @@ impl LongOperation for ExportDocxUseCase {
 /// the conventional Word indent step used for both blockquote nesting and list
 /// indentation.
 const INDENT_STEP_TWIPS: i32 = 720;
+
+/// Word style ids for an epigraph's two paragraph kinds. Ids, not display names: the id is
+/// what a paragraph references, the name is what the style panel shows.
+const EPIGRAPH_STYLE_ID: &str = "Epigraph";
+const EPIGRAPH_ATTRIBUTION_STYLE_ID: &str = "EpigraphAttribution";
 
 /// Hanging indent applied to numbered/bulleted/task paragraphs so the marker
 /// sits in the gutter and the text aligns, in twips.
@@ -277,6 +282,7 @@ impl ExportDocxUseCase {
                 &frame,
                 &cell_frame_ids,
                 0,
+                None,
                 &mut numbering,
                 cancel_flag,
                 &mut elements,
@@ -301,6 +307,23 @@ impl ExportDocxUseCase {
         let paragraph_count = elements.len() as i64;
 
         let mut docx = Docx::new();
+        // Real named styles, so an epigraph is restylable in Word's style panel rather
+        // than being a paragraph that merely happens to be indented. Declared always:
+        // an unused style costs a few bytes and a conditional declaration is one more
+        // thing to get out of step with the paragraphs that reference it.
+        docx = docx
+            .add_style(
+                Style::new(EPIGRAPH_STYLE_ID, StyleType::Paragraph)
+                    .name("Epigraph")
+                    .italic()
+                    .indent(Some(INDENT_STEP_TWIPS), None, None, None),
+            )
+            .add_style(
+                Style::new(EPIGRAPH_ATTRIBUTION_STYLE_ID, StyleType::Paragraph)
+                    .name("Epigraph Attribution")
+                    .indent(Some(INDENT_STEP_TWIPS), None, None, None)
+                    .align(AlignmentType::Right),
+            );
         // Register numbering definitions before the body so the referenced ids
         // resolve.
         for (abstract_num, num) in numbering.defs {
@@ -390,6 +413,7 @@ impl ExportDocxUseCase {
         frame: &Frame,
         cell_frame_ids: &HashSet<EntityId>,
         quote_depth: usize,
+        semantic: Option<&SemanticRole>,
         numbering: &mut NumberingBuilder,
         cancel_flag: Option<&AtomicBool>,
         out: &mut Vec<DocxElement>,
@@ -407,7 +431,7 @@ impl ExportDocxUseCase {
                     // Positive: a block id.
                     let block_id = entry as EntityId;
                     if let Some(block) = uow.get_block(&block_id)? {
-                        let paragraph = self.render_block(uow, &block, quote_depth, numbering)?;
+                        let paragraph = self.render_block(uow, &block, quote_depth, semantic, numbering)?;
                         out.push(DocxElement::Paragraph(Box::new(paragraph)));
                     }
                 } else {
@@ -430,11 +454,17 @@ impl ExportDocxUseCase {
                         } else {
                             quote_depth
                         };
+                        let sub_semantic = if sub_frame.fmt_is_blockquote == Some(true) {
+                            sub_frame.fmt_semantic_role.as_ref()
+                        } else {
+                            semantic
+                        };
                         self.render_frame_content(
                             uow,
                             &sub_frame,
                             cell_frame_ids,
                             sub_depth,
+                            sub_semantic,
                             numbering,
                             cancel_flag,
                             out,
@@ -457,7 +487,7 @@ impl ExportDocxUseCase {
             blocks.sort_by_key(|b| b.document_position);
             for block in &blocks {
                 check_cancelled(cancel_flag)?;
-                let paragraph = self.render_block(uow, block, quote_depth, numbering)?;
+                let paragraph = self.render_block(uow, block, quote_depth, semantic, numbering)?;
                 out.push(DocxElement::Paragraph(Box::new(paragraph)));
             }
         }
@@ -473,6 +503,7 @@ impl ExportDocxUseCase {
         uow: &dyn ExportDocxUnitOfWorkTrait,
         block: &Block,
         quote_depth: usize,
+        semantic: Option<&SemanticRole>,
         numbering: &mut NumberingBuilder,
     ) -> Result<docx_rs::Paragraph> {
         use docx_rs::*;
@@ -579,6 +610,18 @@ impl ExportDocxUseCase {
             // Plain body paragraph: manuscript typography (line spacing, first-line indent,
             // paragraph spacing, alignment) from the export options, over any blockquote indent.
             paragraph = self.apply_body_style(paragraph, block, quote_indent);
+            // An epigraph's paragraphs carry its named style. Which of the two is
+            // decided by the alignment the author already gave the line: the attribution
+            // is the right-aligned one, which is the convention the editor writes and
+            // every other writer renders — so nothing extra has to be recorded to tell
+            // a quotation's last line from its source line.
+            if let Some(SemanticRole::Epigraph) = semantic {
+                paragraph = paragraph.style(if block.fmt_alignment == Some(Alignment::Right) {
+                    EPIGRAPH_ATTRIBUTION_STYLE_ID
+                } else {
+                    EPIGRAPH_STYLE_ID
+                });
+            }
         }
 
         Ok(add_inline_content(paragraph, &elements))
@@ -742,6 +785,7 @@ impl ExportDocxUseCase {
                             &cell_frame,
                             &HashSet::new(),
                             0,
+                            None,
                             numbering,
                             None,
                             &mut cell_elements,

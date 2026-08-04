@@ -144,6 +144,17 @@ entities:
       - name: fmt_is_blockquote
         type: bool
         optional: true
+      # What this frame *is*, when a blockquote is standing in for something a format
+      # can name semantically. A publisher's epigraph is still a blockquote everywhere
+      # it is rendered, but EPUB can say `epub:type="epigraph"`, DOCX can give it a
+      # named style, and Typst has a real attribution slot — none of which is reachable
+      # from "this is quoted text" alone. Absent for an ordinary quotation.
+      - name: fmt_semantic_role
+        type: enum
+        enum_name: SemanticRole
+        enum_values:
+          - Epigraph
+        optional: true
       - name: table
         type: entity
         entity: Table

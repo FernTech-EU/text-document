@@ -2,6 +2,7 @@
 
 use common::entities::Frame;
 pub use common::entities::FramePosition;
+pub use common::entities::SemanticRole;
 use common::types::EntityId;
 use serde::{Deserialize, Serialize};
 use std::convert::From;
@@ -24,6 +25,7 @@ pub struct FrameDto {
     pub fmt_border: Option<i64>,
     pub fmt_position: Option<FramePosition>,
     pub fmt_is_blockquote: Option<bool>,
+    pub fmt_semantic_role: Option<SemanticRole>,
     pub table: Option<EntityId>,
 }
 
@@ -46,6 +48,7 @@ impl From<FrameDto> for Frame {
             fmt_border: dto.fmt_border,
             fmt_position: dto.fmt_position,
             fmt_is_blockquote: dto.fmt_is_blockquote,
+            fmt_semantic_role: dto.fmt_semantic_role.clone(),
             table: dto.table,
             byte_range: (0, 0),
         }
@@ -71,6 +74,7 @@ impl From<&FrameDto> for Frame {
             fmt_border: dto.fmt_border,
             fmt_position: dto.fmt_position.clone(),
             fmt_is_blockquote: dto.fmt_is_blockquote,
+            fmt_semantic_role: dto.fmt_semantic_role.clone(),
             table: dto.table,
             byte_range: (0, 0),
         }
@@ -96,6 +100,7 @@ impl From<Frame> for FrameDto {
             fmt_border: entity.fmt_border,
             fmt_position: entity.fmt_position,
             fmt_is_blockquote: entity.fmt_is_blockquote,
+            fmt_semantic_role: entity.fmt_semantic_role.clone(),
             table: entity.table,
         }
     }
@@ -118,6 +123,7 @@ pub struct CreateFrameDto {
     pub fmt_border: Option<i64>,
     pub fmt_position: Option<FramePosition>,
     pub fmt_is_blockquote: Option<bool>,
+    pub fmt_semantic_role: Option<SemanticRole>,
     pub table: Option<EntityId>,
 }
 
@@ -140,6 +146,7 @@ impl From<CreateFrameDto> for Frame {
             fmt_border: dto.fmt_border,
             fmt_position: dto.fmt_position,
             fmt_is_blockquote: dto.fmt_is_blockquote,
+            fmt_semantic_role: dto.fmt_semantic_role.clone(),
             table: dto.table,
             byte_range: (0, 0),
         }
@@ -165,6 +172,7 @@ impl From<&CreateFrameDto> for Frame {
             fmt_border: dto.fmt_border,
             fmt_position: dto.fmt_position.clone(),
             fmt_is_blockquote: dto.fmt_is_blockquote,
+            fmt_semantic_role: dto.fmt_semantic_role.clone(),
             table: dto.table,
             byte_range: (0, 0),
         }
@@ -189,6 +197,7 @@ impl From<Frame> for CreateFrameDto {
             fmt_border: entity.fmt_border,
             fmt_position: entity.fmt_position,
             fmt_is_blockquote: entity.fmt_is_blockquote,
+            fmt_semantic_role: entity.fmt_semantic_role.clone(),
             table: entity.table,
         }
     }
@@ -210,6 +219,7 @@ pub struct UpdateFrameDto {
     pub fmt_border: Option<i64>,
     pub fmt_position: Option<FramePosition>,
     pub fmt_is_blockquote: Option<bool>,
+    pub fmt_semantic_role: Option<SemanticRole>,
 }
 
 impl From<UpdateFrameDto> for Frame {
@@ -229,6 +239,7 @@ impl From<UpdateFrameDto> for Frame {
             fmt_border: dto.fmt_border,
             fmt_position: dto.fmt_position,
             fmt_is_blockquote: dto.fmt_is_blockquote,
+            fmt_semantic_role: dto.fmt_semantic_role.clone(),
             parent_frame: Default::default(),
             blocks: Default::default(),
             table: Default::default(),
@@ -254,6 +265,7 @@ impl From<&UpdateFrameDto> for Frame {
             fmt_border: dto.fmt_border,
             fmt_position: dto.fmt_position.clone(),
             fmt_is_blockquote: dto.fmt_is_blockquote,
+            fmt_semantic_role: dto.fmt_semantic_role.clone(),
             parent_frame: Default::default(),
             blocks: Default::default(),
             table: Default::default(),
@@ -279,6 +291,7 @@ impl From<Frame> for UpdateFrameDto {
             fmt_border: entity.fmt_border,
             fmt_position: entity.fmt_position,
             fmt_is_blockquote: entity.fmt_is_blockquote,
+            fmt_semantic_role: entity.fmt_semantic_role.clone(),
         }
     }
 }
@@ -300,6 +313,7 @@ impl From<FrameDto> for UpdateFrameDto {
             fmt_border: dto.fmt_border,
             fmt_position: dto.fmt_position,
             fmt_is_blockquote: dto.fmt_is_blockquote,
+            fmt_semantic_role: dto.fmt_semantic_role.clone(),
         }
     }
 }
