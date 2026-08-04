@@ -10,9 +10,7 @@ use crate::html_render;
 use anyhow::{Result, anyhow};
 use common::database::QueryUnitOfWork;
 use common::database::Store;
-use common::entities::{
-    Block, Document, Frame, List, Root, SemanticRole, Table, TableCell,
-};
+use common::entities::{Block, Document, Frame, List, Root, SemanticRole, Table, TableCell};
 use common::long_operation::{LongOperation, OperationProgress};
 use common::parser_tools::EpubExportOptions;
 use common::types::{EntityId, ROOT_ENTITY_ID};
@@ -454,6 +452,14 @@ fn push_block_run_units(store: &Store, blocks: &[Block], out: &mut Vec<RenderUni
 /// the text of the heading that opened it, except the front-matter chapter (and the single
 /// chapter of a headingless document), which takes the book title from `options` (or
 /// "Untitled" when that's blank too).
+///
+/// A block's `fmt_page_break_before` deliberately does **not** split here. It is tempting —
+/// a spine document is the most literal "new page" an EPUB has — but it would give every
+/// dedication and copyright page its own spine item with no heading to name it, and a
+/// chapter with no title falls back to the book's, so the table of contents would fill with
+/// repeated entries. The break is carried as CSS instead (`break-before` plus its CSS2
+/// spelling, from `html_render`), which is in EPUB 3's supported subset and is honoured by
+/// every reading system that paginates.
 fn split_into_chapters(units: Vec<RenderUnit>, options: &EpubExportOptions) -> Vec<Chapter> {
     let front_title = if options.title.trim().is_empty() {
         "Untitled".to_string()

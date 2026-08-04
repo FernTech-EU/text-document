@@ -5,8 +5,9 @@ use anyhow::{Result, anyhow};
 use common::database::QueryUnitOfWork;
 use common::database::rope_helpers::block_content_via_store;
 use common::entities::{
-    Alignment, Block, Document, Frame, List, ListStyle, MarkerType, Root, Table, TableCell,
- SemanticRole};
+    Alignment, Block, Document, Frame, List, ListStyle, MarkerType, Root, SemanticRole, Table,
+    TableCell,
+};
 use common::format_runs::{InlineContent, InlineSegment};
 use common::long_operation::LongOperation;
 use common::types::{EntityId, ROOT_ENTITY_ID};
@@ -324,6 +325,19 @@ impl ExportDocxUseCase {
                     .indent(Some(INDENT_STEP_TWIPS), None, None, None)
                     .align(AlignmentType::Right),
             );
+        // …and the heading styles the heading paragraphs below reference by id. docx-rs
+        // ships no built-in styles at all, so without this every `Heading1` in the file is
+        // a dangling reference the reader resolves from its own catalogue — which is how a
+        // book title asked to be a title and arrived as whatever Word had lying around.
+        for (i, h) in self
+            .dto
+            .options
+            .resolved_heading_styles()
+            .iter()
+            .enumerate()
+        {
+            docx = docx.add_style(heading_style(i + 1, h));
+        }
         // Register numbering definitions before the body so the referenced ids
         // resolve.
         for (abstract_num, num) in numbering.defs {
@@ -431,7 +445,8 @@ impl ExportDocxUseCase {
                     // Positive: a block id.
                     let block_id = entry as EntityId;
                     if let Some(block) = uow.get_block(&block_id)? {
-                        let paragraph = self.render_block(uow, &block, quote_depth, semantic, numbering)?;
+                        let paragraph =
+                            self.render_block(uow, &block, quote_depth, semantic, numbering)?;
                         out.push(DocxElement::Paragraph(Box::new(paragraph)));
                     }
                 } else {
@@ -547,6 +562,12 @@ impl ExportDocxUseCase {
         }
         if block.fmt_non_breakable_lines == Some(true) {
             paragraph = paragraph.keep_lines(true);
+        }
+        // Set here, in the common section, so it survives whichever of the three branches
+        // below claims the block: `<w:pageBreakBefore/>` and `<w:pStyle/>` are independent
+        // children of `<w:pPr>`, so applying a style afterwards cannot drop it.
+        if block.fmt_page_break_before == Some(true) {
+            paragraph = paragraph.page_break_before(true);
         }
         if let Some(alignment) = &block.fmt_alignment {
             paragraph = paragraph.align(map_alignment(alignment));
@@ -849,6 +870,51 @@ fn map_alignment(alignment: &Alignment) -> docx_rs::AlignmentType {
         Alignment::Center => AlignmentType::Center,
         Alignment::Justify => AlignmentType::Justified,
     }
+}
+
+/// Build the `HeadingN` paragraph style definition for one level.
+///
+/// `outline_lvl` is what makes the result more than cosmetic: it is the field Word's
+/// navigation pane and its automatic table of contents both read, so a document whose
+/// headings carry it becomes navigable rather than merely large-and-bold.
+fn heading_style(level: usize, h: &common::parser_tools::DocxHeadingStyle) -> docx_rs::Style {
+    use docx_rs::*;
+    let mut style = Style::new(format!("Heading{level}"), StyleType::Paragraph)
+        .name(format!("heading {level}"))
+        // Zero-based, and clamped to Word's nine outline levels.
+        .outline_lvl(level.clamp(1, 9) - 1);
+    if let Some(size) = h.size_half_points {
+        style = style.size(size);
+    }
+    if h.bold {
+        style = style.bold();
+    }
+    if h.italic {
+        style = style.italic();
+    }
+    if let Some(a) = &h.alignment {
+        style = style.align(map_alignment(a));
+    }
+    if h.space_before_twips.is_some() || h.space_after_twips.is_some() {
+        let mut ls = LineSpacing::new();
+        if let Some(before) = h.space_before_twips {
+            ls = ls.before(before.max(0) as u32);
+        }
+        if let Some(after) = h.space_after_twips {
+            ls = ls.after(after.max(0) as u32);
+        }
+        style = style.line_spacing(ls);
+    }
+    // `Style` exposes no builder for these two, but its `paragraph_property` is public
+    // and *is* written out by its XML builder — the same door `render_block` already
+    // goes through for `bidi`.
+    if h.keep_with_next {
+        style.paragraph_property = style.paragraph_property.keep_next(true);
+    }
+    if h.page_break_before {
+        style.paragraph_property = style.paragraph_property.page_break_before(true);
+    }
+    style
 }
 
 /// Render a fenced/code block as a single monospaced, shaded paragraph.

@@ -170,6 +170,134 @@ fn hyperlink_paths(p: &Paragraph) -> Vec<String> {
         .collect()
 }
 
+/// Whether the paragraph carries `<w:pageBreakBefore/>`. Same serde route as
+/// `space_before` — the property's fields are private to docx-rs.
+fn page_break_before(p: &Paragraph) -> bool {
+    serde_json::to_value(&p.property)
+        .ok()
+        .and_then(|v| v.get("pageBreakBefore").and_then(|b| b.as_bool()))
+        .unwrap_or(false)
+}
+
+// --- pagination ------------------------------------------------------------
+
+#[test]
+fn a_flagged_block_carries_page_break_before() {
+    let docx = docx_from_djot("First.\n\n{page_break_before=true}\nSecond.");
+    assert!(!page_break_before(para_containing(&docx, "First")));
+    assert!(page_break_before(para_containing(&docx, "Second")));
+}
+
+/// The flag is set in the common formatting section, before the heading/list/plain
+/// dispatch, so applying a style afterwards cannot drop it.
+#[test]
+fn a_heading_keeps_its_page_break_alongside_its_style() {
+    let docx = docx_from_djot("Body.\n\n{page_break_before=true}\n# Chapter Two");
+    let p = para_containing(&docx, "Chapter Two");
+    assert!(page_break_before(p));
+    assert_eq!(
+        p.property.style.as_ref().map(|s| s.val.as_str()),
+        Some("Heading1"),
+        "the heading style must still be applied"
+    );
+}
+
+#[test]
+fn an_unflagged_block_has_no_page_break() {
+    let docx = docx_from_djot("Just prose.");
+    assert!(!page_break_before(para_containing(&docx, "Just prose")));
+}
+
+// --- heading styles --------------------------------------------------------
+
+/// Every `HeadingN` a paragraph can reference must be *defined* in the file. Referencing
+/// an undefined style id is legal OOXML — the reader silently substitutes its own — which
+/// is exactly how an export asking for a chapter title arrived as whatever Word had.
+#[test]
+fn the_heading_styles_referenced_are_actually_defined() {
+    let docx =
+        docx_from_djot("# One\n\n## Two\n\n### Three\n\n#### Four\n\n##### Five\n\n###### Six");
+    let defined: Vec<&str> = docx
+        .styles
+        .styles
+        .iter()
+        .map(|s| s.style_id.as_str())
+        .collect();
+    for level in 1..=6 {
+        let id = format!("Heading{level}");
+        assert!(
+            defined.contains(&id.as_str()),
+            "{id} is referenced by a paragraph but never defined; defined: {defined:?}"
+        );
+    }
+}
+
+/// Not merely present: sized, so a level-1 heading is visibly a title rather than body
+/// text, and carrying the outline level Word's navigation pane and TOC read.
+#[test]
+fn a_defined_heading_style_is_sized_and_outlined() {
+    let docx = docx_from_djot("# One");
+    let h1 = docx
+        .styles
+        .styles
+        .iter()
+        .find(|s| s.style_id == "Heading1")
+        .expect("Heading1 defined");
+    let json = serde_json::to_value(h1).expect("serialize");
+    let size = json["runProperty"]["sz"].as_u64();
+    assert_eq!(
+        size,
+        Some(43),
+        "12 pt body x 1.8 rounds to 43 half-points, not {size:?}"
+    );
+    assert_eq!(json["paragraphProperty"]["outlineLvl"].as_u64(), Some(0));
+    assert_eq!(json["paragraphProperty"]["keepNext"].as_bool(), Some(true));
+    assert_eq!(
+        json["paragraphProperty"]["lineSpacing"]["before"].as_u64(),
+        Some(480)
+    );
+}
+
+/// A caller that supplies its own ramp gets exactly that, not the default one.
+#[test]
+fn caller_supplied_heading_styles_win() {
+    use common::parser_tools::{DocxExportOptions, DocxHeadingStyle};
+    let (db, ev, _) = setup().expect("setup");
+    import_djot(&db, &ev, "# One");
+    let docx = document_io_controller::build_docx_document(
+        &db,
+        &ExportDocxDto {
+            options: DocxExportOptions {
+                heading_styles: vec![DocxHeadingStyle {
+                    size_half_points: Some(24),
+                    bold: false,
+                    alignment: Some(common::entities::Alignment::Center),
+                    page_break_before: true,
+                    ..DocxHeadingStyle::default()
+                }],
+                ..DocxExportOptions::default()
+            },
+            ..ExportDocxDto::default()
+        },
+    )
+    .expect("build_docx_document");
+    let h1 = docx
+        .styles
+        .styles
+        .iter()
+        .find(|s| s.style_id == "Heading1")
+        .expect("Heading1 defined");
+    let json = serde_json::to_value(h1).expect("serialize");
+    assert_eq!(json["runProperty"]["sz"].as_u64(), Some(24));
+    assert_eq!(
+        json["paragraphProperty"]["pageBreakBefore"].as_bool(),
+        Some(true)
+    );
+    // Shunn's chapter openers are body-sized and centred, not bold and enlarged —
+    // the case that makes the ramp overridable rather than baked in.
+    assert_ne!(json["runProperty"]["bold"].as_bool(), Some(true));
+}
+
 // --- alignment -------------------------------------------------------------
 
 #[test]

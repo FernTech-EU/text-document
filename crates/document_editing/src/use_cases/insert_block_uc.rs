@@ -161,6 +161,9 @@ fn execute_insert_block(
         fmt_tab_positions: current_block.fmt_tab_positions.clone(),
         fmt_line_height: current_block.fmt_line_height,
         fmt_non_breakable_lines: current_block.fmt_non_breakable_lines,
+        // A split tail starts no page: the head kept the break, and inheriting it here
+        // would turn one page boundary into two.
+        fmt_page_break_before: None,
         fmt_direction: current_block.fmt_direction.clone(),
         fmt_background_color: current_block.fmt_background_color.clone(),
         fmt_is_code_block: current_block.fmt_is_code_block,

@@ -287,6 +287,7 @@ fn execute_content_insert(
             updated_current.fmt_heading_level = first_parsed.heading_level;
             updated_current.fmt_line_height = first_parsed.line_height;
             updated_current.fmt_non_breakable_lines = first_parsed.non_breakable_lines;
+            updated_current.fmt_page_break_before = first_parsed.page_break_before;
             updated_current.fmt_direction = first_parsed.direction.clone();
             updated_current.fmt_background_color = first_parsed.background_color.clone();
             updated_current.updated_at = now;
@@ -397,6 +398,7 @@ fn execute_content_insert(
                 fmt_tab_positions: vec![],
                 fmt_line_height: parsed.line_height,
                 fmt_non_breakable_lines: parsed.non_breakable_lines,
+                fmt_page_break_before: parsed.page_break_before,
                 fmt_direction: parsed.direction.clone(),
                 fmt_background_color: parsed.background_color.clone(),
                 fmt_is_code_block: None,
@@ -537,6 +539,9 @@ fn execute_content_insert(
                 } else {
                     current_block.fmt_non_breakable_lines
                 },
+                // A split tail starts no page: the head kept the break, and inheriting it here
+                // would turn one page boundary into two.
+                fmt_page_break_before: None,
                 fmt_direction: if overwrite_head {
                     None
                 } else {
@@ -657,6 +662,7 @@ fn execute_content_insert(
             updated_current.fmt_heading_level = parsed.heading_level;
             updated_current.fmt_line_height = parsed.line_height;
             updated_current.fmt_non_breakable_lines = parsed.non_breakable_lines;
+            updated_current.fmt_page_break_before = parsed.page_break_before;
             updated_current.fmt_direction = parsed.direction.clone();
             updated_current.fmt_background_color = parsed.background_color.clone();
             updated_current.updated_at = now;
@@ -702,6 +708,7 @@ fn execute_content_insert(
                     fmt_tab_positions: vec![],
                     fmt_line_height: None,
                     fmt_non_breakable_lines: None,
+                    fmt_page_break_before: None,
                     fmt_direction: None,
                     fmt_background_color: None,
                     fmt_is_code_block: None,
@@ -834,6 +841,7 @@ fn execute_content_insert(
                 fmt_tab_positions: vec![],
                 fmt_line_height: parsed.line_height,
                 fmt_non_breakable_lines: parsed.non_breakable_lines,
+                fmt_page_break_before: parsed.page_break_before,
                 fmt_direction: parsed.direction.clone(),
                 fmt_background_color: parsed.background_color.clone(),
                 fmt_is_code_block: None,
@@ -872,6 +880,9 @@ fn execute_content_insert(
                 fmt_tab_positions: current_block.fmt_tab_positions.clone(),
                 fmt_line_height: current_block.fmt_line_height,
                 fmt_non_breakable_lines: current_block.fmt_non_breakable_lines,
+                // A split tail starts no page: the head kept the break, and inheriting it here
+                // would turn one page boundary into two.
+                fmt_page_break_before: None,
                 fmt_direction: current_block.fmt_direction.clone(),
                 fmt_background_color: current_block.fmt_background_color.clone(),
                 fmt_is_code_block: current_block.fmt_is_code_block,

@@ -66,6 +66,7 @@ impl ParsedElement {
                                 blockquote_depth: t.blockquote_depth,
                                 line_height: None,
                                 non_breakable_lines: None,
+                                page_break_before: None,
                                 direction: None,
                                 background_color: None,
                                 alignment: None,
@@ -95,6 +96,7 @@ impl ParsedElement {
                 blockquote_depth: 0,
                 line_height: None,
                 non_breakable_lines: None,
+                page_break_before: None,
                 direction: None,
                 background_color: None,
                 alignment: None,
@@ -128,6 +130,9 @@ pub struct ParsedBlock {
     pub blockquote_depth: u32,
     pub line_height: Option<i64>,
     pub non_breakable_lines: Option<bool>,
+    /// Start this block on a new page (djot `{page_break_before=true}`). Maps to
+    /// `Block.fmt_page_break_before`. `None` when absent.
+    pub page_break_before: Option<bool>,
     pub direction: Option<TextDirection>,
     pub background_color: Option<String>,
     /// Paragraph alignment (djot `{alignment=left|right|center|justify}`). Maps
@@ -157,6 +162,7 @@ impl ParsedBlock {
             && self.blockquote_depth == 0
             && self.line_height.is_none()
             && self.non_breakable_lines.is_none()
+            && self.page_break_before.is_none()
             && self.direction.is_none()
             && self.background_color.is_none()
             && self.alignment.is_none()
@@ -223,6 +229,7 @@ pub fn parse_markdown(markdown: &str) -> Vec<ParsedElement> {
                         blockquote_depth,
                         line_height: None,
                         non_breakable_lines: None,
+                        page_break_before: None,
                         direction: None,
                         background_color: None,
                         alignment: None,
@@ -253,6 +260,7 @@ pub fn parse_markdown(markdown: &str) -> Vec<ParsedElement> {
                     blockquote_depth,
                     line_height: None,
                     non_breakable_lines: None,
+                    page_break_before: None,
                     direction: None,
                     background_color: None,
                     alignment: None,
@@ -290,6 +298,7 @@ pub fn parse_markdown(markdown: &str) -> Vec<ParsedElement> {
                         blockquote_depth,
                         line_height: None,
                         non_breakable_lines: None,
+                        page_break_before: None,
                         direction: None,
                         background_color: None,
                         alignment: None,
@@ -323,6 +332,7 @@ pub fn parse_markdown(markdown: &str) -> Vec<ParsedElement> {
                         blockquote_depth,
                         line_height: None,
                         non_breakable_lines: None,
+                        page_break_before: None,
                         direction: None,
                         background_color: None,
                         alignment: None,
@@ -364,6 +374,7 @@ pub fn parse_markdown(markdown: &str) -> Vec<ParsedElement> {
                     blockquote_depth,
                     line_height: None,
                     non_breakable_lines: None,
+                    page_break_before: None,
                     direction: None,
                     background_color: None,
                     alignment: None,
@@ -516,6 +527,7 @@ pub fn parse_markdown(markdown: &str) -> Vec<ParsedElement> {
                     blockquote_depth,
                     line_height: None,
                     non_breakable_lines: None,
+                    page_break_before: None,
                     direction: None,
                     background_color: None,
                     alignment: None,
@@ -549,6 +561,7 @@ pub fn parse_markdown(markdown: &str) -> Vec<ParsedElement> {
             blockquote_depth,
             line_height: None,
             non_breakable_lines: None,
+            page_break_before: None,
             direction: None,
             background_color: None,
             alignment: None,
@@ -576,6 +589,7 @@ pub fn parse_markdown(markdown: &str) -> Vec<ParsedElement> {
             blockquote_depth: 0,
             line_height: None,
             non_breakable_lines: None,
+            page_break_before: None,
             direction: None,
             background_color: None,
             alignment: None,
@@ -609,12 +623,14 @@ use scraper::Node;
 struct BlockStyles {
     line_height: Option<i64>,
     non_breakable_lines: Option<bool>,
+    page_break_before: Option<bool>,
     direction: Option<TextDirection>,
     background_color: Option<String>,
 }
 
 /// Parse relevant CSS properties from an inline style string.
-/// Handles: line-height, white-space, direction, background-color.
+/// Handles: line-height, white-space, break-before/page-break-before, direction,
+/// background-color.
 fn parse_block_styles(style: &str) -> BlockStyles {
     let mut result = BlockStyles::default();
     for part in style.split(';') {
@@ -631,6 +647,16 @@ fn parse_block_styles(style: &str) -> BlockStyles {
                 }
                 "white-space" if val == "pre" || val == "nowrap" || val == "pre-wrap" => {
                     result.non_breakable_lines = Some(true);
+                }
+                // CSS3 `break-before` and its CSS2 predecessor `page-break-before` mean
+                // the same thing; both are read because both are written (browsers still
+                // want the legacy spelling, and so do most EPUB engines).
+                "break-before" | "page-break-before" => {
+                    result.page_break_before = match val.to_ascii_lowercase().as_str() {
+                        "page" | "always" | "left" | "right" | "recto" | "verso" => Some(true),
+                        "avoid" | "auto" => Some(false),
+                        _ => None,
+                    };
                 }
                 "direction" => {
                     if val.eq_ignore_ascii_case("rtl") {
@@ -915,6 +941,7 @@ pub fn parse_html_elements(html: &str) -> Vec<ParsedElement> {
                         blockquote_depth: bq_depth,
                         line_height: None,
                         non_breakable_lines: None,
+                        page_break_before: None,
                         direction: None,
                         background_color: None,
                         alignment: None,
@@ -982,6 +1009,7 @@ pub fn parse_html_elements(html: &str) -> Vec<ParsedElement> {
                             blockquote_depth: bq_depth,
                             line_height: css.line_height,
                             non_breakable_lines: css.non_breakable_lines,
+                            page_break_before: css.page_break_before,
                             direction: css.direction,
                             background_color: css.background_color,
                             alignment: None,
@@ -1048,6 +1076,7 @@ pub fn parse_html_elements(html: &str) -> Vec<ParsedElement> {
                         blockquote_depth,
                         line_height: None,
                         non_breakable_lines: None,
+                        page_break_before: None,
                         direction: None,
                         background_color: None,
                         alignment: None,
@@ -1210,6 +1239,7 @@ pub fn parse_html_elements(html: &str) -> Vec<ParsedElement> {
             blockquote_depth: 0,
             line_height: None,
             non_breakable_lines: None,
+            page_break_before: None,
             direction: None,
             background_color: None,
             alignment: None,
@@ -1237,6 +1267,7 @@ pub fn parse_html_elements(html: &str) -> Vec<ParsedElement> {
             blockquote_depth: 0,
             line_height: None,
             non_breakable_lines: None,
+            page_break_before: None,
             direction: None,
             background_color: None,
             alignment: None,
@@ -1374,6 +1405,7 @@ struct DjotBlockStyle {
     alignment: Option<Alignment>,
     line_height: Option<i64>,
     non_breakable_lines: Option<bool>,
+    page_break_before: Option<bool>,
     direction: Option<TextDirection>,
     background_color: Option<String>,
     top_margin: Option<i64>,
@@ -1394,6 +1426,9 @@ impl DjotBlockStyle {
         }
         if other.non_breakable_lines.is_some() {
             self.non_breakable_lines = other.non_breakable_lines;
+        }
+        if other.page_break_before.is_some() {
+            self.page_break_before = other.page_break_before;
         }
         if other.direction.is_some() {
             self.direction = other.direction;
@@ -1416,7 +1451,8 @@ impl DjotBlockStyle {
 /// Read the round-tripped block-style attributes off a djot block's
 /// [`jotdown::Attributes`], honouring the import [`DjotImportOptions`]. Keys are
 /// the model field names (`alignment`, `line_height`, `direction`,
-/// `non_breakable_lines`, `background_color`); unrecognised values are ignored.
+/// `non_breakable_lines`, `page_break_before`, `background_color`, `top_margin`,
+/// `text_indent`, `semantic_role`); unrecognised values are ignored.
 fn block_attrs_to_style(attrs: &jotdown::Attributes, opts: &DjotImportOptions) -> DjotBlockStyle {
     let mut style = DjotBlockStyle::default();
 
@@ -1449,6 +1485,15 @@ fn block_attrs_to_style(attrs: &jotdown::Attributes, opts: &DjotImportOptions) -
         && let Some(v) = attrs.get_value("non_breakable_lines")
     {
         style.non_breakable_lines = match v.to_string().as_str() {
+            "true" => Some(true),
+            "false" => Some(false),
+            _ => None,
+        };
+    }
+    if opts.page_break_before
+        && let Some(v) = attrs.get_value("page_break_before")
+    {
+        style.page_break_before = match v.to_string().as_str() {
             "true" => Some(true),
             "false" => Some(false),
             _ => None,
@@ -1514,6 +1559,7 @@ fn djot_push_block(
         blockquote_depth,
         line_height: style.line_height,
         non_breakable_lines: style.non_breakable_lines,
+        page_break_before: style.page_break_before,
         direction: style.direction,
         background_color: style.background_color,
         alignment: style.alignment,

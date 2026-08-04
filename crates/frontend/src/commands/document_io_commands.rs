@@ -13,7 +13,7 @@ use document_io::{
 };
 
 use common::long_operation::OperationProgress;
-use common::parser_tools::DjotExportOptions;
+use common::parser_tools::{DjotExportOptions, MarkdownExportOptions, PlainTextExportOptions};
 
 pub fn import_plain_text(ctx: &AppContext, dto: &ImportPlainTextDto) -> Result<()> {
     document_io_controller::import_plain_text(&ctx.db_context, &ctx.event_hub, dto)
@@ -28,8 +28,22 @@ pub fn export_plain_text(ctx: &AppContext) -> Result<ExportPlainTextDto> {
 /// [`export_plain_text`] with blockquotes indented — for writing a `.txt` file, not for
 /// anything that computes offsets against the result.
 pub fn export_plain_text_indented(ctx: &AppContext) -> Result<ExportPlainTextDto> {
-    document_io_controller::export_plain_text_with(&ctx.db_context, &ctx.event_hub, true)
-        .context("export_plain_text_indented")
+    export_plain_text_with(
+        ctx,
+        PlainTextExportOptions {
+            quote_indent: true,
+            ..PlainTextExportOptions::addressable()
+        },
+    )
+}
+
+/// [`export_plain_text`] with every presentation option under the caller's control.
+pub fn export_plain_text_with(
+    ctx: &AppContext,
+    options: PlainTextExportOptions,
+) -> Result<ExportPlainTextDto> {
+    document_io_controller::export_plain_text_with(&ctx.db_context, &ctx.event_hub, options)
+        .context("export_plain_text_with")
 }
 
 /// import_markdown (long operation)
@@ -69,6 +83,15 @@ pub fn get_import_markdown_result(
 pub fn export_markdown(ctx: &AppContext) -> Result<ExportMarkdownDto> {
     document_io_controller::export_markdown(&ctx.db_context, &ctx.event_hub)
         .context("export_markdown")
+}
+
+/// [`export_markdown`] with the presentation opt-ins.
+pub fn export_markdown_with(
+    ctx: &AppContext,
+    options: MarkdownExportOptions,
+) -> Result<ExportMarkdownDto> {
+    document_io_controller::export_markdown_with(&ctx.db_context, &ctx.event_hub, options)
+        .context("export_markdown_with")
 }
 
 /// import_djot (long operation)

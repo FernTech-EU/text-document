@@ -65,6 +65,7 @@ pub struct SetBlockFormatDto {
     pub marker: Option<MarkerType>,
     pub line_height: Option<i64>,
     pub non_breakable_lines: Option<bool>,
+    pub page_break_before: Option<bool>,
     pub direction: Option<TextDirection>,
     /// Unset the block's stored direction, handing the paragraph back to
     /// the bidi algorithm's first-strong-character detection.

@@ -8,7 +8,10 @@ use crate::{DocumentError, Result};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
 
-use crate::{DjotExportOptions, DjotImportOptions, ResourceType, TextDirection, WrapMode};
+use crate::{
+    DjotExportOptions, DjotImportOptions, MarkdownExportOptions, PlainTextExportOptions,
+    ResourceType, TextDirection, WrapMode,
+};
 use frontend::commands::{
     block_commands, document_commands, document_inspection_commands, document_io_commands,
     document_search_commands, frame_commands, resource_commands, table_cell_commands,
@@ -228,6 +231,19 @@ impl TextDocument {
         Ok(dto.plain_text)
     }
 
+    /// [`to_plain_text`](Self::to_plain_text) with every presentation option chosen
+    /// explicitly — quoted-block indentation, and a `U+000C` form feed before each block
+    /// that asks to start a new page.
+    ///
+    /// Subject to the same warning as [`to_plain_text_indented`](Self::to_plain_text_indented):
+    /// anything other than [`PlainTextExportOptions::addressable`] shifts offsets, so this is
+    /// for files being written out, never for text anyone addresses back into the document.
+    pub fn to_plain_text_with(&self, options: PlainTextExportOptions) -> Result<String> {
+        let inner = self.inner.lock();
+        let dto = document_io_commands::export_plain_text_with(&inner.ctx, options)?;
+        Ok(dto.plain_text)
+    }
+
     /// Replace the entire document with Markdown. Clears undo history.
     ///
     /// This is a **long operation**. Returns a typed [`Operation`] handle.
@@ -258,6 +274,15 @@ impl TextDocument {
     pub fn to_markdown(&self) -> Result<String> {
         let inner = self.inner.lock();
         let dto = document_io_commands::export_markdown(&inner.ctx)?;
+        Ok(dto.markdown_text)
+    }
+
+    /// [`to_markdown`](Self::to_markdown) with the presentation opt-ins — today, whether a
+    /// block that asks to start a new page gets a raw-HTML page break emitted above it.
+    /// Off by default, because raw HTML is not Markdown.
+    pub fn to_markdown_with(&self, options: MarkdownExportOptions) -> Result<String> {
+        let inner = self.inner.lock();
+        let dto = document_io_commands::export_markdown_with(&inner.ctx, options)?;
         Ok(dto.markdown_text)
     }
 

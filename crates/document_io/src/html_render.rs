@@ -118,6 +118,14 @@ pub fn render_blocks_html(store: &Store, blocks: &[Block]) -> String {
             if block.fmt_non_breakable_lines == Some(true) {
                 styles.push("white-space: pre".into());
             }
+            // Both spellings, because neither alone reaches everything: `break-before`
+            // is the CSS3 property, `page-break-before` its CSS2 predecessor, and
+            // EPUB reading systems and browser print engines are split between them.
+            // Inert on screen, load-bearing on paper.
+            if block.fmt_page_break_before == Some(true) {
+                styles.push("break-before: page".into());
+                styles.push("page-break-before: always".into());
+            }
             if block.fmt_direction == Some(TextDirection::RightToLeft) {
                 styles.push("direction: rtl".into());
             }

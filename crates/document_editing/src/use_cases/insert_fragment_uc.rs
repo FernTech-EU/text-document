@@ -994,6 +994,7 @@ fn insert_mixed_fragment(
         updated_current.fmt_tab_positions = fb.tab_positions.clone();
         updated_current.fmt_line_height = fb.line_height;
         updated_current.fmt_non_breakable_lines = fb.non_breakable_lines;
+        updated_current.fmt_page_break_before = fb.page_break_before;
         updated_current.fmt_direction = fb.direction.clone();
         updated_current.fmt_background_color = fb.background_color.clone();
         updated_current.fmt_is_code_block = fb.is_code_block;
@@ -1119,6 +1120,7 @@ fn insert_mixed_fragment(
                     fmt_tab_positions: frag_block.tab_positions.clone(),
                     fmt_line_height: frag_block.line_height,
                     fmt_non_breakable_lines: frag_block.non_breakable_lines,
+                    fmt_page_break_before: frag_block.page_break_before,
                     fmt_direction: frag_block.direction.clone(),
                     fmt_background_color: frag_block.background_color.clone(),
                     fmt_is_code_block: frag_block.is_code_block,
@@ -1445,6 +1447,9 @@ fn insert_mixed_fragment(
             } else {
                 current_block.fmt_non_breakable_lines
             },
+            // A split tail starts no page: the head kept the break, and inheriting it here
+            // would turn one page boundary into two.
+            fmt_page_break_before: None,
             fmt_direction: if overwrite_head {
                 None
             } else {
@@ -1835,6 +1840,7 @@ fn execute_insert_fragment(
             updated_current.fmt_tab_positions = first_frag.tab_positions.clone();
             updated_current.fmt_line_height = first_frag.line_height;
             updated_current.fmt_non_breakable_lines = first_frag.non_breakable_lines;
+            updated_current.fmt_page_break_before = first_frag.page_break_before;
             updated_current.fmt_direction = first_frag.direction.clone();
             updated_current.fmt_background_color = first_frag.background_color.clone();
             updated_current.fmt_is_code_block = first_frag.is_code_block;
@@ -1920,6 +1926,7 @@ fn execute_insert_fragment(
                 fmt_tab_positions: frag_block.tab_positions.clone(),
                 fmt_line_height: frag_block.line_height,
                 fmt_non_breakable_lines: frag_block.non_breakable_lines,
+                fmt_page_break_before: frag_block.page_break_before,
                 fmt_direction: frag_block.direction.clone(),
                 fmt_background_color: frag_block.background_color.clone(),
                 fmt_is_code_block: frag_block.is_code_block,
@@ -2028,6 +2035,9 @@ fn execute_insert_fragment(
                 } else {
                     current_block.fmt_non_breakable_lines
                 },
+                // A split tail starts no page: the head kept the break, and inheriting it here
+                // would turn one page boundary into two.
+                fmt_page_break_before: None,
                 fmt_direction: if overwrite_head {
                     None
                 } else {
@@ -2216,6 +2226,7 @@ fn execute_insert_fragment(
             updated_current.fmt_tab_positions = frag_block.tab_positions.clone();
             updated_current.fmt_line_height = frag_block.line_height;
             updated_current.fmt_non_breakable_lines = frag_block.non_breakable_lines;
+            updated_current.fmt_page_break_before = frag_block.page_break_before;
             updated_current.fmt_direction = frag_block.direction.clone();
             updated_current.fmt_background_color = frag_block.background_color.clone();
             updated_current.fmt_is_code_block = frag_block.is_code_block;
@@ -2250,6 +2261,7 @@ fn execute_insert_fragment(
                     fmt_tab_positions: vec![],
                     fmt_line_height: None,
                     fmt_non_breakable_lines: None,
+                    fmt_page_break_before: None,
                     fmt_direction: None,
                     fmt_background_color: None,
                     fmt_is_code_block: None,
@@ -2389,6 +2401,7 @@ fn execute_insert_fragment(
                 fmt_tab_positions: frag_block.tab_positions.clone(),
                 fmt_line_height: frag_block.line_height,
                 fmt_non_breakable_lines: frag_block.non_breakable_lines,
+                fmt_page_break_before: frag_block.page_break_before,
                 fmt_direction: frag_block.direction.clone(),
                 fmt_background_color: frag_block.background_color.clone(),
                 fmt_is_code_block: frag_block.is_code_block,
@@ -2421,6 +2434,9 @@ fn execute_insert_fragment(
                 fmt_tab_positions: current_block.fmt_tab_positions.clone(),
                 fmt_line_height: current_block.fmt_line_height,
                 fmt_non_breakable_lines: current_block.fmt_non_breakable_lines,
+                // A split tail starts no page: the head kept the break, and inheriting it here
+                // would turn one page boundary into two.
+                fmt_page_break_before: None,
                 fmt_direction: current_block.fmt_direction.clone(),
                 fmt_background_color: current_block.fmt_background_color.clone(),
                 fmt_is_code_block: current_block.fmt_is_code_block,

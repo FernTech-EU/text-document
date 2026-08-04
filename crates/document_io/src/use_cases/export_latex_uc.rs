@@ -5,7 +5,8 @@ use anyhow::{Result, anyhow};
 use common::database::QueryUnitOfWork;
 use common::database::rope_helpers::block_content_via_store;
 use common::entities::{
-    Block, Document, Frame, List, ListStyle, Root, Table, TableCell, TextDirection,
+    Alignment, Block, Document, Frame, List, ListStyle, Root, SemanticRole, Table, TableCell,
+    TextDirection,
 };
 use common::format_runs::InlineContent;
 use common::types::{EntityId, ROOT_ENTITY_ID};
@@ -159,7 +160,7 @@ impl ExportLatexUseCase {
             // No child_order: fall back to rendering all blocks sorted by position
             let mut blocks: Vec<&Block> = block_map.values().collect();
             blocks.sort_by_key(|b| b.document_position);
-            self.render_blocks_latex(uow, &blocks, &mut parts)?;
+            self.render_blocks_latex(uow, &blocks, frame.fmt_semantic_role.as_ref(), &mut parts)?;
         } else {
             // Use child_order to interleave blocks and sub-frames
             // Collect consecutive blocks, then render them as a group
@@ -176,7 +177,12 @@ impl ExportLatexUseCase {
                     // Negative = negated sub-frame ID
                     // Flush pending blocks first
                     if !pending_blocks.is_empty() {
-                        self.render_blocks_latex(uow, &pending_blocks, &mut parts)?;
+                        self.render_blocks_latex(
+                            uow,
+                            &pending_blocks,
+                            frame.fmt_semantic_role.as_ref(),
+                            &mut parts,
+                        )?;
                         pending_blocks.clear();
                     }
 
@@ -194,7 +200,12 @@ impl ExportLatexUseCase {
 
             // Flush remaining pending blocks
             if !pending_blocks.is_empty() {
-                self.render_blocks_latex(uow, &pending_blocks, &mut parts)?;
+                self.render_blocks_latex(
+                    uow,
+                    &pending_blocks,
+                    frame.fmt_semantic_role.as_ref(),
+                    &mut parts,
+                )?;
             }
         }
 
@@ -217,11 +228,18 @@ impl ExportLatexUseCase {
         &self,
         uow: &dyn ExportLatexUnitOfWorkTrait,
         blocks: &[&Block],
+        semantic: Option<&SemanticRole>,
         parts: &mut Vec<String>,
     ) -> Result<()> {
         let mut i = 0;
         while i < blocks.len() {
             let block = blocks[i];
+
+            // Its own entry in `parts` (they are joined with a blank line), so it can
+            // never end up glued to the front of a `\\section{…}` and swallow it.
+            if block.fmt_page_break_before == Some(true) {
+                parts.push("\\newpage".to_string());
+            }
 
             // Check if block has a list
             let list_ids = uow.get_block_relationship(
@@ -259,7 +277,11 @@ impl ExportLatexUseCase {
                         None
                     };
 
-                    if b_list.is_some() {
+                    // A run becomes one `itemize`/`enumerate`, so a page break inside
+                    // it has nowhere to go — end the run and let the outer loop emit it.
+                    if b_list.is_some()
+                        && !(b.fmt_page_break_before == Some(true) && !items.is_empty())
+                    {
                         let inline_latex = self.render_inline_latex(uow, b)?;
                         items.push(format!("\\item {}", inline_latex));
                         i += 1;
@@ -296,6 +318,31 @@ impl ExportLatexUseCase {
                 } else {
                     inline_latex
                 };
+
+                // Alignment. LaTeX's default is justified-with-ragged-bottom, so Left
+                // and Justify need no environment; only the two that actually move the
+                // text do. Emitted before the wraps below so `\\setstretch` and friends
+                // apply inside the alignment group, not the other way round.
+                match block.fmt_alignment {
+                    Some(Alignment::Center) => {
+                        content = format!("\\begin{{center}}\n{}\n\\end{{center}}", content);
+                    }
+                    Some(Alignment::Right) => {
+                        content =
+                            format!("\\begin{{flushright}}\n{}\n\\end{{flushright}}", content);
+                    }
+                    Some(Alignment::Left) | Some(Alignment::Justify) | None => {}
+                }
+
+                // An epigraph's quotation is set in italics and its attribution is not
+                // — the same split every sibling writer makes, and decided the same way:
+                // by the right alignment the author already gave the source line. Applied
+                // before the alignment wrap so the italics stay inside the group.
+                if let Some(SemanticRole::Epigraph) = semantic
+                    && block.fmt_alignment != Some(Alignment::Right)
+                {
+                    content = format!("{{\\itshape {}}}", content);
+                }
 
                 // Wrap with line-height
                 if let Some(lh) = block.fmt_line_height {

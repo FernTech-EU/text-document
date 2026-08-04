@@ -82,22 +82,26 @@ pub fn export_plain_text(
     db_context: &DbContext,
     event_hub: &Arc<EventHub>,
 ) -> Result<ExportPlainTextDto> {
-    export_plain_text_with(db_context, event_hub, false)
+    export_plain_text_with(
+        db_context,
+        event_hub,
+        common::parser_tools::PlainTextExportOptions::addressable(),
+    )
 }
 
-/// [`export_plain_text`], with blockquoted blocks indented for a written-out `.txt` file.
+/// [`export_plain_text`], with the presentation options a written-out `.txt` file wants.
 ///
-/// Separate entry point rather than a flag on the default one, because the default one's
-/// output is load-bearing: it is pinned to the document's addressable text, so indenting
-/// it would move every search offset inside a quote.
+/// Separate entry point rather than flags on the default one, because the default one's
+/// output is load-bearing: it is pinned to the document's addressable text, so anything
+/// that indents or inserts would move every search offset after it.
 pub fn export_plain_text_with(
     db_context: &DbContext,
     event_hub: &Arc<EventHub>,
-    quote_indent: bool,
+    options: common::parser_tools::PlainTextExportOptions,
 ) -> Result<ExportPlainTextDto> {
     let uow_context = ExportPlainTextUnitOfWorkFactory::new(db_context);
     let mut uc = ExportPlainTextUseCase::new(Box::new(uow_context));
-    let return_dto = uc.execute(quote_indent)?;
+    let return_dto = uc.execute(options)?;
     // Notify that the handling manifest has been loaded
     event_hub.send_event(Event {
         origin: Origin::DocumentIo(ExportPlainText),
@@ -147,8 +151,23 @@ pub fn export_markdown(
     db_context: &DbContext,
     event_hub: &Arc<EventHub>,
 ) -> Result<ExportMarkdownDto> {
+    export_markdown_with(
+        db_context,
+        event_hub,
+        common::parser_tools::MarkdownExportOptions::default(),
+    )
+}
+
+/// [`export_markdown`] with the presentation opt-ins. Separate for the same reason as
+/// its plain-text sibling: the default output stays plain Markdown, with no raw HTML in
+/// it that nobody asked for.
+pub fn export_markdown_with(
+    db_context: &DbContext,
+    event_hub: &Arc<EventHub>,
+    options: common::parser_tools::MarkdownExportOptions,
+) -> Result<ExportMarkdownDto> {
     let uow_context = ExportMarkdownUnitOfWorkFactory::new(db_context);
-    let mut uc = ExportMarkdownUseCase::new(Box::new(uow_context));
+    let mut uc = ExportMarkdownUseCase::with_options(Box::new(uow_context), options);
     let return_dto = uc.execute()?;
     // Notify that the handling manifest has been loaded
     event_hub.send_event(Event {

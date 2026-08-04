@@ -3,9 +3,7 @@ use crate::ExportHtmlDto;
 use crate::html_render;
 use anyhow::{Result, anyhow};
 use common::database::QueryUnitOfWork;
-use common::entities::{
-    Block, Document, Frame, List, Root, SemanticRole, Table, TableCell,
-};
+use common::entities::{Block, Document, Frame, List, Root, SemanticRole, Table, TableCell};
 use common::types::{EntityId, ROOT_ENTITY_ID};
 use std::collections::HashSet;
 
@@ -204,10 +202,7 @@ impl ExportHtmlUseCase {
                                 }
                                 None => "",
                             };
-                            parts.push(format!(
-                                "<blockquote{}>{}</blockquote>",
-                                semantics, inner
-                            ));
+                            parts.push(format!("<blockquote{}>{}</blockquote>", semantics, inner));
                         }
                     } else {
                         // Non-blockquote sub-frame: render normally

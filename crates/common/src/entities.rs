@@ -136,6 +136,13 @@ pub struct Block {
     pub fmt_tab_positions: Vec<i64>,
     pub fmt_line_height: Option<i64>,
     pub fmt_non_breakable_lines: Option<bool>,
+    /// Start this block on a new page. Its neighbour above keeps a block's lines
+    /// together; this one puts a page boundary in front of it. Only the paginated
+    /// formats can honour it literally — DOCX `w:pageBreakBefore`, Typst `#pagebreak`,
+    /// LaTeX `\newpage`, CSS `break-before` — and the flowing ones render it as best
+    /// they can or not at all. `None` means "wherever the text falls".
+    #[serde(default)]
+    pub fmt_page_break_before: Option<bool>,
     pub fmt_direction: Option<TextDirection>,
     pub fmt_background_color: Option<String>,
     pub fmt_is_code_block: Option<bool>,

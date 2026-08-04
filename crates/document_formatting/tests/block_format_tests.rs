@@ -30,6 +30,7 @@ fn test_set_block_format_all_fields() -> Result<()> {
             marker: Some(MarkerType::Checked),
             line_height: Some(150),
             non_breakable_lines: Some(true),
+            page_break_before: Some(true),
             direction: Some(TextDirection::RightToLeft),
             clear_direction: false,
             background_color: Some("#ff0000".into()),
@@ -60,6 +61,7 @@ fn test_set_block_format_all_fields() -> Result<()> {
     );
     assert_eq!(block.fmt_line_height, Some(150));
     assert_eq!(block.fmt_non_breakable_lines, Some(true));
+    assert_eq!(block.fmt_page_break_before, Some(true));
     assert_eq!(
         block.fmt_direction,
         Some(common::entities::TextDirection::RightToLeft)

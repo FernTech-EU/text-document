@@ -4,6 +4,7 @@ use anyhow::{Result, anyhow};
 use common::database::QueryUnitOfWork;
 use common::database::rope_helpers::{block_content_via_store, rope_flat_text_if_simple};
 use common::entities::{Block, Document, Frame, Root};
+use common::parser_tools::{FORM_FEED, PlainTextExportOptions};
 use common::types::{EntityId, ROOT_ENTITY_ID};
 use std::collections::HashMap;
 
@@ -82,16 +83,19 @@ impl ExportPlainTextUseCase {
         ExportPlainTextUseCase { uow_factory }
     }
 
-    /// `quote_indent` opts into indenting blockquoted blocks — off for the plain export.
-    ///
-    /// It has to be opt-in. `to_plain_text()` is pinned character-for-character to the
-    /// document's own addressable text (bar table anchors), which is what `find_all` and
-    /// `replace_text` compute offsets against; indenting it unconditionally shifts every
-    /// offset inside a quote and silently desynchronises search from the document.
+    /// Every option is opt-in, and that is not mere caution. `to_plain_text()` is pinned
+    /// character-for-character to the document's own addressable text (bar table anchors),
+    /// which is what `find_all` and `replace_text` compute offsets against; indenting a
+    /// quote — or inserting a form feed — shifts every offset after it and silently
+    /// desynchronises search from the document.
     /// `plain_text_order_tests::the_human_view_is_the_addressable_view_minus_its_anchors`
-    /// is the test that says so. Presentation indentation is a *file export* concern, so
-    /// only the caller writing a `.txt` file asks for it.
-    pub fn execute(&mut self, quote_indent: bool) -> Result<ExportPlainTextDto> {
+    /// is the test that says so. Presentation is a *file export* concern, so only the
+    /// caller writing a `.txt` file asks for it.
+    pub fn execute(&mut self, options: PlainTextExportOptions) -> Result<ExportPlainTextDto> {
+        let PlainTextExportOptions {
+            quote_indent,
+            page_breaks,
+        } = options;
         let uow = self.uow_factory.create();
         uow.begin_transaction()?;
 
@@ -119,7 +123,8 @@ impl ExportPlainTextUseCase {
         // Fast path: flat single-frame document with no tables has its
         // entire plain-text representation already laid out in rope
         // byte order. One allocation replaces the per-block walk.
-        if let Some(plain_text) = rope_flat_text_if_simple(&store, frame_ids.len()) {
+        if !page_breaks && let Some(plain_text) = rope_flat_text_if_simple(&store, frame_ids.len())
+        {
             uow.end_transaction()?;
             return Ok(ExportPlainTextDto { plain_text });
         }
@@ -188,9 +193,17 @@ impl ExportPlainTextUseCase {
             .iter()
             .map(|block| {
                 let text = block_content_via_store(block, &store);
-                match quote_depth.get(&block.id) {
+                let text = match quote_depth.get(&block.id) {
                     Some(&depth) => indent_quoted(&text, depth),
                     None => text,
+                };
+                // The form feed leads its block, on its own — that is what a page break
+                // is in a text file, and putting it inside the line would make it part
+                // of the first word.
+                if page_breaks && block.fmt_page_break_before == Some(true) {
+                    format!("{FORM_FEED}{text}")
+                } else {
+                    text
                 }
             })
             .collect::<Vec<String>>()

@@ -5,6 +5,7 @@ use common::database::QueryUnitOfWork;
 use common::database::rope_helpers::block_content_via_store;
 use common::entities::{Block, Document, Frame, List, ListStyle, Root, Table, TableCell};
 use common::format_runs::{InlineContent, InlineSegment};
+use common::parser_tools::MarkdownExportOptions;
 use common::types::{EntityId, ROOT_ENTITY_ID};
 use std::collections::HashSet;
 
@@ -30,11 +31,22 @@ pub trait ExportMarkdownUnitOfWorkTrait: QueryUnitOfWork {}
 
 pub struct ExportMarkdownUseCase {
     uow_factory: Box<dyn ExportMarkdownUnitOfWorkFactoryTrait>,
+    options: MarkdownExportOptions,
 }
 
 impl ExportMarkdownUseCase {
     pub fn new(uow_factory: Box<dyn ExportMarkdownUnitOfWorkFactoryTrait>) -> Self {
-        ExportMarkdownUseCase { uow_factory }
+        Self::with_options(uow_factory, MarkdownExportOptions::default())
+    }
+
+    pub fn with_options(
+        uow_factory: Box<dyn ExportMarkdownUnitOfWorkFactoryTrait>,
+        options: MarkdownExportOptions,
+    ) -> Self {
+        ExportMarkdownUseCase {
+            uow_factory,
+            options,
+        }
     }
 
     pub fn execute(&mut self) -> Result<ExportMarkdownDto> {
@@ -364,6 +376,22 @@ impl ExportMarkdownUseCase {
             *current_list_id = None;
             *ordered_list_counter = 0;
             format!("{}{}", quote_prefix, inline_md)
+        };
+
+        // A page break is its own raw-HTML block above the line it precedes — Markdown
+        // has nothing native to say this with, so the block is the least-bad carrier
+        // (see `markdown_page_break`). Never on a list item: it would land inside the
+        // list and break the run apart.
+        let block_line = if self.options.page_breaks
+            && block.fmt_page_break_before == Some(true)
+            && !is_list_item
+        {
+            format!(
+                "{quote_prefix}{}\n\n{block_line}",
+                common::parser_tools::markdown_page_break()
+            )
+        } else {
+            block_line
         };
 
         Ok((block_line, is_list_item))

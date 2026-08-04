@@ -12,7 +12,83 @@
 //! (set on the model) and emitted as a paragraph-level `<w:bidi/>`. A document that mixes LTR
 //! and RTL scenes is therefore handled per paragraph, independently of these options.
 
+use crate::entities::Alignment;
 use serde::{Deserialize, Serialize};
+
+/// How one `HeadingN` paragraph style is **defined** in the output.
+///
+/// Paragraphs carrying a heading level reference a style id (`Heading1`…`Heading6`), and a
+/// referenced-but-undefined id is not an error in OOXML — the reader silently substitutes its
+/// own built-in. That is why an export could ask for a 24 pt centred chapter title and open
+/// as whatever Word felt like: nothing in the file ever said what `Heading1` *is*.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DocxHeadingStyle {
+    /// Size in half-points (24 = 12 pt). `None` ⇒ the document's body size.
+    pub size_half_points: Option<usize>,
+    pub bold: bool,
+    pub italic: bool,
+    /// Paragraph alignment. `None` ⇒ inherit (left, or right in an RTL paragraph).
+    pub alignment: Option<Alignment>,
+    /// Space above, in twips (pt × 20).
+    pub space_before_twips: Option<i32>,
+    /// Space below, in twips.
+    pub space_after_twips: Option<i32>,
+    /// Keep the heading on the same page as what follows it, so a chapter title can never
+    /// be left stranded alone at the foot of a page.
+    pub keep_with_next: bool,
+    /// Start the heading on a new page. This is the *style-level* rule ("every heading at
+    /// this level opens a page"); a single block can also ask for it through
+    /// `Block::fmt_page_break_before`, and either one is enough.
+    pub page_break_before: bool,
+}
+
+impl Default for DocxHeadingStyle {
+    fn default() -> Self {
+        Self {
+            size_half_points: None,
+            bold: true,
+            italic: false,
+            alignment: None,
+            space_before_twips: None,
+            space_after_twips: None,
+            keep_with_next: true,
+            page_break_before: false,
+        }
+    }
+}
+
+impl DocxHeadingStyle {
+    /// The conventional six-level ramp, scaled off `body_half_points`: each level a little
+    /// smaller than the one above, bold, opening with space and never orphaned from its text.
+    /// Deliberately close to what a reader's own built-in headings look like, because this
+    /// exists to make the file *say* what it was already silently relying on.
+    pub fn default_ramp(body_half_points: usize) -> Vec<Self> {
+        // (size multiple, space above in points, space below in points)
+        const RAMP: [(f32, f32, f32); 6] = [
+            (1.80, 24.0, 12.0),
+            (1.50, 18.0, 9.0),
+            (1.25, 14.0, 7.0),
+            (1.10, 12.0, 6.0),
+            (1.00, 12.0, 6.0),
+            (1.00, 12.0, 6.0),
+        ];
+        RAMP.iter()
+            .enumerate()
+            .map(|(i, &(scale, before_pt, after_pt))| Self {
+                size_half_points: Some(((body_half_points as f32 * scale).round() as usize).max(2)),
+                bold: true,
+                // Level 6 is the one conventionally set apart by slope rather than size,
+                // since it is already at body size and cannot get smaller.
+                italic: i == 5,
+                alignment: None,
+                space_before_twips: Some((before_pt * 20.0) as i32),
+                space_after_twips: Some((after_pt * 20.0) as i32),
+                keep_with_next: true,
+                page_break_before: false,
+            })
+            .collect()
+    }
+}
 
 /// Page geometry + base typography overrides for a DOCX export. Every field is optional; the
 /// [`Default`] is "no overrides" — exactly what plain `to_docx` produces.
@@ -52,11 +128,26 @@ pub struct DocxExportOptions {
     /// Optional running-header text shown before the page number (e.g. `"Lastname / TITLE"`).
     /// Only used when [`page_numbers`](Self::page_numbers) is set.
     pub running_header: Option<String>,
+    /// Definitions for `Heading1`…`Heading6`, index 0 being level 1. Empty ⇒ the writer
+    /// falls back to [`DocxHeadingStyle::default_ramp`] over the body size, because the one
+    /// thing it must never do is leave the ids undefined for the reader to guess at.
+    #[serde(default)]
+    pub heading_styles: Vec<DocxHeadingStyle>,
 }
 
 impl DocxExportOptions {
     /// docx-rs's built-in defaults — no manuscript styling (what plain `to_docx` uses).
     pub fn plain() -> Self {
         Self::default()
+    }
+
+    /// The heading styles to write, resolved: the caller's when it gave any, otherwise the
+    /// default ramp scaled off whatever body size this export uses.
+    pub fn resolved_heading_styles(&self) -> Vec<DocxHeadingStyle> {
+        if self.heading_styles.is_empty() {
+            DocxHeadingStyle::default_ramp(self.font_half_points.unwrap_or(24))
+        } else {
+            self.heading_styles.clone()
+        }
     }
 }

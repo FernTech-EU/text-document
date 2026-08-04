@@ -278,6 +278,49 @@ fn block_non_breakable_lines_round_trips() {
 }
 
 #[test]
+fn block_page_break_before_round_trips() {
+    assert_contains(
+        &fixpoint("{page_break_before=true}\nStarts a page."),
+        "page_break_before=true",
+    );
+}
+
+/// `false` is a real answer, not a missing one: a block that says "do NOT start a page"
+/// has to survive a save/load, or the setting silently reverts to the document default.
+#[test]
+fn an_explicit_no_page_break_survives_rather_than_vanishing() {
+    assert_contains(
+        &fixpoint("{page_break_before=false}\nStays put."),
+        "page_break_before=false",
+    );
+}
+
+/// A page break rides in the same single attribute line as everything else on the block —
+/// a second `{...}` line would be parsed as a separate empty block.
+#[test]
+fn a_page_break_shares_one_attribute_line_with_its_neighbours() {
+    let dj = fixpoint("{alignment=center page_break_before=true text_indent=0}\nChapter One");
+    assert_contains(&dj, "page_break_before=true");
+    assert_contains(&dj, "alignment=center");
+    assert_contains(&dj, "text_indent=0");
+    let attr_lines = dj
+        .lines()
+        .filter(|l| l.trim_start().starts_with('{'))
+        .count();
+    assert_eq!(
+        attr_lines, 1,
+        "expected exactly one attribute line in:\n{dj}"
+    );
+}
+
+#[test]
+fn a_heading_can_start_a_page() {
+    let dj = fixpoint("{page_break_before=true}\n# Chapter One");
+    assert_contains(&dj, "page_break_before=true");
+    assert_contains(&dj, "# Chapter One");
+}
+
+#[test]
 fn block_background_color_round_trips() {
     assert_contains(
         &fixpoint("{background_color=\"#ff0000\"}\nColoured."),

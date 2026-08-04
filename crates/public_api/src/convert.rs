@@ -325,6 +325,7 @@ impl BlockFormat {
             marker: self.marker.as_ref().map(marker_to_dto),
             line_height: self.line_height.map(|v| (v * 1000.0) as i64),
             non_breakable_lines: self.non_breakable_lines,
+            page_break_before: self.page_break_before,
             direction: self.direction.as_ref().map(direction_to_dto),
             clear_direction: self.clear_direction,
             background_color: self.background_color.clone(),
@@ -356,6 +357,7 @@ impl From<&frontend::block::dtos::BlockDto> for BlockFormat {
             tab_positions: b.fmt_tab_positions.iter().map(|&v| v as i32).collect(),
             line_height: b.fmt_line_height.map(|v| v as f32 / 1000.0),
             non_breakable_lines: b.fmt_non_breakable_lines,
+            page_break_before: b.fmt_page_break_before,
             direction: b.fmt_direction.clone(),
             // Reading a block never asks to clear anything.
             clear_direction: false,

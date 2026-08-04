@@ -655,6 +655,11 @@ fn render_block_attrs(
     {
         pairs.push(format!("non_breakable_lines={nbl}"));
     }
+    if options.page_break_before
+        && let Some(pbb) = block.fmt_page_break_before
+    {
+        pairs.push(format!("page_break_before={pbb}"));
+    }
     if options.background_color
         && let Some(bg) = &block.fmt_background_color
     {

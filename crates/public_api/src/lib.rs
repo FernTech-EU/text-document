@@ -47,9 +47,10 @@ pub use frontend::block::dtos::{Alignment, MarkerType};
 pub use frontend::block::dtos::{CharVerticalAlignment, InlineContent, UnderlineStyle};
 pub use frontend::common::format_runs::ReplaceFormatPolicy;
 pub use frontend::common::parser_tools::{
-    CountMethod, DjotExportOptions, DjotImportOptions, DocxExportOptions, EpubExportOptions,
-    PdfExportOptions, Sentence, TABLE_ANCHOR, WordCharCounts, count, count_djot,
-    djot_to_plain_text, sentence_bounds, sentences,
+    CountMethod, DjotExportOptions, DjotImportOptions, DocxExportOptions, DocxHeadingStyle,
+    EpubExportOptions, MarkdownExportOptions, PdfExportOptions, PlainTextExportOptions, Sentence,
+    TABLE_ANCHOR, WordCharCounts, count, count_djot, djot_to_plain_text, sentence_bounds,
+    sentences,
 };
 
 /// The matcher, as a pure function over `&str` — no document, no store, no threads.
@@ -203,6 +204,8 @@ pub struct BlockFormat {
     pub tab_positions: Vec<i32>,
     pub line_height: Option<f32>,
     pub non_breakable_lines: Option<bool>,
+    /// Start this block on a new page, where the target format can paginate.
+    pub page_break_before: Option<bool>,
     pub direction: Option<TextDirection>,
     /// Unset the block's direction rather than setting one.
     ///

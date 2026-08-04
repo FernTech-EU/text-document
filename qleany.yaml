@@ -236,6 +236,14 @@ entities:
       - name: fmt_non_breakable_lines
         type: bool
         optional: true
+      # Start this block on a new page. Its neighbour above keeps a block's lines
+      # together; this one puts a page boundary in front of it. Only the paginated
+      # formats can honour it literally (DOCX `w:pageBreakBefore`, Typst `#pagebreak`,
+      # LaTeX `\newpage`, CSS `break-before`); the flowing ones render it as best they
+      # can or ignore it. Absent means "wherever the text falls".
+      - name: fmt_page_break_before
+        type: bool
+        optional: true
       - name: fmt_direction
         type: enum
         enum_name: TextDirection

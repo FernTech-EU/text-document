@@ -449,6 +449,11 @@ fn block_to_fragment_block(
         } else {
             None
         },
+        page_break_before: if is_full_block {
+            block.fmt_page_break_before
+        } else {
+            None
+        },
         direction: if is_full_block {
             block.fmt_direction.clone()
         } else {

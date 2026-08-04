@@ -263,6 +263,41 @@ fn leading_numbered_looking_prose_does_not_become_a_typst_list() {
 
 // --- end-to-end write-to-disk via the LongOperation path -----------------------
 
+/// A page break really produces a second page, and the *only* thing producing it is the
+/// flag: the same prose without it fits on one.
+#[test]
+fn a_page_break_actually_opens_a_new_page() {
+    let one = count_pdf_pages(&pdf_from_djot("Alpha.\n\nBeta.", pdf_options()));
+    let two = count_pdf_pages(&pdf_from_djot(
+        "Alpha.\n\n{page_break_before=true}\nBeta.",
+        pdf_options(),
+    ));
+    assert_eq!(one, 1, "the control document must be a single page");
+    assert_eq!(two, 2, "the break must open a second page");
+}
+
+/// `weak: true`, so a break on the very first block does not open on a blank one.
+#[test]
+fn a_break_on_the_first_block_does_not_produce_a_leading_blank_page() {
+    let pages = count_pdf_pages(&pdf_from_djot(
+        "{page_break_before=true}\n# Chapter One\n\nProse.",
+        pdf_options(),
+    ));
+    assert_eq!(pages, 1, "expected no blank leading page");
+}
+
+/// The break is its own Typst chunk, so the `= ` that follows it still reads as a heading
+/// rather than being buried mid-line.
+#[test]
+fn a_heading_after_a_page_break_is_still_a_heading() {
+    let bytes = pdf_from_djot(
+        "Body.\n\n{page_break_before=true}\n# Chapter Two\n\nMore.",
+        pdf_options(),
+    );
+    assert_eq!(count_pdf_pages(&bytes), 2);
+    assert!(bytes.starts_with(b"%PDF-"));
+}
+
 #[test]
 fn rich_document_writes_a_real_pdf_file_to_disk() {
     let (db, ev, _) = setup().expect("setup");

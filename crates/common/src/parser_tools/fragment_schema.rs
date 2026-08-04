@@ -73,6 +73,10 @@ pub struct FragmentBlock {
     pub tab_positions: Vec<i64>,
     pub line_height: Option<i64>,
     pub non_breakable_lines: Option<bool>,
+    /// Start this block on a new page. `#[serde(default)]` because a fragment
+    /// copied by a build that predates the field carries no such key.
+    #[serde(default)]
+    pub page_break_before: Option<bool>,
     pub direction: Option<TextDirection>,
     pub background_color: Option<String>,
     pub is_code_block: Option<bool>,

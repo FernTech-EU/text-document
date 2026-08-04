@@ -200,6 +200,16 @@ pub fn render_blocks_typst(store: &Store, blocks: &[Block], options: &PdfExportO
     while i < blocks.len() {
         let block = &blocks[i];
 
+        // --- Page break -------------------------------------------------------------
+        // Its own `parts` entry rather than a prefix on the block's text: the join below
+        // is "\n\n", and a heading's `= ` marker is only a heading at the true start of a
+        // line, so gluing anything in front of it would silently turn a chapter title into
+        // a paragraph. `weak: true` means "unless we are already at the top of a page",
+        // which keeps a break on the very first block from opening on a blank one.
+        if block.fmt_page_break_before == Some(true) {
+            parts.push("#pagebreak(weak: true)".to_string());
+        }
+
         // --- Code block ---
         if block.fmt_is_code_block == Some(true) {
             let raw_text = raw_block_text(store, block);
@@ -240,7 +250,10 @@ pub fn render_blocks_typst(store: &Store, blocks: &[Block], options: &PdfExportO
                     .list
                     .is_some_and(|list_id| store.lists.read().contains_key(&list_id));
 
-                if b_is_listed {
+                // A run is collapsed into ONE `#enum`/`#list` call, so a page break
+                // inside it has nowhere to go. End the run instead and let the outer
+                // loop emit the break and open a fresh list after it.
+                if b_is_listed && !(b.fmt_page_break_before == Some(true) && !items.is_empty()) {
                     let inline = render_inline_typst(store, b);
                     items.push(format!("[{inline}]"));
                     i += 1;
