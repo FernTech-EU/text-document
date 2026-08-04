@@ -12,7 +12,9 @@
 use crate::ExportPdfDto;
 use crate::ExportPdfResultDto;
 use crate::typst_compile::compile_typst_pdf;
-use crate::typst_markup::{render_blocks_typst, render_table_typst, typst_preamble};
+use crate::typst_markup::{
+    hoist_leading_pagebreak, render_blocks_typst, render_table_typst, typst_preamble,
+};
 use anyhow::{Result, anyhow};
 use common::database::QueryUnitOfWork;
 use common::entities::{
@@ -384,6 +386,11 @@ impl ExportPdfUseCase {
                             && let Some((body, attribution)) =
                                 self.split_epigraph_typst(uow, sf, cell_frame_ids)?
                         {
+                            // A page break opening the quotation has to come out of it —
+                            // Typst refuses one inside a container, and it means "start a
+                            // page, then quote" in any case.
+                            let (brk, body) = hoist_leading_pagebreak(&body);
+                            parts.extend(brk.map(str::to_string));
                             parts.push(format!(
                                 "#quote(block: true, attribution: [{attribution}])[{body}]"
                             ));
@@ -392,6 +399,8 @@ impl ExportPdfUseCase {
                         // Recursively render the blockquote frame content
                         let inner = self.render_frame_typst(uow, &sub_frame_id, cell_frame_ids)?;
                         if !inner.is_empty() {
+                            let (brk, inner) = hoist_leading_pagebreak(&inner);
+                            parts.extend(brk.map(str::to_string));
                             parts.push(format!("#quote(block: true)[{inner}]"));
                         }
                     } else {

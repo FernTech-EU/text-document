@@ -319,6 +319,16 @@ impl ExportLatexUseCase {
                     inline_latex
                 };
 
+                // The block's own space-above — the gap a blank-line scene break opens, and
+                // the drop that puts a title page's title a third of the way down. Never
+                // emitted here before, so both were silently flat. `\vspace*` rather than
+                // `\vspace`, since the starred form is not discarded at a page break, and
+                // that is the one place the space is load-bearing. 96 px to the inch, 72 pt
+                // to the inch.
+                if let Some(tm) = block.fmt_top_margin.filter(|&t| t > 0) {
+                    content = format!("\\vspace*{{{:.1}pt}}\n{}", tm as f64 * 0.75, content);
+                }
+
                 // Alignment. LaTeX's default is justified-with-ragged-bottom, so Left
                 // and Justify need no environment; only the two that actually move the
                 // text do. Emitted before the wraps below so `\\setstretch` and friends

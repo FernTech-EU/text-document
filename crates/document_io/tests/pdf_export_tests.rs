@@ -298,6 +298,31 @@ fn a_heading_after_a_page_break_is_still_a_heading() {
     assert!(bytes.starts_with(b"%PDF-"));
 }
 
+/// Typst refuses a `#pagebreak` inside any container — "pagebreaks are not allowed inside
+/// of containers" — and it fails the whole export, not just the quote. A break that opens
+/// a quotation therefore has to be lifted out of it, which is what it meant anyway.
+#[test]
+fn a_page_break_opening_a_quotation_is_lifted_out_of_it() {
+    let bytes = pdf_from_djot(
+        "Body.\n\n> {page_break_before=true}\n> Quoted matter.\n\nAfter.",
+        pdf_options(),
+    );
+    assert!(bytes.starts_with(b"%PDF-"));
+    assert_eq!(count_pdf_pages(&bytes), 2, "the break must still break");
+}
+
+/// Same, for the epigraph shape — which goes through Typst's `quote(attribution:)` slot
+/// and so builds its container a different way.
+#[test]
+fn a_page_break_opening_an_epigraph_is_lifted_out_of_it() {
+    let bytes = pdf_from_djot(
+        "Body.\n\n> {semantic_role=epigraph page_break_before=true}\n> All happy families.\n>\n         > {alignment=right}\n> Tolstoy\n\nAfter.",
+        pdf_options(),
+    );
+    assert!(bytes.starts_with(b"%PDF-"));
+    assert_eq!(count_pdf_pages(&bytes), 2);
+}
+
 #[test]
 fn rich_document_writes_a_real_pdf_file_to_disk() {
     let (db, ev, _) = setup().expect("setup");

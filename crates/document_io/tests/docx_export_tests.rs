@@ -208,6 +208,17 @@ fn an_unflagged_block_has_no_page_break() {
     assert!(!page_break_before(para_containing(&docx, "Just prose")));
 }
 
+/// A heading's own space-above must survive. It is how a title page drops its title a
+/// third of the way down the page, and a heading never reaches `apply_body_style`, which
+/// is where every other block's `fmt_top_margin` is applied.
+#[test]
+fn a_heading_keeps_its_own_space_above() {
+    let docx = docx_from_djot("{top_margin=288}\n# A Title");
+    let p = para_containing(&docx, "A Title");
+    // 288 logical px = 3 inches = 4320 twips.
+    assert_eq!(space_before(p), Some(4320));
+}
+
 // --- heading styles --------------------------------------------------------
 
 /// Every `HeadingN` a paragraph can reference must be *defined* in the file. Referencing

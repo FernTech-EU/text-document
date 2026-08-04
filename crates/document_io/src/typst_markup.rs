@@ -193,6 +193,26 @@ pub fn typst_preamble(options: &PdfExportOptions) -> String {
 /// List items and code blocks intentionally do NOT receive those block-level wraps, mirroring
 /// `render_blocks_html`'s own precedent (its list/code branches carry no `style_attr` either) —
 /// only the "normal block" (heading/paragraph) branch does.
+/// The page-break part [`render_blocks_typst`] emits, verbatim.
+///
+/// Exposed so a caller that is about to wrap the rendered blocks in a *container* can
+/// find one and lift it out first: Typst rejects `#pagebreak` inside any container
+/// outright — "pagebreaks are not allowed inside of containers" — and a whole PDF export
+/// fails on it, so this cannot be left to chance.
+pub const TYPST_PAGEBREAK: &str = "#pagebreak(weak: true)";
+
+/// Split a leading [`TYPST_PAGEBREAK`] off a rendered body, returning it separately.
+///
+/// A break at the very start of a quotation means "start a page, then quote" — so hoisting
+/// it out of the container is not merely the way to keep Typst happy, it is also what the
+/// break was asking for.
+pub fn hoist_leading_pagebreak(body: &str) -> (Option<&'static str>, &str) {
+    match body.strip_prefix(TYPST_PAGEBREAK) {
+        Some(rest) => (Some(TYPST_PAGEBREAK), rest.trim_start_matches('\n')),
+        None => (None, body),
+    }
+}
+
 pub fn render_blocks_typst(store: &Store, blocks: &[Block], options: &PdfExportOptions) -> String {
     let mut parts: Vec<String> = Vec::new();
     let mut i = 0;
@@ -207,7 +227,7 @@ pub fn render_blocks_typst(store: &Store, blocks: &[Block], options: &PdfExportO
         // a paragraph. `weak: true` means "unless we are already at the top of a page",
         // which keeps a break on the very first block from opening on a blank one.
         if block.fmt_page_break_before == Some(true) {
-            parts.push("#pagebreak(weak: true)".to_string());
+            parts.push(TYPST_PAGEBREAK.to_string());
         }
 
         // --- Code block ---

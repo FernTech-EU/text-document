@@ -35,11 +35,7 @@ pub struct ExportMarkdownUseCase {
 }
 
 impl ExportMarkdownUseCase {
-    pub fn new(uow_factory: Box<dyn ExportMarkdownUnitOfWorkFactoryTrait>) -> Self {
-        Self::with_options(uow_factory, MarkdownExportOptions::default())
-    }
-
-    pub fn with_options(
+    pub fn new(
         uow_factory: Box<dyn ExportMarkdownUnitOfWorkFactoryTrait>,
         options: MarkdownExportOptions,
     ) -> Self {

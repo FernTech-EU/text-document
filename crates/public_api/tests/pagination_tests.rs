@@ -195,6 +195,18 @@ fn latex_leaves_the_default_alignments_unwrapped() {
     assert!(!tex.contains("\\begin{flushright}"), "{tex}");
 }
 
+/// A block's own space-above was never emitted in LaTeX at all, so a blank-line scene
+/// break's gap and a title page's drop were both silently flat.
+#[test]
+fn latex_emits_a_blocks_own_space_above() {
+    let d = TextDocument::new();
+    d.set_djot_sync("{top_margin=96}\nAfter a gap.")
+        .expect("set_djot");
+    let tex = d.to_latex("article", true).expect("to_latex");
+    // 96 logical px = 1 inch = 72 pt.
+    assert!(tex.contains("\\vspace*{72.0pt}"), "{tex}");
+}
+
 /// Every other writer names an epigraph; LaTeX rendered it as an ordinary quotation.
 /// The quotation is italic and the attribution is not — decided, as everywhere else, by
 /// the right alignment the author already gave the source line.

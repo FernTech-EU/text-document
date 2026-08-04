@@ -593,6 +593,20 @@ impl ExportDocxUseCase {
             if quote_indent > 0 {
                 paragraph = paragraph.indent(Some(quote_indent), None, None, None);
             }
+            // A heading does not take the document's body spacing — its style carries its
+            // own — but its *own* space-above is a block-level instruction and has to
+            // survive, because that is how a title page drops its title down the page.
+            // `apply_body_style` handles this for ordinary paragraphs; a heading never
+            // reaches it.
+            if let Some(before) = block.fmt_top_margin.filter(|&t| t > 0) {
+                let mut ls = LineSpacing::new().before(px_to_twips(before) as u32);
+                if let Some(lh) = block.fmt_line_height {
+                    ls = ls
+                        .line_rule(LineSpacingType::Auto)
+                        .line((lh as f64 / 1000.0 * 240.0) as i32);
+                }
+                paragraph = paragraph.line_spacing(ls);
+            }
         } else if let Some((list_id, list_entity)) = &list {
             let level = list_entity.indent.clamp(0, 8) as usize;
             if is_task {

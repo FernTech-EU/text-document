@@ -167,7 +167,7 @@ pub fn export_markdown_with(
     options: common::parser_tools::MarkdownExportOptions,
 ) -> Result<ExportMarkdownDto> {
     let uow_context = ExportMarkdownUnitOfWorkFactory::new(db_context);
-    let mut uc = ExportMarkdownUseCase::with_options(Box::new(uow_context), options);
+    let mut uc = ExportMarkdownUseCase::new(Box::new(uow_context), options);
     let return_dto = uc.execute()?;
     // Notify that the handling manifest has been loaded
     event_hub.send_event(Event {
