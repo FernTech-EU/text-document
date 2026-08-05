@@ -3,7 +3,6 @@ use common::database::Store;
 use common::database::rope_helpers::{block_char_length, find_block_at_char_position};
 use common::direct_access::frame::frame_repository::FrameRelationshipField;
 use common::entities::{Block, Frame};
-use common::format_runs::{InlineContent, InlineSegment};
 use common::types::EntityId;
 
 /// Trait for UoW operations needed to create a cell frame. All
@@ -202,38 +201,6 @@ pub fn find_block_at_position(
         return Ok((block.clone(), blocks.len() - 1, offset));
     }
     Err(anyhow!("No blocks found in document"))
-}
-
-/// Find the inline segment at a given character offset within a block,
-/// and compute the offset within that segment.
-///
-/// Returns `(segment, index_in_list, offset_within_segment)`.
-pub fn find_segment_at_offset(
-    segments: &[InlineSegment],
-    offset: i64,
-) -> Result<(InlineSegment, usize, i64)> {
-    let mut running = 0i64;
-    for (i, seg) in segments.iter().enumerate() {
-        let seg_len = match &seg.content {
-            InlineContent::Text(s) => s.chars().count() as i64,
-            InlineContent::Image { .. } => 1,
-            InlineContent::Empty => 0,
-        };
-        if offset <= running + seg_len {
-            return Ok((seg.clone(), i, offset - running));
-        }
-        running += seg_len;
-    }
-    // Fall back to last segment at its end
-    if let Some(seg) = segments.last() {
-        let seg_len = match &seg.content {
-            InlineContent::Text(s) => s.chars().count() as i64,
-            InlineContent::Image { .. } => 1,
-            InlineContent::Empty => 0,
-        };
-        return Ok((seg.clone(), segments.len() - 1, seg_len));
-    }
-    Err(anyhow!("No inline segments found in block"))
 }
 
 /// Collect all block IDs in document order by traversing child_order recursively.
