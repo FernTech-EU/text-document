@@ -668,6 +668,71 @@ impl TextDocument {
         DocumentStats::from(&dto)
     }
 
+    /// Every footnote reference in the document, as `(position, label)`, in
+    /// reading order.
+    ///
+    /// The seam a host uses to tie its own note storage to the prose: Skribisto
+    /// keeps note bodies in its store, so what it needs from the document is
+    /// only *where* the references are and *which* note each names.
+    ///
+    /// Positions are document-absolute character offsets — the same space a
+    /// cursor and a search hit use — so a caller can go straight from a caret to
+    /// the note under it without a second lookup.
+    pub fn footnote_references(&self) -> Vec<(usize, String)> {
+        let inner = self.inner.lock();
+        let store = inner.ctx.db_context.get_store();
+
+        let refs = store.block_footnote_refs.read();
+        if refs.is_empty() {
+            return Vec::new();
+        }
+
+        // Block order, then byte order within a block — the order they are read.
+        let mut blocks: Vec<(i64, u64)> = store
+            .blocks
+            .read()
+            .values()
+            .map(|b| (b.document_position, b.id))
+            .collect();
+        blocks.sort_unstable();
+
+        let mut out = Vec::new();
+        for (position, block_id) in blocks {
+            let Some(anchors) = refs.get(&block_id) else {
+                continue;
+            };
+            let Some(block) = store.blocks.read().get(&block_id).cloned() else {
+                continue;
+            };
+            let text =
+                frontend::common::database::rope_helpers::block_content_via_store(&block, &store);
+            let mut ordered: Vec<_> = anchors.iter().collect();
+            ordered.sort_by_key(|a| a.byte_offset);
+            for anchor in ordered {
+                // Byte offset within the block → character offset within the
+                // document. The two differ the moment the block holds anything
+                // outside ASCII, which for prose is immediately.
+                let chars_before = text
+                    .get(..anchor.byte_offset as usize)
+                    .map(|s| s.chars().count())
+                    .unwrap_or(0);
+                out.push((position as usize + chars_before, anchor.label.clone()));
+            }
+        }
+        out
+    }
+
+    /// The label of the footnote reference at `position`, if one sits there.
+    ///
+    /// What "the caret is on a footnote" means, for a host wiring a two-way
+    /// selection between its notes list and the prose.
+    pub fn footnote_reference_at(&self, position: usize) -> Option<String> {
+        self.footnote_references()
+            .into_iter()
+            .find(|(at, _)| *at == position)
+            .map(|(_, label)| label)
+    }
+
     /// Get the total character count. O(1) — reads cached value.
     pub fn character_count(&self) -> usize {
         let inner = self.inner.lock();

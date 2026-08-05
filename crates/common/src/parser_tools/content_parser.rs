@@ -3118,17 +3118,16 @@ pub fn djot_to_plain_text(djot: &str, options: &DjotImportOptions) -> String {
             ParsedElement::Block(block) => {
                 push(&block_prose(block), &mut out, &mut first);
             }
-            // A definition's blocks are mirrored into the rope in parse order
-            // like any others (`import_djot_uc` appends them), so they are part
-            // of the text the document searches and have to be part of this
-            // string too — that is the whole contract of this function. Omitting
-            // them would put every offset after a definition out by the note's
-            // own length.
-            ParsedElement::FootnoteDefinition { blocks, .. } => {
-                for block in blocks {
-                    push(&block_prose(block), &mut out, &mut first);
-                }
-            }
+            // A note's body is **out of flow**: it is not laid out where its
+            // definition was written, it is not part of a copied fragment, and
+            // the document does not count its characters. So it is not part of
+            // the addressable text either — which is the one thing that has to
+            // stay true here, since `character_count()` and this string are
+            // compared directly.
+            //
+            // Its blocks do live in the rope, because they have to live
+            // somewhere; they are simply not addressable prose.
+            ParsedElement::FootnoteDefinition { .. } => {}
             ParsedElement::Table(table) => {
                 // The import mirrors a table into the rope as a lone `U+FFFC` sentinel
                 // followed by its cells, one per block (`rope_append_table_anchor`). The

@@ -667,7 +667,11 @@ fn spans_plain_text(spans: &[ParsedSpan]) -> String {
     spans
         .iter()
         .map(|s| {
-            if s.image.is_some() {
+            // Every inline object contributes its sentinel: the anchors this
+            // fragment carries are positioned against *this* string, so an
+            // object missing from it puts every anchor after it out by three
+            // bytes.
+            if s.image.is_some() || s.footnote_ref.is_some() {
                 "\u{FFFC}"
             } else {
                 s.text.as_str()
@@ -681,8 +685,15 @@ fn span_to_fragment_element(span: &ParsedSpan) -> FragmentElement {
     // `Text("")` for it, which is what this did, produced a fragment with an
     // empty element and no image anywhere: `insert_djot` of an image markup
     // returned `Ok` and inserted nothing at all.
-    let content = match &span.image {
-        Some(img) => InlineContent::Image {
+    //
+    // A footnote reference is the same shape and the same trap: its span carries
+    // no text either, so the identical `Text("")` would have made
+    // `insert_footnote_reference` a no-op that reported success.
+    let content = match (&span.footnote_ref, &span.image) {
+        (Some(label), _) => InlineContent::FootnoteRef {
+            label: label.clone(),
+        },
+        (None, Some(img)) => InlineContent::Image {
             name: img.src.clone(),
             alt: img.alt.clone(),
             width: img.width,
@@ -691,7 +702,7 @@ fn span_to_fragment_element(span: &ParsedSpan) -> FragmentElement {
             // re-encodes the image, so there is no quality to carry.
             quality: 100,
         },
-        None => InlineContent::Text(span.text.clone()),
+        (None, None) => InlineContent::Text(span.text.clone()),
     };
     let fmt_font_family = if span.code {
         Some("monospace".into())

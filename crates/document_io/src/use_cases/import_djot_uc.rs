@@ -487,7 +487,7 @@ fn import_parsed_elements(
                             plain_text,
                             runs: format_runs,
                             images: block_images,
-                    footnote_refs: block_footnote_refs,
+                            footnote_refs: block_footnote_refs,
                         } = format_runs_from_spans(&cell.spans, false);
 
                         // Create block in cell frame

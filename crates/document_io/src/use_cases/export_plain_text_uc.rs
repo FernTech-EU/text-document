@@ -118,6 +118,7 @@ impl ExportPlainTextUseCase {
             quote_indent,
             page_breaks,
             strip_images,
+            endnote_footnotes,
         } = options;
         let uow = self.uow_factory.create();
         uow.begin_transaction()?;
@@ -146,7 +147,17 @@ impl ExportPlainTextUseCase {
         // Fast path: flat single-frame document with no tables has its
         // entire plain-text representation already laid out in rope
         // byte order. One allocation replaces the per-block walk.
-        if !page_breaks && let Some(plain_text) = rope_flat_text_if_simple(&store, frame_ids.len())
+        // The flat-rope fast path reproduces the document verbatim, which is
+        // right for the addressable view and wrong the moment notes have to be
+        // lifted to the end — it would print each one twice, once in place and
+        // once in the list.
+        //
+        // Short-circuit on purpose: `Footnotes::build` walks every block and
+        // frame in the document, which is exactly the work this fast path exists
+        // to avoid. It runs only when notes would actually have to move.
+        if !page_breaks
+            && (!endnote_footnotes || crate::footnotes::Footnotes::build(&store).is_empty())
+            && let Some(plain_text) = rope_flat_text_if_simple(&store, frame_ids.len())
         {
             uow.end_transaction()?;
             return Ok(ExportPlainTextDto {
@@ -193,8 +204,10 @@ impl ExportPlainTextUseCase {
         let mut all_block_ids: Vec<EntityId> = Vec::new();
         let mut quote_depth: HashMap<EntityId, usize> = HashMap::new();
         for frame_id in &frame_ids {
-            // A note's body is not prose in the flow. Collecting its blocks here
-            // would splice the note into the sentence its definition followed.
+            // A note's body is out of flow in every view: the document does not
+            // count its characters, so including it here would make this string
+            // longer than the document it claims to reproduce. The presentation
+            // view puts it back, once, as an endnote at the end.
             if notes.is_definition(*frame_id) {
                 continue;
             }
@@ -241,6 +254,39 @@ impl ExportPlainTextUseCase {
             })
             .collect::<Vec<String>>()
             .join("\n");
+
+        // Plain text has no way to mark a note as a note, and no page to put one
+        // at the foot of — so the notes become an endnote list, which is what a
+        // manuscript printed without markup has always done. Numbered to match
+        // the markers already in the prose.
+        let mut plain_text = plain_text;
+        let printed = if endnote_footnotes {
+            notes.in_print_order()
+        } else {
+            Vec::new()
+        };
+        if !printed.is_empty() {
+            plain_text.push_str("\n");
+            for (number, _, frame_id) in printed {
+                let block_ids = uow.get_frame_relationship(
+                    &frame_id,
+                    &common::direct_access::frame::FrameRelationshipField::Blocks,
+                )?;
+                let blocks_opt = uow.get_block_multi(&block_ids)?;
+                let mut blocks: Vec<Block> = blocks_opt.into_iter().flatten().collect();
+                blocks.sort_by_key(|b| b.document_position);
+                let body = blocks
+                    .iter()
+                    .map(|b| block_content_via_store(b, &store))
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                let body = body.trim();
+                if body.is_empty() {
+                    continue;
+                }
+                plain_text.push_str(&format!("\n{number}. {body}"));
+            }
+        }
 
         uow.end_transaction()?;
 

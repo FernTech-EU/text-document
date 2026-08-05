@@ -226,7 +226,7 @@ impl ExportHtmlUseCase {
                         &uow.store(),
                         &pending_blocks,
                         image_policy,
-            &notes,
+                        &notes,
                     );
                     if !html.is_empty() {
                         parts.push(html);
@@ -245,7 +245,8 @@ impl ExportHtmlUseCase {
                 if let Some(ref sf) = sub_frame {
                     if sf.fmt_is_blockquote == Some(true) {
                         // Recursively render the blockquote frame content
-                        let inner = self.render_frame_html(uow, &sub_frame_id, cell_frame_ids, notes)?;
+                        let inner =
+                            self.render_frame_html(uow, &sub_frame_id, cell_frame_ids, notes)?;
                         if !inner.is_empty() {
                             // A blockquote standing in for something a format can name
                             // gets said so. `epub:type` is the EPUB Structural Semantics
@@ -262,7 +263,8 @@ impl ExportHtmlUseCase {
                         }
                     } else {
                         // Non-blockquote sub-frame: render normally
-                        let inner = self.render_frame_html(uow, &sub_frame_id, cell_frame_ids, notes)?;
+                        let inner =
+                            self.render_frame_html(uow, &sub_frame_id, cell_frame_ids, notes)?;
                         if !inner.is_empty() {
                             parts.push(inner);
                         }
@@ -273,8 +275,12 @@ impl ExportHtmlUseCase {
 
         // Flush remaining blocks
         if !pending_blocks.is_empty() {
-            let html = html_render::render_blocks_html(&uow.store(), &pending_blocks, image_policy,
-            &notes);
+            let html = html_render::render_blocks_html(
+                &uow.store(),
+                &pending_blocks,
+                image_policy,
+                &notes,
+            );
             if !html.is_empty() {
                 parts.push(html);
             }

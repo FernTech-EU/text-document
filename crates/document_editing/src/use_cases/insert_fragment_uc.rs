@@ -90,10 +90,11 @@ impl BlockInline {
             byte_end: r.byte_end + delta,
             format: r.format,
         }));
-        self.images.extend(other.images.into_iter().map(|i| ImageAnchor {
-            byte_offset: i.byte_offset + delta,
-            ..i
-        }));
+        self.images
+            .extend(other.images.into_iter().map(|i| ImageAnchor {
+                byte_offset: i.byte_offset + delta,
+                ..i
+            }));
         self.notes
             .extend(other.notes.into_iter().map(|n| FootnoteRefAnchor {
                 byte_offset: n.byte_offset + delta,
@@ -1074,13 +1075,8 @@ fn insert_mixed_fragment(
         .unwrap_or(0);
 
     // ── Update the head block ──
-    let (head_plain, head_inline) = build_head_state(
-        &text_before,
-        &left,
-        merge_first,
-        overwrite_head,
-        first_fb,
-    );
+    let (head_plain, head_inline) =
+        build_head_state(&text_before, &left, merge_first, overwrite_head, first_fb);
 
     let mut updated_current = current_block.clone();
     if overwrite_head {
@@ -1474,8 +1470,7 @@ fn insert_mixed_fragment(
         .map(|b| b.plain_text.chars().count() as i64)
         .unwrap_or(0);
 
-    let (tail_plain, tail_inline) =
-        build_tail_state(&text_after, &right, last_frag);
+    let (tail_plain, tail_inline) = build_tail_state(&text_after, &right, last_frag);
     let tail_text_length = tail_inline.logical_len(&tail_plain);
 
     let skip_tail_block = tail_plain.is_empty() && last_frag.is_none() && right_image_count == 0;
@@ -1818,10 +1813,16 @@ fn execute_insert_fragment(
         // the paste happened to push into its old position.
         let mut images = current_inline.images.clone();
         common::format_runs::shift_images_for_insert(&mut images, byte_offset, inserted_bytes);
-        images.extend(inline_frag_runs.images.iter().cloned().map(|img| ImageAnchor {
-            byte_offset: img.byte_offset + byte_offset,
-            ..img
-        }));
+        images.extend(
+            inline_frag_runs
+                .images
+                .iter()
+                .cloned()
+                .map(|img| ImageAnchor {
+                    byte_offset: img.byte_offset + byte_offset,
+                    ..img
+                }),
+        );
         images.sort_by_key(|a| a.byte_offset);
 
         let mut notes = current_inline.notes.clone();

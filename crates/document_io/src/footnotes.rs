@@ -146,9 +146,7 @@ impl Footnotes {
             .definitions
             .iter()
             .filter_map(|(label, frame)| {
-                self.numbers
-                    .get(label)
-                    .map(|n| (*n, label.clone(), *frame))
+                self.numbers.get(label).map(|n| (*n, label.clone(), *frame))
             })
             .collect();
         out.sort_unstable();

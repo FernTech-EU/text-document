@@ -135,6 +135,38 @@ impl ExportMarkdownUseCase {
             }
         }
 
+        // The definitions, after the prose. Markdown's footnote extension uses
+        // djot's own shape, so this is the native construct rather than a
+        // fallback: a reader that understands footnotes links them up, and one
+        // that does not still shows the note as readable text at the end.
+        //
+        // Continuation lines are indented four spaces, which is what keeps a
+        // multi-paragraph note attached to its definition instead of ending it.
+        for (_, label, frame_id) in notes.in_print_order() {
+            let frame = uow.get_frame(&frame_id)?;
+            let Some(ref f) = frame else { continue };
+            let body = self.render_frame_content(&*uow, f, &cell_frame_ids, "")?;
+            if body.trim().is_empty() {
+                continue;
+            }
+            if !output_parts.is_empty() {
+                output_parts.push("\n\n".to_string());
+            }
+            let mut lines = body.trim().lines();
+            let mut out = String::new();
+            if let Some(first) = lines.next() {
+                out.push_str(&format!("[^{label}]: {first}"));
+            }
+            for line in lines {
+                out.push('\n');
+                if !line.is_empty() {
+                    out.push_str("    ");
+                    out.push_str(line);
+                }
+            }
+            output_parts.push(out);
+        }
+
         uow.end_transaction()?;
 
         let markdown_text = output_parts.concat();

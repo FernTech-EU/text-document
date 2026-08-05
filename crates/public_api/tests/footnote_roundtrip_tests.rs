@@ -40,14 +40,8 @@ fn a_reference_and_its_definition_both_survive() {
     let doc = doc_from("Prose[^n1] here.\n\n[^n1]: The note body.\n");
     let out = doc.to_djot().expect("export");
     assert!(out.contains("[^n1]"), "reference lost: {out:?}");
-    assert!(
-        out.contains("[^n1]:"),
-        "definition lost: {out:?}"
-    );
-    assert!(
-        out.contains("The note body"),
-        "note body lost: {out:?}"
-    );
+    assert!(out.contains("[^n1]:"), "definition lost: {out:?}");
+    assert!(out.contains("The note body"), "note body lost: {out:?}");
 }
 
 /// Export is a fixpoint: a second pass changes nothing.
@@ -183,9 +177,8 @@ fn html_renders_a_noteref_and_its_aside() {
 /// still gets 1, 2, 3 down the page.
 #[test]
 fn notes_are_numbered_in_reading_order_not_definition_order() {
-    let doc = doc_from(
-        "First[^b] then second[^a].\n\n[^a]: Defined first.\n\n[^b]: Defined second.\n",
-    );
+    let doc =
+        doc_from("First[^b] then second[^a].\n\n[^a]: Defined first.\n\n[^b]: Defined second.\n");
     let html = doc.to_html().expect("html");
 
     let first_marker = html.find("<sup>1</sup>").expect("a first marker");
@@ -217,4 +210,150 @@ fn a_note_body_is_not_also_rendered_as_prose() {
         1,
         "the note body was rendered more than once: {html}"
     );
+}
+
+const WITH_NOTE: &str = "Prose[^n1] here.\n\n[^n1]: The note body.\n";
+
+/// LaTeX puts the note's text *at the reference* — there is no definition site
+/// and no label. That inverts what DOCX and HTML do, which is why the body is
+/// rendered before the prose that cites it.
+#[test]
+fn latex_carries_the_body_at_the_reference() {
+    let latex = doc_from(WITH_NOTE)
+        .to_latex("article", true)
+        .expect("latex");
+    assert!(latex.contains("\\footnote{"), "no native footnote: {latex}");
+    assert!(
+        latex.contains("The note body"),
+        "the body never reached the reference: {latex}"
+    );
+    // The body must not *also* appear as a stray paragraph.
+    assert_eq!(
+        latex.matches("The note body").count(),
+        1,
+        "the body was rendered twice: {latex}"
+    );
+}
+
+/// Markdown's footnote extension uses djot's own shape, so this is the native
+/// construct rather than a fallback.
+#[test]
+fn markdown_emits_a_reference_and_a_definition() {
+    let md = doc_from(WITH_NOTE).to_markdown().expect("markdown");
+    assert!(md.contains("[^n1]"), "no reference: {md}");
+    assert!(md.contains("[^n1]:"), "no definition: {md}");
+    assert!(md.contains("The note body"), "no body: {md}");
+}
+
+/// Plain text has no page to put a note at the foot of, so notes become a
+/// numbered endnote list — but only in the presentation view. The addressable
+/// view must stay character-for-character the document.
+#[test]
+fn plain_text_lists_notes_only_in_the_presentation_view() {
+    use text_document::PlainTextExportOptions;
+    let doc = doc_from(WITH_NOTE);
+
+    let presented = doc
+        .to_plain_text_with(PlainTextExportOptions::presentation())
+        .expect("presentation");
+    assert!(
+        presented.contains("1. The note body"),
+        "no endnote list: {presented:?}"
+    );
+
+    let addressable = doc
+        .to_plain_text_with(PlainTextExportOptions::addressable())
+        .expect("addressable");
+    assert_eq!(
+        addressable.chars().count(),
+        doc.character_count(),
+        "the addressable view stopped matching the document: {addressable:?}"
+    );
+    assert!(
+        !addressable.contains("1. The note body"),
+        "an endnote list leaked into the addressable view: {addressable:?}"
+    );
+}
+
+/// The seam a host uses to tie its own note storage to the prose: where the
+/// references are, and which note each names.
+#[test]
+fn references_are_reportable_by_position_and_label() {
+    let doc = doc_from("One[^a] two[^b] three.\n");
+    let refs = doc.footnote_references();
+
+    assert_eq!(
+        refs.iter().map(|(_, l)| l.as_str()).collect::<Vec<_>>(),
+        vec!["a", "b"],
+        "references must come back in reading order"
+    );
+
+    // Positions are document-absolute character offsets, so a caret lands on
+    // exactly one of them.
+    let (pos_a, _) = refs[0];
+    assert_eq!(doc.footnote_reference_at(pos_a).as_deref(), Some("a"));
+    assert_eq!(doc.footnote_reference_at(pos_a + 1), None);
+}
+
+/// Positions are character offsets, not byte offsets.
+///
+/// Prose is full of characters that are not one byte — an em-dash, an accent, a
+/// curly quote — and the two spaces diverge at the first of them. A host
+/// comparing a caret (characters) against a byte offset would put every note
+/// after such a character in the wrong place.
+#[test]
+fn reference_positions_are_characters_not_bytes() {
+    let doc = doc_from("café—dash[^a]\n");
+    let refs = doc.footnote_references();
+    assert_eq!(refs.len(), 1);
+
+    // "café—dash" is 9 characters but 12 bytes.
+    assert_eq!(refs[0].0, 9, "the position must be in characters");
+    assert_eq!(doc.footnote_reference_at(9).as_deref(), Some("a"));
+}
+
+/// Inserting a reference at the caret puts one there, costs one character, and
+/// survives the save/reload the editor performs constantly.
+#[test]
+fn a_reference_can_be_inserted_at_the_caret() {
+    let doc = doc_from("Before after.\n");
+    let before = doc.character_count();
+
+    let cursor = doc.cursor();
+    cursor.set_position(6, text_document::MoveMode::MoveAnchor);
+    cursor.insert_footnote_reference("mynote").expect("insert");
+
+    assert_eq!(
+        doc.character_count() - before,
+        1,
+        "an inserted reference must cost exactly one character"
+    );
+    assert_eq!(
+        doc.footnote_reference_at(6).as_deref(),
+        Some("mynote"),
+        "the reference is not where it was inserted: {:?}",
+        doc.footnote_references()
+    );
+
+    // And it round-trips, which is the half a dedicated insert path would miss.
+    let out = doc.to_djot().expect("export");
+    assert!(
+        out.contains("[^mynote]"),
+        "insertion did not survive: {out:?}"
+    );
+}
+
+/// Typst takes the note's text at the reference, like LaTeX, and numbers and
+/// places it itself.
+#[cfg(feature = "pdf")]
+#[test]
+fn typst_carries_the_body_at_the_reference() {
+    let doc = doc_from(WITH_NOTE);
+    let out = std::env::temp_dir().join("footnote_typst_probe.pdf");
+    // The PDF path is the only public route to the Typst markup, so this
+    // asserts on the compile succeeding with a footnote present — a malformed
+    // `#footnote[…]` fails Typst outright rather than rendering wrongly.
+    doc.to_pdf(&out).expect("pdf").wait().expect("pdf compile");
+    assert!(out.exists(), "no PDF produced");
+    let _ = std::fs::remove_file(&out);
 }

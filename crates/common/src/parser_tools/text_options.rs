@@ -49,6 +49,19 @@ pub struct PlainTextExportOptions {
     /// comment's anchor) must therefore leave it in, which is exactly the
     /// difference between [`Self::addressable`] and [`Self::presentation`].
     pub strip_images: bool,
+    /// Lift footnotes out of the flow and list them, numbered, at the end.
+    ///
+    /// **Presentation only**, and for exactly the reason `strip_images` is. A
+    /// note's body is real content in the document, sitting in the rope where
+    /// its definition was written, and the addressable view has to agree with
+    /// the document character for character. Moving those blocks to the end —
+    /// or worse, printing them twice — puts every offset after them wrong,
+    /// which is every search hit and every comment anchor below the note.
+    ///
+    /// A written-out `.txt` has no page to put a footnote at the foot of, so
+    /// the endnote list is what a manuscript printed without markup has always
+    /// done.
+    pub endnote_footnotes: bool,
 }
 
 impl PlainTextExportOptions {
@@ -60,6 +73,7 @@ impl PlainTextExportOptions {
             quote_indent: false,
             page_breaks: false,
             strip_images: false,
+            endnote_footnotes: false,
         }
     }
 
@@ -69,6 +83,7 @@ impl PlainTextExportOptions {
             quote_indent: true,
             page_breaks: true,
             strip_images: true,
+            endnote_footnotes: true,
         }
     }
 }

@@ -212,10 +212,10 @@ impl LongOperation for ImportHtmlUseCase {
 
             match parsed_element {
                 // Neither importer's parser emits a definition yet — the HTML and
-            // Markdown footnote syntaxes are a separate pass. Dropping it here
-            // is therefore unreachable today, and stated rather than assumed.
-            ParsedElement::FootnoteDefinition { .. } => {}
-            ParsedElement::Block(parsed_block) => {
+                // Markdown footnote syntaxes are a separate pass. Dropping it here
+                // is therefore unreachable today, and stated rather than assumed.
+                ParsedElement::FootnoteDefinition { .. } => {}
+                ParsedElement::Block(parsed_block) => {
                     transition_bq_depth(
                         &mut uow,
                         doc_id,

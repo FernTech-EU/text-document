@@ -35,6 +35,13 @@ pub trait ExportDocxUnitOfWorkFactoryTrait: Send + Sync {
 #[macros::uow_action(entity = "TableCell", action = "GetMultiRO", thread_safe = true)]
 pub trait ExportDocxUnitOfWorkTrait: QueryUnitOfWork + Send + Sync {}
 
+/// Each note's body as finished paragraphs, by label.
+///
+/// OOXML carries a footnote's text inside the run that references it, so the
+/// body has to be in hand by the time a marker is built — the same inversion
+/// LaTeX has, and why both pre-render rather than emitting at a definition site.
+type NoteParagraphs = std::collections::HashMap<String, Vec<docx_rs::Paragraph>>;
+
 pub struct ExportDocxUseCase {
     uow_factory: Box<dyn ExportDocxUnitOfWorkFactoryTrait>,
     dto: ExportDocxDto,
@@ -249,6 +256,36 @@ impl ExportDocxUseCase {
 
         let notes = crate::footnotes::Footnotes::build(&uow.store());
 
+        // Render every note's body first, while `note_paragraphs` is still
+        // empty — so a note that cites another note produces an empty inner
+        // footnote rather than recursing. Word has no nested footnote either.
+        let note_paragraphs: NoteParagraphs = {
+            let mut built: NoteParagraphs = std::collections::HashMap::new();
+            let mut note_numbering = NumberingBuilder::default();
+            for (_, label, frame_id) in notes.in_print_order() {
+                let block_ids = uow.get_frame_relationship(
+                    &frame_id,
+                    &common::direct_access::frame::FrameRelationshipField::Blocks,
+                )?;
+                let blocks_opt = uow.get_block_multi(&block_ids)?;
+                let mut blocks: Vec<Block> = blocks_opt.into_iter().flatten().collect();
+                blocks.sort_by_key(|b| b.document_position);
+                let mut paragraphs = Vec::with_capacity(blocks.len());
+                for block in &blocks {
+                    paragraphs.push(self.render_block(
+                        &*uow,
+                        block,
+                        0,
+                        None,
+                        &mut note_numbering,
+                        &std::collections::HashMap::new(),
+                    )?);
+                }
+                built.insert(label, paragraphs);
+            }
+            built
+        };
+
         let mut numbering = NumberingBuilder::default();
         let mut elements: Vec<DocxElement> = Vec::new();
 
@@ -282,7 +319,8 @@ impl ExportDocxUseCase {
 
             // A table anchor frame contributes one table.
             if let Some(table_id) = frame.table {
-                let table = self.render_table_docx(uow, &table_id, &mut numbering)?;
+                let table =
+                    self.render_table_docx(uow, &table_id, &mut numbering, &note_paragraphs)?;
                 elements.push(DocxElement::Table(Box::new(table)));
                 continue;
             }
@@ -294,6 +332,7 @@ impl ExportDocxUseCase {
                 0,
                 None,
                 &mut numbering,
+                &note_paragraphs,
                 cancel_flag,
                 &mut elements,
             )?;
@@ -438,6 +477,7 @@ impl ExportDocxUseCase {
         quote_depth: usize,
         semantic: Option<&SemanticRole>,
         numbering: &mut NumberingBuilder,
+        notes: &NoteParagraphs,
         cancel_flag: Option<&AtomicBool>,
         out: &mut Vec<DocxElement>,
     ) -> Result<()> {
@@ -454,8 +494,14 @@ impl ExportDocxUseCase {
                     // Positive: a block id.
                     let block_id = entry as EntityId;
                     if let Some(block) = uow.get_block(&block_id)? {
-                        let paragraph =
-                            self.render_block(uow, &block, quote_depth, semantic, numbering)?;
+                        let paragraph = self.render_block(
+                            uow,
+                            &block,
+                            quote_depth,
+                            semantic,
+                            numbering,
+                            notes,
+                        )?;
                         out.push(DocxElement::Paragraph(Box::new(paragraph)));
                     }
                 } else {
@@ -467,7 +513,7 @@ impl ExportDocxUseCase {
                     if let Some(sub_frame) = uow.get_frame(&sub_frame_id)? {
                         // Table anchor sub-frame.
                         if let Some(table_id) = sub_frame.table {
-                            let table = self.render_table_docx(uow, &table_id, numbering)?;
+                            let table = self.render_table_docx(uow, &table_id, numbering, notes)?;
                             out.push(DocxElement::Table(Box::new(table)));
                             continue;
                         }
@@ -490,6 +536,7 @@ impl ExportDocxUseCase {
                             sub_depth,
                             sub_semantic,
                             numbering,
+                            notes,
                             cancel_flag,
                             out,
                         )?;
@@ -511,7 +558,8 @@ impl ExportDocxUseCase {
             blocks.sort_by_key(|b| b.document_position);
             for block in &blocks {
                 check_cancelled(cancel_flag)?;
-                let paragraph = self.render_block(uow, block, quote_depth, semantic, numbering)?;
+                let paragraph =
+                    self.render_block(uow, block, quote_depth, semantic, numbering, notes)?;
                 out.push(DocxElement::Paragraph(Box::new(paragraph)));
             }
         }
@@ -529,6 +577,7 @@ impl ExportDocxUseCase {
         quote_depth: usize,
         semantic: Option<&SemanticRole>,
         numbering: &mut NumberingBuilder,
+        notes: &NoteParagraphs,
     ) -> Result<docx_rs::Paragraph> {
         use docx_rs::*;
 
@@ -672,6 +721,7 @@ impl ExportDocxUseCase {
             paragraph,
             &elements,
             &self.dto.options.images,
+            notes,
         ))
     }
 
@@ -753,6 +803,7 @@ impl ExportDocxUseCase {
         uow: &dyn ExportDocxUnitOfWorkTrait,
         table_id: &EntityId,
         numbering: &mut NumberingBuilder,
+        notes: &NoteParagraphs,
     ) -> Result<docx_rs::Table> {
         use docx_rs::*;
 
@@ -835,6 +886,7 @@ impl ExportDocxUseCase {
                             0,
                             None,
                             numbering,
+                            notes,
                             None,
                             &mut cell_elements,
                         )?;
@@ -1038,17 +1090,30 @@ fn build_image_run(
 
 /// Build a DOCX run for one inline segment, applying its character formatting.
 /// Returns `None` for segments that contribute no text.
-fn build_run(elem: &InlineSegment, images: &ExportImages) -> Option<docx_rs::Run> {
+fn build_run(
+    elem: &InlineSegment,
+    images: &ExportImages,
+    notes: &std::collections::HashMap<String, Vec<docx_rs::Paragraph>>,
+) -> Option<docx_rs::Run> {
     use docx_rs::*;
 
+    // A real OOXML footnote: Word numbers it, places it at the foot of the page
+    // it lands on, and renumbers when the text reflows. A reference whose body
+    // this document does not hold still gets its note — an empty one — because
+    // dropping the run entirely would delete the marker from the sentence.
+    if let InlineContent::FootnoteRef { label } = &elem.content {
+        let mut footnote = Footnote::new();
+        for paragraph in notes.get(label).cloned().unwrap_or_default() {
+            footnote = footnote.add_content(paragraph);
+        }
+        return Some(Run::new().add_footnote_reference(footnote));
+    }
+
     let text = match &elem.content {
+        // Handled above, before any of the text machinery: a reference has no
+        // text of its own, and its whole rendering is the run it returns there.
+        InlineContent::FootnoteRef { .. } => return None,
         InlineContent::Text(t) => t.clone(),
-        // A footnote reference. The marker shown is the label until the
-        // definition pass lands: numbering is a fact about document order,
-        // which a per-block renderer cannot see. Unreachable today — nothing
-        // can author a reference yet — and replaced when definitions are
-        // rendered.
-        InlineContent::FootnoteRef { label } => label.clone(),
         InlineContent::Image {
             name,
             alt,
@@ -1097,6 +1162,7 @@ fn add_inline_content(
     mut paragraph: docx_rs::Paragraph,
     elements: &[InlineSegment],
     images: &ExportImages,
+    notes: &std::collections::HashMap<String, Vec<docx_rs::Paragraph>>,
 ) -> docx_rs::Paragraph {
     use docx_rs::*;
 
@@ -1109,7 +1175,7 @@ fn add_inline_content(
 
     let mut pieces: Vec<Piece> = Vec::new();
     for elem in elements {
-        let Some(run) = build_run(elem, images) else {
+        let Some(run) = build_run(elem, images, notes) else {
             continue;
         };
         match &elem.fmt_anchor_href {

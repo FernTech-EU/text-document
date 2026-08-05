@@ -257,7 +257,15 @@ pub fn hoist_leading_pagebreak(body: &str) -> (Option<&'static str>, &str) {
     }
 }
 
-pub fn render_blocks_typst(store: &Store, blocks: &[Block], options: &PdfExportOptions) -> String {
+/// Each note's body, already rendered to Typst markup, by label.
+pub type TypstNotes = std::collections::HashMap<String, String>;
+
+pub fn render_blocks_typst(
+    store: &Store,
+    blocks: &[Block],
+    options: &PdfExportOptions,
+    notes: &TypstNotes,
+) -> String {
     let image_paths = typst_image_paths(&options.images);
     let mut parts: Vec<String> = Vec::new();
     let mut i = 0;
@@ -319,7 +327,7 @@ pub fn render_blocks_typst(store: &Store, blocks: &[Block], options: &PdfExportO
                 // inside it has nowhere to go. End the run instead and let the outer
                 // loop emit the break and open a fresh list after it.
                 if b_is_listed && !(b.fmt_page_break_before == Some(true) && !items.is_empty()) {
-                    let inline = render_inline_typst(store, b, &image_paths);
+                    let inline = render_inline_typst(store, b, &image_paths, notes);
                     items.push(format!("[{inline}]"));
                     i += 1;
                 } else {
@@ -338,7 +346,7 @@ pub fn render_blocks_typst(store: &Store, blocks: &[Block], options: &PdfExportO
             parts.push(format!("{call}{}", items.join("")));
         } else {
             // --- Normal block (paragraph / heading) ---
-            let inline = render_inline_typst(store, block, &image_paths);
+            let inline = render_inline_typst(store, block, &image_paths, notes);
 
             // Skip a block with no inline content: an empty paragraph would inject a stray blank
             // (doubling the `\n\n` join) and an empty heading would emit a bare `= ` — a
@@ -477,6 +485,7 @@ pub fn render_inline_typst(
     store: &Store,
     block: &Block,
     image_paths: &std::collections::BTreeMap<String, String>,
+    notes: &TypstNotes,
 ) -> String {
     let block_text = block_content_via_store(block, store);
     let elements = inline_segments_for_block(store, block.id, &block_text);
@@ -487,16 +496,22 @@ pub fn render_inline_typst(
         let is_monospace = elem.fmt_font_family.as_deref() == Some("monospace");
 
         let text = match &elem.content {
-            // A footnote reference. The marker is raised and emitted whole — it
-            // must not fall through the emphasis wrapping below, which would
-            // mark up something Typst already sets superscript.
+            // Typst's `#footnote[…]` takes the note's text at the reference and
+            // numbers and places it itself — the same inversion LaTeX has, which
+            // is why the body arrives pre-rendered.
             //
-            // Typst's own `#footnote[…]` takes the body at the reference site,
-            // so it is reachable only once the definition walk supplies one;
-            // until then this is the marker alone, which is the correct
-            // rendering of a reference whose note lives elsewhere.
+            // Emitted whole and done: falling through to the emphasis wrapping
+            // below would mark up something Typst already sets raised.
+            //
+            // A reference whose body this document does not hold degrades to a
+            // raised marker. Not `#footnote[]`, which would print an empty note
+            // at the foot of the page and number it — a note that says nothing
+            // is worse than a marker pointing outward.
             InlineContent::FootnoteRef { label } => {
-                out.push_str(&format!("#super[{}]", escape_typst(label)));
+                match notes.get(label.as_str()) {
+                    Some(body) => out.push_str(&format!("#footnote[{body}]")),
+                    None => out.push_str(&format!("#super[{}]", escape_typst(label))),
+                }
                 continue;
             }
             InlineContent::Text(t) => {
@@ -613,6 +628,7 @@ pub fn render_table_typst(
     store: &Store,
     table_id: EntityId,
     image_paths: &std::collections::BTreeMap<String, String>,
+    notes: &TypstNotes,
 ) -> Result<String> {
     let table = store
         .tables
@@ -661,7 +677,7 @@ pub fn render_table_typst(
 
                     let mut cell_parts: Vec<String> = Vec::new();
                     for block in &blocks {
-                        let inline = render_inline_typst(store, block, image_paths);
+                        let inline = render_inline_typst(store, block, image_paths, notes);
                         if !inline.is_empty() {
                             cell_parts.push(inline);
                         }

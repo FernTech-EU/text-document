@@ -209,6 +209,31 @@ impl ExportPdfUseCase {
 
         let notes = crate::footnotes::Footnotes::build(&uow.store());
 
+        // Each note's body as Typst markup, rendered before the prose that
+        // cites it — `#footnote[…]` takes its text at the reference. Built with
+        // an empty map so a note citing another note degrades to a marker
+        // rather than recursing.
+        let mut note_bodies = crate::typst_markup::TypstNotes::new();
+        {
+            let empty = crate::typst_markup::TypstNotes::new();
+            for (_, label, frame_id) in notes.in_print_order() {
+                let block_ids = uow.get_frame_relationship(
+                    &frame_id,
+                    &common::direct_access::frame::FrameRelationshipField::Blocks,
+                )?;
+                let blocks_opt = uow.get_block_multi(&block_ids)?;
+                let mut blocks: Vec<Block> = blocks_opt.into_iter().flatten().collect();
+                blocks.sort_by_key(|b| b.document_position);
+                let body = crate::typst_markup::render_blocks_typst(
+                    &uow.store(),
+                    &blocks,
+                    &self.dto.options,
+                    &empty,
+                );
+                note_bodies.insert(label, body.trim().to_string());
+            }
+        }
+
         let total_frames = frame_ids.len().max(1);
         for (frame_idx, frame_id) in frame_ids.iter().enumerate() {
             check_cancelled(cancel_flag)?;
@@ -231,7 +256,8 @@ impl ExportPdfUseCase {
                 continue;
             }
 
-            let frame_typst = self.render_frame_typst(uow, frame_id, &cell_frame_ids)?;
+            let frame_typst =
+                self.render_frame_typst(uow, frame_id, &cell_frame_ids, &note_bodies)?;
             if !frame_typst.is_empty() {
                 body_parts.push(frame_typst);
             }
@@ -270,6 +296,7 @@ impl ExportPdfUseCase {
         uow: &dyn ExportPdfUnitOfWorkTrait,
         frame_id: &EntityId,
         cell_frame_ids: &HashSet<EntityId>,
+        notes: &crate::typst_markup::TypstNotes,
     ) -> Result<String> {
         let frame = uow
             .get_frame(frame_id)?
@@ -281,12 +308,13 @@ impl ExportPdfUseCase {
                 &uow.store(),
                 table_id,
                 &crate::typst_markup::typst_image_paths(&self.dto.options.images),
+                notes,
             );
         }
 
         // If child_order is populated, use it to interleave blocks and sub-frames
         if !frame.child_order.is_empty() {
-            return self.render_frame_typst_by_child_order(uow, &frame, cell_frame_ids);
+            return self.render_frame_typst_by_child_order(uow, &frame, cell_frame_ids, notes);
         }
 
         // Fallback: render all blocks in document_position order (original behaviour)
@@ -307,6 +335,7 @@ impl ExportPdfUseCase {
             &uow.store(),
             &blocks,
             &self.dto.options,
+            notes,
         ))
     }
 
@@ -324,6 +353,7 @@ impl ExportPdfUseCase {
         uow: &dyn ExportPdfUnitOfWorkTrait,
         frame: &Frame,
         _cell_frame_ids: &HashSet<EntityId>,
+        notes: &crate::typst_markup::TypstNotes,
     ) -> Result<Option<(String, String)>> {
         let mut blocks: Vec<Block> = Vec::new();
         for &entry in &frame.child_order {
@@ -344,11 +374,12 @@ impl ExportPdfUseCase {
             return Ok(None);
         }
         let attribution_block = blocks.pop().expect("checked non-empty above");
-        let body = render_blocks_typst(&uow.store(), &blocks, &self.dto.options);
+        let body = render_blocks_typst(&uow.store(), &blocks, &self.dto.options, notes);
         let attribution = render_blocks_typst(
             &uow.store(),
             std::slice::from_ref(&attribution_block),
             &self.dto.options,
+            notes,
         );
         Ok(Some((body, attribution)))
     }
@@ -362,6 +393,7 @@ impl ExportPdfUseCase {
         uow: &dyn ExportPdfUnitOfWorkTrait,
         frame: &Frame,
         cell_frame_ids: &HashSet<EntityId>,
+        notes: &crate::typst_markup::TypstNotes,
     ) -> Result<String> {
         let mut parts: Vec<String> = Vec::new();
         // Accumulate consecutive blocks so we can group list items.
@@ -378,8 +410,12 @@ impl ExportPdfUseCase {
                 // Negative: negated sub-frame ID
                 // First, flush any accumulated blocks
                 if !pending_blocks.is_empty() {
-                    let typst =
-                        render_blocks_typst(&uow.store(), &pending_blocks, &self.dto.options);
+                    let typst = render_blocks_typst(
+                        &uow.store(),
+                        &pending_blocks,
+                        &self.dto.options,
+                        notes,
+                    );
                     if !typst.is_empty() {
                         parts.push(typst);
                     }
@@ -402,7 +438,7 @@ impl ExportPdfUseCase {
                         // and a reader's tooling can tell the two apart.
                         if sf.fmt_semantic_role == Some(SemanticRole::Epigraph)
                             && let Some((body, attribution)) =
-                                self.split_epigraph_typst(uow, sf, cell_frame_ids)?
+                                self.split_epigraph_typst(uow, sf, cell_frame_ids, notes)?
                         {
                             // A page break opening the quotation has to come out of it —
                             // Typst refuses one inside a container, and it means "start a
@@ -415,7 +451,8 @@ impl ExportPdfUseCase {
                             continue;
                         }
                         // Recursively render the blockquote frame content
-                        let inner = self.render_frame_typst(uow, &sub_frame_id, cell_frame_ids)?;
+                        let inner =
+                            self.render_frame_typst(uow, &sub_frame_id, cell_frame_ids, notes)?;
                         if !inner.is_empty() {
                             let (brk, inner) = hoist_leading_pagebreak(&inner);
                             parts.extend(brk.map(str::to_string));
@@ -423,7 +460,8 @@ impl ExportPdfUseCase {
                         }
                     } else {
                         // Non-blockquote sub-frame: render normally
-                        let inner = self.render_frame_typst(uow, &sub_frame_id, cell_frame_ids)?;
+                        let inner =
+                            self.render_frame_typst(uow, &sub_frame_id, cell_frame_ids, notes)?;
                         if !inner.is_empty() {
                             parts.push(inner);
                         }
@@ -434,7 +472,8 @@ impl ExportPdfUseCase {
 
         // Flush remaining blocks
         if !pending_blocks.is_empty() {
-            let typst = render_blocks_typst(&uow.store(), &pending_blocks, &self.dto.options);
+            let typst =
+                render_blocks_typst(&uow.store(), &pending_blocks, &self.dto.options, notes);
             if !typst.is_empty() {
                 parts.push(typst);
             }

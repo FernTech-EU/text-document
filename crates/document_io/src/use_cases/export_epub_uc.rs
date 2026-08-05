@@ -281,7 +281,8 @@ impl ExportEpubUseCase {
         // Table anchor frame — render the table instead of blocks. A table is always one
         // opaque unit: it never opens a new chapter.
         if let Some(table_id) = frame.table {
-            let html = html_render::render_table_html(&uow.store(), table_id, image_policy, &notes)?;
+            let html =
+                html_render::render_table_html(&uow.store(), table_id, image_policy, &notes)?;
             if !html.is_empty() {
                 out.push(RenderUnit::content(html));
             }

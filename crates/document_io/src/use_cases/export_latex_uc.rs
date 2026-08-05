@@ -38,6 +38,15 @@ pub struct ExportLatexUseCase {
     /// the block. Mirrors `ExportMarkdownUseCase::options`, which holds its
     /// export settings as a field for the same reason.
     omit_images: bool,
+    /// Each note's body, already rendered, by label — for the same reason
+    /// `omit_images` is a field: the inline renderer that needs it sits four
+    /// calls down a walk threading only the uow and the block.
+    ///
+    /// LaTeX takes the note's text *at the reference*, not at a definition
+    /// site, so the body has to be in hand by the time a marker is written.
+    /// That inverts the arrangement DOCX and HTML use and is why this is
+    /// pre-rendered rather than emitted where the definition sits.
+    note_bodies: std::collections::HashMap<String, String>,
 }
 
 impl ExportLatexUseCase {
@@ -45,6 +54,7 @@ impl ExportLatexUseCase {
         ExportLatexUseCase {
             uow_factory,
             omit_images: false,
+            note_bodies: std::collections::HashMap::new(),
         }
     }
 
@@ -93,6 +103,18 @@ impl ExportLatexUseCase {
         let mut body_parts: Vec<String> = Vec::new();
 
         let notes = crate::footnotes::Footnotes::build(&uow.store());
+
+        // Render every note's body before the prose that cites it. Deliberately
+        // before `note_bodies` is populated, so a note citing another note falls
+        // back to a bare `\footnotemark` instead of recursing — LaTeX has no
+        // nested footnote anyway, and a stack overflow is a poor way to find out.
+        self.note_bodies.clear();
+        let mut bodies = std::collections::HashMap::new();
+        for (_, label, frame_id) in notes.in_print_order() {
+            let body = self.render_frame_latex(&*uow, &frame_id, &cell_frame_ids)?;
+            bodies.insert(label, body.trim().to_string());
+        }
+        self.note_bodies = bodies;
 
         for frame_id in &frame_ids {
             // Skip cell frames — they're rendered as part of their table
@@ -471,11 +493,17 @@ impl ExportLatexUseCase {
         for elem in &elements {
             let text = match &elem.content {
                 InlineContent::Text(t) => escape_latex(t),
-                // `\footnotemark` is LaTeX's own primitive for a marker whose
-                // text is supplied elsewhere, and it auto-numbers — so a
-                // reference renders correctly even before definitions do.
-                InlineContent::FootnoteRef { .. } => {
-                    latex.push_str("\\footnotemark{}");
+                // `\footnote{…}` carries the note's text at the reference,
+                // which is where LaTeX puts it — no definition site, no label.
+                // A reference whose body this document does not hold falls back
+                // to `\footnotemark`, LaTeX's own primitive for a marker whose
+                // text is supplied elsewhere: it still auto-numbers, so the
+                // sequence a reader sees stays right.
+                InlineContent::FootnoteRef { label } => {
+                    match self.note_bodies.get(label) {
+                        Some(body) => latex.push_str(&format!("\\footnote{{{body}}}")),
+                        None => latex.push_str("\\footnotemark{}"),
+                    }
                     continue;
                 }
                 InlineContent::Image {

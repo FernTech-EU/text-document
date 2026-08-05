@@ -798,6 +798,22 @@ impl TextCursor {
         self.insert_fragment(&frag)
     }
 
+    /// Insert a footnote reference naming `label` at the cursor.
+    ///
+    /// Goes through Djot rather than a dedicated editing use case, and
+    /// deliberately: `[^label]` is what `Content` stores and what a reload
+    /// parses, so the reference on screen and the reference that survives a save
+    /// are produced by the same code path. An insertion route of its own would
+    /// work right up until the document was closed and reopened.
+    ///
+    /// The label is the note's durable identity, minted by the caller. It is
+    /// never the number — that is derived at render time from document order,
+    /// so inserting a note above this one renumbers it without touching a
+    /// character of the prose.
+    pub fn insert_footnote_reference(&self, label: &str) -> Result<()> {
+        self.insert_djot(&format!("[^{label}]"))
+    }
+
     /// Insert a document fragment at the cursor. Replaces selection if any.
     pub fn insert_fragment(&self, fragment: &DocumentFragment) -> Result<()> {
         let (pos, anchor) = self.read_cursor();
