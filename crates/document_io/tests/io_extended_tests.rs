@@ -215,6 +215,7 @@ fn test_export_latex_simple() -> Result<()> {
         &ExportLatexDto {
             document_class: String::new(),
             include_preamble: false,
+                omit_images: false,
         },
     )?;
     assert!(result.latex_text.contains("Hello World"));
@@ -232,6 +233,7 @@ fn test_export_latex_with_preamble() -> Result<()> {
         &ExportLatexDto {
             document_class: "article".to_string(),
             include_preamble: true,
+                omit_images: false,
         },
     )?;
     assert!(result.latex_text.contains("\\documentclass{article}"));
@@ -252,6 +254,7 @@ fn test_export_latex_without_preamble() -> Result<()> {
         &ExportLatexDto {
             document_class: String::new(),
             include_preamble: false,
+                omit_images: false,
         },
     )?;
     assert!(!result.latex_text.contains("\\documentclass"));
@@ -342,6 +345,7 @@ fn test_export_latex_escapes_special_chars() -> Result<()> {
         &ExportLatexDto {
             document_class: String::new(),
             include_preamble: false,
+                omit_images: false,
         },
     )?;
 
@@ -436,6 +440,7 @@ fn test_export_latex_heading() -> Result<()> {
         &ExportLatexDto {
             document_class: "article".to_string(),
             include_preamble: true,
+                omit_images: false,
         },
     )?;
 

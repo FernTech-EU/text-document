@@ -440,11 +440,28 @@ impl TextDocument {
     }
 
     /// Export the entire document as LaTeX.
+    ///
+    /// Images are emitted as `\includegraphics{src}`, which LaTeX resolves
+    /// against the filesystem at compile time — so the caller is responsible for
+    /// placing those files beside the `.tex`. Use
+    /// [`to_latex_with_options`](Self::to_latex_with_options) to drop them
+    /// instead.
     pub fn to_latex(&self, document_class: &str, include_preamble: bool) -> Result<String> {
+        self.to_latex_with_options(document_class, include_preamble, false)
+    }
+
+    /// [`to_latex`](Self::to_latex), with the choice of dropping inline images.
+    pub fn to_latex_with_options(
+        &self,
+        document_class: &str,
+        include_preamble: bool,
+        omit_images: bool,
+    ) -> Result<String> {
         let inner = self.inner.lock();
         let dto = frontend::document_io::ExportLatexDto {
             document_class: document_class.into(),
             include_preamble,
+            omit_images,
         };
         let result = document_io_commands::export_latex(&inner.ctx, &dto)?;
         Ok(result.latex_text)

@@ -58,6 +58,14 @@ pub struct ExportHtmlDto {
 pub struct ExportLatexDto {
     pub document_class: String,
     pub include_preamble: bool,
+    /// Drop inline images instead of emitting `\includegraphics`.
+    ///
+    /// LaTeX resolves a graphic against the filesystem when the document is
+    /// compiled, so a caller that will not place the files beside the `.tex` is
+    /// choosing between a build error and no image. `#[serde(default)]` so an
+    /// older `{ document_class, include_preamble }` payload still loads.
+    #[serde(default)]
+    pub omit_images: bool,
 }
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct ExportLatexResultDto {

@@ -33,14 +33,23 @@ pub trait ExportLatexUnitOfWorkTrait: QueryUnitOfWork {}
 
 pub struct ExportLatexUseCase {
     uow_factory: Box<dyn ExportLatexUnitOfWorkFactoryTrait>,
+    /// Copied off the DTO at the top of `execute`, because the inline renderer
+    /// that needs it sits four calls down a walk that threads only the uow and
+    /// the block. Mirrors `ExportMarkdownUseCase::options`, which holds its
+    /// export settings as a field for the same reason.
+    omit_images: bool,
 }
 
 impl ExportLatexUseCase {
     pub fn new(uow_factory: Box<dyn ExportLatexUnitOfWorkFactoryTrait>) -> Self {
-        ExportLatexUseCase { uow_factory }
+        ExportLatexUseCase {
+            uow_factory,
+            omit_images: false,
+        }
     }
 
     pub fn execute(&mut self, dto: &ExportLatexDto) -> Result<ExportLatexResultDto> {
+        self.omit_images = dto.omit_images;
         let uow = self.uow_factory.create();
         uow.begin_transaction()?;
 
@@ -456,30 +465,34 @@ impl ExportLatexUseCase {
                     height,
                     ..
                 } => {
-                    // LaTeX resolves `\includegraphics` against the filesystem at
-                    // compile time, so the `src` is emitted as the document
-                    // stores it and placing the file beside the `.tex` is the
-                    // caller's job — this crate writes no files. `graphicx` is
-                    // already in the emitted preamble.
-                    //
-                    // Sizes are in `bp` (big points, 1/72") because the model's
-                    // dimensions are logical pixels at 96 dpi; LaTeX's own `pt`
-                    // is 1/72.27" and would be silently ~0.4% off.
-                    let mut opts = Vec::new();
-                    if *width > 0 {
-                        opts.push(format!("width={}bp", *width as f64 * 0.75));
-                    }
-                    if *height > 0 {
-                        opts.push(format!("height={}bp", *height as f64 * 0.75));
-                    }
-                    if opts.is_empty() {
-                        format!("\\includegraphics{{{}}}", escape_latex(name))
+                    if self.omit_images {
+                        String::new()
                     } else {
-                        format!(
-                            "\\includegraphics[{}]{{{}}}",
-                            opts.join(","),
-                            escape_latex(name)
-                        )
+                        // LaTeX resolves `\includegraphics` against the filesystem at
+                        // compile time, so the `src` is emitted as the document
+                        // stores it and placing the file beside the `.tex` is the
+                        // caller's job — this crate writes no files. `graphicx` is
+                        // already in the emitted preamble.
+                        //
+                        // Sizes are in `bp` (big points, 1/72") because the model's
+                        // dimensions are logical pixels at 96 dpi; LaTeX's own `pt`
+                        // is 1/72.27" and would be silently ~0.4% off.
+                        let mut opts = Vec::new();
+                        if *width > 0 {
+                            opts.push(format!("width={}bp", *width as f64 * 0.75));
+                        }
+                        if *height > 0 {
+                            opts.push(format!("height={}bp", *height as f64 * 0.75));
+                        }
+                        if opts.is_empty() {
+                            format!("\\includegraphics{{{}}}", escape_latex(name))
+                        } else {
+                            format!(
+                                "\\includegraphics[{}]{{{}}}",
+                                opts.join(","),
+                                escape_latex(name)
+                            )
+                        }
                     }
                 }
                 InlineContent::Empty => String::new(),

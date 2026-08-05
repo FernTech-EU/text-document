@@ -627,6 +627,41 @@ fn package_epub(
             .map_err(|e| anyhow!("EPUB: {e}"))?;
     }
 
+    // The cover comes first, and it is added twice on purpose. `add_cover_image`
+    // is what marks it `properties="cover-image"` in the OPF manifest, which is
+    // how a reader knows to show it on a shelf — but `epub-builder` stops there
+    // and generates no page, so a book opened and read straight through would
+    // begin at chapter one and never display it. The XHTML page below is what a
+    // reader actually turns to. `linear` stays default so it sits in the spine
+    // ahead of the first chapter.
+    if let Some(cover) = &options.cover {
+        let href = format!("cover.{}", cover.extension());
+        builder
+            .add_cover_image(&href, cover.bytes.as_slice(), cover.mime_type.clone())
+            .map_err(|e| anyhow!("EPUB: adding cover: {e}"))?;
+        // `width:100%` with `height:auto` rather than a fixed size: a cover is
+        // one image on a page whose dimensions belong to the reading device, and
+        // every ereader screen is a different shape.
+        let alt = html_render::escape_html(if options.title.trim().is_empty() {
+            "Cover"
+        } else {
+            options.title.trim()
+        });
+        let body = format!(
+            "<div epub:type=\"cover\" style=\"text-align:center;margin:0;padding:0;\">\
+             <img src=\"{href}\" alt=\"{alt}\" style=\"max-width:100%;height:auto;\"/></div>"
+        );
+        let xhtml = wrap_xhtml("Cover", lang, options.rtl, &body);
+        builder
+            .add_content(
+                // No `.title(…)`: `EpubContent` only enters the table of
+                // contents when it carries one, and a "Cover" row above chapter
+                // one is noise in every reader's navigation pane.
+                EpubContent::new("cover.xhtml", xhtml.as_bytes()).reftype(ReferenceType::Cover),
+            )
+            .map_err(|e| anyhow!("EPUB: adding cover page: {e}"))?;
+    }
+
     // Write every image into the package and list it in the OPF manifest. The
     // chapter HTML already points at these hrefs (see `image_packaging_map`);
     // without this the `<img src>` in every chapter dangles, which is exactly

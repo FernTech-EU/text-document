@@ -144,6 +144,72 @@ fn latex_emits_includegraphics_with_a_size_and_declares_graphicx() {
     );
 }
 
+#[test]
+fn latex_can_omit_images() {
+    // `\includegraphics` is resolved by the LaTeX compiler against the
+    // filesystem, so an export whose caller will not place the files beside the
+    // `.tex` has to leave the command out or the build fails outright.
+    let tex = doc_with_image()
+        .to_latex_with_options("article", true, true)
+        .expect("latex");
+    assert!(!tex.contains("\\includegraphics"), "{tex}");
+    assert!(tex.contains("before") && tex.contains("after"), "{tex}");
+}
+
+// ── Markdown and Djot ───────────────────────────────────────────────────
+
+#[test]
+fn markdown_and_djot_reference_their_images_by_default() {
+    let doc = doc_with_image();
+    let md = doc.to_markdown().expect("markdown");
+    assert!(md.contains("![a blue square](pic.png)"), "{md}");
+    let dj = doc.to_djot().expect("djot");
+    assert!(dj.contains("![a blue square](pic.png)"), "{dj}");
+    // Djot has attribute syntax, so unlike Markdown it keeps the display size.
+    assert!(dj.contains("width=64"), "{dj}");
+}
+
+#[test]
+fn markdown_can_omit_images_without_losing_the_surrounding_prose() {
+    let md = doc_with_image()
+        .to_markdown_with(text_document::MarkdownExportOptions {
+            omit_images: true,
+            ..Default::default()
+        })
+        .expect("markdown");
+    assert!(!md.contains("pic.png"), "{md}");
+    // Not the alt text either: Markdown cannot mark a description as standing in
+    // for a picture, so it would read as a sentence the author never wrote.
+    assert!(!md.contains("a blue square"), "{md}");
+    assert!(md.contains("before") && md.contains("after"), "{md}");
+}
+
+#[test]
+fn djot_can_omit_images_without_losing_the_surrounding_prose() {
+    let dj = doc_with_image()
+        .to_djot_with_options(text_document::DjotExportOptions {
+            omit_images: true,
+            ..Default::default()
+        })
+        .expect("djot");
+    assert!(!dj.contains("pic.png"), "{dj}");
+    assert!(dj.contains("before") && dj.contains("after"), "{dj}");
+}
+
+#[test]
+fn dropping_every_optional_attribute_still_keeps_the_images() {
+    // `DjotExportOptions::none()` means "no optional block attributes". An image
+    // is content, not styling, and must survive that setting — the field sits in
+    // the same struct, so this is the mistake worth pinning.
+    let dj = doc_with_image()
+        .to_djot_with_options(text_document::DjotExportOptions::none())
+        .expect("djot");
+    assert!(
+        dj.contains("pic.png"),
+        "images are not a block attribute: {dj}"
+    );
+}
+
 // ── DOCX ────────────────────────────────────────────────────────────────
 
 #[test]
@@ -254,5 +320,73 @@ fn epub_without_bytes_degrades_to_the_description() {
     assert!(
         !names.iter().any(|n| n.contains("images/")),
         "nothing should be packaged when no bytes were supplied: {names:?}"
+    );
+}
+
+// ── EPUB cover ──────────────────────────────────────────────────────────
+
+#[test]
+fn epub_marks_a_cover_in_the_manifest_and_gives_it_a_page() {
+    let dir = tempfile::tempdir().expect("tmp");
+    let path = dir.path().join("out.epub");
+    doc_with_image()
+        .to_epub_with_options(
+            path.to_str().unwrap(),
+            EpubExportOptions {
+                title: "Test".into(),
+                language: "en".into(),
+                cover: Some(ExportImage::new(png_bytes(), "image/png")),
+                ..Default::default()
+            },
+        )
+        .expect("start")
+        .wait()
+        .expect("epub");
+
+    let bytes = std::fs::read(&path).expect("read epub");
+    let names = zip_names(&bytes);
+
+    // The bytes have to actually be in the package…
+    let (_, stored) = zip_entry(&bytes, "cover.png")
+        .unwrap_or_else(|| panic!("cover missing from the package: {names:?}"));
+    assert_eq!(
+        stored,
+        png_bytes(),
+        "packaged cover differs from the source"
+    );
+
+    // …the manifest has to say it is the cover, or a reader shows a blank
+    // rectangle on its shelf…
+    let (_, opf) = zip_entry(&bytes, ".opf").expect("content.opf");
+    let opf = String::from_utf8_lossy(&opf);
+    assert!(
+        opf.contains("cover-image"),
+        "cover is not marked in the manifest: {opf}"
+    );
+
+    // …and there has to be a page, because `add_cover_image` alone generates
+    // none and a book read straight through would open on chapter one.
+    let (_, page) = zip_entry(&bytes, "cover.xhtml").expect("cover page");
+    let page = String::from_utf8_lossy(&page);
+    assert!(
+        page.contains("cover.png"),
+        "cover page shows nothing: {page}"
+    );
+    assert!(page.contains("alt="), "cover image has no alt text: {page}");
+}
+
+#[test]
+fn an_epub_without_a_cover_gains_no_cover_files() {
+    let dir = tempfile::tempdir().expect("tmp");
+    let path = dir.path().join("out.epub");
+    doc_with_image()
+        .to_epub(path.to_str().unwrap())
+        .expect("start")
+        .wait()
+        .expect("epub");
+    let names = zip_names(&std::fs::read(&path).expect("read epub"));
+    assert!(
+        !names.iter().any(|n| n.contains("cover")),
+        "a book with no cover should carry no cover entries: {names:?}"
     );
 }

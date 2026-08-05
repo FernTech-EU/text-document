@@ -34,14 +34,24 @@ pub trait ExportDjotUnitOfWorkTrait: QueryUnitOfWork {}
 
 pub struct ExportDjotUseCase {
     uow_factory: Box<dyn ExportDjotUnitOfWorkFactoryTrait>,
+    /// Copied off `options` at the top of `execute`. The inline renderer that
+    /// needs it is reached both from `render_block_line` (which carries
+    /// `options`) and from `render_inline_djot` (which does not), so a
+    /// parameter would have to be threaded through a walk that otherwise has no
+    /// interest in export settings. Mirrors `ExportMarkdownUseCase::options`.
+    omit_images: bool,
 }
 
 impl ExportDjotUseCase {
     pub fn new(uow_factory: Box<dyn ExportDjotUnitOfWorkFactoryTrait>) -> Self {
-        ExportDjotUseCase { uow_factory }
+        ExportDjotUseCase {
+            uow_factory,
+            omit_images: false,
+        }
     }
 
     pub fn execute(&mut self, options: &DjotExportOptions) -> Result<ExportDjotDto> {
+        self.omit_images = options.omit_images;
         let uow = self.uow_factory.create();
         uow.begin_transaction()?;
 
@@ -464,6 +474,9 @@ impl ExportDjotUseCase {
                     height,
                     ..
                 } => {
+                    if self.omit_images {
+                        continue;
+                    }
                     // Djot carries display size as inline attributes. Writing
                     // them keeps a resize durable across a save/reload, and
                     // round-trips through this crate's own importer.

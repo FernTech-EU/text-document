@@ -32,4 +32,13 @@ pub struct EpubExportOptions {
     /// entry here degrades to its alt text.
     #[serde(default)]
     pub images: super::image_options::ExportImages,
+    /// The book's cover.
+    ///
+    /// Separate from [`Self::images`] because a cover is not inline content: it
+    /// is never referenced by a `src` in the prose, it is marked in the OPF
+    /// manifest so a reader shows it in the library rather than mid-chapter, and
+    /// it gets a page of its own at the front of the book. `None` ⇒ no cover,
+    /// which is what every EPUB this crate produced before the field existed.
+    #[serde(default)]
+    pub cover: Option<super::image_options::ExportImage>,
 }

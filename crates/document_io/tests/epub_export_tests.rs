@@ -244,6 +244,7 @@ fn epub_metadata_title_author_lang_land_in_the_opf() {
             language: "fr".to_string(),
             rtl: false,
             images: Default::default(),
+            cover: None,
         },
     );
     let opf = content_opf(&bytes);
@@ -330,6 +331,7 @@ fn rich_document_packs_to_a_valid_epub_file_on_disk() {
                 language: "en".to_string(),
                 rtl: false,
                 images: Default::default(),
+                cover: None,
             },
         },
     )

@@ -112,7 +112,10 @@ fn markdown_is_clean_by_default() {
 #[test]
 fn markdown_emits_a_raw_html_break_when_asked() {
     let md = doc()
-        .to_markdown_with(MarkdownExportOptions { page_breaks: true })
+        .to_markdown_with(MarkdownExportOptions {
+            page_breaks: true,
+            ..Default::default()
+        })
         .expect("to_markdown_with");
     assert!(md.contains("break-before: page"), "{md}");
     let brk = md.find("<div").expect("a break");

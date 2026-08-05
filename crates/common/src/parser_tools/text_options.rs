@@ -66,4 +66,14 @@ pub struct MarkdownExportOptions {
     /// default: raw HTML is not Markdown, and an export nobody is going to paginate is
     /// better off clean.
     pub page_breaks: bool,
+    /// Drop inline images instead of emitting `![alt](src)`.
+    ///
+    /// A Markdown export references its images by path and cannot carry their
+    /// bytes, so a caller that will not place those files beside the output is
+    /// choosing between a dangling reference and no image at all. Off by
+    /// default, because the reference is what a caller who *does* write the
+    /// files needs — see [`crate::parser_tools::HtmlImageMode`] for the same
+    /// choice in the one text format that can also inline the bytes.
+    #[serde(default)]
+    pub omit_images: bool,
 }

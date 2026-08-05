@@ -407,9 +407,16 @@ impl ExportMarkdownUseCase {
                     }
                 }
                 InlineContent::Image { name, alt, .. } => {
-                    // Markdown has no attribute syntax, so display size cannot
-                    // survive here; alt and source do.
-                    format!("![{}]({})", alt, name)
+                    if self.options.omit_images {
+                        // Not even the alt text: Markdown has no way to mark a
+                        // deliberately absent image, so a bare description would
+                        // read as a sentence the author never wrote.
+                        String::new()
+                    } else {
+                        // Markdown has no attribute syntax, so display size cannot
+                        // survive here; alt and source do.
+                        format!("![{}]({})", alt, name)
+                    }
                 }
                 InlineContent::Empty => String::new(),
             };

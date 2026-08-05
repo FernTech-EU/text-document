@@ -114,6 +114,15 @@ pub struct DjotExportOptions {
     /// Emit the enclosing blockquote's semantic role as `{semantic_role=…}` on the
     /// quote's first block, so the model→djot→model round trip stays a fixpoint.
     pub semantic_role: bool,
+    /// Drop inline images instead of emitting `![alt](src){width=… height=…}`.
+    ///
+    /// Unlike every other field here this one is not a block attribute and is
+    /// **not** governed by [`Self::all`]/[`Self::none`]: an image is content, not
+    /// styling, so "emit no optional attributes" must not quietly delete it.
+    /// Only a caller that has decided not to place the image files beside the
+    /// output turns it on.
+    #[serde(default)]
+    pub omit_images: bool,
 }
 
 impl DjotExportOptions {
@@ -129,6 +138,7 @@ impl DjotExportOptions {
             top_margin: true,
             text_indent: true,
             semantic_role: true,
+            omit_images: false,
         }
     }
 
@@ -145,6 +155,8 @@ impl DjotExportOptions {
             top_margin: false,
             text_indent: false,
             semantic_role: false,
+            // Content, not styling — see the field's own doc.
+            omit_images: false,
         }
     }
 }
