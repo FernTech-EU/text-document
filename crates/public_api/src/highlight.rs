@@ -1053,6 +1053,39 @@ pub(crate) fn merge_highlight_spans(
                     element_id,
                 });
             }
+            // A reference is a single-character position too, so it takes a
+            // highlight the same way an image does — a find hit or a spell
+            // range covering it must recolour the marker, not skip it.
+            FragmentContent::FootnoteReference {
+                ref label,
+                ref marker,
+                ref format,
+                offset,
+                element_id,
+            } => {
+                let active: Vec<&HighlightSpan> = spans
+                    .iter()
+                    .filter(|s| {
+                        let s_end = s.start + s.length;
+                        s.start < offset + 1 && s_end > offset
+                    })
+                    .collect();
+
+                let note_format = if active.is_empty() {
+                    format.clone()
+                } else {
+                    let merged_hl = merge_overlapping_highlights(&active);
+                    apply_highlight(format, &merged_hl)
+                };
+
+                result.push(FragmentContent::FootnoteReference {
+                    label: label.clone(),
+                    marker: marker.clone(),
+                    format: note_format,
+                    offset,
+                    element_id,
+                });
+            }
         }
     }
 

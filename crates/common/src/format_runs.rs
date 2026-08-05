@@ -111,12 +111,27 @@ pub enum ReplaceFormatPolicy {
     PreserveNothing,
 }
 
-/// Content type for an inline segment: text, image, or empty.
+/// Content type for an inline segment: text, image, footnote reference, or empty.
 #[derive(Serialize, Deserialize, Default, Clone, Debug, PartialEq, Eq)]
 pub enum InlineContent {
     #[default]
     Empty,
     Text(String),
+    /// A footnote reference — the marker in the prose that points at a note.
+    ///
+    /// Carries only the **label**, never the number a reader sees. The number is
+    /// a fact about document order and about which notes an export happens to
+    /// include, so storing it would mean rewriting the author's prose every time
+    /// a note was inserted above it. Renderers derive it; the model never knows
+    /// it.
+    ///
+    /// The label need not resolve. A reference whose definition lives outside
+    /// this document — which is the normal state for a host that owns note
+    /// bodies itself — must survive a round trip unchanged, so nothing here
+    /// requires a matching definition to exist.
+    FootnoteRef {
+        label: String,
+    },
     Image {
         name: String,
         /// Alternative text describing the image.
@@ -218,6 +233,66 @@ pub struct ImageAnchor {
     pub height: i64,
     pub quality: i64,
     pub format: CharacterFormat,
+}
+
+/// A footnote reference embedded at a specific byte position inside a block.
+///
+/// The exact shape of [`ImageAnchor`], and for the same reason: a reference is
+/// an inline object occupying one `U+FFFC` sentinel in the block's text, so the
+/// rope moves it with every edit and deleting the sentence deletes the
+/// reference — no re-anchoring, no quote matching, no orphan state to keep.
+///
+/// It carries its own [`CharacterFormat`] because a reference is normally
+/// superscript, and because whatever formatting surrounds it should not bleed
+/// onto the marker.
+///
+/// What it deliberately does **not** carry is the number. See
+/// [`InlineContent::FootnoteRef`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FootnoteRefAnchor {
+    pub byte_offset: u32,
+    /// Matches a footnote definition's `Frame::footnote_label`, when one exists
+    /// in this document at all. Djot's `[^label]` syntax on the wire.
+    pub label: String,
+    pub format: CharacterFormat,
+}
+
+/// One inline object anchored in a block: an image, or a footnote reference.
+///
+/// Both occupy a single `U+FFFC` and are woven into the text by the same rules,
+/// so the weave takes them as one byte-ordered sequence rather than walking two
+/// lists and hoping they interleave. They are stored apart because they are
+/// edited apart, and are brought together only here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BlockAnchor<'a> {
+    Image(&'a ImageAnchor),
+    FootnoteRef(&'a FootnoteRefAnchor),
+}
+
+impl BlockAnchor<'_> {
+    /// Byte position of this anchor's sentinel within the block's text.
+    pub fn byte_offset(&self) -> u32 {
+        match self {
+            BlockAnchor::Image(i) => i.byte_offset,
+            BlockAnchor::FootnoteRef(f) => f.byte_offset,
+        }
+    }
+}
+
+/// Every anchor in a block, in byte order.
+///
+/// A stable sort, so an image and a reference mirrored at the same offset keep
+/// a deterministic order rather than swapping between reads — which would show
+/// up as a diff in exported Djot for a document nobody edited.
+pub fn block_anchors<'a>(
+    images: &'a [ImageAnchor],
+    footnote_refs: &'a [FootnoteRefAnchor],
+) -> Vec<BlockAnchor<'a>> {
+    let mut anchors: Vec<BlockAnchor<'a>> = Vec::with_capacity(images.len() + footnote_refs.len());
+    anchors.extend(images.iter().map(BlockAnchor::Image));
+    anchors.extend(footnote_refs.iter().map(BlockAnchor::FootnoteRef));
+    anchors.sort_by_key(|a| a.byte_offset());
+    anchors
 }
 
 /// Debug-only invariant check. Run from `debug_assert!` callsites in
@@ -677,6 +752,23 @@ fn dominant_format(runs: &[FormatRun], start: u32, end: u32) -> Option<Character
 
 /// Apply an "insert" shift to a block's image anchors. Anchors at or
 /// past the offset move forward by `inserted_bytes`.
+/// Apply an "insert" mutation to a block's footnote references — the rule
+/// [`shift_images_for_insert`] applies, for the same reason.
+pub fn shift_footnote_refs_for_insert(
+    notes: &mut [FootnoteRefAnchor],
+    byte_offset: u32,
+    inserted_bytes: u32,
+) {
+    if inserted_bytes == 0 {
+        return;
+    }
+    for note in notes.iter_mut() {
+        if note.byte_offset >= byte_offset {
+            note.byte_offset += inserted_bytes;
+        }
+    }
+}
+
 pub fn shift_images_for_insert(images: &mut [ImageAnchor], byte_offset: u32, inserted_bytes: u32) {
     if inserted_bytes == 0 {
         return;
@@ -773,6 +865,27 @@ pub fn split_runs_at(runs: &[FormatRun], byte_offset: u32) -> (Vec<FormatRun>, V
 
 /// Split block image anchors at `byte_offset`. Anchors at exactly
 /// `byte_offset` go to the right half (rebased to offset 0).
+/// Split footnote references at `byte_offset`, rebasing the right-hand side to
+/// zero — the exact rule [`split_images_at`] applies, because a reference
+/// occupies a block the same way an image does.
+pub fn split_footnote_refs_at(
+    notes: &[FootnoteRefAnchor],
+    byte_offset: u32,
+) -> (Vec<FootnoteRefAnchor>, Vec<FootnoteRefAnchor>) {
+    let mut left = Vec::new();
+    let mut right = Vec::new();
+    for note in notes {
+        if note.byte_offset < byte_offset {
+            left.push(note.clone());
+        } else {
+            let mut new = note.clone();
+            new.byte_offset -= byte_offset;
+            right.push(new);
+        }
+    }
+    (left, right)
+}
+
 pub fn split_images_at(
     images: &[ImageAnchor],
     byte_offset: u32,
@@ -853,6 +966,9 @@ pub enum InlinePiece<'a> {
     /// An image anchored at this position. Contributes one logical character
     /// and zero bytes.
     Image(&'a ImageAnchor),
+    /// A footnote reference anchored at this position. Contributes one logical
+    /// character and zero bytes, exactly as an image does.
+    FootnoteRef(&'a FootnoteRefAnchor),
 }
 
 /// Interleave a block's format runs and image anchors into one ordered stream.
@@ -874,25 +990,26 @@ pub enum InlinePiece<'a> {
 ///
 /// Callers map the returned pieces to their own types; nobody re-derives the
 /// ordering.
-pub fn merge_runs_and_images<'a>(
+pub fn merge_runs_and_anchors<'a>(
     plain_text: &str,
     runs: &'a [FormatRun],
-    images: &'a [ImageAnchor],
+    anchors: &[BlockAnchor<'a>],
 ) -> Vec<InlinePiece<'a>> {
     let text_len = plain_text.len() as u32;
     let mut out: Vec<InlinePiece<'a>> = Vec::new();
-    let mut img_iter = images.iter().peekable();
+    let mut img_iter = anchors.iter().peekable();
     // Highest byte offset already emitted. Never moves backwards.
     let mut cursor: u32 = 0;
 
-    /// Bytes an image occupies in `plain_text`.
+    /// Bytes an anchor occupies in `plain_text`.
     ///
     /// `insert_image` mirrors a `U+FFFC` OBJECT REPLACEMENT CHARACTER into the
     /// rope at the anchor's `byte_offset`, so an image's own character sits in
     /// the text and text resuming after the image must step over it. Emitting
     /// both the image piece *and* the sentinel yields the image twice — which
     /// is what made a selection across an image read back with a doubled
-    /// sentinel and a missing following character.
+    /// sentinel and a missing following character. A footnote reference is
+    /// mirrored the same way and steps over the same three bytes.
     ///
     /// Checked rather than assumed: `U+FFFC` also marks table anchors, and not
     /// every writer of an `ImageAnchor` mirrors one (the test harness writes
@@ -916,15 +1033,24 @@ pub fn merge_runs_and_images<'a>(
         }
     };
 
+    /// The piece an anchor contributes, whichever kind it is.
+    fn piece<'a>(anchor: &BlockAnchor<'a>) -> InlinePiece<'a> {
+        match *anchor {
+            BlockAnchor::Image(i) => InlinePiece::Image(i),
+            BlockAnchor::FootnoteRef(f) => InlinePiece::FootnoteRef(f),
+        }
+    }
+
     for run in runs {
-        // Images strictly before this run: unformatted gap text, then the image.
-        while let Some(img) = img_iter.peek() {
-            if img.byte_offset >= run.byte_start {
+        // Anchors strictly before this run: unformatted gap text, then the anchor.
+        while let Some(anchor) = img_iter.peek() {
+            let at = anchor.byte_offset();
+            if at >= run.byte_start {
                 break;
             }
-            push_text(&mut out, cursor, img.byte_offset, None);
-            out.push(InlinePiece::Image(img));
-            cursor = cursor.max(img.byte_offset + sentinel_len(plain_text, img.byte_offset));
+            push_text(&mut out, cursor, at, None);
+            out.push(piece(anchor));
+            cursor = cursor.max(at + sentinel_len(plain_text, at));
             img_iter.next();
         }
 
@@ -932,17 +1058,18 @@ pub fn merge_runs_and_images<'a>(
         push_text(&mut out, cursor, run.byte_start, None);
         cursor = cursor.max(run.byte_start);
 
-        // Images inside the run split it, keeping the run's format on both
-        // sides. `<=` so an image sitting exactly on the run's end boundary is
+        // Anchors inside the run split it, keeping the run's format on both
+        // sides. `<=` so an anchor sitting exactly on the run's end boundary is
         // consumed here rather than deferred — deferring it is what produced
         // the out-of-order emission described above.
-        while let Some(img) = img_iter.peek() {
-            if img.byte_offset > run.byte_end {
+        while let Some(anchor) = img_iter.peek() {
+            let at = anchor.byte_offset();
+            if at > run.byte_end {
                 break;
             }
-            push_text(&mut out, cursor, img.byte_offset, Some(&run.format));
-            out.push(InlinePiece::Image(img));
-            cursor = cursor.max(img.byte_offset + sentinel_len(plain_text, img.byte_offset));
+            push_text(&mut out, cursor, at, Some(&run.format));
+            out.push(piece(anchor));
+            cursor = cursor.max(at + sentinel_len(plain_text, at));
             img_iter.next();
         }
 
@@ -950,11 +1077,12 @@ pub fn merge_runs_and_images<'a>(
         cursor = cursor.max(run.byte_end);
     }
 
-    // Images past the last run.
-    for img in img_iter {
-        push_text(&mut out, cursor, img.byte_offset, None);
-        out.push(InlinePiece::Image(img));
-        cursor = cursor.max(img.byte_offset + sentinel_len(plain_text, img.byte_offset));
+    // Anchors past the last run.
+    for anchor in img_iter {
+        let at = anchor.byte_offset();
+        push_text(&mut out, cursor, at, None);
+        out.push(piece(anchor));
+        cursor = cursor.max(at + sentinel_len(plain_text, at));
     }
 
     push_text(&mut out, cursor, text_len, None);
@@ -975,11 +1103,12 @@ pub fn inline_segments_view(
     plain_text: &str,
     runs: &[FormatRun],
     images: &[ImageAnchor],
+    footnote_refs: &[FootnoteRefAnchor],
 ) -> Vec<InlineSegment> {
     let bytes = plain_text.as_bytes();
     let default_format = CharacterFormat::default();
 
-    merge_runs_and_images(plain_text, runs, images)
+    merge_runs_and_anchors(plain_text, runs, &block_anchors(images, footnote_refs))
         .into_iter()
         .map(|piece| match piece {
             InlinePiece::Text { start, end, format } => {
@@ -1002,6 +1131,16 @@ pub fn inline_segments_view(
                         width: anchor.width,
                         height: anchor.height,
                         quality: anchor.quality,
+                    },
+                    ..Default::default()
+                };
+                apply_character_format_to_segment(&mut seg, &anchor.format);
+                seg
+            }
+            InlinePiece::FootnoteRef(anchor) => {
+                let mut seg = InlineSegment {
+                    content: InlineContent::FootnoteRef {
+                        label: anchor.label.clone(),
                     },
                     ..Default::default()
                 };
@@ -1047,11 +1186,28 @@ mod tests {
         }
     }
 
+    fn fn_anchor(at: u32, label: &str) -> FootnoteRefAnchor {
+        FootnoteRefAnchor {
+            byte_offset: at,
+            label: label.into(),
+            format: CharacterFormat::default(),
+        }
+    }
+
     /// Render a merge as a compact string so ordering assertions read clearly:
     /// `"hello"` for unformatted text, `"*bold*"` for formatted, `[name]` for
-    /// an image.
+    /// an image, `^label^` for a footnote reference.
     fn shape(text: &str, runs: &[FormatRun], images: &[ImageAnchor]) -> String {
-        merge_runs_and_images(text, runs, images)
+        shape_with(text, runs, images, &[])
+    }
+
+    fn shape_with(
+        text: &str,
+        runs: &[FormatRun],
+        images: &[ImageAnchor],
+        notes: &[FootnoteRefAnchor],
+    ) -> String {
+        merge_runs_and_anchors(text, runs, &block_anchors(images, notes))
             .into_iter()
             .map(|p| match p {
                 InlinePiece::Text { start, end, format } => {
@@ -1063,9 +1219,41 @@ mod tests {
                     }
                 }
                 InlinePiece::Image(a) => format!("[{}]", a.name),
+                InlinePiece::FootnoteRef(a) => format!("^{}^", a.label),
             })
             .collect::<Vec<_>>()
             .join("|")
+    }
+
+    /// A footnote reference weaves exactly as an image does — the whole reason
+    /// the two share one function instead of getting a second copy of it.
+    #[test]
+    fn a_footnote_reference_inside_a_run_splits_it() {
+        let text = "abcdef";
+        let runs = [run(0, 6, true)];
+        assert_eq!(
+            shape_with(text, &runs, &[], &[fn_anchor(3, "n1")]),
+            "*abc*|^n1^|*def*"
+        );
+    }
+
+    /// Images and references are stored in separate lists but occupy one
+    /// stream. Walking the two lists in sequence rather than merging them by
+    /// offset would emit every image before every note regardless of where they
+    /// actually sit — the ordering bug this weave exists to prevent, in a new
+    /// disguise.
+    #[test]
+    fn images_and_references_interleave_by_position() {
+        let text = "abcdefgh";
+        assert_eq!(
+            shape_with(
+                text,
+                &[],
+                &[anchor(6, "img")],
+                &[fn_anchor(2, "early"), fn_anchor(7, "late")]
+            ),
+            "ab|^early^|cdef|[img]|g|^late^|h"
+        );
     }
 
     /// **The regression.** An image anchored inside a formatted run used to be
@@ -1159,7 +1347,7 @@ mod tests {
             ),
         ];
         for (i, (runs, images)) in arrangements.iter().enumerate() {
-            let pieces = merge_runs_and_images(text, runs, images);
+            let pieces = merge_runs_and_anchors(text, runs, &block_anchors(images, &[]));
             let mut cursor = 0u32;
             let mut rebuilt = String::new();
             for piece in &pieces {
@@ -1183,7 +1371,7 @@ mod tests {
     /// `inline_segments_view` is built on the merge, so it inherits the fix.
     #[test]
     fn inline_segments_view_places_a_mid_run_image_correctly() {
-        let segs = inline_segments_view("abcdef", &[run(0, 6, true)], &[anchor(3, "img")]);
+        let segs = inline_segments_view("abcdef", &[run(0, 6, true)], &[anchor(3, "img")], &[]);
         assert_eq!(segs.len(), 3);
         assert!(matches!(&segs[0].content, InlineContent::Text(t) if t == "abc"));
         assert!(matches!(&segs[1].content, InlineContent::Image { name, .. } if name == "img"));
@@ -1197,7 +1385,7 @@ mod tests {
     fn inline_segments_view_carries_alt_text_through() {
         let mut a = anchor(1, "img");
         a.alt = "a black cat".into();
-        let segs = inline_segments_view("ab", &[], &[a]);
+        let segs = inline_segments_view("ab", &[], &[a], &[]);
         let alt = segs.iter().find_map(|s| match &s.content {
             InlineContent::Image { alt, .. } => Some(alt.clone()),
             _ => None,

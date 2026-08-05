@@ -95,6 +95,18 @@ pub struct Frame {
     /// surfaced through DTOs.
     #[serde(default)]
     pub byte_range: (u32, u32),
+    /// The footnote this frame *is the body of*, identified by the label its
+    /// references name it with. `None` for every ordinary frame.
+    ///
+    /// A definition is arbitrary block content, so it needs a frame of its own
+    /// exactly as a table cell does — but unlike a cell it is not part of the
+    /// flow it was written in: it belongs at the foot of a page, the end of a
+    /// chapter, or wherever the format puts notes. So it is a **detached**
+    /// top-level frame, reachable by label rather than by position.
+    ///
+    /// Hand-maintained beside `byte_range` above, for the same reason.
+    #[serde(default)]
+    pub footnote_label: Option<String>,
 }
 
 impl HasId for Frame {

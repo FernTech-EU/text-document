@@ -141,7 +141,9 @@ impl GetTextAtPositionUseCase {
 
                 let elem_text = match &seg.content {
                     InlineContent::Text(s) => s.clone(),
-                    InlineContent::Image { .. } => "\u{FFFC}".to_string(),
+                    InlineContent::Image { .. } | InlineContent::FootnoteRef { .. } => {
+                        "\u{FFFC}".to_string()
+                    }
                     InlineContent::Empty => String::new(),
                 };
 
@@ -175,7 +177,7 @@ impl GetTextAtPositionUseCase {
                 // short of its run.
                 match &seg.content {
                     InlineContent::Text(s) => current_byte_offset += s.len() as u32,
-                    InlineContent::Image { .. } => {
+                    InlineContent::Image { .. } | InlineContent::FootnoteRef { .. } => {
                         current_byte_offset += '\u{FFFC}'.len_utf8() as u32
                     }
                     InlineContent::Empty => {}

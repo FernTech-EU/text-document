@@ -143,6 +143,7 @@ fn execute_insert_frame(
         fmt_semantic_role: None,
         table: None,
         byte_range: (0, 0),
+        footnote_label: None,
     };
 
     let created_frame = uow.create_frame(&new_frame, doc_id, -1)?;

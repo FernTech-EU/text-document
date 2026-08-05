@@ -750,7 +750,12 @@ impl TextDocument {
                             Some((*element_id, block_start + frag_start, frag_start, *length));
                     }
                 }
+                // Both objects occupy exactly one position and answer for it
+                // whole — there is no offset *inside* either to report.
                 crate::flow::FragmentContent::Image {
+                    offset, element_id, ..
+                }
+                | crate::flow::FragmentContent::FootnoteReference {
                     offset, element_id, ..
                 } => {
                     if offset_in_block == *offset {

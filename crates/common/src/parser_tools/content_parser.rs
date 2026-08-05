@@ -40,6 +40,9 @@ pub struct ParsedSpan {
     pub link_href: Option<String>,
     /// Set when this span is an inline image rather than text.
     pub image: Option<ParsedImage>,
+    /// Set when this span is a footnote *reference* rather than text — the
+    /// label naming the note, never the number a reader sees.
+    pub footnote_ref: Option<String>,
 }
 
 /// A parsed table cell containing inline spans.
@@ -65,6 +68,16 @@ pub struct ParsedTable {
 pub enum ParsedElement {
     Block(ParsedBlock),
     Table(ParsedTable),
+    /// A footnote definition: the label its references name, and the blocks
+    /// making up its body.
+    ///
+    /// Separate from `Block` because a definition is not part of the flow it was
+    /// written in — it belongs wherever the output format puts notes, which the
+    /// importer expresses by giving it a detached frame of its own.
+    FootnoteDefinition {
+        label: String,
+        blocks: Vec<ParsedBlock>,
+    },
 }
 
 impl ParsedElement {
@@ -75,6 +88,11 @@ impl ParsedElement {
         for elem in elements {
             match elem {
                 ParsedElement::Block(b) => blocks.push(b),
+                // A definition is not part of the flow it was written in — it
+                // belongs wherever the format puts notes. Flattening it in
+                // would splice a note's body into the prose at the point the
+                // definition happened to be typed.
+                ParsedElement::FootnoteDefinition { .. } => {}
                 ParsedElement::Table(t) => {
                     for row in t.rows {
                         for cell in row {
@@ -502,6 +520,7 @@ pub fn parse_markdown(markdown: &str) -> Vec<ParsedElement> {
                         subscript: false,
                         link_href: link_href.clone(),
                         image: Some(image),
+                        footnote_ref: None,
                     };
                     if in_table {
                         current_cell_spans.push(span);
@@ -533,6 +552,7 @@ pub fn parse_markdown(markdown: &str) -> Vec<ParsedElement> {
                     subscript: false,
                     link_href: link_href.clone(),
                     image: None,
+                    footnote_ref: None,
                 };
                 if in_table {
                     current_cell_spans.push(span);
@@ -555,6 +575,7 @@ pub fn parse_markdown(markdown: &str) -> Vec<ParsedElement> {
                     subscript: false,
                     link_href: link_href.clone(),
                     image: None,
+                    footnote_ref: None,
                 };
                 if in_table {
                     current_cell_spans.push(span);
@@ -577,6 +598,7 @@ pub fn parse_markdown(markdown: &str) -> Vec<ParsedElement> {
                     subscript: false,
                     link_href: link_href.clone(),
                     image: None,
+                    footnote_ref: None,
                 };
                 if in_table {
                     current_cell_spans.push(span);
@@ -829,6 +851,7 @@ pub fn parse_html_elements(html: &str) -> Vec<ParsedElement> {
                             subscript: false,
                             link_href: state.link_href.clone(),
                             image: None,
+                            footnote_ref: None,
                         });
                     }
                 }
@@ -1175,6 +1198,7 @@ pub fn parse_html_elements(html: &str) -> Vec<ParsedElement> {
                             subscript: false,
                             link_href: state.link_href.clone(),
                             image: None,
+                            footnote_ref: None,
                         }],
                         heading_level: None,
                         list_style: None,
@@ -1247,6 +1271,7 @@ pub fn parse_html_elements(html: &str) -> Vec<ParsedElement> {
                             subscript: false,
                             link_href: state.link_href.clone(),
                             image: None,
+                            footnote_ref: None,
                         });
                     }
                 }
@@ -1445,15 +1470,30 @@ pub fn character_format_from_span(
 /// non-overlapping, coalesced `Vec<FormatRun>`. Both safe to feed straight
 /// into the store under the dual-write bridge.
 pub fn format_runs_from_spans(spans: &[ParsedSpan], is_code_block: bool) -> ParsedInline {
-    use crate::format_runs::{CharacterFormat, FormatRun, ImageAnchor, coalesce_in_place};
+    use crate::format_runs::{
+        CharacterFormat, FootnoteRefAnchor, FormatRun, ImageAnchor, coalesce_in_place,
+    };
 
     let mut plain_text = String::new();
     let mut runs: Vec<FormatRun> = Vec::new();
     let mut images: Vec<ImageAnchor> = Vec::new();
+    let mut footnote_refs: Vec<FootnoteRefAnchor> = Vec::new();
     let default = CharacterFormat::default();
 
     for span in spans {
         let byte_start = plain_text.len() as u32;
+
+        if let Some(label) = &span.footnote_ref {
+            // A reference occupies one U+FFFC, exactly as an image does, so
+            // every downstream offset treats the two alike.
+            plain_text.push('\u{FFFC}');
+            footnote_refs.push(FootnoteRefAnchor {
+                byte_offset: byte_start,
+                label: label.clone(),
+                format: character_format_from_span(span, is_code_block),
+            });
+            continue;
+        }
 
         if let Some(image) = &span.image {
             // An image occupies one U+FFFC in the text, exactly as
@@ -1492,6 +1532,7 @@ pub fn format_runs_from_spans(spans: &[ParsedSpan], is_code_block: bool) -> Pars
         plain_text,
         runs,
         images,
+        footnote_refs,
     }
 }
 
@@ -1506,6 +1547,7 @@ pub struct ParsedInline {
     pub plain_text: String,
     pub runs: Vec<crate::format_runs::FormatRun>,
     pub images: Vec<crate::format_runs::ImageAnchor>,
+    pub footnote_refs: Vec<crate::format_runs::FootnoteRefAnchor>,
 }
 
 // ─── Djot parsing ────────────────────────────────────────────────────
@@ -1788,6 +1830,11 @@ pub fn parse_djot(djot: &str, options: &DjotImportOptions) -> Vec<ParsedElement>
     // nested `Start`; decremented on every `End`.
     let mut skip_depth: u32 = 0;
 
+    // The label and element index of the footnote definition currently open,
+    // if any. Djot has no footnote inside a footnote, so one slot is enough
+    // where the dropped containers need a depth counter.
+    let mut footnote_open: Option<(String, usize)> = None;
+
     // Push one inline span carrying the current formatting state into the
     // active sink (table cell or block). A macro (not a closure) to avoid
     // borrowing `current_spans`/`current_cell_spans` across the formatting
@@ -1812,6 +1859,7 @@ pub fn parse_djot(djot: &str, options: &DjotImportOptions) -> Vec<ParsedElement>
                     subscript,
                     link_href: link_href.clone(),
                     image: None,
+                    footnote_ref: None,
                 };
                 if in_table_cell {
                     current_cell_spans.push(sp);
@@ -1836,6 +1884,7 @@ pub fn parse_djot(djot: &str, options: &DjotImportOptions) -> Vec<ParsedElement>
                 subscript,
                 link_href: link_href.clone(),
                 image: Some($img),
+                footnote_ref: None,
             };
             if in_table_cell {
                 current_cell_spans.push(sp);
@@ -2120,10 +2169,68 @@ pub fn parse_djot(djot: &str, options: &DjotImportOptions) -> Vec<ParsedElement>
                 }
             }
 
+            // ── Footnote definitions ──
+            //
+            // The body is ordinary block content, so it is parsed by the
+            // ordinary machinery: flush whatever inline run is open, note where
+            // this definition's blocks start, and let them accumulate. `End`
+            // lifts them back out. Nesting cannot occur — djot has no footnote
+            // inside a footnote — so one mark suffices where the dropped
+            // containers below need a depth counter.
+            E::Start(C::Footnote { label }, _) => {
+                if !current_spans.is_empty() {
+                    djot_push_block(
+                        &mut elements,
+                        std::mem::take(&mut current_spans),
+                        None,
+                        cur_list_style.clone(),
+                        cur_list_indent,
+                        cur_list_prefix.clone(),
+                        cur_list_suffix.clone(),
+                        cur_marker.clone(),
+                        false,
+                        None,
+                        blockquote_depth,
+                        DjotBlockStyle::default(),
+                    );
+                }
+                footnote_open = Some((label.to_string(), elements.len()));
+            }
+            E::End(C::Footnote { .. }) => {
+                if !current_spans.is_empty() {
+                    djot_push_block(
+                        &mut elements,
+                        std::mem::take(&mut current_spans),
+                        None,
+                        cur_list_style.clone(),
+                        cur_list_indent,
+                        cur_list_prefix.clone(),
+                        cur_list_suffix.clone(),
+                        cur_marker.clone(),
+                        false,
+                        None,
+                        blockquote_depth,
+                        DjotBlockStyle::default(),
+                    );
+                }
+                if let Some((label, start)) = footnote_open.take() {
+                    let blocks: Vec<ParsedBlock> = elements
+                        .drain(start..)
+                        .filter_map(|e| match e {
+                            ParsedElement::Block(b) => Some(b),
+                            // A table inside a footnote is not representable as
+                            // note content; its cells would have to become
+                            // blocks and lose their structure either way.
+                            _ => None,
+                        })
+                        .collect();
+                    elements.push(ParsedElement::FootnoteDefinition { label, blocks });
+                }
+            }
+
             // ── Unrepresentable containers: drop the entire subtree ──
             E::Start(
-                C::Footnote { .. }
-                | C::Math { .. }
+                C::Math { .. }
                 | C::RawBlock { .. }
                 | C::RawInline { .. }
                 | C::DescriptionList
@@ -2167,9 +2274,34 @@ pub fn parse_djot(djot: &str, options: &DjotImportOptions) -> Vec<ParsedElement>
                     );
                 }
             }
-            // Symbols, footnote refs, escapes, blanklines, thematic breaks and
-            // dangling block attributes carry no representable content.
-            E::Symbol(_) | E::FootnoteReference(_) => {}
+            // A footnote reference. jotdown emits this purely syntactically —
+            // it never checks that a matching `[^label]:` exists anywhere — so a
+            // reference whose definition lives outside this document (the normal
+            // state for a host that owns note bodies itself) arrives here just
+            // the same, and must survive.
+            E::FootnoteReference(label) => {
+                let sp = ParsedSpan {
+                    text: String::new(),
+                    bold,
+                    italic,
+                    underline,
+                    strikeout,
+                    code,
+                    superscript,
+                    subscript,
+                    link_href: link_href.clone(),
+                    image: None,
+                    footnote_ref: Some(label.to_string()),
+                };
+                if in_table_cell {
+                    current_cell_spans.push(sp);
+                } else {
+                    current_spans.push(sp);
+                }
+            }
+            // Symbols, escapes, blanklines, thematic breaks and dangling block
+            // attributes carry no representable content.
+            E::Symbol(_) => {}
             E::Escape | E::Blankline => {}
             E::ThematicBreak(_) | E::Attributes(_) => {}
 
@@ -2270,6 +2402,9 @@ mod tests {
             .map(|e| match e {
                 ParsedElement::Block(b) => (false, b.blockquote_depth),
                 ParsedElement::Table(t) => (true, t.blockquote_depth),
+                // Definitions carry no blockquote nesting of their own; this
+                // helper exists for the nesting assertions and never sees one.
+                ParsedElement::FootnoteDefinition { .. } => (false, 0),
             })
             .collect()
     }
@@ -2923,6 +3058,37 @@ pub const TABLE_ANCHOR: &str = "\u{FFFC}";
 /// therefore orders a blockquote's prose differently (`"> a0\n\na"` exports as `"a\na0"`
 /// but is *searched* as `"a0\na"`). The authority is what a search sees, because that is
 /// what a replace edits. See `claude_reviews/text-document-plain-text-ordering.md`.
+/// One span's contribution to the addressable text.
+///
+/// An inline object carries no prose but **does** occupy one `U+FFFC` in the
+/// document (`format_runs_from_spans` mirrors it there), so it has to occupy one
+/// here too. Leaving it out makes this string shorter than the document it
+/// claims to be byte-identical to, and every offset past the object — every
+/// search hit, every comment anchor — lands a character early.
+fn span_prose(span: &ParsedSpan, out: &mut String) {
+    if span.image.is_some() || span.footnote_ref.is_some() {
+        out.push('\u{FFFC}');
+        return;
+    }
+    out.push_str(&span.text);
+}
+
+fn block_prose(block: &ParsedBlock) -> String {
+    let mut prose = String::new();
+    for span in &block.spans {
+        span_prose(span, &mut prose);
+    }
+    prose
+}
+
+fn cell_prose(cell: &ParsedTableCell) -> String {
+    let mut prose = String::new();
+    for span in &cell.spans {
+        span_prose(span, &mut prose);
+    }
+    prose
+}
+
 pub fn djot_to_plain_text(djot: &str, options: &DjotImportOptions) -> String {
     // Deliberately NOT `ParsedElement::flatten_to_blocks`: that helper drops a table's
     // anchor and yields only its cells, which would silently shift every offset in a
@@ -2950,11 +3116,18 @@ pub fn djot_to_plain_text(djot: &str, options: &DjotImportOptions) -> String {
     for element in &elements {
         match element {
             ParsedElement::Block(block) => {
-                let mut prose = String::new();
-                for span in &block.spans {
-                    prose.push_str(&span.text);
+                push(&block_prose(block), &mut out, &mut first);
+            }
+            // A definition's blocks are mirrored into the rope in parse order
+            // like any others (`import_djot_uc` appends them), so they are part
+            // of the text the document searches and have to be part of this
+            // string too — that is the whole contract of this function. Omitting
+            // them would put every offset after a definition out by the note's
+            // own length.
+            ParsedElement::FootnoteDefinition { blocks, .. } => {
+                for block in blocks {
+                    push(&block_prose(block), &mut out, &mut first);
                 }
-                push(&prose, &mut out, &mut first);
             }
             ParsedElement::Table(table) => {
                 // The import mirrors a table into the rope as a lone `U+FFFC` sentinel
@@ -2966,11 +3139,7 @@ pub fn djot_to_plain_text(djot: &str, options: &DjotImportOptions) -> String {
                 push(TABLE_ANCHOR, &mut out, &mut first);
                 for row in &table.rows {
                     for cell in row {
-                        let mut prose = String::new();
-                        for span in &cell.spans {
-                            prose.push_str(&span.text);
-                        }
-                        push(&prose, &mut out, &mut first);
+                        push(&cell_prose(cell), &mut out, &mut first);
                     }
                 }
             }

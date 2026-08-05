@@ -76,6 +76,27 @@ pub enum FragmentContent {
         /// `set_word_starts` on the corresponding `Role::TextRun`.
         word_starts: Vec<u8>,
     },
+    /// A footnote reference. The layout engine draws `marker` at this position
+    /// and reserves what those glyphs advance to.
+    ///
+    /// Occupies exactly **one** character of the document however many glyphs
+    /// `marker` shapes to — the same `U+FFFC` an image occupies. The two facts
+    /// are what make the reference atomic to the caret: a layout engine must
+    /// map every glyph of the marker back to this one offset.
+    FootnoteReference {
+        /// Identifies the note. Stable, stored, and never shown.
+        label: String,
+        /// What to draw — a number, usually. **Presentation only**: derived from
+        /// document order, or supplied by the host, and never part of the
+        /// document. Storing it would mean rewriting the author's prose every
+        /// time a note was inserted above this one.
+        marker: String,
+        format: TextFormat,
+        /// Character offset within the block (block-relative).
+        offset: usize,
+        /// Stable synthesized id for the underlying reference anchor.
+        element_id: u64,
+    },
     /// An inline image. The layout engine reserves space for it.
     ///
     /// To retrieve the image pixel data, use the existing

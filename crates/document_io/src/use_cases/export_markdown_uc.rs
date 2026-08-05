@@ -293,7 +293,8 @@ impl ExportMarkdownUseCase {
                 match &elem.content {
                     InlineContent::Text(t) => raw_text.push_str(t),
                     InlineContent::Empty => {}
-                    InlineContent::Image { .. } => {}
+                    // Neither has raw text to contribute to a verbatim block.
+                    InlineContent::Image { .. } | InlineContent::FootnoteRef { .. } => {}
                 }
             }
 
@@ -399,6 +400,13 @@ impl ExportMarkdownUseCase {
         for elem in elements {
             let is_code = elem.fmt_font_family.as_deref() == Some("monospace");
             let text = match &elem.content {
+                // Markdown's own footnote-reference syntax, the same shape djot
+                // uses. Emitted and done — it must not fall through into the
+                // emphasis wrapping below.
+                InlineContent::FootnoteRef { label } => {
+                    inline_md.push_str(&format!("[^{label}]"));
+                    continue;
+                }
                 InlineContent::Text(t) => {
                     if is_code {
                         t.clone()

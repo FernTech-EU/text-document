@@ -272,6 +272,11 @@ impl TextBlock {
                     format,
                     offset: frag_offset,
                     ..
+                }
+                | FragmentContent::FootnoteReference {
+                    format,
+                    offset: frag_offset,
+                    ..
                 } => {
                     if offset == *frag_offset {
                         return Some(format.clone());
@@ -557,7 +562,7 @@ fn build_raw_fragments(
         }
     };
 
-    let (runs, images) = {
+    let (runs, images, notes) = {
         let store = inner.ctx.db_context.get_store();
         let runs: Vec<FormatRun> = store
             .format_runs
@@ -571,14 +576,21 @@ fn build_raw_fragments(
             .get(&block_id)
             .cloned()
             .unwrap_or_default();
-        (runs, images)
+        let notes = store
+            .block_footnote_refs
+            .read()
+            .get(&block_id)
+            .cloned()
+            .unwrap_or_default();
+        (runs, images, notes)
     };
 
-    // One shared weave of runs + image anchors (see
-    // `common::format_runs::merge_runs_and_images`). This used to be a second,
+    // One shared weave of runs + anchors (see
+    // `common::format_runs::merge_runs_and_anchors`). This used to be a second,
     // hand-written copy of that algorithm, and the two disagreed on an image
     // sitting exactly on a run boundary.
-    let pieces = frontend::common::format_runs::merge_runs_and_images(plain, &runs, &images);
+    let anchors = frontend::common::format_runs::block_anchors(&images, &notes);
+    let pieces = frontend::common::format_runs::merge_runs_and_anchors(plain, &runs, &anchors);
 
     let mut fragments = Vec::with_capacity(pieces.len());
     let mut char_offset: usize = 0;
@@ -598,6 +610,20 @@ fn build_raw_fragments(
                     word_starts,
                 });
                 char_offset += length;
+            }
+            frontend::common::format_runs::InlinePiece::FootnoteRef(note) => {
+                fragments.push(FragmentContent::FootnoteReference {
+                    label: note.label.clone(),
+                    // The label stands in until a host supplies real numbering:
+                    // document order is not visible from inside one block.
+                    marker: note.label.clone(),
+                    format: TextFormat::from(&note.format),
+                    offset: char_offset,
+                    element_id: synth_element_id(block_id, note.byte_offset),
+                });
+                // One logical character, like an image — the U+FFFC in the rope
+                // holds its position.
+                char_offset += 1;
             }
             frontend::common::format_runs::InlinePiece::Image(img) => {
                 fragments.push(FragmentContent::Image {

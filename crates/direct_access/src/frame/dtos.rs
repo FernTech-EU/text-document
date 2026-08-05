@@ -51,6 +51,7 @@ impl From<FrameDto> for Frame {
             fmt_semantic_role: dto.fmt_semantic_role.clone(),
             table: dto.table,
             byte_range: (0, 0),
+            footnote_label: None,
         }
     }
 }
@@ -77,6 +78,7 @@ impl From<&FrameDto> for Frame {
             fmt_semantic_role: dto.fmt_semantic_role.clone(),
             table: dto.table,
             byte_range: (0, 0),
+            footnote_label: None,
         }
     }
 }
@@ -149,6 +151,7 @@ impl From<CreateFrameDto> for Frame {
             fmt_semantic_role: dto.fmt_semantic_role.clone(),
             table: dto.table,
             byte_range: (0, 0),
+            footnote_label: None,
         }
     }
 }
@@ -175,6 +178,7 @@ impl From<&CreateFrameDto> for Frame {
             fmt_semantic_role: dto.fmt_semantic_role.clone(),
             table: dto.table,
             byte_range: (0, 0),
+            footnote_label: None,
         }
     }
 }
@@ -244,6 +248,7 @@ impl From<UpdateFrameDto> for Frame {
             blocks: Default::default(),
             table: Default::default(),
             byte_range: Default::default(),
+            footnote_label: None,
         }
     }
 }
@@ -270,6 +275,7 @@ impl From<&UpdateFrameDto> for Frame {
             blocks: Default::default(),
             table: Default::default(),
             byte_range: Default::default(),
+            footnote_label: None,
         }
     }
 }

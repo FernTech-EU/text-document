@@ -5,7 +5,9 @@
 //! tests.
 
 use crate::database::Store;
-use crate::format_runs::{FormatRun, ImageAnchor, InlineSegment, inline_segments_view};
+use crate::format_runs::{
+    FootnoteRefAnchor, FormatRun, ImageAnchor, InlineSegment, inline_segments_view,
+};
 use crate::types::EntityId;
 
 /// Fetch the format runs for a block. Returns an empty Vec if the block
@@ -13,6 +15,16 @@ use crate::types::EntityId;
 pub fn get_format_runs(store: &Store, block_id: EntityId) -> Vec<FormatRun> {
     store
         .format_runs
+        .read()
+        .get(&block_id)
+        .cloned()
+        .unwrap_or_default()
+}
+
+/// Fetch the footnote references anchored in a block.
+pub fn get_block_footnote_refs(store: &Store, block_id: EntityId) -> Vec<FootnoteRefAnchor> {
+    store
+        .block_footnote_refs
         .read()
         .get(&block_id)
         .cloned()
@@ -43,5 +55,6 @@ pub fn inline_segments_for_block(
 ) -> Vec<InlineSegment> {
     let runs = get_format_runs(store, block_id);
     let images = get_block_images(store, block_id);
-    inline_segments_view(block_plain_text, &runs, &images)
+    let notes = get_block_footnote_refs(store, block_id);
+    inline_segments_view(block_plain_text, &runs, &images, &notes)
 }

@@ -9,7 +9,7 @@
 
 use crate::database::block_offset_index::BlockOffsetIndex;
 use crate::entities::*;
-use crate::format_runs::{FormatRun, ImageAnchor};
+use crate::format_runs::{FootnoteRefAnchor, FormatRun, ImageAnchor};
 use crate::snapshot::{StoreSnapshot, StoreSnapshotTrait};
 use crate::types::EntityId;
 use im::HashMap;
@@ -39,6 +39,13 @@ pub struct RopeStore {
     // ── Per-block character formatting + image anchors ────────────────
     pub format_runs: RwLock<HashMap<EntityId, Vec<FormatRun>>>,
     pub block_images: RwLock<HashMap<EntityId, Vec<ImageAnchor>>>,
+    /// Footnote references anchored in each block, byte-ordered.
+    ///
+    /// Beside `block_images` rather than merged with it: the two are written by
+    /// different editing paths and read together only through
+    /// `format_runs::block_anchors`, which is the one place their interleaving is
+    /// decided.
+    pub block_footnote_refs: RwLock<HashMap<EntityId, Vec<FootnoteRefAnchor>>>,
 
     // ── Document-wide block ordering (sorted by rope position) ────────
     pub block_offsets: RwLock<BlockOffsetIndex>,
@@ -73,6 +80,7 @@ impl RopeStore {
             table_cells: self.table_cells.read().clone(),
             format_runs: self.format_runs.read().clone(),
             block_images: self.block_images.read().clone(),
+            block_footnote_refs: self.block_footnote_refs.read().clone(),
             block_offsets: self.block_offsets.read().clone(),
             counters: self.counters.read().clone(),
         }
@@ -92,6 +100,7 @@ impl RopeStore {
         *self.table_cells.write() = snap.table_cells.clone();
         *self.format_runs.write() = snap.format_runs.clone();
         *self.block_images.write() = snap.block_images.clone();
+        *self.block_footnote_refs.write() = snap.block_footnote_refs.clone();
         *self.block_offsets.write() = snap.block_offsets.clone();
         *self.counters.write() = snap.counters.clone();
     }
@@ -110,6 +119,7 @@ impl RopeStore {
         *self.table_cells.write() = snap.table_cells.clone();
         *self.format_runs.write() = snap.format_runs.clone();
         *self.block_images.write() = snap.block_images.clone();
+        *self.block_footnote_refs.write() = snap.block_footnote_refs.clone();
         *self.block_offsets.write() = snap.block_offsets.clone();
         // counters intentionally not restored
     }
@@ -180,6 +190,7 @@ pub struct RopeStoreSnapshot {
     pub(crate) table_cells: HashMap<EntityId, TableCell>,
     pub(crate) format_runs: HashMap<EntityId, Vec<FormatRun>>,
     pub(crate) block_images: HashMap<EntityId, Vec<ImageAnchor>>,
+    pub(crate) block_footnote_refs: HashMap<EntityId, Vec<FootnoteRefAnchor>>,
     pub(crate) block_offsets: BlockOffsetIndex,
     pub(crate) counters: StdHashMap<String, EntityId>,
 }

@@ -1035,6 +1035,12 @@ fn build_run(elem: &InlineSegment, images: &ExportImages) -> Option<docx_rs::Run
 
     let text = match &elem.content {
         InlineContent::Text(t) => t.clone(),
+        // A footnote reference. The marker shown is the label until the
+        // definition pass lands: numbering is a fact about document order,
+        // which a per-block renderer cannot see. Unreachable today — nothing
+        // can author a reference yet — and replaced when definitions are
+        // rendered.
+        InlineContent::FootnoteRef { label } => label.clone(),
         InlineContent::Image {
             name,
             alt,

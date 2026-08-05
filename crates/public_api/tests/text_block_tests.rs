@@ -382,7 +382,9 @@ fn fragments_offsets_are_sequential() {
                 assert_eq!(*offset, expected_offset);
                 expected_offset += length;
             }
-            FragmentContent::Image { offset, .. } => {
+            // Both objects cost exactly one character.
+            FragmentContent::Image { offset, .. }
+            | FragmentContent::FootnoteReference { offset, .. } => {
                 assert_eq!(*offset, expected_offset);
                 expected_offset += 1;
             }

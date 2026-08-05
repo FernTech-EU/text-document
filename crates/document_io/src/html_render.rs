@@ -217,6 +217,21 @@ pub fn render_inline_html(store: &Store, block: &Block, images: HtmlImagePolicy<
     for elem in &elements {
         let text = match &elem.content {
             InlineContent::Text(t) => escape_html(t),
+            // A footnote reference. The marker shown is the label until the
+            // definition pass lands: numbering is a fact about document order,
+            // which a per-block renderer cannot see. Unreachable today — nothing
+            // can author a reference yet — and replaced when definitions are
+            // rendered.
+            InlineContent::FootnoteRef { label } => {
+                let id = escape_html(label);
+                // Both the `epub:type` and the DPUB-ARIA role: `epub:type`
+                // alone reaches no assistive technology, the same pairing the
+                // epigraph work settled on.
+                html.push_str(&format!(
+                    "<a epub:type=\"noteref\" role=\"doc-noteref\" href=\"#fn-{id}\"><sup>{id}</sup></a>"
+                ));
+                continue;
+            }
             InlineContent::Image {
                 name,
                 alt,

@@ -129,7 +129,33 @@ impl ExportDjotUseCase {
                     if !output_parts.is_empty() {
                         output_parts.push("\n\n".to_string());
                     }
-                    output_parts.push(frame_text);
+                    // A footnote definition frame is body content that has to
+                    // announce whose body it is. Without the `[^label]:` prefix
+                    // the note re-parses as an ordinary paragraph sitting where
+                    // the definition was typed — the body survives, the fact
+                    // that it *is* a note does not.
+                    //
+                    // Continuation lines are indented, which is how djot marks a
+                    // multi-block note body as belonging to the definition
+                    // rather than ending it.
+                    if let Some(ref label) = f.footnote_label {
+                        let mut lines = frame_text.lines();
+                        let mut out = String::new();
+                        if let Some(first) = lines.next() {
+                            out.push_str(&format!("[^{label}]: {first}"));
+                        }
+                        for line in lines {
+                            out.push('\n');
+                            if line.is_empty() {
+                                continue;
+                            }
+                            out.push_str("    ");
+                            out.push_str(line);
+                        }
+                        output_parts.push(out);
+                    } else {
+                        output_parts.push(frame_text);
+                    }
                 }
             }
         }
@@ -308,7 +334,9 @@ impl ExportDjotUseCase {
                 match &elem.content {
                     InlineContent::Text(t) => raw_text.push_str(t),
                     InlineContent::Empty => {}
-                    InlineContent::Image { .. } => {}
+                    // Neither an image nor a footnote reference has raw text to
+                    // contribute to a verbatim code block.
+                    InlineContent::Image { .. } | InlineContent::FootnoteRef { .. } => {}
                 }
             }
 
@@ -485,6 +513,22 @@ impl ExportDjotUseCase {
                         out.push_str(&format!("{{width={width} height={height}}}"));
                     }
                     ("", out, "")
+                }
+                // A footnote reference is written and **done** — it does not
+                // fall through into the mark-wrapping cascade below the way an
+                // image deliberately does (an image can be linked; a reference
+                // cannot).
+                //
+                // Falling through would be the superscript-link bug wearing a
+                // new hat. A reference normally carries
+                // `vertical_alignment: SuperScript`, because that is what draws
+                // the marker in the editor — so the cascade would wrap it as
+                // `^[^label]^`, marking up syntax that every djot reader
+                // already renders raised, and handing the re-parse a
+                // superscript containing a footnote instead of a footnote.
+                InlineContent::FootnoteRef { label } => {
+                    inline.push_str(&format!("[^{label}]"));
+                    continue;
                 }
                 InlineContent::Empty => continue,
             };

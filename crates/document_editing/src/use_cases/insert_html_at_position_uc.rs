@@ -173,6 +173,7 @@ fn execute_content_insert(
             plain_text: inserted_plain,
             runs: inserted_runs_at_zero,
             images: inserted_images,
+            footnote_refs: _,
         } = parsed_block_payload(parsed);
         let inserted_len = inserted_plain.chars().count() as i64;
 
@@ -258,6 +259,7 @@ fn execute_content_insert(
             plain_text: first_plain,
             runs: first_runs_at_zero,
             images: first_images,
+            footnote_refs: _,
         } = parsed_block_payload(first_parsed);
         let first_len = first_plain.chars().count() as i64;
 
@@ -393,6 +395,7 @@ fn execute_content_insert(
                 plain_text: block_plain,
                 runs: block_runs,
                 images: block_images,
+                footnote_refs: _,
             } = parsed_block_payload(parsed);
             let block_text_len = block_plain.chars().count() as i64;
 
@@ -466,6 +469,7 @@ fn execute_content_insert(
             plain_text: last_plain,
             runs: last_runs_at_zero,
             images: last_images,
+            footnote_refs: _,
         } = parsed_block_payload(last_parsed);
         let last_len = last_plain.chars().count() as i64;
 
@@ -682,6 +686,7 @@ fn execute_content_insert(
             plain_text: block_plain,
             runs: block_runs,
             images: block_images,
+            footnote_refs: _,
         } = parsed_block_payload(parsed);
         let block_text_len = block_plain.chars().count() as i64;
 

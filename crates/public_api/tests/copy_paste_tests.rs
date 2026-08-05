@@ -881,6 +881,11 @@ fn fingerprint_block(snap: &BlockSnapshot) -> ElementFingerprint {
                 frag_bolds.push(format.font_bold);
                 frag_italics.push(format.font_italic);
             }
+            text_document::FragmentContent::FootnoteReference { label, .. } => {
+                frag_texts.push(format!("[fn:{}]", label));
+                frag_bolds.push(None);
+                frag_italics.push(None);
+            }
             text_document::FragmentContent::Image { name, .. } => {
                 frag_texts.push(format!("[img:{}]", name));
                 frag_bolds.push(None);

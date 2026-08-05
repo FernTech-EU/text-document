@@ -196,6 +196,10 @@ fn import_parsed_elements(
         }
 
         match parsed_element {
+            // Neither importer's parser emits a definition yet — the HTML and
+            // Markdown footnote syntaxes are a separate pass. Dropping it here
+            // is therefore unreachable today, and stated rather than assumed.
+            ParsedElement::FootnoteDefinition { .. } => {}
             ParsedElement::Block(parsed_block) => {
                 transition_bq_depth(
                     uow,
@@ -210,6 +214,7 @@ fn import_parsed_elements(
                     plain_text,
                     runs: format_runs,
                     images: block_images,
+                    footnote_refs: block_footnote_refs,
                 } = format_runs_from_spans(&parsed_block.spans, parsed_block.is_code_block);
                 let line_len = plain_text.chars().count() as i64;
 
@@ -356,6 +361,7 @@ fn import_parsed_elements(
                             plain_text,
                             runs: format_runs,
                             images: block_images,
+                            footnote_refs: block_footnote_refs,
                         } = format_runs_from_spans(&cell.spans, false);
 
                         // Create block in cell frame

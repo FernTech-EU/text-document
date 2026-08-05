@@ -369,6 +369,7 @@ fn execute_insert_table(
         fmt_semantic_role: None,
         table: Some(created_table.id),
         byte_range: (0, 0),
+        footnote_label: None,
     };
     let created_anchor = uow.create_frame(&anchor_frame, doc_id, -1)?;
 

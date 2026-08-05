@@ -501,7 +501,7 @@ fn extract_elements_in_range(
     for elem in elements {
         let elem_char_len = match &elem.content {
             InlineContent::Text(s) => s.chars().count(),
-            InlineContent::Image { .. } => 1,
+            InlineContent::Image { .. } | InlineContent::FootnoteRef { .. } => 1,
             InlineContent::Empty => 0,
         };
 
@@ -537,8 +537,11 @@ fn extract_elements_in_range(
                     result_text.push_str(&slice);
                 }
             }
-            InlineContent::Image { .. } => {
-                // Image is 1 char, include if in range
+            // Both objects are 1 char, included only whole. The sentinel goes
+            // into the fragment's own plain text here, which is the half
+            // `insert_fragment_uc` reads back — the two must agree about what
+            // the object costs or a paste shifts every position after it.
+            InlineContent::Image { .. } | InlineContent::FootnoteRef { .. } => {
                 if take_start == 0 && take_end == 1 {
                     result_elements.push(FragmentElement::from_segment(elem));
                     result_text.push('\u{FFFC}');

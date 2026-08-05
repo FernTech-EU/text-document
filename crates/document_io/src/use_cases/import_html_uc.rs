@@ -211,7 +211,11 @@ impl LongOperation for ImportHtmlUseCase {
             }
 
             match parsed_element {
-                ParsedElement::Block(parsed_block) => {
+                // Neither importer's parser emits a definition yet — the HTML and
+            // Markdown footnote syntaxes are a separate pass. Dropping it here
+            // is therefore unreachable today, and stated rather than assumed.
+            ParsedElement::FootnoteDefinition { .. } => {}
+            ParsedElement::Block(parsed_block) => {
                     transition_bq_depth(
                         &mut uow,
                         doc_id,
@@ -225,6 +229,7 @@ impl LongOperation for ImportHtmlUseCase {
                         plain_text,
                         runs: format_runs,
                         images: block_images,
+                        footnote_refs: block_footnote_refs,
                     } = format_runs_from_spans(&parsed_block.spans, parsed_block.is_code_block);
                     let line_len = plain_text.chars().count() as i64;
 
@@ -376,6 +381,7 @@ impl LongOperation for ImportHtmlUseCase {
                                 plain_text,
                                 runs: format_runs,
                                 images: block_images,
+                                footnote_refs: block_footnote_refs,
                             } = format_runs_from_spans(&cell.spans, false);
 
                             let block = Block {

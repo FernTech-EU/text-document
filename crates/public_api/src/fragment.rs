@@ -433,6 +433,15 @@ fn push_inline_html(out: &mut String, elements: &[FragmentElement]) {
     for elem in elements {
         let text = match &elem.content {
             InlineContent::Text(t) => escape_html(t),
+            // A reference carried onto the clipboard keeps its marker; the note
+            // body is not part of the fragment.
+            InlineContent::FootnoteRef { label } => {
+                let id = escape_html(label);
+                out.push_str(&format!(
+                    "<a epub:type=\"noteref\" role=\"doc-noteref\" href=\"#fn-{id}\"><sup>{id}</sup></a>"
+                ));
+                continue;
+            }
             InlineContent::Image {
                 name,
                 alt,
@@ -567,6 +576,7 @@ fn render_inline_markdown(elements: &[FragmentElement]) -> String {
             // `name` was used as both alt and source, so a pasted image
             // described itself with its filename.
             InlineContent::Image { name, alt, .. } => format!("![{alt}]({name})"),
+            InlineContent::FootnoteRef { label } => format!("[^{label}]"),
             InlineContent::Empty => String::new(),
         };
 
@@ -729,6 +739,11 @@ fn parsed_elements_to_fragment(parsed: Vec<ParsedElement>) -> DocumentFragment {
 
     for elem in parsed {
         match elem {
+            // A clipboard fragment carries prose, not note bodies: a definition
+            // has no position in the flow being copied, and pasting one would
+            // splice a note's text into the middle of a sentence. The reference
+            // travels; the body stays where it is defined.
+            ParsedElement::FootnoteDefinition { .. } => {}
             ParsedElement::Block(pb) => {
                 let elements: Vec<FragmentElement> =
                     pb.spans.iter().map(span_to_fragment_element).collect();

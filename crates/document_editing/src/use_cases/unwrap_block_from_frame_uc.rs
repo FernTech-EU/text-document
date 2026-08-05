@@ -141,6 +141,7 @@ fn execute_unwrap_block_from_frame(
             fmt_semantic_role: owner.fmt_semantic_role.clone(),
             table: None,
             byte_range: (0, 0),
+            footnote_label: None,
         };
         let created = uow.create_frame(&template, doc_id, -1)?;
         let mut updated = created.clone();
