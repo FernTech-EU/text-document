@@ -77,7 +77,12 @@ impl HtmlImagePolicy<'_> {
 /// blocks, headings, and plain paragraphs. Mirrors the dispatch order used
 /// by the DOCX/djot exporters: code block, then list membership, then
 /// heading/paragraph.
-pub fn render_blocks_html(store: &Store, blocks: &[Block], images: HtmlImagePolicy<'_>) -> String {
+pub fn render_blocks_html(
+    store: &Store,
+    blocks: &[Block],
+    images: HtmlImagePolicy<'_>,
+    notes: &crate::footnotes::Footnotes,
+) -> String {
     let mut parts: Vec<String> = Vec::new();
     let mut i = 0;
 
@@ -128,7 +133,7 @@ pub fn render_blocks_html(store: &Store, blocks: &[Block], images: HtmlImagePoli
                     .is_some_and(|list_id| store.lists.read().contains_key(&list_id));
 
                 if b_is_listed {
-                    let inline_html = render_inline_html(store, b, images);
+                    let inline_html = render_inline_html(store, b, images, notes);
                     list_items.push(format!("<li>{}</li>", inline_html));
                     i += 1;
                 } else {
@@ -144,7 +149,7 @@ pub fn render_blocks_html(store: &Store, blocks: &[Block], images: HtmlImagePoli
             ));
         } else {
             // --- Normal block (paragraph / heading) ---
-            let inline_html = render_inline_html(store, block, images);
+            let inline_html = render_inline_html(store, block, images, notes);
 
             let mut styles: Vec<String> = Vec::new();
             match block.fmt_alignment {
@@ -208,7 +213,18 @@ pub fn render_blocks_html(store: &Store, blocks: &[Block], images: HtmlImagePoli
 
 /// Render one block's inline content (text runs + images) as HTML, applying
 /// character formatting (monospace/bold/italic/underline/strike/hyperlink).
-pub fn render_inline_html(store: &Store, block: &Block, images: HtmlImagePolicy<'_>) -> String {
+/// Render one block's inline content.
+///
+/// Takes the document's resolved footnotes rather than defaulting them: a
+/// reference has to print its number, and a convenience overload that quietly
+/// passed none would render every marker as a raw label with nothing to say it
+/// was wrong.
+pub fn render_inline_html(
+    store: &Store,
+    block: &Block,
+    images: HtmlImagePolicy<'_>,
+    notes: &crate::footnotes::Footnotes,
+) -> String {
     let block_text = block_content_via_store(block, store);
     let elements = inline_segments_for_block(store, block.id, &block_text);
 
@@ -217,18 +233,19 @@ pub fn render_inline_html(store: &Store, block: &Block, images: HtmlImagePolicy<
     for elem in &elements {
         let text = match &elem.content {
             InlineContent::Text(t) => escape_html(t),
-            // A footnote reference. The marker shown is the label until the
-            // definition pass lands: numbering is a fact about document order,
-            // which a per-block renderer cannot see. Unreachable today — nothing
-            // can author a reference yet — and replaced when definitions are
-            // rendered.
+            // A footnote reference.
+            //
+            // Both the `epub:type` and the DPUB-ARIA role: `epub:type` alone
+            // reaches no assistive technology, the same pairing the epigraph
+            // work settled on. Reading systems render this pair as a pop-up,
+            // which is a reflowable book's own idiom for a footnote — there is
+            // no page bottom to put one at.
             InlineContent::FootnoteRef { label } => {
                 let id = escape_html(label);
-                // Both the `epub:type` and the DPUB-ARIA role: `epub:type`
-                // alone reaches no assistive technology, the same pairing the
-                // epigraph work settled on.
+                let marker = escape_html(&notes.marker(label));
                 html.push_str(&format!(
-                    "<a epub:type=\"noteref\" role=\"doc-noteref\" href=\"#fn-{id}\"><sup>{id}</sup></a>"
+                    "<a epub:type=\"noteref\" role=\"doc-noteref\" href=\"#fn-{id}\" \
+                     id=\"fnref-{id}\"><sup>{marker}</sup></a>"
                 ));
                 continue;
             }
@@ -329,6 +346,7 @@ pub fn render_table_html(
     store: &Store,
     table_id: EntityId,
     images: HtmlImagePolicy<'_>,
+    notes: &crate::footnotes::Footnotes,
 ) -> Result<String> {
     let table = store
         .tables
@@ -392,7 +410,7 @@ pub fn render_table_html(
 
                     let mut cell_parts: Vec<String> = Vec::new();
                     for block in &blocks {
-                        let inline_html = render_inline_html(store, block, images);
+                        let inline_html = render_inline_html(store, block, images, notes);
                         if !inline_html.is_empty() {
                             cell_parts.push(inline_html);
                         }

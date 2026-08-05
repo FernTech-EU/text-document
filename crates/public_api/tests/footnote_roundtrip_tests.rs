@@ -143,3 +143,78 @@ fn a_paragraph_that_looks_like_a_definition_stays_prose() {
         "the prose was consumed as a definition body: {once:?}"
     );
 }
+
+/// HTML renders the reading-system idiom: a `noteref` marker linked to a
+/// `doc-footnote` aside, numbered in reading order.
+///
+/// A reflowable book has no page bottom, so this pair *is* the footnote — it is
+/// what Apple Books and others turn into a pop-up. Both the `epub:type` and the
+/// DPUB-ARIA role, because `epub:type` alone reaches no assistive technology.
+#[test]
+fn html_renders_a_noteref_and_its_aside() {
+    let doc = doc_from("Prose[^n1] here.\n\n[^n1]: The note body.\n");
+    let html = doc.to_html().expect("html");
+
+    assert!(
+        html.contains(r#"role="doc-noteref""#),
+        "no noteref marker: {html}"
+    );
+    assert!(
+        html.contains(r#"epub:type="footnote""#) && html.contains(r#"role="doc-footnote""#),
+        "no footnote aside: {html}"
+    );
+    assert!(
+        html.contains("The note body"),
+        "the note's body never rendered: {html}"
+    );
+    // The marker is the derived number, not the stored label.
+    assert!(
+        html.contains("<sup>1</sup>"),
+        "the marker should be the number 1, not the label: {html}"
+    );
+    assert!(
+        !html.contains("<sup>n1</sup>"),
+        "the raw label leaked into the marker: {html}"
+    );
+}
+
+/// Numbering follows the order references are *read*, not the order notes were
+/// written. A writer who collects their definitions at the bottom of the file
+/// still gets 1, 2, 3 down the page.
+#[test]
+fn notes_are_numbered_in_reading_order_not_definition_order() {
+    let doc = doc_from(
+        "First[^b] then second[^a].\n\n[^a]: Defined first.\n\n[^b]: Defined second.\n",
+    );
+    let html = doc.to_html().expect("html");
+
+    let first_marker = html.find("<sup>1</sup>").expect("a first marker");
+    let second_marker = html.find("<sup>2</sup>").expect("a second marker");
+    assert!(
+        first_marker < second_marker,
+        "markers are out of order: {html}"
+    );
+    // `b` is referenced first, so it is note 1 even though `a` is defined first.
+    let b_ref = html.find("fn-b").expect("a reference to b");
+    let a_ref = html.find("fn-a").expect("a reference to a");
+    assert!(
+        b_ref < a_ref,
+        "the note referenced first must be numbered first: {html}"
+    );
+}
+
+/// A note's body must not also appear as ordinary prose.
+///
+/// Definitions are top-level frames, and every exporter's outer loop walks all
+/// of them — so without a skip-set the body renders twice: once inline where the
+/// definition was typed, and once as the note.
+#[test]
+fn a_note_body_is_not_also_rendered_as_prose() {
+    let doc = doc_from("Prose[^n] here.\n\n[^n]: UNIQUEBODYTEXT.\n");
+    let html = doc.to_html().expect("html");
+    assert_eq!(
+        html.matches("UNIQUEBODYTEXT").count(),
+        1,
+        "the note body was rendered more than once: {html}"
+    );
+}

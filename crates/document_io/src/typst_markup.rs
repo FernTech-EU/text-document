@@ -487,6 +487,18 @@ pub fn render_inline_typst(
         let is_monospace = elem.fmt_font_family.as_deref() == Some("monospace");
 
         let text = match &elem.content {
+            // A footnote reference. The marker is raised and emitted whole — it
+            // must not fall through the emphasis wrapping below, which would
+            // mark up something Typst already sets superscript.
+            //
+            // Typst's own `#footnote[…]` takes the body at the reference site,
+            // so it is reachable only once the definition walk supplies one;
+            // until then this is the marker alone, which is the correct
+            // rendering of a reference whose note lives elsewhere.
+            InlineContent::FootnoteRef { label } => {
+                out.push_str(&format!("#super[{}]", escape_typst(label)));
+                continue;
+            }
             InlineContent::Text(t) => {
                 if is_monospace {
                     format!("#raw(\"{}\")", escape_typst_string(t))

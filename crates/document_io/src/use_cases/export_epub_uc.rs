@@ -214,6 +214,8 @@ impl ExportEpubUseCase {
         let image_hrefs = image_packaging_map(&self.dto.options.images);
         let image_policy = html_render::HtmlImagePolicy::Rewrite(&image_hrefs);
 
+        let notes = crate::footnotes::Footnotes::build(&uow.store());
+
         let mut units: Vec<RenderUnit> = Vec::new();
 
         let total_frames = frame_ids.len().max(1);
@@ -232,7 +234,14 @@ impl ExportEpubUseCase {
                 continue;
             }
 
-            self.render_frame_units(uow, frame_id, &cell_frame_ids, image_policy, &mut units)?;
+            self.render_frame_units(
+                uow,
+                frame_id,
+                &cell_frame_ids,
+                &notes,
+                image_policy,
+                &mut units,
+            )?;
 
             let pct = 10.0 + (frame_idx as f32 / total_frames as f32) * 60.0;
             progress_callback(OperationProgress::new(
@@ -261,6 +270,7 @@ impl ExportEpubUseCase {
         uow: &dyn ExportEpubUnitOfWorkTrait,
         frame_id: &EntityId,
         cell_frame_ids: &HashSet<EntityId>,
+        notes: &crate::footnotes::Footnotes,
         image_policy: html_render::HtmlImagePolicy<'_>,
         out: &mut Vec<RenderUnit>,
     ) -> Result<()> {
@@ -271,7 +281,7 @@ impl ExportEpubUseCase {
         // Table anchor frame — render the table instead of blocks. A table is always one
         // opaque unit: it never opens a new chapter.
         if let Some(table_id) = frame.table {
-            let html = html_render::render_table_html(&uow.store(), table_id, image_policy)?;
+            let html = html_render::render_table_html(&uow.store(), table_id, image_policy, &notes)?;
             if !html.is_empty() {
                 out.push(RenderUnit::content(html));
             }
@@ -284,6 +294,7 @@ impl ExportEpubUseCase {
                 uow,
                 &frame,
                 cell_frame_ids,
+                notes,
                 image_policy,
                 out,
             );
@@ -303,7 +314,7 @@ impl ExportEpubUseCase {
         let mut blocks: Vec<Block> = blocks_opt.into_iter().flatten().collect();
         blocks.sort_by_key(|b| b.document_position);
 
-        push_block_run_units(&uow.store(), &blocks, image_policy, out);
+        push_block_run_units(&uow.store(), &blocks, image_policy, notes, out);
         Ok(())
     }
 
@@ -314,6 +325,7 @@ impl ExportEpubUseCase {
         uow: &dyn ExportEpubUnitOfWorkTrait,
         frame: &Frame,
         cell_frame_ids: &HashSet<EntityId>,
+        notes: &crate::footnotes::Footnotes,
         image_policy: html_render::HtmlImagePolicy<'_>,
         out: &mut Vec<RenderUnit>,
     ) -> Result<()> {
@@ -331,7 +343,7 @@ impl ExportEpubUseCase {
                 // Negative: negated sub-frame ID
                 // First, flush any accumulated blocks
                 if !pending_blocks.is_empty() {
-                    push_block_run_units(&uow.store(), &pending_blocks, image_policy, out);
+                    push_block_run_units(&uow.store(), &pending_blocks, image_policy, notes, out);
                     pending_blocks.clear();
                 }
 
@@ -353,6 +365,7 @@ impl ExportEpubUseCase {
                             uow,
                             &sub_frame_id,
                             cell_frame_ids,
+                            notes,
                             image_policy,
                             &mut inner,
                         )?;
@@ -380,6 +393,7 @@ impl ExportEpubUseCase {
                             uow,
                             &sub_frame_id,
                             cell_frame_ids,
+                            notes,
                             image_policy,
                             out,
                         )?;
@@ -390,7 +404,7 @@ impl ExportEpubUseCase {
 
         // Flush remaining blocks
         if !pending_blocks.is_empty() {
-            push_block_run_units(&uow.store(), &pending_blocks, image_policy, out);
+            push_block_run_units(&uow.store(), &pending_blocks, image_policy, notes, out);
         }
 
         Ok(())
@@ -455,6 +469,7 @@ fn push_block_run_units(
     store: &Store,
     blocks: &[Block],
     image_policy: html_render::HtmlImagePolicy<'_>,
+    notes: &crate::footnotes::Footnotes,
     out: &mut Vec<RenderUnit>,
 ) {
     let mut i = 0;
@@ -464,6 +479,7 @@ fn push_block_run_units(
                 store,
                 std::slice::from_ref(&blocks[i]),
                 image_policy,
+                notes,
             );
             let text = html_render::block_plain_text(store, &blocks[i]);
             out.push(RenderUnit {
@@ -479,7 +495,7 @@ fn push_block_run_units(
         while i < blocks.len() && heading_level_for_split(store, &blocks[i]).is_none() {
             i += 1;
         }
-        let html = html_render::render_blocks_html(store, &blocks[start..i], image_policy);
+        let html = html_render::render_blocks_html(store, &blocks[start..i], image_policy, notes);
         if !html.is_empty() {
             out.push(RenderUnit::content(html));
         }

@@ -97,11 +97,20 @@ impl ExportHtmlUseCase {
             }
         }
 
+        let notes = crate::footnotes::Footnotes::build(&uow.store());
+
         let mut body_parts: Vec<String> = Vec::new();
 
         for frame_id in &frame_ids {
             // Skip cell frames — they're rendered as part of their table
             if cell_frame_ids.contains(frame_id) {
+                continue;
+            }
+            // Skip note bodies. They are top-level frames, so this outer walk
+            // would otherwise render each one as ordinary prose, in the middle
+            // of the chapter, wherever its definition was typed. They come back
+            // below as `<aside>`s.
+            if notes.is_definition(*frame_id) {
                 continue;
             }
             // Skip sub-frames (parent_frame != None) — recursively rendered
@@ -113,10 +122,22 @@ impl ExportHtmlUseCase {
                 continue;
             }
 
-            let frame_html = self.render_frame_html(&*uow, frame_id, &cell_frame_ids)?;
+            let frame_html = self.render_frame_html(&*uow, frame_id, &cell_frame_ids, &notes)?;
             if !frame_html.is_empty() {
                 body_parts.push(frame_html);
             }
+        }
+
+        // The notes themselves, after the prose. `doc-footnote` on an `<aside>`
+        // is what a reading system turns into a pop-up; the back-link is what
+        // lets a reader who followed the marker get back to the sentence.
+        for (number, label, frame_id) in notes.in_print_order() {
+            let body = self.render_frame_html(&*uow, &frame_id, &cell_frame_ids, &notes)?;
+            let id = crate::html_render::escape_html(&label);
+            body_parts.push(format!(
+                "<aside epub:type=\"footnote\" role=\"doc-footnote\" id=\"fn-{id}\">\
+                 <a href=\"#fnref-{id}\" role=\"doc-backlink\">{number}</a>. {body}</aside>"
+            ));
         }
 
         uow.end_transaction()?;
@@ -137,6 +158,7 @@ impl ExportHtmlUseCase {
         uow: &dyn ExportHtmlUnitOfWorkTrait,
         frame_id: &EntityId,
         cell_frame_ids: &HashSet<EntityId>,
+        notes: &crate::footnotes::Footnotes,
     ) -> Result<String> {
         let image_policy = self.image_policy();
         let frame = uow
@@ -145,12 +167,12 @@ impl ExportHtmlUseCase {
 
         // Table anchor frame — render the table instead of blocks
         if let Some(table_id) = frame.table {
-            return html_render::render_table_html(&uow.store(), table_id, image_policy);
+            return html_render::render_table_html(&uow.store(), table_id, image_policy, &notes);
         }
 
         // If child_order is populated, use it to interleave blocks and sub-frames
         if !frame.child_order.is_empty() {
-            return self.render_frame_by_child_order(uow, &frame, cell_frame_ids);
+            return self.render_frame_by_child_order(uow, &frame, cell_frame_ids, notes);
         }
 
         // Fallback: render all blocks in document_position order (original behaviour)
@@ -171,6 +193,7 @@ impl ExportHtmlUseCase {
             &uow.store(),
             &blocks,
             image_policy,
+            &notes,
         ))
     }
 
@@ -181,6 +204,7 @@ impl ExportHtmlUseCase {
         uow: &dyn ExportHtmlUnitOfWorkTrait,
         frame: &Frame,
         cell_frame_ids: &HashSet<EntityId>,
+        notes: &crate::footnotes::Footnotes,
     ) -> Result<String> {
         let image_policy = self.image_policy();
         let mut parts: Vec<String> = Vec::new();
@@ -202,6 +226,7 @@ impl ExportHtmlUseCase {
                         &uow.store(),
                         &pending_blocks,
                         image_policy,
+            &notes,
                     );
                     if !html.is_empty() {
                         parts.push(html);
@@ -220,7 +245,7 @@ impl ExportHtmlUseCase {
                 if let Some(ref sf) = sub_frame {
                     if sf.fmt_is_blockquote == Some(true) {
                         // Recursively render the blockquote frame content
-                        let inner = self.render_frame_html(uow, &sub_frame_id, cell_frame_ids)?;
+                        let inner = self.render_frame_html(uow, &sub_frame_id, cell_frame_ids, notes)?;
                         if !inner.is_empty() {
                             // A blockquote standing in for something a format can name
                             // gets said so. `epub:type` is the EPUB Structural Semantics
@@ -237,7 +262,7 @@ impl ExportHtmlUseCase {
                         }
                     } else {
                         // Non-blockquote sub-frame: render normally
-                        let inner = self.render_frame_html(uow, &sub_frame_id, cell_frame_ids)?;
+                        let inner = self.render_frame_html(uow, &sub_frame_id, cell_frame_ids, notes)?;
                         if !inner.is_empty() {
                             parts.push(inner);
                         }
@@ -248,7 +273,8 @@ impl ExportHtmlUseCase {
 
         // Flush remaining blocks
         if !pending_blocks.is_empty() {
-            let html = html_render::render_blocks_html(&uow.store(), &pending_blocks, image_policy);
+            let html = html_render::render_blocks_html(&uow.store(), &pending_blocks, image_policy,
+            &notes);
             if !html.is_empty() {
                 parts.push(html);
             }

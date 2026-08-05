@@ -92,9 +92,17 @@ impl ExportLatexUseCase {
 
         let mut body_parts: Vec<String> = Vec::new();
 
+        let notes = crate::footnotes::Footnotes::build(&uow.store());
+
         for frame_id in &frame_ids {
             // Skip cell frames — they're rendered as part of their table
             if cell_frame_ids.contains(frame_id) {
+                continue;
+            }
+            // Skip note bodies: a definition is a top-level frame, so this
+            // walk would otherwise render it as ordinary prose in the middle of
+            // the chapter, at the point the definition happened to be typed.
+            if notes.is_definition(*frame_id) {
                 continue;
             }
             // Skip sub-frames (parent_frame != None) — recursively rendered

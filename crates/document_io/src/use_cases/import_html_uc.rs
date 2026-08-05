@@ -278,6 +278,13 @@ impl LongOperation for ImportHtmlUseCase {
                         } else {
                             images_map.remove(&created_block.id);
                         }
+                        // Footnote references index into the same block text.
+                        let mut notes_map = store.block_footnote_refs.write();
+                        if !block_footnote_refs.is_empty() {
+                            notes_map.insert(created_block.id, block_footnote_refs);
+                        } else {
+                            notes_map.remove(&created_block.id);
+                        }
                     }
 
                     // Handle list items
@@ -406,6 +413,13 @@ impl LongOperation for ImportHtmlUseCase {
                                     images_map.insert(created_block.id, block_images);
                                 } else {
                                     images_map.remove(&created_block.id);
+                                }
+                                // Footnote references index into the same block text.
+                                let mut notes_map = store.block_footnote_refs.write();
+                                if !block_footnote_refs.is_empty() {
+                                    notes_map.insert(created_block.id, block_footnote_refs);
+                                } else {
+                                    notes_map.remove(&created_block.id);
                                 }
                             }
 

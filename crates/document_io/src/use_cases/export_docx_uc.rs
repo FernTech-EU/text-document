@@ -247,6 +247,8 @@ impl ExportDocxUseCase {
             Some("Walking document tree...".to_string()),
         ));
 
+        let notes = crate::footnotes::Footnotes::build(&uow.store());
+
         let mut numbering = NumberingBuilder::default();
         let mut elements: Vec<DocxElement> = Vec::new();
 
@@ -264,6 +266,12 @@ impl ExportDocxUseCase {
                 continue;
             };
 
+            // Skip note bodies: a definition is a top-level frame, so this
+            // walk would otherwise render it as ordinary prose in the middle of
+            // the chapter, at the point the definition happened to be typed.
+            if notes.is_definition(frame.id) {
+                continue;
+            }
             // Only top-level frames are walked here. Sub-frames (blockquotes,
             // nested content) are reached recursively from their parent's
             // `child_order`; rendering them again at the top level would

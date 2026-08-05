@@ -188,9 +188,16 @@ impl ExportPlainTextUseCase {
             }
         }
 
+        let notes = crate::footnotes::Footnotes::build(&store);
+
         let mut all_block_ids: Vec<EntityId> = Vec::new();
         let mut quote_depth: HashMap<EntityId, usize> = HashMap::new();
         for frame_id in &frame_ids {
+            // A note's body is not prose in the flow. Collecting its blocks here
+            // would splice the note into the sentence its definition followed.
+            if notes.is_definition(*frame_id) {
+                continue;
+            }
             let depth = if quote_indent {
                 blockquote_depth(*frame_id, &frames_by_id)
             } else {
