@@ -773,9 +773,12 @@ mod tests {
             ..Default::default()
         };
         let markup = format!("{}{escaped}\n", typst_preamble(&options));
-        let (pdf, _pages) =
-            crate::typst_compile::compile_typst_pdf(&markup, vec![TEST_FONT.to_vec()], &Default::default())
-                .expect("adversarial-but-escaped prose must compile as plain text");
+        let (pdf, _pages) = crate::typst_compile::compile_typst_pdf(
+            &markup,
+            vec![TEST_FONT.to_vec()],
+            &Default::default(),
+        )
+        .expect("adversarial-but-escaped prose must compile as plain text");
         assert!(pdf.starts_with(b"%PDF-"));
     }
 
@@ -797,9 +800,12 @@ mod tests {
             ..Default::default()
         };
         let markup = format!("{}Hello, world.\n", typst_preamble(&options));
-        let (pdf, _pages) =
-            crate::typst_compile::compile_typst_pdf(&markup, vec![TEST_FONT.to_vec()], &Default::default())
-                .expect("default preamble must compile");
+        let (pdf, _pages) = crate::typst_compile::compile_typst_pdf(
+            &markup,
+            vec![TEST_FONT.to_vec()],
+            &Default::default(),
+        )
+        .expect("default preamble must compile");
         assert!(pdf.starts_with(b"%PDF-"));
     }
 
@@ -816,9 +822,12 @@ mod tests {
             ..Default::default()
         };
         let markup = format!("{}Bonjour le monde.\n", typst_preamble(&options));
-        let (pdf, _pages) =
-            crate::typst_compile::compile_typst_pdf(&markup, vec![TEST_FONT.to_vec()], &Default::default())
-                .expect("preamble with metadata must compile");
+        let (pdf, _pages) = crate::typst_compile::compile_typst_pdf(
+            &markup,
+            vec![TEST_FONT.to_vec()],
+            &Default::default(),
+        )
+        .expect("preamble with metadata must compile");
         assert!(pdf.starts_with(b"%PDF-"));
     }
 }

@@ -417,7 +417,8 @@ fn png_bytes() -> Vec<u8> {
         enc.set_color(png::ColorType::Rgba);
         enc.set_depth(png::BitDepth::Eight);
         let mut w = enc.write_header().unwrap();
-        w.write_image_data(&[0u8, 128, 255, 255].repeat(12)).unwrap();
+        w.write_image_data(&[0u8, 128, 255, 255].repeat(12))
+            .unwrap();
     }
     buf
 }
@@ -443,7 +444,11 @@ fn an_inline_image_compiles_into_the_pdf() {
         options_with_image(),
     );
     assert_eq!(&pdf[..5], b"%PDF-", "not a PDF");
-    assert!(pdf.len() > 1000, "suspiciously small PDF: {} bytes", pdf.len());
+    assert!(
+        pdf.len() > 1000,
+        "suspiciously small PDF: {} bytes",
+        pdf.len()
+    );
     assert_eq!(count_pdf_pages(&pdf), 1);
 }
 

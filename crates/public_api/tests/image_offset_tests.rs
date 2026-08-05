@@ -153,9 +153,13 @@ fn an_image_inserted_after_another_anchors_in_the_right_place() {
     doc.set_djot_sync("abcdef\n").expect("import");
     doc.add_resource(ResourceType::Image, "p.png", "image/png", b"fake")
         .expect("resource");
-    doc.cursor_at(2).insert_image("p.png", "", 9, 9).expect("first");
+    doc.cursor_at(2)
+        .insert_image("p.png", "", 9, 9)
+        .expect("first");
     // Position 5 is two characters past the first image.
-    doc.cursor_at(5).insert_image("p.png", "", 9, 9).expect("second");
+    doc.cursor_at(5)
+        .insert_image("p.png", "", 9, 9)
+        .expect("second");
 
     assert_eq!(doc.character_count(), 8);
     assert_eq!(text_with_images(&doc), "ab\u{FFFC}cd\u{FFFC}ef");
@@ -170,7 +174,9 @@ fn inserting_an_image_does_not_shift_existing_formatting() {
     doc.add_resource(ResourceType::Image, "p.png", "image/png", b"fake")
         .expect("resource");
     // Insert at the very start, before the emphasised run.
-    doc.cursor_at(0).insert_image("p.png", "", 9, 9).expect("insert");
+    doc.cursor_at(0)
+        .insert_image("p.png", "", 9, 9)
+        .expect("insert");
 
     let djot = doc.to_djot().expect("export");
     assert!(

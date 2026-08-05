@@ -102,12 +102,11 @@ impl LongOperation for ExportPdfUseCase {
             Some("Compiling Typst to PDF...".to_string()),
         ));
 
-        let (pdf_bytes, page_count) =
-            compile_typst_pdf(
-                &markup,
-                self.dto.options.font_bytes.clone(),
-                &self.dto.options.images,
-            )?;
+        let (pdf_bytes, page_count) = compile_typst_pdf(
+            &markup,
+            self.dto.options.font_bytes.clone(),
+            &self.dto.options.images,
+        )?;
 
         progress_callback(OperationProgress::new(
             95.0,
@@ -145,12 +144,11 @@ impl ExportPdfUseCase {
         let result = self.build_markup(&*uow, &|_progress| {}, None);
         uow.end_transaction()?;
         let markup = result?;
-        let (pdf_bytes, page_count) =
-            compile_typst_pdf(
-                &markup,
-                self.dto.options.font_bytes.clone(),
-                &self.dto.options.images,
-            )?;
+        let (pdf_bytes, page_count) = compile_typst_pdf(
+            &markup,
+            self.dto.options.font_bytes.clone(),
+            &self.dto.options.images,
+        )?;
         Ok((pdf_bytes, page_count as i64))
     }
 

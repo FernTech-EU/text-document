@@ -9,7 +9,9 @@ use common::database::rope_helpers::{
 use common::entities::{Block, Document, Frame, FramePosition, List, Root, Table, TableCell};
 
 use common::long_operation::LongOperation;
-use common::parser_tools::content_parser::{ParsedElement, ParsedInline, format_runs_from_spans, parse_djot};
+use common::parser_tools::content_parser::{
+    ParsedElement, ParsedInline, format_runs_from_spans, parse_djot,
+};
 use common::parser_tools::list_grouper::ListGrouper;
 use common::types::{EntityId, ROOT_ENTITY_ID};
 use std::sync::Arc;
@@ -223,10 +225,10 @@ fn import_parsed_elements(
                 }
 
                 let ParsedInline {
-                        plain_text,
-                        runs: format_runs,
-                        images: block_images,
-                    } = format_runs_from_spans(&parsed_block.spans, parsed_block.is_code_block);
+                    plain_text,
+                    runs: format_runs,
+                    images: block_images,
+                } = format_runs_from_spans(&parsed_block.spans, parsed_block.is_code_block);
                 let line_len = plain_text.chars().count() as i64;
 
                 // Create Block in the current (possibly blockquote) frame
@@ -391,10 +393,10 @@ fn import_parsed_elements(
                         created_cell_frame_ids.push(created_cell_frame.id);
 
                         let ParsedInline {
-    plain_text,
-    runs: format_runs,
-    images: block_images,
-} = format_runs_from_spans(&cell.spans, false);
+                            plain_text,
+                            runs: format_runs,
+                            images: block_images,
+                        } = format_runs_from_spans(&cell.spans, false);
 
                         // Create block in cell frame
                         let block = Block {

@@ -49,9 +49,8 @@ pub use frontend::common::format_runs::ReplaceFormatPolicy;
 pub use frontend::common::parser_tools::{
     CountMethod, DjotExportOptions, DjotImportOptions, DocxExportOptions, DocxHeadingStyle,
     EpubExportOptions, ExportImage, ExportImages, HtmlExportOptions, HtmlImageMode,
-    MarkdownExportOptions, PdfExportOptions, PlainTextExportOptions, Sentence,
-    TABLE_ANCHOR, WordCharCounts, count, count_djot, djot_to_plain_text, sentence_bounds,
-    sentences,
+    MarkdownExportOptions, PdfExportOptions, PlainTextExportOptions, Sentence, TABLE_ANCHOR,
+    WordCharCounts, count, count_djot, djot_to_plain_text, sentence_bounds, sentences,
 };
 
 /// The matcher, as a pure function over `&str` — no document, no store, no threads.

@@ -162,7 +162,10 @@ mod tests {
     fn extension_falls_back_visibly_for_unknown_types() {
         assert_eq!(ExportImage::new(vec![], "image/png").extension(), "png");
         assert_eq!(ExportImage::new(vec![], "image/jpeg").extension(), "jpg");
-        assert_eq!(ExportImage::new(vec![], "application/x-thing").extension(), "bin");
+        assert_eq!(
+            ExportImage::new(vec![], "application/x-thing").extension(),
+            "bin"
+        );
     }
 
     #[test]

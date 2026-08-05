@@ -24,7 +24,8 @@ fn png_bytes() -> Vec<u8> {
         enc.set_color(png::ColorType::Rgba);
         enc.set_depth(png::BitDepth::Eight);
         let mut w = enc.write_header().unwrap();
-        w.write_image_data(&[0u8, 128, 255, 255].repeat(12)).unwrap();
+        w.write_image_data(&[0u8, 128, 255, 255].repeat(12))
+            .unwrap();
     }
     buf
 }
@@ -72,7 +73,10 @@ fn zip_names(archive: &[u8]) -> Vec<String> {
 fn html_references_the_src_by_default() {
     let html = doc_with_image().to_html().expect("html");
     assert!(html.contains("src=\"pic.png\""), "{html}");
-    assert!(html.contains("alt=\"a blue square\""), "alt missing: {html}");
+    assert!(
+        html.contains("alt=\"a blue square\""),
+        "alt missing: {html}"
+    );
     assert!(html.contains("width=\"64\""), "size missing: {html}");
 }
 
@@ -127,7 +131,10 @@ fn a_data_uri_export_with_no_bytes_falls_back_to_the_description() {
 #[test]
 fn latex_emits_includegraphics_with_a_size_and_declares_graphicx() {
     let tex = doc_with_image().to_latex("article", true).expect("latex");
-    assert!(tex.contains("\\includegraphics["), "no sized include: {tex}");
+    assert!(
+        tex.contains("\\includegraphics["),
+        "no sized include: {tex}"
+    );
     assert!(tex.contains("pic.png"), "{tex}");
     // 64 logical px at 96 dpi = 48 big points.
     assert!(tex.contains("width=48bp"), "wrong unit or size: {tex}");

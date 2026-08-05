@@ -751,7 +751,6 @@ pub fn parse_html(html: &str) -> Vec<ParsedBlock> {
     ParsedElement::flatten_to_blocks(parse_html_elements(html))
 }
 
-
 /// Build an inline-image span from an `<img>` element, if it has a usable
 /// source.
 ///

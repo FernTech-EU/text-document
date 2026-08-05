@@ -8,12 +8,12 @@ use crate::ExportEpubDto;
 use crate::ExportEpubResultDto;
 use crate::html_render;
 use anyhow::{Result, anyhow};
-use common::parser_tools::ExportImages;
 use common::database::QueryUnitOfWork;
 use common::database::Store;
 use common::entities::{Block, Document, Frame, List, Root, SemanticRole, Table, TableCell};
 use common::long_operation::{LongOperation, OperationProgress};
 use common::parser_tools::EpubExportOptions;
+use common::parser_tools::ExportImages;
 use common::types::{EntityId, ROOT_ENTITY_ID};
 use epub_builder::{
     EpubBuilder, EpubContent, EpubVersion, PageDirection, ReferenceType, ZipLibrary,
@@ -280,7 +280,13 @@ impl ExportEpubUseCase {
 
         // If child_order is populated, use it to interleave blocks and sub-frames
         if !frame.child_order.is_empty() {
-            return self.render_frame_units_by_child_order(uow, &frame, cell_frame_ids, image_policy, out);
+            return self.render_frame_units_by_child_order(
+                uow,
+                &frame,
+                cell_frame_ids,
+                image_policy,
+                out,
+            );
         }
 
         // Fallback: render all blocks in document_position order (original behaviour)
@@ -343,7 +349,13 @@ impl ExportEpubUseCase {
                         // it isn't a real chapter boundary, so it doesn't participate in
                         // chapter splitting (unlike a plain non-blockquote sub-frame, below).
                         let mut inner: Vec<RenderUnit> = Vec::new();
-                        self.render_frame_units(uow, &sub_frame_id, cell_frame_ids, image_policy, &mut inner)?;
+                        self.render_frame_units(
+                            uow,
+                            &sub_frame_id,
+                            cell_frame_ids,
+                            image_policy,
+                            &mut inner,
+                        )?;
                         let inner_html: String = inner.into_iter().map(|u| u.html).collect();
                         if !inner_html.is_empty() {
                             // EPUB is the format that can actually say what this is:
@@ -364,7 +376,13 @@ impl ExportEpubUseCase {
                     } else {
                         // Non-blockquote sub-frame: render normally, into the same stream —
                         // its headings (if any) still participate in chapter splitting.
-                        self.render_frame_units(uow, &sub_frame_id, cell_frame_ids, image_policy, out)?;
+                        self.render_frame_units(
+                            uow,
+                            &sub_frame_id,
+                            cell_frame_ids,
+                            image_policy,
+                            out,
+                        )?;
                     }
                 }
             }
@@ -442,7 +460,11 @@ fn push_block_run_units(
     let mut i = 0;
     while i < blocks.len() {
         if let Some(level) = heading_level_for_split(store, &blocks[i]) {
-            let html = html_render::render_blocks_html(store, std::slice::from_ref(&blocks[i]), image_policy);
+            let html = html_render::render_blocks_html(
+                store,
+                std::slice::from_ref(&blocks[i]),
+                image_policy,
+            );
             let text = html_render::block_plain_text(store, &blocks[i]);
             out.push(RenderUnit {
                 heading_level: Some(level),

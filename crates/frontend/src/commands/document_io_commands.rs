@@ -181,7 +181,6 @@ pub fn export_html_with_options(
     )
 }
 
-
 pub fn export_latex(ctx: &AppContext, dto: &ExportLatexDto) -> Result<ExportLatexResultDto> {
     document_io_controller::export_latex(&ctx.db_context, &ctx.event_hub, dto)
         .context("export_latex")

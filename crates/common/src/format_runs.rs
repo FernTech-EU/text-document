@@ -908,9 +908,9 @@ pub fn merge_runs_and_images<'a>(
     }
 
     let push_text = |out: &mut Vec<InlinePiece<'a>>,
-                         start: u32,
-                         end: u32,
-                         format: Option<&'a CharacterFormat>| {
+                     start: u32,
+                     end: u32,
+                     format: Option<&'a CharacterFormat>| {
         if start < end {
             out.push(InlinePiece::Text { start, end, format });
         }

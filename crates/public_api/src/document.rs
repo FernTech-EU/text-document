@@ -18,6 +18,7 @@ use frontend::commands::{
     table_commands, undo_redo_commands,
 };
 
+use crate::HtmlExportOptions;
 use crate::convert::{self, to_i64, to_usize};
 use crate::cursor::TextCursor;
 use crate::events::{self, DocumentEvent, Subscription};
@@ -27,7 +28,6 @@ use crate::operation::{
     DjotImportResult, DocxExportResult, EpubExportResult, HtmlImportResult, MarkdownImportResult,
     Operation, PdfExportResult,
 };
-use crate::HtmlExportOptions;
 use crate::{BlockFormat, BlockInfo, DocumentStats, FindMatch, FindOptions, ReplaceRange};
 
 /// A rich text document.
@@ -773,7 +773,11 @@ impl TextDocument {
     ///
     /// The trailing edge is inclusive of the caret: a `position` at the very end of the block
     /// resolves to the last sentence rather than to nothing.
-    pub fn sentence_at(&self, position: usize, content_locale: Option<&str>) -> Option<(usize, usize)> {
+    pub fn sentence_at(
+        &self,
+        position: usize,
+        content_locale: Option<&str>,
+    ) -> Option<(usize, usize)> {
         let inner = self.inner.lock();
         let block_dto = frontend::document_inspection::GetBlockAtPositionDto {
             position: to_i64(position),

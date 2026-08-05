@@ -222,10 +222,10 @@ impl LongOperation for ImportHtmlUseCase {
                     )?;
 
                     let ParsedInline {
-                            plain_text,
-                            runs: format_runs,
-                            images: block_images,
-                        } = format_runs_from_spans(&parsed_block.spans, parsed_block.is_code_block);
+                        plain_text,
+                        runs: format_runs,
+                        images: block_images,
+                    } = format_runs_from_spans(&parsed_block.spans, parsed_block.is_code_block);
                     let line_len = plain_text.chars().count() as i64;
 
                     let current_frame_id = frame_stack.last().unwrap().frame_id;

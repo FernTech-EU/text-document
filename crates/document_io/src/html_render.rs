@@ -61,13 +61,16 @@ impl HtmlImagePolicy<'_> {
             // a reference that might resolve beats a picture silently deleted.
             Self::Rewrite(map) => Some(map.get(name).cloned().unwrap_or_else(|| name.to_string())),
             Self::DataUri(images) => images.get(name).map(|img| {
-                format!("data:{};base64,{}", img.mime_type, base64_encode(&img.bytes))
+                format!(
+                    "data:{};base64,{}",
+                    img.mime_type,
+                    base64_encode(&img.bytes)
+                )
             }),
             Self::Omit => None,
         }
     }
 }
-
 
 /// Render a slice of blocks (already fetched, in document order) as HTML,
 /// grouping consecutive list items into `<ul>`/`<ol>` and handling code
@@ -227,8 +230,11 @@ pub fn render_inline_html(store: &Store, block: &Block, images: HtmlImagePolicy<
                     // even when empty — an explicit empty alt is the correct way
                     // to say "decorative", whereas a missing attribute says
                     // nothing at all.
-                    let mut tag =
-                        format!("<img src=\"{}\" alt=\"{}\"", escape_html(&src), escape_html(alt));
+                    let mut tag = format!(
+                        "<img src=\"{}\" alt=\"{}\"",
+                        escape_html(&src),
+                        escape_html(alt)
+                    );
                     if *width > 0 {
                         tag.push_str(&format!(" width=\"{width}\""));
                     }

@@ -164,7 +164,8 @@ mod tests {
     #[test]
     fn compiles_trivial_markup_to_a_pdf() {
         let markup = "#set page(width: 10cm, height: 10cm)\nHello, world.";
-        let (pdf, pages) = compile_typst_pdf(markup, vec![TEST_FONT.to_vec()], &Default::default()).expect("compiles");
+        let (pdf, pages) = compile_typst_pdf(markup, vec![TEST_FONT.to_vec()], &Default::default())
+            .expect("compiles");
         assert!(pdf.starts_with(b"%PDF-"), "output must be a PDF");
         assert!(pdf.len() > 100, "a real PDF is not a handful of bytes");
         assert_eq!(pages, 1, "one short line lays out on a single page");
@@ -178,7 +179,8 @@ mod tests {
 
     #[test]
     fn corrupt_font_bytes_are_rejected_not_silently_dropped() {
-        let err = compile_typst_pdf("Hello.", vec![vec![0u8; 16]], &Default::default()).unwrap_err();
+        let err =
+            compile_typst_pdf("Hello.", vec![vec![0u8; 16]], &Default::default()).unwrap_err();
         assert!(
             err.to_string().contains("could not be parsed as a font"),
             "got: {err}"
@@ -187,8 +189,12 @@ mod tests {
 
     #[test]
     fn bad_markup_reports_a_readable_diagnostic() {
-        let err =
-            compile_typst_pdf("#foo_bar_does_not_exist()", vec![TEST_FONT.to_vec()], &Default::default()).unwrap_err();
+        let err = compile_typst_pdf(
+            "#foo_bar_does_not_exist()",
+            vec![TEST_FONT.to_vec()],
+            &Default::default(),
+        )
+        .unwrap_err();
         assert!(err.to_string().contains("unknown variable"), "got: {err}");
     }
 
@@ -198,7 +204,8 @@ mod tests {
         // compiles (with fallback glyphs), which is the behaviour `compile_typst_pdf` relies on
         // rather than escalating to a hard error.
         let markup = "#set text(font: \"Totally Not A Real Font\")\nHello.";
-        let (pdf, _) = compile_typst_pdf(markup, vec![TEST_FONT.to_vec()], &Default::default()).expect("still compiles");
+        let (pdf, _) = compile_typst_pdf(markup, vec![TEST_FONT.to_vec()], &Default::default())
+            .expect("still compiles");
         assert!(pdf.starts_with(b"%PDF-"));
     }
 }

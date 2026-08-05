@@ -113,8 +113,29 @@ impl ExportLatexUseCase {
             } else {
                 &dto.document_class
             };
+            // `secnumdepth = -1` turns off LaTeX's own section numbering.
+            //
+            // A heading reaches this exporter as finished text: a caller that numbers its
+            // headings has already composed "Chapter 3 — The Storm" into the string below,
+            // and `\section{…}` in a default `article` (secnumdepth 3) would print its own
+            // counter in front of it — "1  Chapter 3 — The Storm", two disagreeing numbers
+            // side by side, and worse with a Part above, where `\subsection` renumbers per
+            // `\section` while the caller's chapter counter does not.
+            //
+            // Unnumbered rather than starred (`\section*`) on purpose: starring also drops
+            // the ToC entry and the running head, which a book wants to keep. This suppresses
+            // only the numeral.
+            //
+            // The Typst backend has carried the same one-line fix since it was written
+            // (`typst_markup.rs`: `#set heading(numbering: none)`, "Skribisto composes its
+            // own, already-numbered heading text — Typst must not additionally auto-number
+            // it"). This is that fix, ported.
+            //
+            // Body-only output (`include_preamble: false`) is deliberately untouched: the
+            // embedding document owns its preamble, and silently rewriting its counters
+            // from inside a fragment would be the wrong kind of helpful.
             format!(
-                "\\documentclass{{{}}}\n\\usepackage{{hyperref}}\n\\usepackage{{ulem}}\n\\usepackage{{graphicx}}\n\\usepackage{{setspace}}\n\\usepackage{{xcolor}}\n\\begin{{document}}\n\n{}\n\n\\end{{document}}",
+                "\\documentclass{{{}}}\n\\usepackage{{hyperref}}\n\\usepackage{{ulem}}\n\\usepackage{{graphicx}}\n\\usepackage{{setspace}}\n\\usepackage{{xcolor}}\n\\setcounter{{secnumdepth}}{{-1}}\n\\begin{{document}}\n\n{}\n\n\\end{{document}}",
                 doc_class, body
             )
         } else {

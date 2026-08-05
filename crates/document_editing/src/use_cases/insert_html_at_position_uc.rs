@@ -16,7 +16,9 @@ use common::format_runs::{
     shift_runs_for_insert, splice_range, split_images_at, split_runs_at,
 };
 
-use common::parser_tools::content_parser::{self, ParsedBlock, ParsedInline, format_runs_from_spans};
+use common::parser_tools::content_parser::{
+    self, ParsedBlock, ParsedInline, format_runs_from_spans,
+};
 use common::parser_tools::list_grouper::ListGrouper;
 use common::snapshot::EntityTreeSnapshot;
 use common::types::{EntityId, ROOT_ENTITY_ID};

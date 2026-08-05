@@ -74,7 +74,6 @@ pub trait ExportPlainTextUnitOfWorkFactoryTrait: Send + Sync {
 #[macros::uow_action(entity = "Block", action = "GetMultiRO")]
 pub trait ExportPlainTextUnitOfWorkTrait: QueryUnitOfWork {}
 
-
 /// Drop inline-image sentinels from plain-text output.
 ///
 /// An image occupies one `U+FFFC` OBJECT REPLACEMENT CHARACTER in the document

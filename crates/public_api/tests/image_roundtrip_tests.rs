@@ -92,7 +92,8 @@ fn alt_text_does_not_leak_into_the_prose() {
 #[test]
 fn an_image_contributes_exactly_one_character_to_the_document() {
     let doc = TextDocument::new();
-    doc.set_djot_sync("ab![alt here](c.png)cd\n").expect("import");
+    doc.set_djot_sync("ab![alt here](c.png)cd\n")
+        .expect("import");
     // "ab" + image + "cd" = 5 logical characters, whatever the alt text says.
     // A parsed image must cost exactly what an inserted one costs, or cursor
     // positions drift the moment a document is reloaded.
