@@ -74,7 +74,7 @@ pub trait ExportPlainTextUnitOfWorkFactoryTrait: Send + Sync {
 #[macros::uow_action(entity = "Block", action = "GetMultiRO")]
 pub trait ExportPlainTextUnitOfWorkTrait: QueryUnitOfWork {}
 
-/// Drop inline-image sentinels from plain-text output.
+/// Drop inline-image sentinels from plain-text output, when asked.
 ///
 /// An image occupies one `U+FFFC` OBJECT REPLACEMENT CHARACTER in the document
 /// text. Plain text has no way to represent a picture, and emitting the raw
@@ -83,8 +83,13 @@ pub trait ExportPlainTextUnitOfWorkTrait: QueryUnitOfWork {}
 /// substituted: alt describes the image for a reader who cannot see it, and
 /// silently promoting it to prose would put words in the manuscript that the
 /// writer never typed.
-fn strip_image_sentinels(text: &str) -> String {
-    if text.contains('\u{FFFC}') {
+///
+/// Only for the *presentation* view. Removing the sentinel removes a character
+/// the document counts, so an addressable view that stripped it would hand every
+/// caller — search, a cursor, a comment's anchor — offsets that drift one place
+/// per image. See `PlainTextExportOptions::strip_images`.
+fn strip_image_sentinels(text: &str, strip: bool) -> String {
+    if strip && text.contains('\u{FFFC}') {
         text.replace('\u{FFFC}', "")
     } else {
         text.to_string()
@@ -112,6 +117,7 @@ impl ExportPlainTextUseCase {
         let PlainTextExportOptions {
             quote_indent,
             page_breaks,
+            strip_images,
         } = options;
         let uow = self.uow_factory.create();
         uow.begin_transaction()?;
@@ -144,7 +150,7 @@ impl ExportPlainTextUseCase {
         {
             uow.end_transaction()?;
             return Ok(ExportPlainTextDto {
-                plain_text: strip_image_sentinels(&plain_text),
+                plain_text: strip_image_sentinels(&plain_text, strip_images),
             });
         }
 
@@ -211,7 +217,8 @@ impl ExportPlainTextUseCase {
         let plain_text = blocks
             .iter()
             .map(|block| {
-                let text = strip_image_sentinels(&block_content_via_store(block, &store));
+                let text =
+                    strip_image_sentinels(&block_content_via_store(block, &store), strip_images);
                 let text = match quote_depth.get(&block.id) {
                     Some(&depth) => indent_quoted(&text, depth),
                     None => text,

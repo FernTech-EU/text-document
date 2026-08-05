@@ -40,14 +40,26 @@ pub struct PlainTextExportOptions {
     pub quote_indent: bool,
     /// Emit [`FORM_FEED`] before a block that asks to start a new page.
     pub page_breaks: bool,
+    /// Drop the `U+FFFC` that stands for an inline image.
+    ///
+    /// **Presentation only.** A written-out `.txt` has no way to show a picture,
+    /// and the raw sentinel renders as an unmarked box — but it is also one
+    /// character of the document, so removing it shifts every offset after it.
+    /// Anything that addresses the text by position (a cursor, a search hit, a
+    /// comment's anchor) must therefore leave it in, which is exactly the
+    /// difference between [`Self::addressable`] and [`Self::presentation`].
+    pub strip_images: bool,
 }
 
 impl PlainTextExportOptions {
-    /// Nothing added — the addressable view, pinned to the document's own search text.
+    /// Nothing added — the addressable view, pinned to the document's own search
+    /// text. Offsets into it are offsets into the document, character for
+    /// character.
     pub const fn addressable() -> Self {
         Self {
             quote_indent: false,
             page_breaks: false,
+            strip_images: false,
         }
     }
 
@@ -56,6 +68,7 @@ impl PlainTextExportOptions {
         Self {
             quote_indent: true,
             page_breaks: true,
+            strip_images: true,
         }
     }
 }

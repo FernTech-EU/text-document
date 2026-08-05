@@ -95,6 +95,7 @@ fn the_form_feed_is_the_only_difference() {
         .to_plain_text_with(PlainTextExportOptions {
             quote_indent: false,
             page_breaks: true,
+            strip_images: true,
         })
         .expect("paged");
     assert_eq!(paged.replace('\u{000C}', ""), plain);

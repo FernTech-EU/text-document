@@ -98,9 +98,19 @@ fn an_image_contributes_exactly_one_character_to_the_document() {
     // A parsed image must cost exactly what an inserted one costs, or cursor
     // positions drift the moment a document is reloaded.
     assert_eq!(doc.character_count(), 5);
-    // `to_plain_text` is the `.txt` export, which omits images by design — the
-    // four letters are all that survives into a plain-text file.
-    assert_eq!(doc.to_plain_text().unwrap(), "abcd");
+    // `to_plain_text` is the *addressable* view, pinned character-for-character
+    // to the document — so the image is still there as its sentinel. Dropping it
+    // here would shift every search hit, cursor position and comment anchor
+    // after it by one.
+    assert_eq!(doc.to_plain_text().unwrap(), "ab\u{FFFC}cd");
+    assert_eq!(doc.to_plain_text().unwrap().chars().count(), 5);
+    // The `.txt` file is the other view, and there the image is omitted.
+    assert_eq!(
+        doc.to_plain_text_with(text_document::PlainTextExportOptions::presentation())
+            .unwrap()
+            .trim_end(),
+        "abcd"
+    );
 }
 
 #[test]
@@ -126,10 +136,30 @@ fn plain_text_export_omits_images_rather_than_leaking_a_sentinel() {
     // A U+FFFC in a .txt renders as an unrenderable box.
     let doc = TextDocument::new();
     doc.set_djot_sync("before ![cat](c.png) after\n").unwrap();
-    let exported = doc.to_plain_text().expect("plain text export");
+    let exported = doc
+        .to_plain_text_with(text_document::PlainTextExportOptions::presentation())
+        .expect("plain text export");
     assert!(
         !exported.contains('\u{FFFC}'),
         "the image sentinel leaked into plain text: {exported:?}"
+    );
+    assert!(exported.contains("before") && exported.contains("after"));
+}
+
+#[test]
+fn the_addressable_view_keeps_the_image_so_offsets_do_not_drift() {
+    // The one that matters for correctness elsewhere: `to_plain_text` is what
+    // search, the cursor and a comment's anchor address positions in. An image
+    // removed from it — but still in the document — would put every one of them
+    // one character out for each picture above the point they name.
+    let doc = TextDocument::new();
+    doc.set_djot_sync("before ![cat](c.png) after\n").unwrap();
+    let addressable = doc.to_plain_text().expect("addressable text");
+    assert!(addressable.contains('\u{FFFC}'), "{addressable:?}");
+    assert_eq!(
+        addressable.chars().count(),
+        doc.character_count(),
+        "the addressable view must agree with the document, character for character"
     );
 }
 
