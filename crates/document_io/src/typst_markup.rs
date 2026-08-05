@@ -103,6 +103,27 @@ fn guard_leading_numbered_list(s: String) -> String {
     }
 }
 
+/// Reduce a language tag to what Typst's `text(lang:)` will accept.
+///
+/// Typst takes an ISO 639 code — two or three letters — and **fails the whole
+/// compile** on anything else: `expected two or three letter language code`.
+/// An ordinary BCP-47 tag like `en-US` or `fr-FR` is therefore not merely
+/// ignored, it costs the writer their PDF. Callers carry full locales (a
+/// project's language is picked from a dictionary list, where the region is the
+/// point), so the reduction belongs here, at the one boundary that has this
+/// constraint — an EPUB's `dc:language`, by contrast, wants the full tag.
+///
+/// Anything that still isn't a bare two/three-letter code after taking the
+/// primary subtag is dropped rather than passed on: without `lang` Typst loses
+/// hyphenation and locale quote styles, which is a far smaller loss than an
+/// export that refuses to run.
+fn typst_lang(tag: &str) -> Option<String> {
+    let primary = tag.trim().split(['-', '_']).next()?.trim();
+    let usable = (2..=3).contains(&primary.chars().count())
+        && primary.chars().all(|c| c.is_ascii_alphabetic());
+    usable.then(|| primary.to_ascii_lowercase())
+}
+
 /// Escapes a string for use as a Typst **string literal** argument (inside `"..."`, e.g.
 /// `#raw("...")`, `#link("...")`, `#set text(font: "...")`, `#set document(title: "...")`) —
 /// backslash and double-quote only. This is deliberately narrower than [`escape_typst`]: string
@@ -167,8 +188,8 @@ pub fn typst_preamble(options: &PdfExportOptions) -> String {
         ));
     }
     text_args.push(format!("size: {}pt", options.font_size_pt));
-    if let Some(lang) = options.lang.as_deref().filter(|l| !l.is_empty()) {
-        text_args.push(format!("lang: \"{}\"", escape_typst_string(lang)));
+    if let Some(lang) = options.lang.as_deref().and_then(typst_lang) {
+        text_args.push(format!("lang: \"{lang}\""));
     }
     text_args.push(format!(
         "dir: {}",
@@ -829,5 +850,41 @@ mod tests {
         )
         .expect("preamble with metadata must compile");
         assert!(pdf.starts_with(b"%PDF-"));
+    }
+
+    /// A regional locale must not fail the export. Typst's `text(lang:)` takes
+    /// an ISO 639 code and errors the whole compile on anything else, so
+    /// `en-US` — what a project whose language was picked from a dictionary
+    /// list actually carries — cost the writer their PDF outright.
+    #[test]
+    fn preamble_with_a_regional_locale_compiles() {
+        let options = PdfExportOptions {
+            font_bytes: vec![TEST_FONT.to_vec()],
+            lang: Some("en-US".to_string()),
+            ..Default::default()
+        };
+        let markup = format!("{}Hello world.\n", typst_preamble(&options));
+        let (pdf, _pages) = crate::typst_compile::compile_typst_pdf(
+            &markup,
+            vec![TEST_FONT.to_vec()],
+            &Default::default(),
+        )
+        .expect("a regional locale must not fail the export");
+        assert!(pdf.starts_with(b"%PDF-"));
+    }
+
+    #[test]
+    fn typst_lang_reduces_to_the_primary_subtag() {
+        assert_eq!(typst_lang("en-US").as_deref(), Some("en"));
+        assert_eq!(typst_lang("fr_FR").as_deref(), Some("fr"));
+        assert_eq!(typst_lang("zh-Hans-CN").as_deref(), Some("zh"));
+        assert_eq!(typst_lang("  DE  ").as_deref(), Some("de"));
+        assert_eq!(typst_lang("fil").as_deref(), Some("fil"));
+        // Dropped rather than passed on to fail the compile.
+        assert_eq!(typst_lang(""), None);
+        assert_eq!(typst_lang("-"), None);
+        assert_eq!(typst_lang("english"), None);
+        assert_eq!(typst_lang("e"), None);
+        assert_eq!(typst_lang("12"), None);
     }
 }
