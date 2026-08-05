@@ -7,7 +7,10 @@ use anyhow::Result;
 use common::format_runs::InlineContent;
 
 use document_formatting::document_formatting_controller;
-use document_formatting::{Alignment, CellVerticalAlignment, ListStyle, SetBlockFormatDto, SetFrameFormatDto, SetListFormatDto, SetTableCellFormatDto, SetTableFormatDto, SetTextFormatDto, TextDirection};
+use document_formatting::{
+    Alignment, CellVerticalAlignment, ListStyle, SetBlockFormatDto, SetFrameFormatDto,
+    SetListFormatDto, SetTableCellFormatDto, SetTableFormatDto, SetTextFormatDto, TextDirection,
+};
 
 use test_harness::{
     block_controller, create_list, export_text, frame_controller, get_all_block_ids, get_block_ids,

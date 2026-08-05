@@ -7,7 +7,9 @@
 //! capability `replace_format_tests.rs` already pins for the batch `replace_text` path,
 //! exercised here through the cursor a live editor actually drives.
 
-use text_document::{DjotExportOptions, DjotImportOptions, MoveMode, ReplaceFormatPolicy, TextDocument};
+use text_document::{
+    DjotExportOptions, DjotImportOptions, MoveMode, ReplaceFormatPolicy, TextDocument,
+};
 
 fn new_doc_with_text(text: &str) -> TextDocument {
     let doc = TextDocument::new();
@@ -19,7 +21,9 @@ fn new_doc_with_text(text: &str) -> TextDocument {
 fn default_policy_matches_plain_insert_text_within_one_block() {
     let via_replace = new_doc_with_text("Hello world");
     let cursor = via_replace.cursor();
-    cursor.replace(6, 11, "Rust", ReplaceFormatPolicy::InheritPreceding).unwrap();
+    cursor
+        .replace(6, 11, "Rust", ReplaceFormatPolicy::InheritPreceding)
+        .unwrap();
 
     let via_insert = new_doc_with_text("Hello world");
     let cursor2 = via_insert.cursor();
@@ -39,10 +43,14 @@ fn default_policy_matches_plain_insert_text_within_one_block() {
 #[test]
 fn start_and_end_may_be_given_in_either_order() {
     let a = new_doc_with_text("Hello world");
-    a.cursor().replace(6, 11, "Rust", ReplaceFormatPolicy::InheritPreceding).unwrap();
+    a.cursor()
+        .replace(6, 11, "Rust", ReplaceFormatPolicy::InheritPreceding)
+        .unwrap();
 
     let b = new_doc_with_text("Hello world");
-    b.cursor().replace(11, 6, "Rust", ReplaceFormatPolicy::InheritPreceding).unwrap();
+    b.cursor()
+        .replace(11, 6, "Rust", ReplaceFormatPolicy::InheritPreceding)
+        .unwrap();
 
     assert_eq!(a.to_plain_text().unwrap(), b.to_plain_text().unwrap());
     assert_eq!(a.to_plain_text().unwrap(), "Hello Rust");
@@ -51,7 +59,9 @@ fn start_and_end_may_be_given_in_either_order() {
 #[test]
 fn zero_length_range_is_a_plain_insert() {
     let doc = new_doc_with_text("Hello world");
-    doc.cursor().replace(5, 5, ",", ReplaceFormatPolicy::PreserveNothing).unwrap();
+    doc.cursor()
+        .replace(5, 5, ",", ReplaceFormatPolicy::PreserveNothing)
+        .unwrap();
     assert_eq!(doc.to_plain_text().unwrap(), "Hello, world");
 }
 
@@ -59,7 +69,9 @@ fn zero_length_range_is_a_plain_insert() {
 fn lands_as_one_undo_entry() {
     let doc = new_doc_with_text("Hello world");
     let cursor = doc.cursor();
-    cursor.replace(6, 11, "Rust", ReplaceFormatPolicy::PreserveNothing).unwrap();
+    cursor
+        .replace(6, 11, "Rust", ReplaceFormatPolicy::PreserveNothing)
+        .unwrap();
     assert_eq!(doc.to_plain_text().unwrap(), "Hello Rust");
 
     doc.undo().unwrap();
@@ -77,9 +89,15 @@ fn lands_as_one_undo_entry() {
 fn leaves_the_cursor_at_the_end_of_the_replacement() {
     let doc = new_doc_with_text("Hello world");
     let cursor = doc.cursor();
-    cursor.replace(6, 11, "Rust", ReplaceFormatPolicy::InheritPreceding).unwrap();
+    cursor
+        .replace(6, 11, "Rust", ReplaceFormatPolicy::InheritPreceding)
+        .unwrap();
     assert_eq!(cursor.position(), 10, "\"Hello \" (6) + \"Rust\" (4) = 10");
-    assert_eq!(cursor.anchor(), 10, "no selection should remain after the replace");
+    assert_eq!(
+        cursor.anchor(),
+        10,
+        "no selection should remain after the replace"
+    );
 }
 
 #[test]
@@ -91,7 +109,9 @@ fn cross_block_selection_falls_back_to_compose_delete_insert() {
     assert_eq!(doc.to_plain_text().unwrap(), "Hello\nWorld");
 
     // Selection spans the block boundary: "o\nWo" -> replaced with "X".
-    doc.cursor().replace(4, 8, "X", ReplaceFormatPolicy::PreserveIfFullyCovered).unwrap();
+    doc.cursor()
+        .replace(4, 8, "X", ReplaceFormatPolicy::PreserveIfFullyCovered)
+        .unwrap();
     assert_eq!(
         doc.to_plain_text().unwrap(),
         "HellXrld",
@@ -100,13 +120,21 @@ fn cross_block_selection_falls_back_to_compose_delete_insert() {
     );
 }
 
-fn replace_and_export(djot: &str, start: usize, end: usize, replacement: &str, policy: ReplaceFormatPolicy) -> String {
+fn replace_and_export(
+    djot: &str,
+    start: usize,
+    end: usize,
+    replacement: &str,
+    policy: ReplaceFormatPolicy,
+) -> String {
     let doc = TextDocument::new();
     doc.set_djot_with_options(djot, DjotImportOptions::default())
         .and_then(|op| op.wait())
         .expect("set_djot");
 
-    doc.cursor().replace(start, end, replacement, policy).expect("replace");
+    doc.cursor()
+        .replace(start, end, replacement, policy)
+        .expect("replace");
 
     doc.to_djot_with_options(DjotExportOptions::default())
         .expect("to_djot")

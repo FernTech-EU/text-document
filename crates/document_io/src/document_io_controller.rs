@@ -305,7 +305,7 @@ pub fn export_html_with_options(
     options: common::parser_tools::HtmlExportOptions,
 ) -> Result<ExportHtmlDto> {
     let uow_context = ExportHtmlUnitOfWorkFactory::new(db_context);
-    let mut uc = ExportHtmlUseCase::new_with_options(Box::new(uow_context), options);
+    let mut uc = ExportHtmlUseCase::new(Box::new(uow_context), options);
     let return_dto = uc.execute()?;
     // Notify that the handling manifest has been loaded
     event_hub.send_event(Event {

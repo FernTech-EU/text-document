@@ -178,7 +178,8 @@ fn an_epigraph_indents_as_one_unit_attribution_included() {
 // The semantic role — what lets a format say "epigraph" rather than "quotation"
 // ---------------------------------------------------------------------------
 
-const EPIGRAPH_DJOT: &str = "> {semantic_role=epigraph}\n> The sea is a going.\n>\n> {alignment=right}\n> — Anon.";
+const EPIGRAPH_DJOT: &str =
+    "> {semantic_role=epigraph}\n> The sea is a going.\n>\n> {alignment=right}\n> — Anon.";
 
 fn doc_of(djot: &str) -> TextDocument {
     let doc = TextDocument::new();

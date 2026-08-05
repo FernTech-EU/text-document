@@ -215,7 +215,7 @@ fn test_export_latex_simple() -> Result<()> {
         &ExportLatexDto {
             document_class: String::new(),
             include_preamble: false,
-                omit_images: false,
+            omit_images: false,
         },
     )?;
     assert!(result.latex_text.contains("Hello World"));
@@ -233,13 +233,22 @@ fn test_export_latex_with_preamble() -> Result<()> {
         &ExportLatexDto {
             document_class: "article".to_string(),
             include_preamble: true,
-                omit_images: false,
+            omit_images: false,
         },
     )?;
     assert!(result.latex_text.contains("\\documentclass{article}"));
     assert!(result.latex_text.contains("\\begin{document}"));
     assert!(result.latex_text.contains("\\end{document}"));
     assert!(result.latex_text.contains("Content"));
+    // A heading arrives here as finished text — a caller that numbers its headings has
+    // already composed "Chapter 3 — The Storm" — so LaTeX must not print its own counter
+    // in front of it. Without this, `article`'s default secnumdepth of 3 rendered
+    // "1  Chapter 3 — The Storm": two disagreeing numbers on one line.
+    assert!(
+        result.latex_text.contains("\\setcounter{secnumdepth}{-1}"),
+        "the preamble must suppress LaTeX's own section numbering: {}",
+        result.latex_text
+    );
 
     Ok(())
 }
@@ -254,12 +263,20 @@ fn test_export_latex_without_preamble() -> Result<()> {
         &ExportLatexDto {
             document_class: String::new(),
             include_preamble: false,
-                omit_images: false,
+            omit_images: false,
         },
     )?;
     assert!(!result.latex_text.contains("\\documentclass"));
     assert!(!result.latex_text.contains("\\begin{document}"));
     assert!(result.latex_text.contains("Content"));
+    // …and the counter reset stays out of a fragment: the embedding document owns its
+    // preamble, and rewriting its counters from inside a body-only export would silently
+    // renumber sections this call knows nothing about.
+    assert!(
+        !result.latex_text.contains("secnumdepth"),
+        "a body-only export must not touch the host document's counters: {}",
+        result.latex_text
+    );
 
     Ok(())
 }
@@ -345,7 +362,7 @@ fn test_export_latex_escapes_special_chars() -> Result<()> {
         &ExportLatexDto {
             document_class: String::new(),
             include_preamble: false,
-                omit_images: false,
+            omit_images: false,
         },
     )?;
 
@@ -440,7 +457,7 @@ fn test_export_latex_heading() -> Result<()> {
         &ExportLatexDto {
             document_class: "article".to_string(),
             include_preamble: true,
-                omit_images: false,
+            omit_images: false,
         },
     )?;
 

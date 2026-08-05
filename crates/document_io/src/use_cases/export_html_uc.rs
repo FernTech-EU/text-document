@@ -33,17 +33,11 @@ pub struct ExportHtmlUseCase {
 }
 
 impl ExportHtmlUseCase {
-    pub fn new(uow_factory: Box<dyn ExportHtmlUnitOfWorkFactoryTrait>) -> Self {
-        ExportHtmlUseCase {
-            uow_factory,
-            options: HtmlExportOptions::default(),
-        }
-    }
-
-    /// Construct with an explicit image policy. The default
-    /// ([`HtmlImageMode::Reference`]) emits `src` verbatim, which is what plain
-    /// `to_html` has always produced.
-    pub fn new_with_options(
+    /// One constructor, taking the options — the shape
+    /// `ExportMarkdownUseCase::new` already uses. `HtmlExportOptions::default()`
+    /// is [`HtmlImageMode::Reference`], which emits `src` verbatim and is what
+    /// plain `to_html` has always produced.
+    pub fn new(
         uow_factory: Box<dyn ExportHtmlUnitOfWorkFactoryTrait>,
         options: HtmlExportOptions,
     ) -> Self {

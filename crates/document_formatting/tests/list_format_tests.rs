@@ -4,8 +4,8 @@ extern crate text_document_formatting as document_formatting;
 
 use anyhow::Result;
 
-use document_formatting::{ListStyle, SetListFormatDto};
 use document_formatting::document_formatting_controller;
+use document_formatting::{ListStyle, SetListFormatDto};
 
 use test_harness::{create_list, list_controller, setup_with_text};
 

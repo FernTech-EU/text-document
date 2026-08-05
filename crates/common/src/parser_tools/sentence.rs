@@ -191,15 +191,23 @@ const PROFILES: &[(&str, &[&str], &[char])] = &[
     // ── Slavic (Latin script) ──
     (
         "pl",
-        &["p", "pan", "pani", "inż", "mgr", "ks", "św", "hab", "red", "płk", "gen", "por", "rys"],
+        &[
+            "p", "pan", "pani", "inż", "mgr", "ks", "św", "hab", "red", "płk", "gen", "por", "rys",
+        ],
         &[],
     ),
     (
         "cs",
-        &["p", "pí", "bc", "judr", "mudr", "phdr", "sv", "plk", "gen", "obr", "kap"],
+        &[
+            "p", "pí", "bc", "judr", "mudr", "phdr", "sv", "plk", "gen", "obr", "kap",
+        ],
         &[],
     ),
-    ("sk", &["p", "pí", "bc", "judr", "mudr", "sv", "plk", "obr"], &[]),
+    (
+        "sk",
+        &["p", "pí", "bc", "judr", "mudr", "sv", "plk", "obr"],
+        &[],
+    ),
     ("sl", &["g", "ga", "gdč", "sv", "št"], &[]),
     ("hr", &["g", "gđa", "gđica", "sv", "br", "sl"], &[]),
     ("bs", &["g", "gđa", "gđica", "sv", "br"], &[]),
@@ -207,7 +215,9 @@ const PROFILES: &[(&str, &[&str], &[char])] = &[
     // on the text, not on the tag's script subtag.
     (
         "sr",
-        &["g", "gđa", "sv", "br", "г", "гђа", "др", "проф", "св", "инж"],
+        &[
+            "g", "gđa", "sv", "br", "г", "гђа", "др", "проф", "св", "инж",
+        ],
         &[],
     ),
     // ── Slavic (Cyrillic script) ──
@@ -221,13 +231,21 @@ const PROFILES: &[(&str, &[&str], &[char])] = &[
     ),
     (
         "uk",
-        &["п", "пан", "пані", "д-р", "проф", "св", "вул", "пл", "обл", "стор", "мал", "гл"],
+        &[
+            "п", "пан", "пані", "д-р", "проф", "св", "вул", "пл", "обл", "стор", "мал", "гл",
+        ],
         &[],
     ),
-    ("be", &["сп", "спн", "д-р", "праф", "св", "вул", "стар"], &[]),
+    (
+        "be",
+        &["сп", "спн", "д-р", "праф", "св", "вул", "стар"],
+        &[],
+    ),
     (
         "bg",
-        &["г", "г-н", "г-жа", "г-ца", "д-р", "проф", "инж", "св", "ул", "пл", "стр", "фиг"],
+        &[
+            "г", "г-н", "г-жа", "г-ца", "д-р", "проф", "инж", "св", "ул", "пл", "стр", "фиг",
+        ],
         &[],
     ),
     (
@@ -236,15 +254,25 @@ const PROFILES: &[(&str, &[&str], &[char])] = &[
         &[],
     ),
     // ── Baltic / Finno-Ugric ──
-    ("lt", &["p", "ponas", "ponia", "doc", "inž", "šv", "psl"], &[]),
+    (
+        "lt",
+        &["p", "ponas", "ponia", "doc", "inž", "šv", "psl"],
+        &[],
+    ),
     ("lv", &["k-gs", "k-dze", "doc", "inž", "sv", "lpp"], &[]),
     ("et", &["hr", "pr", "prl", "dots", "lk"], &[]),
-    ("fi", &["hra", "rva", "nti", "tri", "ks", "vrt", "kuva"], &[]),
+    (
+        "fi",
+        &["hra", "rva", "nti", "tri", "ks", "vrt", "kuva"],
+        &[],
+    ),
     ("hu", &["id", "ifj", "özv", "szt", "vö", "kb", "ún"], &[]),
     // ── Hellenic ──
     (
         "el",
-        &["κ", "κα", "κος", "κύρ", "δρ", "καθ", "αγ", "σελ", "βλ", "εικ", "κεφ"],
+        &[
+            "κ", "κα", "κος", "κύρ", "δρ", "καθ", "αγ", "σελ", "βλ", "εικ", "κεφ",
+        ],
         &[],
     ),
     // ── Celtic / other European ──
@@ -261,7 +289,18 @@ const PROFILES: &[(&str, &[&str], &[char])] = &[
     (
         "tr",
         &[
-            "sn", "doç", "av", "öğr", "yrd", "alb", "gen", "hz", "bkz", "sf", "şek", "i\u{307}st",
+            "sn",
+            "doç",
+            "av",
+            "öğr",
+            "yrd",
+            "alb",
+            "gen",
+            "hz",
+            "bkz",
+            "sf",
+            "şek",
+            "i\u{307}st",
         ],
         &[],
     ),
@@ -311,7 +350,6 @@ impl Profile {
             },
         }
     }
-
 }
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -335,7 +373,9 @@ fn ends_with_abbreviation(before: &str, profile: &Profile) -> bool {
         // Anchor on a boundary so `st` cannot fire inside `august`. A preceding space covers
         // running prose; the opening bracket and quotation marks cover `(cf` and `“Dr`.
         lower.strip_suffix(*abbr).is_some_and(|head| {
-            head.ends_with([' ', '\u{a0}', '\u{202f}', '(', '[', '"', '\'', '«', '»', '“', '„'])
+            head.ends_with([
+                ' ', '\u{a0}', '\u{202f}', '(', '[', '"', '\'', '«', '»', '“', '„',
+            ])
         })
     };
     profile.abbreviations.iter().any(matches)
@@ -501,7 +541,10 @@ pub fn sentences<'a>(text: &'a str, locale: Option<&str>) -> Vec<Sentence<'a>> {
             }
             b
         };
-        out.push(Sentence { text: &text[byte_start..byte_end], char_range: start..trimmed_end });
+        out.push(Sentence {
+            text: &text[byte_start..byte_end],
+            char_range: start..trimmed_end,
+        });
     }
     out
 }
@@ -571,7 +614,11 @@ fn char_breaks(text: &str, locale: Option<&str>) -> Option<Vec<usize>> {
 /// not the gap after it. `None` when nothing but whitespace is left.
 fn trim_trailing_whitespace(text: &str, start: usize, end: usize) -> Option<(usize, usize)> {
     let mut trimmed = end;
-    let mut it = text.chars().skip(start).take(end - start).collect::<Vec<_>>();
+    let mut it = text
+        .chars()
+        .skip(start)
+        .take(end - start)
+        .collect::<Vec<_>>();
     while trimmed > start {
         match it.pop() {
             Some(c) if c.is_whitespace() => trimmed -= 1,
@@ -640,10 +687,22 @@ mod tests {
     fn the_shared_latin_titles_reach_every_latin_language() {
         for (tag, text, want) in [
             ("nl", "Dhr. Jansen kwam. Hij zweeg.", "Dhr. Jansen kwam."),
-            ("pl", "Przyszedł prof. Nowak. Potem wyszedł.", "Przyszedł prof. Nowak."),
-            ("cs", "Přišel pan Dr. Novák. Pak odešel.", "Přišel pan Dr. Novák."),
+            (
+                "pl",
+                "Przyszedł prof. Nowak. Potem wyszedł.",
+                "Przyszedł prof. Nowak.",
+            ),
+            (
+                "cs",
+                "Přišel pan Dr. Novák. Pak odešel.",
+                "Přišel pan Dr. Novák.",
+            ),
             ("hu", "Megjött Dr. Nagy. Aztán elment.", "Megjött Dr. Nagy."),
-            ("it", "È arrivato il Sig. Rossi. Poi tacque.", "È arrivato il Sig. Rossi."),
+            (
+                "it",
+                "È arrivato il Sig. Rossi. Poi tacque.",
+                "È arrivato il Sig. Rossi.",
+            ),
         ] {
             assert_eq!(split(text, Some(tag))[0], want, "{tag}");
         }
@@ -693,8 +752,15 @@ mod tests {
     #[test]
     fn an_abutting_closing_quote_needs_no_tailoring() {
         assert_eq!(
-            split("She paused. \"Are you sure?\" he asked. Then silence.", Some("en")),
-            ["She paused.", "\"Are you sure?\" he asked.", "Then silence."]
+            split(
+                "She paused. \"Are you sure?\" he asked. Then silence.",
+                Some("en")
+            ),
+            [
+                "She paused.",
+                "\"Are you sure?\" he asked.",
+                "Then silence."
+            ]
         );
         assert_eq!(
             split("Powiedział: „Naprawdę?” Potem wyszedł.", Some("pl")),
@@ -707,7 +773,10 @@ mod tests {
     #[test]
     fn french_guillemets_close_across_their_space() {
         assert_eq!(
-            split("Mme Aubry hésita. « Vraiment ? » demanda-t-il. Puis le silence.", Some("fr")),
+            split(
+                "Mme Aubry hésita. « Vraiment ? » demanda-t-il. Puis le silence.",
+                Some("fr")
+            ),
             [
                 "Mme Aubry hésita.",
                 "« Vraiment ? » demanda-t-il.",
@@ -787,10 +856,7 @@ mod tests {
             ["Πού πηγαίνεις\u{37e}", "Δεν ξέρω."]
         );
         // The ano teleia is Greek's *semicolon* and keeps not terminating.
-        assert_eq!(
-            split("Ήρθε· κάθισε.", Some("el")),
-            ["Ήρθε· κάθισε."]
-        );
+        assert_eq!(split("Ήρθε· κάθισε.", Some("el")), ["Ήρθε· κάθισε."]);
         // …and a semicolon in any other language stays a semicolon.
         assert_eq!(
             split("He came; she left.", Some("en")),
@@ -832,7 +898,10 @@ mod tests {
             split("Mr. Smith went home.", Some("zz")),
             ["Mr.", "Smith went home."]
         );
-        assert_eq!(split("Mr. Smith went home.", None), ["Mr.", "Smith went home."]);
+        assert_eq!(
+            split("Mr. Smith went home.", None),
+            ["Mr.", "Smith went home."]
+        );
     }
 
     /// **The shared-title list must not leak into languages that never asked for it.**
@@ -898,7 +967,10 @@ mod tests {
     #[test]
     fn a_caret_at_the_very_end_belongs_to_the_last_sentence() {
         let text = "One. Two.";
-        assert_eq!(sentence_bounds(text, text.chars().count(), Some("en")), Some((5, 9)));
+        assert_eq!(
+            sentence_bounds(text, text.chars().count(), Some("en")),
+            Some((5, 9))
+        );
         // Past the end is clamped rather than panicking.
         assert_eq!(sentence_bounds(text, 9_999, Some("en")), Some((5, 9)));
     }
@@ -911,7 +983,10 @@ mod tests {
 
     #[test]
     fn a_single_sentence_block_is_one_range() {
-        assert_eq!(sentence_bounds("Just the one", 5, Some("en")), Some((0, 12)));
+        assert_eq!(
+            sentence_bounds("Just the one", 5, Some("en")),
+            Some((0, 12))
+        );
     }
 
     /// Offsets are **char** offsets, so a block of multi-byte text must not report byte
@@ -952,9 +1027,15 @@ mod tests {
             ("   ", Some("en")),
         ];
         for (text, locale) in corpus {
-            let batch: Vec<String> =
-                sentences(text, *locale).into_iter().map(|s| s.text.to_string()).collect();
-            assert_eq!(batch, split(text, *locale), "disagreement on {text:?} ({locale:?})");
+            let batch: Vec<String> = sentences(text, *locale)
+                .into_iter()
+                .map(|s| s.text.to_string())
+                .collect();
+            assert_eq!(
+                batch,
+                split(text, *locale),
+                "disagreement on {text:?} ({locale:?})"
+            );
         }
     }
 
@@ -964,8 +1045,11 @@ mod tests {
     fn the_slice_and_the_range_describe_the_same_span() {
         let text = "Ééé les uns. Ààà les autres. Fin.";
         for s in sentences(text, Some("fr")) {
-            let by_range: String =
-                text.chars().skip(s.char_range.start).take(s.char_range.len()).collect();
+            let by_range: String = text
+                .chars()
+                .skip(s.char_range.start)
+                .take(s.char_range.len())
+                .collect();
             assert_eq!(s.text, by_range, "slice and range disagree for {s:?}");
         }
     }
@@ -1025,6 +1109,9 @@ mod tests {
             1,
             "known gap: an em-dash turn has no closing mark for the splitter to see"
         );
-        assert!(sentences(turns, Some("fr-FR")).len() >= 2, "a newline still separates turns");
+        assert!(
+            sentences(turns, Some("fr-FR")).len() >= 2,
+            "a newline still separates turns"
+        );
     }
 }
