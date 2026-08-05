@@ -668,6 +668,22 @@ impl TextDocument {
         DocumentStats::from(&dto)
     }
 
+    /// Tell the document what each footnote label should print.
+    ///
+    /// Presentation only: never stored, never exported, never part of the text. A
+    /// reference occupies one character whatever its marker says.
+    ///
+    /// Set it when the numbers are a fact about something larger than this
+    /// document — a host compiling one chapter of a book knows the chapter's notes
+    /// continue a sequence this document cannot see. Leave it unset and the
+    /// document numbers its own references in reading order, which is right when
+    /// the document *is* the whole text.
+    pub fn set_footnote_markers(&self, markers: std::collections::HashMap<String, String>) {
+        let inner = self.inner.lock();
+        let store = inner.ctx.db_context.get_store();
+        *store.footnote_markers.write() = markers;
+    }
+
     /// Every footnote reference in the document, as `(position, label)`, in
     /// reading order.
     ///

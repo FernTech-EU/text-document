@@ -32,6 +32,8 @@ pub struct Footnotes {
     definitions: HashMap<String, EntityId>,
     /// Every definition frame, for the outer walk to skip.
     definition_frames: HashSet<EntityId>,
+    /// What the host says each label prints, when it has an opinion.
+    overrides: HashMap<String, String>,
 }
 
 impl Footnotes {
@@ -101,6 +103,7 @@ impl Footnotes {
             numbers,
             definitions,
             definition_frames,
+            overrides: store.footnote_markers.read().clone(),
         }
     }
 
@@ -123,6 +126,13 @@ impl Footnotes {
     /// appeared in the walk — visible and traceable, rather than an empty
     /// marker the reader cannot tell from a rendering fault.
     pub fn marker(&self, label: &str) -> String {
+        // The host wins. It knows things this document cannot: which chapter of
+        // which book this text came from, and therefore whether note numbering
+        // restarted above it. A document holding one exported chapter would
+        // otherwise number its notes from one and disagree with the editor.
+        if let Some(m) = self.overrides.get(label) {
+            return m.clone();
+        }
         match self.numbers.get(label) {
             Some(n) => n.to_string(),
             None => label.to_string(),

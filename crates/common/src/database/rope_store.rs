@@ -46,6 +46,18 @@ pub struct RopeStore {
     /// `format_runs::block_anchors`, which is the one place their interleaving is
     /// decided.
     pub block_footnote_refs: RwLock<HashMap<EntityId, Vec<FootnoteRefAnchor>>>,
+    /// Host-supplied markers by footnote label — what a reference *prints*.
+    ///
+    /// Ambient and presentation-only, like a syntax highlighter: never serialised,
+    /// never part of the document, and consulted when a reference is rendered.
+    ///
+    /// It exists because the number is a fact about the **host's** manuscript, not
+    /// about this document. Skribisto compiles one chapter into a document of its
+    /// own, and that document's reading order would number the chapter's notes from
+    /// one — disagreeing with the badge the writer sees in the editor, for the same
+    /// note, at the same moment. Empty means "number them yourself", which is the
+    /// right answer for a document that *is* the whole text.
+    pub footnote_markers: RwLock<StdHashMap<String, String>>,
 
     // ── Document-wide block ordering (sorted by rope position) ────────
     pub block_offsets: RwLock<BlockOffsetIndex>,
@@ -81,6 +93,7 @@ impl RopeStore {
             format_runs: self.format_runs.read().clone(),
             block_images: self.block_images.read().clone(),
             block_footnote_refs: self.block_footnote_refs.read().clone(),
+            footnote_markers: self.footnote_markers.read().clone(),
             block_offsets: self.block_offsets.read().clone(),
             counters: self.counters.read().clone(),
         }
@@ -101,6 +114,7 @@ impl RopeStore {
         *self.format_runs.write() = snap.format_runs.clone();
         *self.block_images.write() = snap.block_images.clone();
         *self.block_footnote_refs.write() = snap.block_footnote_refs.clone();
+        *self.footnote_markers.write() = snap.footnote_markers.clone();
         *self.block_offsets.write() = snap.block_offsets.clone();
         *self.counters.write() = snap.counters.clone();
     }
@@ -120,6 +134,7 @@ impl RopeStore {
         *self.format_runs.write() = snap.format_runs.clone();
         *self.block_images.write() = snap.block_images.clone();
         *self.block_footnote_refs.write() = snap.block_footnote_refs.clone();
+        *self.footnote_markers.write() = snap.footnote_markers.clone();
         *self.block_offsets.write() = snap.block_offsets.clone();
         // counters intentionally not restored
     }
@@ -191,6 +206,7 @@ pub struct RopeStoreSnapshot {
     pub(crate) format_runs: HashMap<EntityId, Vec<FormatRun>>,
     pub(crate) block_images: HashMap<EntityId, Vec<ImageAnchor>>,
     pub(crate) block_footnote_refs: HashMap<EntityId, Vec<FootnoteRefAnchor>>,
+    pub(crate) footnote_markers: StdHashMap<String, String>,
     pub(crate) block_offsets: BlockOffsetIndex,
     pub(crate) counters: StdHashMap<String, EntityId>,
 }
