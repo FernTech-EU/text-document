@@ -672,6 +672,7 @@ pub fn insert_image(
             ImageAnchor {
                 byte_offset,
                 name: image_name.to_string(),
+                alt: String::new(),
                 width,
                 height,
                 quality: 100,

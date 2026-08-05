@@ -103,7 +103,11 @@ impl LongOperation for ExportPdfUseCase {
         ));
 
         let (pdf_bytes, page_count) =
-            compile_typst_pdf(&markup, self.dto.options.font_bytes.clone())?;
+            compile_typst_pdf(
+                &markup,
+                self.dto.options.font_bytes.clone(),
+                &self.dto.options.images,
+            )?;
 
         progress_callback(OperationProgress::new(
             95.0,
@@ -142,7 +146,11 @@ impl ExportPdfUseCase {
         uow.end_transaction()?;
         let markup = result?;
         let (pdf_bytes, page_count) =
-            compile_typst_pdf(&markup, self.dto.options.font_bytes.clone())?;
+            compile_typst_pdf(
+                &markup,
+                self.dto.options.font_bytes.clone(),
+                &self.dto.options.images,
+            )?;
         Ok((pdf_bytes, page_count as i64))
     }
 
@@ -263,7 +271,11 @@ impl ExportPdfUseCase {
 
         // Table anchor frame — render the table instead of blocks.
         if let Some(table_id) = frame.table {
-            return render_table_typst(&uow.store(), table_id);
+            return render_table_typst(
+                &uow.store(),
+                table_id,
+                &crate::typst_markup::typst_image_paths(&self.dto.options.images),
+            );
         }
 
         // If child_order is populated, use it to interleave blocks and sub-frames

@@ -74,6 +74,24 @@ pub trait ExportPlainTextUnitOfWorkFactoryTrait: Send + Sync {
 #[macros::uow_action(entity = "Block", action = "GetMultiRO")]
 pub trait ExportPlainTextUnitOfWorkTrait: QueryUnitOfWork {}
 
+
+/// Drop inline-image sentinels from plain-text output.
+///
+/// An image occupies one `U+FFFC` OBJECT REPLACEMENT CHARACTER in the document
+/// text. Plain text has no way to represent a picture, and emitting the raw
+/// sentinel put an unrenderable box in the writer's `.txt` — so the image is
+/// omitted rather than transliterated. Its alt text is deliberately *not*
+/// substituted: alt describes the image for a reader who cannot see it, and
+/// silently promoting it to prose would put words in the manuscript that the
+/// writer never typed.
+fn strip_image_sentinels(text: &str) -> String {
+    if text.contains('\u{FFFC}') {
+        text.replace('\u{FFFC}', "")
+    } else {
+        text.to_string()
+    }
+}
+
 pub struct ExportPlainTextUseCase {
     uow_factory: Box<dyn ExportPlainTextUnitOfWorkFactoryTrait>,
 }
@@ -126,7 +144,9 @@ impl ExportPlainTextUseCase {
         if !page_breaks && let Some(plain_text) = rope_flat_text_if_simple(&store, frame_ids.len())
         {
             uow.end_transaction()?;
-            return Ok(ExportPlainTextDto { plain_text });
+            return Ok(ExportPlainTextDto {
+                plain_text: strip_image_sentinels(&plain_text),
+            });
         }
 
         // Slow path: tables or multi-frame documents. Cell content and a blockquote's prose
@@ -192,7 +212,7 @@ impl ExportPlainTextUseCase {
         let plain_text = blocks
             .iter()
             .map(|block| {
-                let text = block_content_via_store(block, &store);
+                let text = strip_image_sentinels(&block_content_via_store(block, &store));
                 let text = match quote_depth.get(&block.id) {
                     Some(&depth) => indent_quoted(&text, depth),
                     None => text,

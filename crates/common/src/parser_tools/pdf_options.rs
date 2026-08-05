@@ -42,6 +42,12 @@ pub struct PdfExportOptions {
     /// At least one entry is required for `document_io::typst_compile::compile_typst_pdf` to
     /// succeed; this struct itself does not enforce that (`Default` is an empty list).
     pub font_bytes: Vec<Vec<u8>>,
+    /// Bytes for the document's inline images, keyed by their `src`, registered
+    /// with the embedded Typst compiler as in-memory virtual files. Exactly the
+    /// same contract as [`font_bytes`](Self::font_bytes) — the caller hands over
+    /// blobs, and no filesystem access happens here.
+    #[serde(default)]
+    pub images: super::image_options::ExportImages,
     /// Body font size, in points.
     pub font_size_pt: f32,
     /// Paragraph line spacing (Typst `leading`), in em. Typst's own default is `0.65`.
@@ -84,6 +90,7 @@ impl Default for PdfExportOptions {
             margin_right_mm: 20.0,
 
             font_family: String::new(),
+            images: Default::default(),
             font_bytes: Vec::new(),
             font_size_pt: 12.0,
             line_spacing: 0.65,

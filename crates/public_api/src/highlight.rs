@@ -1018,6 +1018,7 @@ pub(crate) fn merge_highlight_spans(
             }
             FragmentContent::Image {
                 ref name,
+                ref alt,
                 width,
                 height,
                 quality,
@@ -1043,6 +1044,7 @@ pub(crate) fn merge_highlight_spans(
 
                 result.push(FragmentContent::Image {
                     name: name.clone(),
+                    alt: alt.clone(),
                     width,
                     height,
                     quality,

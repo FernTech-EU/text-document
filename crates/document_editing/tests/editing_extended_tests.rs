@@ -105,8 +105,10 @@ fn test_insert_image() -> Result<()> {
             position: 5,
             anchor: 5,
             image_name: "test.png".to_string(),
+            alt: String::new(),
             width: 100,
             height: 50,
+            quality: 100,
         },
     )?;
 
@@ -135,8 +137,10 @@ fn test_insert_image_undo() -> Result<()> {
             position: 3,
             anchor: 3,
             image_name: "photo.jpg".to_string(),
+            alt: String::new(),
             width: 200,
             height: 150,
+            quality: 100,
         },
     )?;
 
@@ -462,8 +466,10 @@ fn test_insert_image_at_position_zero() -> Result<()> {
             position: 0,
             anchor: 0,
             image_name: "start.png".to_string(),
+            alt: String::new(),
             width: 50,
             height: 50,
+            quality: 100,
         },
     )?;
 
@@ -495,8 +501,10 @@ fn test_insert_image_with_selection_errors() -> Result<()> {
             position: 6,
             anchor: 11,
             image_name: "replaced.png".to_string(),
+            alt: String::new(),
             width: 100,
             height: 100,
+            quality: 100,
         },
     );
 
@@ -716,8 +724,10 @@ fn test_insert_image_cross_block_selection_errors() -> Result<()> {
             position: 3,
             anchor: 9,
             image_name: "bridge.png".to_string(),
+            alt: String::new(),
             width: 200,
             height: 100,
+            quality: 100,
         },
     );
 

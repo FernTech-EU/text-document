@@ -138,7 +138,7 @@ fn insert_image_inserts_object_replacement_sentinel() {
     let doc = TextDocument::new();
     doc.set_plain_text("ab").unwrap();
     let cursor = doc.cursor_at(1);
-    cursor.insert_image("img1", 100, 100).unwrap();
+    cursor.insert_image("img1", "", 100, 100).unwrap();
 
     let store = doc.rope_store_for_test();
     let rope = store.rope.read();

@@ -26,7 +26,7 @@ use common::entities::{
 };
 use common::format_runs::InlineContent;
 use common::format_runs_query::inline_segments_for_block;
-use common::parser_tools::PdfExportOptions;
+use common::parser_tools::{ExportImages, PdfExportOptions};
 use common::types::EntityId;
 
 // ─────────────────────────── Escaping ───────────────────────────
@@ -38,6 +38,29 @@ use common::types::EntityId;
 /// for instance) — the same trade-off `escape_latex` already makes for `&%$#_{}~^`. This is the
 /// only rule that is unconditionally injection-proof without per-context parsing, which matters
 /// here specifically because author prose must never be able to inject Typst code.
+
+/// Virtual-file path for each supplied image, keyed by the document's `src`.
+///
+/// Both the markup emitter and the compiler's file resolver call this, so the
+/// `#image("…")` in the markup and the registered virtual file can never drift
+/// apart. Names are sequential rather than derived from `src`: a `src` may be an
+/// absolute path, may contain characters Typst reads as path syntax, and may
+/// differ only in ways a filesystem would flatten.
+pub(crate) fn typst_image_paths(
+    images: &ExportImages,
+) -> std::collections::BTreeMap<String, String> {
+    images
+        .iter()
+        .enumerate()
+        .map(|(i, (src, image))| {
+            (
+                src.clone(),
+                format!("/images/img_{:03}.{}", i + 1, image.extension()),
+            )
+        })
+        .collect()
+}
+
 pub fn escape_typst(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for ch in s.chars() {
@@ -214,6 +237,7 @@ pub fn hoist_leading_pagebreak(body: &str) -> (Option<&'static str>, &str) {
 }
 
 pub fn render_blocks_typst(store: &Store, blocks: &[Block], options: &PdfExportOptions) -> String {
+    let image_paths = typst_image_paths(&options.images);
     let mut parts: Vec<String> = Vec::new();
     let mut i = 0;
 
@@ -274,7 +298,7 @@ pub fn render_blocks_typst(store: &Store, blocks: &[Block], options: &PdfExportO
                 // inside it has nowhere to go. End the run instead and let the outer
                 // loop emit the break and open a fresh list after it.
                 if b_is_listed && !(b.fmt_page_break_before == Some(true) && !items.is_empty()) {
-                    let inline = render_inline_typst(store, b);
+                    let inline = render_inline_typst(store, b, &image_paths);
                     items.push(format!("[{inline}]"));
                     i += 1;
                 } else {
@@ -293,7 +317,7 @@ pub fn render_blocks_typst(store: &Store, blocks: &[Block], options: &PdfExportO
             parts.push(format!("{call}{}", items.join("")));
         } else {
             // --- Normal block (paragraph / heading) ---
-            let inline = render_inline_typst(store, block);
+            let inline = render_inline_typst(store, block, &image_paths);
 
             // Skip a block with no inline content: an empty paragraph would inject a stray blank
             // (doubling the `\n\n` join) and an empty heading would emit a bare `= ` — a
@@ -428,7 +452,11 @@ fn bullet_marker(style: &ListStyle) -> &'static str {
 /// formatting (monospace/bold/italic/underline/strike/super/sub/hyperlink). Nesting order
 /// (innermost to outermost) mirrors `render_inline_latex`: monospace, bold, italic, underline,
 /// strike, vertical alignment, then hyperlink outermost.
-pub fn render_inline_typst(store: &Store, block: &Block) -> String {
+pub fn render_inline_typst(
+    store: &Store,
+    block: &Block,
+    image_paths: &std::collections::BTreeMap<String, String>,
+) -> String {
     let block_text = block_content_via_store(block, store);
     let elements = inline_segments_for_block(store, block.id, &block_text);
 
@@ -445,13 +473,34 @@ pub fn render_inline_typst(store: &Store, block: &Block) -> String {
                     escape_typst(t)
                 }
             }
-            InlineContent::Image { name, .. } => {
-                // No embedded-image support in the PDF exporter yet (Typst would need the image
-                // bytes registered as a virtual file); fall back to the image's name as literal
-                // text, exactly as `render_raw_text`-style fallbacks do elsewhere for a
-                // plain-text rendering of an unsupported inline kind.
-                escape_typst(name)
-            }
+            InlineContent::Image {
+                name,
+                alt,
+                width,
+                height,
+                ..
+            } => match image_paths.get(name) {
+                Some(path) => {
+                    // Display size, when the document carries one, is emitted in
+                    // points at 96 dpi — the unit the model's pixel dimensions
+                    // are in. Without it Typst lays the image out at its natural
+                    // size, which for a phone photo overruns the page.
+                    let mut args = format!("\"{}\"", escape_typst_string(path));
+                    if *width > 0 {
+                        args.push_str(&format!(", width: {}pt", *width as f64 * 72.0 / 96.0));
+                    }
+                    if *height > 0 {
+                        args.push_str(&format!(", height: {}pt", *height as f64 * 72.0 / 96.0));
+                    }
+                    if !alt.is_empty() {
+                        args.push_str(&format!(", alt: \"{}\"", escape_typst_string(alt)));
+                    }
+                    format!("#image({args})")
+                }
+                // No bytes supplied for this image: show its description rather
+                // than its filename, which means nothing to a reader.
+                None => escape_typst(alt),
+            },
             InlineContent::Empty => String::new(),
         };
 
@@ -527,7 +576,11 @@ fn raw_block_text(store: &Store, block: &Block) -> String {
 /// every subsequent cell by one position). A position that is NOT covered but has no `TableCell`
 /// entity at all (a genuine gap in the model, not a span) still gets an empty `[]` filler, since
 /// Typst's auto-placement has no way to know a gap was intentional.
-pub fn render_table_typst(store: &Store, table_id: EntityId) -> Result<String> {
+pub fn render_table_typst(
+    store: &Store,
+    table_id: EntityId,
+    image_paths: &std::collections::BTreeMap<String, String>,
+) -> Result<String> {
     let table = store
         .tables
         .read()
@@ -575,7 +628,7 @@ pub fn render_table_typst(store: &Store, table_id: EntityId) -> Result<String> {
 
                     let mut cell_parts: Vec<String> = Vec::new();
                     for block in &blocks {
-                        let inline = render_inline_typst(store, block);
+                        let inline = render_inline_typst(store, block, image_paths);
                         if !inline.is_empty() {
                             cell_parts.push(inline);
                         }
@@ -721,7 +774,7 @@ mod tests {
         };
         let markup = format!("{}{escaped}\n", typst_preamble(&options));
         let (pdf, _pages) =
-            crate::typst_compile::compile_typst_pdf(&markup, vec![TEST_FONT.to_vec()])
+            crate::typst_compile::compile_typst_pdf(&markup, vec![TEST_FONT.to_vec()], &Default::default())
                 .expect("adversarial-but-escaped prose must compile as plain text");
         assert!(pdf.starts_with(b"%PDF-"));
     }
@@ -745,7 +798,7 @@ mod tests {
         };
         let markup = format!("{}Hello, world.\n", typst_preamble(&options));
         let (pdf, _pages) =
-            crate::typst_compile::compile_typst_pdf(&markup, vec![TEST_FONT.to_vec()])
+            crate::typst_compile::compile_typst_pdf(&markup, vec![TEST_FONT.to_vec()], &Default::default())
                 .expect("default preamble must compile");
         assert!(pdf.starts_with(b"%PDF-"));
     }
@@ -764,7 +817,7 @@ mod tests {
         };
         let markup = format!("{}Bonjour le monde.\n", typst_preamble(&options));
         let (pdf, _pages) =
-            crate::typst_compile::compile_typst_pdf(&markup, vec![TEST_FONT.to_vec()])
+            crate::typst_compile::compile_typst_pdf(&markup, vec![TEST_FONT.to_vec()], &Default::default())
                 .expect("preamble with metadata must compile");
         assert!(pdf.starts_with(b"%PDF-"));
     }

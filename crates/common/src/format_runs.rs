@@ -119,6 +119,18 @@ pub enum InlineContent {
     Text(String),
     Image {
         name: String,
+        /// Alternative text describing the image.
+        ///
+        /// Carried on the model rather than derived from the resource name
+        /// because it is the image's accessible description and its export
+        /// representation (HTML/EPUB `alt`, DOCX drawing description, Djot's
+        /// `![…]` label) — a filename is none of those things.
+        ///
+        /// `#[serde(default)]`: fragments are serialized onto the OS clipboard,
+        /// so a payload written by a build without this field must still
+        /// deserialize.
+        #[serde(default)]
+        alt: String,
         width: i64,
         height: i64,
         quality: i64,
@@ -198,6 +210,10 @@ pub struct FormatRun {
 pub struct ImageAnchor {
     pub byte_offset: u32,
     pub name: String,
+    /// Alternative text. See [`InlineContent::Image::alt`] for why it lives on
+    /// the model and why it defaults.
+    #[serde(default)]
+    pub alt: String,
     pub width: i64,
     pub height: i64,
     pub quality: i64,
@@ -698,36 +714,29 @@ pub fn shift_images_for_delete(
 /// document-space char position to the byte position where text edits
 /// should land in `block.plain_text`.
 ///
-/// Images contribute 1 logical character but 0 bytes in `plain_text`.
-/// Images at the same byte_offset are visited in their stored order.
-pub fn logical_offset_to_byte(plain_text: &str, images: &[ImageAnchor], char_offset: i64) -> u32 {
+/// Each image already occupies exactly one character of `plain_text`: the
+/// `U+FFFC` OBJECT REPLACEMENT CHARACTER that `insert_image` mirrors into the
+/// rope, which [`ImageAnchor::byte_offset`] points at. So a logical offset *is*
+/// a character offset and this is a plain char→byte mapping.
+///
+/// `images` is retained in the signature — and deliberately unused — because
+/// getting this wrong is silent and expensive, and callers pass it naturally.
+/// The previous implementation walked the anchor list *in addition to*
+/// `char_indices()`, so every image advanced the logical counter twice. That
+/// dates from the pre-rope model, where an anchor genuinely contributed no
+/// bytes; once the sentinel went into the rope the two representations started
+/// double-counting. The visible effects: selecting across an image returned the
+/// wrong text (an extra sentinel, a missing character), and deleting a range
+/// containing one removed too little.
+pub fn logical_offset_to_byte(plain_text: &str, _images: &[ImageAnchor], char_offset: i64) -> u32 {
     if char_offset <= 0 {
         return 0;
     }
-    let mut logical: i64 = 0;
-    let mut images_consumed = 0usize;
-    for (b, _) in plain_text.char_indices() {
-        while images_consumed < images.len() && images[images_consumed].byte_offset <= b as u32 {
-            if logical == char_offset {
-                return b as u32;
-            }
-            logical += 1;
-            images_consumed += 1;
-        }
-        if logical == char_offset {
-            return b as u32;
-        }
-        logical += 1;
-    }
-    let plain_len = plain_text.len() as u32;
-    while images_consumed < images.len() {
-        if logical == char_offset {
-            return plain_len;
-        }
-        logical += 1;
-        images_consumed += 1;
-    }
-    plain_len
+    plain_text
+        .char_indices()
+        .nth(char_offset as usize)
+        .map(|(b, _)| b as u32)
+        .unwrap_or(plain_text.len() as u32)
 }
 
 /// Split a block's format runs at `byte_offset`. The returned right-hand
@@ -828,6 +837,131 @@ pub fn apply_character_format_to_segment(seg: &mut InlineSegment, fmt: &Characte
     seg.fmt_vertical_alignment = fmt.vertical_alignment.clone();
 }
 
+/// One ordered piece of a block's inline content: a run of text, or an image.
+///
+/// Produced by [`merge_runs_and_images`] and mapped by each caller into its own
+/// output type.
+#[derive(Debug, Clone, PartialEq)]
+pub enum InlinePiece<'a> {
+    /// Byte range `[start, end)` of the block's `plain_text`. `format` is
+    /// `None` for bytes no format run covers.
+    Text {
+        start: u32,
+        end: u32,
+        format: Option<&'a CharacterFormat>,
+    },
+    /// An image anchored at this position. Contributes one logical character
+    /// and zero bytes.
+    Image(&'a ImageAnchor),
+}
+
+/// Interleave a block's format runs and image anchors into one ordered stream.
+///
+/// A block stores three parallel things — the text bytes, a list of formatted
+/// byte ranges, and a list of image anchors keyed by byte offset — and every
+/// reader has to weave them back into document order. That weave is fiddly in
+/// exactly one place: an image anchored *inside* a formatted run has to split
+/// the run, emitting the text before it, then the image, then the rest of the
+/// run with the same format.
+///
+/// This function exists because that weave was previously written out twice, by
+/// hand, in two crates, and the two copies disagreed. The version behind
+/// `inline_segments_view` only checked `img.byte_offset < run.byte_start`, so an
+/// image inside a run was skipped by the run loop entirely and swept up by the
+/// trailing loop — landing **after every run in the block**. Insert a picture
+/// into the middle of a bold sentence and every exporter, and the fragment/copy
+/// path, moved it to the end of the paragraph.
+///
+/// Callers map the returned pieces to their own types; nobody re-derives the
+/// ordering.
+pub fn merge_runs_and_images<'a>(
+    plain_text: &str,
+    runs: &'a [FormatRun],
+    images: &'a [ImageAnchor],
+) -> Vec<InlinePiece<'a>> {
+    let text_len = plain_text.len() as u32;
+    let mut out: Vec<InlinePiece<'a>> = Vec::new();
+    let mut img_iter = images.iter().peekable();
+    // Highest byte offset already emitted. Never moves backwards.
+    let mut cursor: u32 = 0;
+
+    /// Bytes an image occupies in `plain_text`.
+    ///
+    /// `insert_image` mirrors a `U+FFFC` OBJECT REPLACEMENT CHARACTER into the
+    /// rope at the anchor's `byte_offset`, so an image's own character sits in
+    /// the text and text resuming after the image must step over it. Emitting
+    /// both the image piece *and* the sentinel yields the image twice — which
+    /// is what made a selection across an image read back with a doubled
+    /// sentinel and a missing following character.
+    ///
+    /// Checked rather than assumed: `U+FFFC` also marks table anchors, and not
+    /// every writer of an `ImageAnchor` mirrors one (the test harness writes
+    /// anchors directly). An anchor without a sentinel is still handled, it
+    /// simply consumes no bytes.
+    fn sentinel_len(plain_text: &str, byte_offset: u32) -> u32 {
+        let at = byte_offset as usize;
+        if plain_text.len() >= at + 3 && plain_text.as_bytes()[at..at + 3] == [0xEF, 0xBF, 0xBC] {
+            3
+        } else {
+            0
+        }
+    }
+
+    let push_text = |out: &mut Vec<InlinePiece<'a>>,
+                         start: u32,
+                         end: u32,
+                         format: Option<&'a CharacterFormat>| {
+        if start < end {
+            out.push(InlinePiece::Text { start, end, format });
+        }
+    };
+
+    for run in runs {
+        // Images strictly before this run: unformatted gap text, then the image.
+        while let Some(img) = img_iter.peek() {
+            if img.byte_offset >= run.byte_start {
+                break;
+            }
+            push_text(&mut out, cursor, img.byte_offset, None);
+            out.push(InlinePiece::Image(img));
+            cursor = cursor.max(img.byte_offset + sentinel_len(plain_text, img.byte_offset));
+            img_iter.next();
+        }
+
+        // Unformatted gap between the last emission and the run's start.
+        push_text(&mut out, cursor, run.byte_start, None);
+        cursor = cursor.max(run.byte_start);
+
+        // Images inside the run split it, keeping the run's format on both
+        // sides. `<=` so an image sitting exactly on the run's end boundary is
+        // consumed here rather than deferred — deferring it is what produced
+        // the out-of-order emission described above.
+        while let Some(img) = img_iter.peek() {
+            if img.byte_offset > run.byte_end {
+                break;
+            }
+            push_text(&mut out, cursor, img.byte_offset, Some(&run.format));
+            out.push(InlinePiece::Image(img));
+            cursor = cursor.max(img.byte_offset + sentinel_len(plain_text, img.byte_offset));
+            img_iter.next();
+        }
+
+        push_text(&mut out, cursor, run.byte_end, Some(&run.format));
+        cursor = cursor.max(run.byte_end);
+    }
+
+    // Images past the last run.
+    for img in img_iter {
+        push_text(&mut out, cursor, img.byte_offset, None);
+        out.push(InlinePiece::Image(img));
+        cursor = cursor.max(img.byte_offset + sentinel_len(plain_text, img.byte_offset));
+    }
+
+    push_text(&mut out, cursor, text_len, None);
+
+    out
+}
+
 /// Synthesize a `Vec<InlineSegment>` view of a block from its
 /// `plain_text`, `format_runs`, and `block_images`. Returns segments
 /// in document order: a Text segment per format run (with a fallback
@@ -842,106 +976,40 @@ pub fn inline_segments_view(
     runs: &[FormatRun],
     images: &[ImageAnchor],
 ) -> Vec<InlineSegment> {
-    let mut out: Vec<InlineSegment> = Vec::new();
     let bytes = plain_text.as_bytes();
+    let default_format = CharacterFormat::default();
 
-    let mut img_iter = images.iter().peekable();
-    let mut cursor: u32 = 0;
-
-    let emit_text =
-        |out: &mut Vec<InlineSegment>, bytes: &[u8], start: u32, end: u32, fmt: CharacterFormat| {
-            if start >= end {
-                return;
+    merge_runs_and_images(plain_text, runs, images)
+        .into_iter()
+        .map(|piece| match piece {
+            InlinePiece::Text { start, end, format } => {
+                let slice = &bytes[start as usize..end as usize];
+                let text = std::str::from_utf8(slice)
+                    .expect("block plain_text must be valid UTF-8")
+                    .to_string();
+                let mut seg = InlineSegment {
+                    content: InlineContent::Text(text),
+                    ..Default::default()
+                };
+                apply_character_format_to_segment(&mut seg, format.unwrap_or(&default_format));
+                seg
             }
-            let slice = &bytes[start as usize..end as usize];
-            let s = std::str::from_utf8(slice)
-                .expect("block plain_text must be valid UTF-8")
-                .to_string();
-            let mut seg = InlineSegment {
-                content: InlineContent::Text(s),
-                ..Default::default()
-            };
-            apply_character_format_to_segment(&mut seg, &fmt);
-            out.push(seg);
-        };
-
-    let emit_image = |out: &mut Vec<InlineSegment>, anchor: &ImageAnchor| {
-        let mut seg = InlineSegment {
-            content: InlineContent::Image {
-                name: anchor.name.clone(),
-                width: anchor.width,
-                height: anchor.height,
-                quality: anchor.quality,
-            },
-            ..Default::default()
-        };
-        apply_character_format_to_segment(&mut seg, &anchor.format);
-        out.push(seg);
-    };
-
-    for run in runs {
-        while let Some(img) = img_iter.peek() {
-            if img.byte_offset < run.byte_start {
-                emit_text(
-                    &mut out,
-                    bytes,
-                    cursor,
-                    img.byte_offset,
-                    CharacterFormat::default(),
-                );
-                emit_image(&mut out, img);
-                cursor = img.byte_offset;
-                img_iter.next();
-            } else {
-                break;
+            InlinePiece::Image(anchor) => {
+                let mut seg = InlineSegment {
+                    content: InlineContent::Image {
+                        name: anchor.name.clone(),
+                        alt: anchor.alt.clone(),
+                        width: anchor.width,
+                        height: anchor.height,
+                        quality: anchor.quality,
+                    },
+                    ..Default::default()
+                };
+                apply_character_format_to_segment(&mut seg, &anchor.format);
+                seg
             }
-        }
-
-        if cursor < run.byte_start {
-            emit_text(
-                &mut out,
-                bytes,
-                cursor,
-                run.byte_start,
-                CharacterFormat::default(),
-            );
-        }
-
-        emit_text(
-            &mut out,
-            bytes,
-            run.byte_start,
-            run.byte_end,
-            run.format.clone(),
-        );
-        cursor = run.byte_end;
-    }
-
-    for img in img_iter {
-        if img.byte_offset > cursor {
-            emit_text(
-                &mut out,
-                bytes,
-                cursor,
-                img.byte_offset,
-                CharacterFormat::default(),
-            );
-            cursor = img.byte_offset;
-        }
-        emit_image(&mut out, img);
-    }
-
-    if (cursor as usize) < bytes.len() {
-        emit_text(
-            &mut out,
-            bytes,
-            cursor,
-            bytes.len() as u32,
-            CharacterFormat::default(),
-        );
-    }
-
-    out
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -963,6 +1031,178 @@ mod tests {
     fn empty_runs_are_well_formed() {
         debug_assert_well_formed(&[], 0);
         debug_assert_well_formed(&[], 100);
+    }
+
+    // ── merge_runs_and_images ────────────────────────────────────────────
+
+    fn anchor(at: u32, name: &str) -> ImageAnchor {
+        ImageAnchor {
+            byte_offset: at,
+            name: name.into(),
+            alt: String::new(),
+            width: 10,
+            height: 10,
+            quality: 100,
+            format: CharacterFormat::default(),
+        }
+    }
+
+    /// Render a merge as a compact string so ordering assertions read clearly:
+    /// `"hello"` for unformatted text, `"*bold*"` for formatted, `[name]` for
+    /// an image.
+    fn shape(text: &str, runs: &[FormatRun], images: &[ImageAnchor]) -> String {
+        merge_runs_and_images(text, runs, images)
+            .into_iter()
+            .map(|p| match p {
+                InlinePiece::Text { start, end, format } => {
+                    let s = &text[start as usize..end as usize];
+                    if format.is_some() {
+                        format!("*{s}*")
+                    } else {
+                        s.to_string()
+                    }
+                }
+                InlinePiece::Image(a) => format!("[{}]", a.name),
+            })
+            .collect::<Vec<_>>()
+            .join("|")
+    }
+
+    /// **The regression.** An image anchored inside a formatted run used to be
+    /// skipped by the run loop (which only tested `offset < run.byte_start`)
+    /// and swept up by the trailing loop, landing after every run in the block.
+    /// Put a picture mid-sentence in bold text and every exporter moved it to
+    /// the end of the paragraph.
+    #[test]
+    fn an_image_inside_a_run_splits_it_instead_of_jumping_to_the_end() {
+        let text = "abcdef";
+        let runs = [run(0, 6, true)];
+        let images = [anchor(3, "img")];
+        assert_eq!(shape(text, &runs, &images), "*abc*|[img]|*def*");
+    }
+
+    #[test]
+    fn an_image_on_a_run_start_boundary_stays_in_place() {
+        let text = "abcdef";
+        let runs = [run(3, 6, true)];
+        assert_eq!(shape(text, &runs, &[anchor(3, "i")]), "abc|[i]|*def*");
+    }
+
+    /// The `<=` in the in-run loop: an image exactly on a run's end boundary is
+    /// consumed with that run rather than deferred to the trailing sweep.
+    #[test]
+    fn an_image_on_a_run_end_boundary_stays_in_place() {
+        let text = "abcdef";
+        let runs = [run(0, 3, true)];
+        assert_eq!(shape(text, &runs, &[anchor(3, "i")]), "*abc*|[i]|def");
+    }
+
+    #[test]
+    fn an_image_between_two_runs_lands_between_them() {
+        let text = "abcdef";
+        let runs = [run(0, 3, true), run(3, 6, false)];
+        let out = shape(text, &runs, &[anchor(3, "i")]);
+        assert_eq!(out, "*abc*|[i]|*def*");
+    }
+
+    #[test]
+    fn several_images_inside_one_run_keep_their_order() {
+        let text = "abcdefgh";
+        let runs = [run(0, 8, true)];
+        let images = [anchor(2, "a"), anchor(5, "b")];
+        assert_eq!(shape(text, &runs, &images), "*ab*|[a]|*cde*|[b]|*fgh*");
+    }
+
+    #[test]
+    fn two_images_at_the_same_offset_both_survive_in_order() {
+        let text = "abcd";
+        let runs = [run(0, 4, true)];
+        let images = [anchor(2, "a"), anchor(2, "b")];
+        assert_eq!(shape(text, &runs, &images), "*ab*|[a]|[b]|*cd*");
+    }
+
+    #[test]
+    fn images_with_no_runs_at_all_are_ordered_with_their_gaps() {
+        let text = "abcdef";
+        let images = [anchor(0, "a"), anchor(3, "b"), anchor(6, "c")];
+        assert_eq!(shape(text, &[], &images), "[a]|abc|[b]|def|[c]");
+    }
+
+    #[test]
+    fn text_uncovered_by_any_run_stays_unformatted() {
+        let text = "abcdef";
+        let runs = [run(2, 4, true)];
+        assert_eq!(shape(text, &runs, &[]), "ab|*cd*|ef");
+    }
+
+    #[test]
+    fn a_block_with_neither_runs_nor_images_is_one_plain_piece() {
+        assert_eq!(shape("abc", &[], &[]), "abc");
+        assert_eq!(shape("", &[], &[]), "");
+    }
+
+    /// Whatever the arrangement, the merge must reproduce the block's bytes
+    /// exactly once, in order — never dropping or duplicating a slice. The
+    /// old implementation could regress its cursor and re-emit text twice.
+    #[test]
+    fn every_byte_is_emitted_exactly_once_and_in_order() {
+        let text = "abcdefghij";
+        let arrangements: [(&[FormatRun], &[ImageAnchor]); 6] = [
+            (&[], &[]),
+            (&[run(0, 10, true)], &[anchor(5, "m")]),
+            (&[run(2, 5, true), run(5, 8, false)], &[anchor(5, "m")]),
+            (&[run(2, 5, true)], &[anchor(0, "a"), anchor(10, "z")]),
+            (&[run(0, 3, true), run(7, 10, true)], &[anchor(3, "m")]),
+            (
+                &[run(1, 4, true), run(4, 9, false)],
+                &[anchor(1, "a"), anchor(4, "b"), anchor(9, "c")],
+            ),
+        ];
+        for (i, (runs, images)) in arrangements.iter().enumerate() {
+            let pieces = merge_runs_and_images(text, runs, images);
+            let mut cursor = 0u32;
+            let mut rebuilt = String::new();
+            for piece in &pieces {
+                if let InlinePiece::Text { start, end, .. } = piece {
+                    assert_eq!(*start, cursor, "arrangement {i}: gap or overlap");
+                    assert!(start < end, "arrangement {i}: empty piece emitted");
+                    rebuilt.push_str(&text[*start as usize..*end as usize]);
+                    cursor = *end;
+                }
+            }
+            assert_eq!(cursor, text.len() as u32, "arrangement {i}: truncated");
+            assert_eq!(rebuilt, text, "arrangement {i}");
+            let img_count = pieces
+                .iter()
+                .filter(|p| matches!(p, InlinePiece::Image(_)))
+                .count();
+            assert_eq!(img_count, images.len(), "arrangement {i}: lost an image");
+        }
+    }
+
+    /// `inline_segments_view` is built on the merge, so it inherits the fix.
+    #[test]
+    fn inline_segments_view_places_a_mid_run_image_correctly() {
+        let segs = inline_segments_view("abcdef", &[run(0, 6, true)], &[anchor(3, "img")]);
+        assert_eq!(segs.len(), 3);
+        assert!(matches!(&segs[0].content, InlineContent::Text(t) if t == "abc"));
+        assert!(matches!(&segs[1].content, InlineContent::Image { name, .. } if name == "img"));
+        assert!(matches!(&segs[2].content, InlineContent::Text(t) if t == "def"));
+        // The split keeps the run's formatting on both sides of the image.
+        assert_eq!(segs[0].fmt_font_bold, Some(true));
+        assert_eq!(segs[2].fmt_font_bold, Some(true));
+    }
+
+    #[test]
+    fn inline_segments_view_carries_alt_text_through() {
+        let mut a = anchor(1, "img");
+        a.alt = "a black cat".into();
+        let segs = inline_segments_view("ab", &[], &[a]);
+        let alt = segs.iter().find_map(|s| match &s.content {
+            InlineContent::Image { alt, .. } => Some(alt.clone()),
+            _ => None,
+        });
+        assert_eq!(alt.as_deref(), Some("a black cat"));
     }
 
     #[test]

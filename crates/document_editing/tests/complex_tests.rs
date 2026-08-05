@@ -1199,8 +1199,10 @@ fn test_delete_all_complex_document_leaves_nothing() -> Result<()> {
             position: 4,
             anchor: 4,
             image_name: "photo.png".to_string(),
+            alt: String::new(),
             width: 200,
             height: 150,
+            quality: 100,
         },
     )?;
 

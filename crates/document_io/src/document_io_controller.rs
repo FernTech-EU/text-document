@@ -295,8 +295,17 @@ pub fn get_import_html_result(
 }
 
 pub fn export_html(db_context: &DbContext, event_hub: &Arc<EventHub>) -> Result<ExportHtmlDto> {
+    export_html_with_options(db_context, event_hub, Default::default())
+}
+
+/// HTML export with an explicit image policy (reference / data URI / omit).
+pub fn export_html_with_options(
+    db_context: &DbContext,
+    event_hub: &Arc<EventHub>,
+    options: common::parser_tools::HtmlExportOptions,
+) -> Result<ExportHtmlDto> {
     let uow_context = ExportHtmlUnitOfWorkFactory::new(db_context);
-    let mut uc = ExportHtmlUseCase::new(Box::new(uow_context));
+    let mut uc = ExportHtmlUseCase::new_with_options(Box::new(uow_context), options);
     let return_dto = uc.execute()?;
     // Notify that the handling manifest has been loaded
     event_hub.send_event(Event {

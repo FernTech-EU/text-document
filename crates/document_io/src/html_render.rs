@@ -28,14 +28,53 @@ use common::database::rope_helpers::block_content_via_store;
 use common::entities::{Alignment, Block, ListStyle, TableCell, TextDirection};
 use common::format_runs::InlineContent;
 use common::format_runs_query::inline_segments_for_block;
+use common::parser_tools::image_options::{ExportImages, base64_encode};
 use common::types::EntityId;
+
+/// How an image is represented in rendered HTML.
+///
+/// The same renderer serves the HTML exporter (whose output is a standalone
+/// string the caller places somewhere) and the EPUB exporter (whose output is a
+/// chapter inside a package that also carries the image files). Those need
+/// different `src` values for the same document, so the choice is a parameter
+/// rather than a constant.
+#[derive(Debug, Clone, Copy, Default)]
+pub enum HtmlImagePolicy<'a> {
+    /// Emit `src` exactly as the document stores it.
+    #[default]
+    Reference,
+    /// Replace `src` via a map of document-src → output-href. Used by the EPUB
+    /// exporter, where every image is repackaged under its own name.
+    Rewrite(&'a std::collections::BTreeMap<String, String>),
+    /// Inline the bytes as a `data:` URI, producing a self-contained document.
+    DataUri(&'a ExportImages),
+    /// Emit no `<img>` at all, leaving only the alt text as the visible content.
+    Omit,
+}
+
+impl HtmlImagePolicy<'_> {
+    /// Resolve one image's `src`, or `None` when it should not be emitted.
+    fn resolve(&self, name: &str) -> Option<String> {
+        match self {
+            Self::Reference => Some(name.to_string()),
+            // An unmapped image keeps its original src rather than vanishing:
+            // a reference that might resolve beats a picture silently deleted.
+            Self::Rewrite(map) => Some(map.get(name).cloned().unwrap_or_else(|| name.to_string())),
+            Self::DataUri(images) => images.get(name).map(|img| {
+                format!("data:{};base64,{}", img.mime_type, base64_encode(&img.bytes))
+            }),
+            Self::Omit => None,
+        }
+    }
+}
+
 
 /// Render a slice of blocks (already fetched, in document order) as HTML,
 /// grouping consecutive list items into `<ul>`/`<ol>` and handling code
 /// blocks, headings, and plain paragraphs. Mirrors the dispatch order used
 /// by the DOCX/djot exporters: code block, then list membership, then
 /// heading/paragraph.
-pub fn render_blocks_html(store: &Store, blocks: &[Block]) -> String {
+pub fn render_blocks_html(store: &Store, blocks: &[Block], images: HtmlImagePolicy<'_>) -> String {
     let mut parts: Vec<String> = Vec::new();
     let mut i = 0;
 
@@ -86,7 +125,7 @@ pub fn render_blocks_html(store: &Store, blocks: &[Block]) -> String {
                     .is_some_and(|list_id| store.lists.read().contains_key(&list_id));
 
                 if b_is_listed {
-                    let inline_html = render_inline_html(store, b);
+                    let inline_html = render_inline_html(store, b, images);
                     list_items.push(format!("<li>{}</li>", inline_html));
                     i += 1;
                 } else {
@@ -102,7 +141,7 @@ pub fn render_blocks_html(store: &Store, blocks: &[Block]) -> String {
             ));
         } else {
             // --- Normal block (paragraph / heading) ---
-            let inline_html = render_inline_html(store, block);
+            let inline_html = render_inline_html(store, block, images);
 
             let mut styles: Vec<String> = Vec::new();
             match block.fmt_alignment {
@@ -166,7 +205,7 @@ pub fn render_blocks_html(store: &Store, blocks: &[Block]) -> String {
 
 /// Render one block's inline content (text runs + images) as HTML, applying
 /// character formatting (monospace/bold/italic/underline/strike/hyperlink).
-pub fn render_inline_html(store: &Store, block: &Block) -> String {
+pub fn render_inline_html(store: &Store, block: &Block, images: HtmlImagePolicy<'_>) -> String {
     let block_text = block_content_via_store(block, store);
     let elements = inline_segments_for_block(store, block.id, &block_text);
 
@@ -177,17 +216,32 @@ pub fn render_inline_html(store: &Store, block: &Block) -> String {
             InlineContent::Text(t) => escape_html(t),
             InlineContent::Image {
                 name,
+                alt,
                 width,
                 height,
                 ..
-            } => {
-                format!(
-                    "<img src=\"{}\" width=\"{}\" height=\"{}\" />",
-                    escape_html(name),
-                    width,
-                    height
-                )
-            }
+            } => match images.resolve(name) {
+                Some(src) => {
+                    // `alt` is required markup, not decoration: an <img> without
+                    // it is inaccessible, and EPUB validators flag it. Emit it
+                    // even when empty — an explicit empty alt is the correct way
+                    // to say "decorative", whereas a missing attribute says
+                    // nothing at all.
+                    let mut tag =
+                        format!("<img src=\"{}\" alt=\"{}\"", escape_html(&src), escape_html(alt));
+                    if *width > 0 {
+                        tag.push_str(&format!(" width=\"{width}\""));
+                    }
+                    if *height > 0 {
+                        tag.push_str(&format!(" height=\"{height}\""));
+                    }
+                    tag.push_str(" />");
+                    tag
+                }
+                // Dropped image: the description is all that is left to show,
+                // and showing it beats leaving a silent hole in the prose.
+                None => escape_html(alt),
+            },
             InlineContent::Empty => String::new(),
         };
 
@@ -250,7 +304,11 @@ pub fn block_plain_text(store: &Store, block: &Block) -> String {
 /// content. Reads `Table`/`TableCell`/`Frame`/`Block` straight off the
 /// store's public entity maps — no transaction/uow needed for a read (see
 /// the module doc comment).
-pub fn render_table_html(store: &Store, table_id: EntityId) -> Result<String> {
+pub fn render_table_html(
+    store: &Store,
+    table_id: EntityId,
+    images: HtmlImagePolicy<'_>,
+) -> Result<String> {
     let table = store
         .tables
         .read()
@@ -313,7 +371,7 @@ pub fn render_table_html(store: &Store, table_id: EntityId) -> Result<String> {
 
                     let mut cell_parts: Vec<String> = Vec::new();
                     for block in &blocks {
-                        let inline_html = render_inline_html(store, block);
+                        let inline_html = render_inline_html(store, block, images);
                         if !inline_html.is_empty() {
                             cell_parts.push(inline_html);
                         }

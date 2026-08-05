@@ -8,6 +8,7 @@ use crate::ExportEpubDto;
 use crate::ExportEpubResultDto;
 use crate::html_render;
 use anyhow::{Result, anyhow};
+use common::parser_tools::ExportImages;
 use common::database::QueryUnitOfWork;
 use common::database::Store;
 use common::entities::{Block, Document, Frame, List, Root, SemanticRole, Table, TableCell};
@@ -101,7 +102,11 @@ impl LongOperation for ExportEpubUseCase {
             Some("Packaging EPUB...".to_string()),
         ));
 
-        let epub_bytes = package_epub(&self.dto.options, &chapters)?;
+        let epub_bytes = package_epub(
+            &self.dto.options,
+            &chapters,
+            &image_packaging_map(&self.dto.options.images),
+        )?;
 
         progress_callback(OperationProgress::new(
             90.0,
@@ -140,7 +145,11 @@ impl ExportEpubUseCase {
         uow.end_transaction()?;
         let chapters = result?;
         let chapter_count = chapters.len() as i64;
-        let epub_bytes = package_epub(&self.dto.options, &chapters)?;
+        let epub_bytes = package_epub(
+            &self.dto.options,
+            &chapters,
+            &image_packaging_map(&self.dto.options.images),
+        )?;
         Ok((epub_bytes, chapter_count))
     }
 
@@ -197,6 +206,14 @@ impl ExportEpubUseCase {
             Some("Walking document tree...".to_string()),
         ));
 
+        // Every image the caller supplied gets a stable packaged name, and the
+        // chapter HTML is rendered against that mapping. Names are derived from
+        // the map's (sorted) iteration order rather than from the document's
+        // `src` strings, because a `src` may be an absolute path, contain
+        // characters an EPUB href cannot carry, or collide after escaping.
+        let image_hrefs = image_packaging_map(&self.dto.options.images);
+        let image_policy = html_render::HtmlImagePolicy::Rewrite(&image_hrefs);
+
         let mut units: Vec<RenderUnit> = Vec::new();
 
         let total_frames = frame_ids.len().max(1);
@@ -215,7 +232,7 @@ impl ExportEpubUseCase {
                 continue;
             }
 
-            self.render_frame_units(uow, frame_id, &cell_frame_ids, &mut units)?;
+            self.render_frame_units(uow, frame_id, &cell_frame_ids, image_policy, &mut units)?;
 
             let pct = 10.0 + (frame_idx as f32 / total_frames as f32) * 60.0;
             progress_callback(OperationProgress::new(
@@ -244,6 +261,7 @@ impl ExportEpubUseCase {
         uow: &dyn ExportEpubUnitOfWorkTrait,
         frame_id: &EntityId,
         cell_frame_ids: &HashSet<EntityId>,
+        image_policy: html_render::HtmlImagePolicy<'_>,
         out: &mut Vec<RenderUnit>,
     ) -> Result<()> {
         let frame = uow
@@ -253,7 +271,7 @@ impl ExportEpubUseCase {
         // Table anchor frame — render the table instead of blocks. A table is always one
         // opaque unit: it never opens a new chapter.
         if let Some(table_id) = frame.table {
-            let html = html_render::render_table_html(&uow.store(), table_id)?;
+            let html = html_render::render_table_html(&uow.store(), table_id, image_policy)?;
             if !html.is_empty() {
                 out.push(RenderUnit::content(html));
             }
@@ -262,7 +280,7 @@ impl ExportEpubUseCase {
 
         // If child_order is populated, use it to interleave blocks and sub-frames
         if !frame.child_order.is_empty() {
-            return self.render_frame_units_by_child_order(uow, &frame, cell_frame_ids, out);
+            return self.render_frame_units_by_child_order(uow, &frame, cell_frame_ids, image_policy, out);
         }
 
         // Fallback: render all blocks in document_position order (original behaviour)
@@ -279,7 +297,7 @@ impl ExportEpubUseCase {
         let mut blocks: Vec<Block> = blocks_opt.into_iter().flatten().collect();
         blocks.sort_by_key(|b| b.document_position);
 
-        push_block_run_units(&uow.store(), &blocks, out);
+        push_block_run_units(&uow.store(), &blocks, image_policy, out);
         Ok(())
     }
 
@@ -290,6 +308,7 @@ impl ExportEpubUseCase {
         uow: &dyn ExportEpubUnitOfWorkTrait,
         frame: &Frame,
         cell_frame_ids: &HashSet<EntityId>,
+        image_policy: html_render::HtmlImagePolicy<'_>,
         out: &mut Vec<RenderUnit>,
     ) -> Result<()> {
         // Accumulate consecutive blocks so we can group list items (and split at headings).
@@ -306,7 +325,7 @@ impl ExportEpubUseCase {
                 // Negative: negated sub-frame ID
                 // First, flush any accumulated blocks
                 if !pending_blocks.is_empty() {
-                    push_block_run_units(&uow.store(), &pending_blocks, out);
+                    push_block_run_units(&uow.store(), &pending_blocks, image_policy, out);
                     pending_blocks.clear();
                 }
 
@@ -324,7 +343,7 @@ impl ExportEpubUseCase {
                         // it isn't a real chapter boundary, so it doesn't participate in
                         // chapter splitting (unlike a plain non-blockquote sub-frame, below).
                         let mut inner: Vec<RenderUnit> = Vec::new();
-                        self.render_frame_units(uow, &sub_frame_id, cell_frame_ids, &mut inner)?;
+                        self.render_frame_units(uow, &sub_frame_id, cell_frame_ids, image_policy, &mut inner)?;
                         let inner_html: String = inner.into_iter().map(|u| u.html).collect();
                         if !inner_html.is_empty() {
                             // EPUB is the format that can actually say what this is:
@@ -345,7 +364,7 @@ impl ExportEpubUseCase {
                     } else {
                         // Non-blockquote sub-frame: render normally, into the same stream —
                         // its headings (if any) still participate in chapter splitting.
-                        self.render_frame_units(uow, &sub_frame_id, cell_frame_ids, out)?;
+                        self.render_frame_units(uow, &sub_frame_id, cell_frame_ids, image_policy, out)?;
                     }
                 }
             }
@@ -353,7 +372,7 @@ impl ExportEpubUseCase {
 
         // Flush remaining blocks
         if !pending_blocks.is_empty() {
-            push_block_run_units(&uow.store(), &pending_blocks, out);
+            push_block_run_units(&uow.store(), &pending_blocks, image_policy, out);
         }
 
         Ok(())
@@ -414,11 +433,16 @@ fn heading_level_for_split(store: &Store, block: &Block) -> Option<i64> {
 /// non-heading blocks in between — which may themselves group into one `<ul>`/`<ol>`, a code
 /// block, or plain paragraphs — are rendered together via [`html_render::render_blocks_html`]
 /// as one unit.
-fn push_block_run_units(store: &Store, blocks: &[Block], out: &mut Vec<RenderUnit>) {
+fn push_block_run_units(
+    store: &Store,
+    blocks: &[Block],
+    image_policy: html_render::HtmlImagePolicy<'_>,
+    out: &mut Vec<RenderUnit>,
+) {
     let mut i = 0;
     while i < blocks.len() {
         if let Some(level) = heading_level_for_split(store, &blocks[i]) {
-            let html = html_render::render_blocks_html(store, std::slice::from_ref(&blocks[i]));
+            let html = html_render::render_blocks_html(store, std::slice::from_ref(&blocks[i]), image_policy);
             let text = html_render::block_plain_text(store, &blocks[i]);
             out.push(RenderUnit {
                 heading_level: Some(level),
@@ -433,7 +457,7 @@ fn push_block_run_units(store: &Store, blocks: &[Block], out: &mut Vec<RenderUni
         while i < blocks.len() && heading_level_for_split(store, &blocks[i]).is_none() {
             i += 1;
         }
-        let html = html_render::render_blocks_html(store, &blocks[start..i]);
+        let html = html_render::render_blocks_html(store, &blocks[start..i], image_policy);
         if !html.is_empty() {
             out.push(RenderUnit::content(html));
         }
@@ -532,7 +556,31 @@ fn wrap_xhtml(title: &str, lang: &str, rtl: bool, body_html: &str) -> String {
 /// setter's `"direction"` key. Both are set here (the dedicated setter in case a future
 /// `epub-builder` version wires it up; `metadata` because it's what actually reaches the
 /// package today), so the RTL option keeps working across an `epub-builder` upgrade either way.
-fn package_epub(options: &EpubExportOptions, chapters: &[Chapter]) -> Result<Vec<u8>> {
+/// Assign each supplied image a stable in-package href.
+///
+/// Sequential names (`images/img_001.png`) rather than the document's own
+/// `src`: a `src` can be an absolute path, can repeat across chapters, and can
+/// contain characters that are legal in a filesystem but not in an EPUB href.
+/// The extension comes from the declared media type so readers dispatch on it
+/// correctly.
+fn image_packaging_map(images: &ExportImages) -> std::collections::BTreeMap<String, String> {
+    images
+        .iter()
+        .enumerate()
+        .map(|(i, (src, image))| {
+            (
+                src.clone(),
+                format!("images/img_{:03}.{}", i + 1, image.extension()),
+            )
+        })
+        .collect()
+}
+
+fn package_epub(
+    options: &EpubExportOptions,
+    chapters: &[Chapter],
+    image_hrefs: &std::collections::BTreeMap<String, String>,
+) -> Result<Vec<u8>> {
     let lang = if options.language.trim().is_empty() {
         "en"
     } else {
@@ -555,6 +603,20 @@ fn package_epub(options: &EpubExportOptions, chapters: &[Chapter]) -> Result<Vec
         builder
             .metadata("direction", "rtl")
             .map_err(|e| anyhow!("EPUB: {e}"))?;
+    }
+
+    // Write every image into the package and list it in the OPF manifest. The
+    // chapter HTML already points at these hrefs (see `image_packaging_map`);
+    // without this the `<img src>` in every chapter dangles, which is exactly
+    // what the exporter did before — valid-looking markup referencing files
+    // that were never written.
+    for (src, href) in image_hrefs {
+        let Some(image) = options.images.get(src) else {
+            continue;
+        };
+        builder
+            .add_resource(href, image.bytes.as_slice(), image.mime_type.clone())
+            .map_err(|e| anyhow!("EPUB: adding image {src}: {e}"))?;
     }
 
     for (i, chapter) in chapters.iter().enumerate() {

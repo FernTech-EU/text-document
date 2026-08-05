@@ -12,7 +12,7 @@ use common::entities::{
 
 use common::long_operation::LongOperation;
 use common::parser_tools::content_parser::{
-    ParsedElement, format_runs_from_spans, parse_html_elements,
+    ParsedElement, ParsedInline, format_runs_from_spans, parse_html_elements,
 };
 use common::parser_tools::list_grouper::ListGrouper;
 use common::types::{EntityId, ROOT_ENTITY_ID};
@@ -221,8 +221,11 @@ impl LongOperation for ImportHtmlUseCase {
                         &mut list_grouper,
                     )?;
 
-                    let (plain_text, format_runs) =
-                        format_runs_from_spans(&parsed_block.spans, parsed_block.is_code_block);
+                    let ParsedInline {
+                            plain_text,
+                            runs: format_runs,
+                            images: block_images,
+                        } = format_runs_from_spans(&parsed_block.spans, parsed_block.is_code_block);
                     let line_len = plain_text.chars().count() as i64;
 
                     let current_frame_id = frame_stack.last().unwrap().frame_id;
@@ -261,6 +264,14 @@ impl LongOperation for ImportHtmlUseCase {
                             runs_map.insert(created_block.id, format_runs);
                         } else {
                             runs_map.remove(&created_block.id);
+                        }
+                        // Image anchors travel with the runs: both index into the same
+                        // block text, which already carries each image's U+FFFC sentinel.
+                        let mut images_map = store.block_images.write();
+                        if !block_images.is_empty() {
+                            images_map.insert(created_block.id, block_images);
+                        } else {
+                            images_map.remove(&created_block.id);
                         }
                     }
 
@@ -361,8 +372,11 @@ impl LongOperation for ImportHtmlUseCase {
                             let created_cell_frame = uow.create_frame(&cell_frame, doc_id, -1)?;
                             created_cell_frame_ids.push(created_cell_frame.id);
 
-                            let (plain_text, format_runs) =
-                                format_runs_from_spans(&cell.spans, false);
+                            let ParsedInline {
+                                plain_text,
+                                runs: format_runs,
+                                images: block_images,
+                            } = format_runs_from_spans(&cell.spans, false);
 
                             let block = Block {
                                 document_position,
@@ -378,6 +392,14 @@ impl LongOperation for ImportHtmlUseCase {
                                     runs_map.insert(created_block.id, format_runs);
                                 } else {
                                     runs_map.remove(&created_block.id);
+                                }
+                                // Image anchors travel with the runs: both index into the same
+                                // block text, which already carries each image's U+FFFC sentinel.
+                                let mut images_map = store.block_images.write();
+                                if !block_images.is_empty() {
+                                    images_map.insert(created_block.id, block_images);
+                                } else {
+                                    images_map.remove(&created_block.id);
                                 }
                             }
 

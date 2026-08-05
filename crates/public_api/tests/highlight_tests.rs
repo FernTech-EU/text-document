@@ -580,7 +580,7 @@ fn highlight_image_fragment() {
     let doc = new_doc("AB");
     // Insert an image between A and B
     let c = doc.cursor_at(1);
-    c.insert_image("test.png", 100, 100).unwrap();
+    c.insert_image("test.png", "", 100, 100).unwrap();
 
     // Highlight the entire block (text + image)
     struct FullHighlighter;

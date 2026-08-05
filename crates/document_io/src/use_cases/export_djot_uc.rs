@@ -457,8 +457,21 @@ impl ExportDjotUseCase {
                     }
                     (l, escape_djot(core), tr)
                 }
-                InlineContent::Image { name, .. } => {
-                    ("", format!("![{}]({})", escape_djot(name), name), "")
+                InlineContent::Image {
+                    name,
+                    alt,
+                    width,
+                    height,
+                    ..
+                } => {
+                    // Djot carries display size as inline attributes. Writing
+                    // them keeps a resize durable across a save/reload, and
+                    // round-trips through this crate's own importer.
+                    let mut out = format!("![{}]({})", escape_djot(alt), name);
+                    if *width > 0 && *height > 0 {
+                        out.push_str(&format!("{{width={width} height={height}}}"));
+                    }
+                    ("", out, "")
                 }
                 InlineContent::Empty => continue,
             };

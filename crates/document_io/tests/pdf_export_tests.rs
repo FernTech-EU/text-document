@@ -405,3 +405,77 @@ fn per_block_spacing_compiles_together_with_rtl_and_alignment() {
     let bytes = pdf_from_djot(djot, pdf_options());
     assert!(bytes.starts_with(b"%PDF-"));
 }
+
+// --- inline images -----------------------------------------------------------
+
+/// A real 4×3 PNG. Typst validates the bytes it is handed, so a placeholder
+/// would fail the compile rather than test the wiring.
+fn png_bytes() -> Vec<u8> {
+    let mut buf = Vec::new();
+    {
+        let mut enc = png::Encoder::new(&mut buf, 4, 3);
+        enc.set_color(png::ColorType::Rgba);
+        enc.set_depth(png::BitDepth::Eight);
+        let mut w = enc.write_header().unwrap();
+        w.write_image_data(&[0u8, 128, 255, 255].repeat(12)).unwrap();
+    }
+    buf
+}
+
+fn options_with_image() -> PdfExportOptions {
+    PdfExportOptions {
+        images: common::parser_tools::ExportImages::from_iter([(
+            "pic.png",
+            common::parser_tools::ExportImage::new(png_bytes(), "image/png"),
+        )]),
+        ..pdf_options()
+    }
+}
+
+/// The whole point of the Typst wiring: the compiler resolves `#image(..)` to a
+/// virtual file the caller registered. If the markup's path and the registered
+/// file id disagree by so much as a leading slash, Typst fails the compile — so
+/// a PDF coming out at all is the assertion.
+#[test]
+fn an_inline_image_compiles_into_the_pdf() {
+    let pdf = pdf_from_djot(
+        "Before ![a blue square](pic.png){width=64 height=48} after.\n",
+        options_with_image(),
+    );
+    assert_eq!(&pdf[..5], b"%PDF-", "not a PDF");
+    assert!(pdf.len() > 1000, "suspiciously small PDF: {} bytes", pdf.len());
+    assert_eq!(count_pdf_pages(&pdf), 1);
+}
+
+/// An image the caller supplied no bytes for must not abort the export — a
+/// missing picture is not worth failing a manuscript over.
+#[test]
+fn an_image_without_bytes_falls_back_to_its_description() {
+    let pdf = pdf_from_djot(
+        "Before ![a blue square](missing.png) after.\n",
+        pdf_options(),
+    );
+    assert_eq!(&pdf[..5], b"%PDF-");
+    assert_eq!(count_pdf_pages(&pdf), 1);
+}
+
+/// Two images must each resolve to their own registered file.
+#[test]
+fn several_images_each_resolve() {
+    let mut images = common::parser_tools::ExportImages::new();
+    for name in ["a.png", "b.png"] {
+        images.insert(
+            name,
+            common::parser_tools::ExportImage::new(png_bytes(), "image/png"),
+        );
+    }
+    let pdf = pdf_from_djot(
+        "![one](a.png) and ![two](b.png)\n",
+        PdfExportOptions {
+            images,
+            ..pdf_options()
+        },
+    );
+    assert_eq!(&pdf[..5], b"%PDF-");
+    assert_eq!(count_pdf_pages(&pdf), 1);
+}

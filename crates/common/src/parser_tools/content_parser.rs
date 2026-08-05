@@ -1,7 +1,30 @@
 use crate::entities::{Alignment, ListStyle, MarkerType, SemanticRole, TextDirection};
 use crate::parser_tools::djot_options::DjotImportOptions;
 
-/// A parsed inline span with formatting info
+/// An inline image recovered by a parser, before it becomes an `ImageAnchor`.
+///
+/// `src` is whatever the source document pointed at — a relative path, a bare
+/// name, a URL. Parsers do not resolve it; that is the embedding application's
+/// job, and this crate never touches the filesystem.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ParsedImage {
+    pub src: String,
+    pub alt: String,
+    /// Display size in pixels, `0` when the source did not state one.
+    ///
+    /// Djot and HTML both carry these as attributes (`{width=800}`,
+    /// `<img width=…>`); Markdown has no syntax for them, so a Markdown import
+    /// leaves both zero and the caller supplies intrinsic dimensions.
+    pub width: i64,
+    pub height: i64,
+}
+
+/// A parsed inline span with formatting info.
+///
+/// A span carries *either* text or an image, never both: an image span's `text`
+/// is empty and its description lives in [`ParsedImage::alt`], so alt text
+/// cannot leak into the block's prose (and therefore cannot be counted as
+/// manuscript words or matched by a search).
 #[derive(Debug, Clone, Default)]
 pub struct ParsedSpan {
     pub text: String,
@@ -15,6 +38,8 @@ pub struct ParsedSpan {
     /// Subscript (djot `~x~`). Maps to `CharVerticalAlignment::SubScript`.
     pub subscript: bool,
     pub link_href: Option<String>,
+    /// Set when this span is an inline image rather than text.
+    pub image: Option<ParsedImage>,
 }
 
 /// A parsed table cell containing inline spans.
@@ -194,6 +219,8 @@ pub fn parse_markdown(markdown: &str) -> Vec<ParsedElement> {
     let mut italic = false;
     let mut strikeout = false;
     let mut link_href: Option<String> = None;
+    // Set between an image's Start and End; its alt text arrives as Text events.
+    let mut pending_image: Option<ParsedImage> = None;
 
     // List style stack for nested lists (also tracks nesting depth)
     let mut list_stack: Vec<Option<ListStyle>> = Vec::new();
@@ -452,7 +479,49 @@ pub fn parse_markdown(markdown: &str) -> Vec<ParsedElement> {
             Event::End(TagEnd::Link) => {
                 link_href = None;
             }
+            // Markdown has no syntax for display size, so width/height stay 0
+            // and the caller supplies the image's intrinsic dimensions.
+            Event::Start(Tag::Image { dest_url, .. }) => {
+                pending_image = Some(ParsedImage {
+                    src: dest_url.to_string(),
+                    alt: String::new(),
+                    width: 0,
+                    height: 0,
+                });
+            }
+            Event::End(TagEnd::Image) => {
+                if let Some(image) = pending_image.take() {
+                    let span = ParsedSpan {
+                        text: String::new(),
+                        bold,
+                        italic,
+                        underline: false,
+                        strikeout,
+                        code: false,
+                        superscript: false,
+                        subscript: false,
+                        link_href: link_href.clone(),
+                        image: Some(image),
+                    };
+                    if in_table {
+                        current_cell_spans.push(span);
+                    } else {
+                        if !in_block {
+                            in_block = true;
+                        }
+                        current_spans.push(span);
+                    }
+                }
+            }
             Event::Text(text) => {
+                // Inside an image this is its alt text, which pulldown-cmark
+                // emits as an ordinary Text event. Without this guard it fell
+                // through and landed in the paragraph as prose — the image was
+                // dropped and its description silently became manuscript text.
+                if let Some(img) = pending_image.as_mut() {
+                    img.alt.push_str(&text);
+                    continue;
+                }
                 let span = ParsedSpan {
                     text: text.to_string(),
                     bold,
@@ -463,6 +532,7 @@ pub fn parse_markdown(markdown: &str) -> Vec<ParsedElement> {
                     superscript: false,
                     subscript: false,
                     link_href: link_href.clone(),
+                    image: None,
                 };
                 if in_table {
                     current_cell_spans.push(span);
@@ -484,6 +554,7 @@ pub fn parse_markdown(markdown: &str) -> Vec<ParsedElement> {
                     superscript: false,
                     subscript: false,
                     link_href: link_href.clone(),
+                    image: None,
                 };
                 if in_table {
                     current_cell_spans.push(span);
@@ -505,6 +576,7 @@ pub fn parse_markdown(markdown: &str) -> Vec<ParsedElement> {
                     superscript: false,
                     subscript: false,
                     link_href: link_href.clone(),
+                    image: None,
                 };
                 if in_table {
                     current_cell_spans.push(span);
@@ -679,6 +751,38 @@ pub fn parse_html(html: &str) -> Vec<ParsedBlock> {
     ParsedElement::flatten_to_blocks(parse_html_elements(html))
 }
 
+
+/// Build an inline-image span from an `<img>` element, if it has a usable
+/// source.
+///
+/// `<img>` was matched by none of the HTML walker's three tag dispatches, so it
+/// fell into their wildcard arms and was dropped whole — silently, and unlike
+/// Markdown not even leaving its alt text behind. That is the path a browser or
+/// Word paste travels.
+fn html_img_span(el: &scraper::node::Element, link_href: Option<String>) -> Option<ParsedSpan> {
+    let src = el.attr("src")?;
+    if src.is_empty() {
+        return None;
+    }
+    let dim = |name: &str| -> i64 {
+        el.attr(name)
+            .and_then(|v| v.trim().trim_end_matches("px").parse::<i64>().ok())
+            .filter(|n| *n > 0)
+            .unwrap_or(0)
+    };
+    Some(ParsedSpan {
+        text: String::new(),
+        link_href,
+        image: Some(ParsedImage {
+            src: src.to_string(),
+            alt: el.attr("alt").unwrap_or_default().to_string(),
+            width: dim("width"),
+            height: dim("height"),
+        }),
+        ..Default::default()
+    })
+}
+
 pub fn parse_html_elements(html: &str) -> Vec<ParsedElement> {
     use scraper::Html;
 
@@ -725,6 +829,7 @@ pub fn parse_html_elements(html: &str) -> Vec<ParsedElement> {
                             superscript: false,
                             subscript: false,
                             link_href: state.link_href.clone(),
+                            image: None,
                         });
                     }
                 }
@@ -741,6 +846,12 @@ pub fn parse_html_elements(html: &str) -> Vec<ParsedElement> {
                             if let Some(href) = el.attr("href") {
                                 new_state.link_href = Some(href.to_string());
                             }
+                        }
+                        "img" => {
+                            if let Some(span) = html_img_span(el, new_state.link_href.clone()) {
+                                spans.push(span);
+                            }
+                            continue;
                         }
                         _ => {}
                     }
@@ -1064,6 +1175,7 @@ pub fn parse_html_elements(html: &str) -> Vec<ParsedElement> {
                             superscript: false,
                             subscript: false,
                             link_href: state.link_href.clone(),
+                            image: None,
                         }],
                         heading_level: None,
                         list_style: None,
@@ -1135,6 +1247,7 @@ pub fn parse_html_elements(html: &str) -> Vec<ParsedElement> {
                             superscript: false,
                             subscript: false,
                             link_href: state.link_href.clone(),
+                            image: None,
                         });
                     }
                 }
@@ -1152,6 +1265,12 @@ pub fn parse_html_elements(html: &str) -> Vec<ParsedElement> {
                             if let Some(href) = el.attr("href") {
                                 new_state.link_href = Some(href.to_string());
                             }
+                        }
+                        "img" => {
+                            if let Some(span) = html_img_span(el, new_state.link_href.clone()) {
+                                spans.push(span);
+                            }
+                            continue;
                         }
                         _ => {}
                     }
@@ -1326,18 +1445,34 @@ pub fn character_format_from_span(
 /// Returns the concatenated `plain_text` of all spans and a sorted,
 /// non-overlapping, coalesced `Vec<FormatRun>`. Both safe to feed straight
 /// into the store under the dual-write bridge.
-pub fn format_runs_from_spans(
-    spans: &[ParsedSpan],
-    is_code_block: bool,
-) -> (String, Vec<crate::format_runs::FormatRun>) {
-    use crate::format_runs::{CharacterFormat, FormatRun, coalesce_in_place};
+pub fn format_runs_from_spans(spans: &[ParsedSpan], is_code_block: bool) -> ParsedInline {
+    use crate::format_runs::{CharacterFormat, FormatRun, ImageAnchor, coalesce_in_place};
 
     let mut plain_text = String::new();
     let mut runs: Vec<FormatRun> = Vec::new();
+    let mut images: Vec<ImageAnchor> = Vec::new();
     let default = CharacterFormat::default();
 
     for span in spans {
         let byte_start = plain_text.len() as u32;
+
+        if let Some(image) = &span.image {
+            // An image occupies one U+FFFC in the text, exactly as
+            // `insert_image` mirrors into the rope, so every downstream offset
+            // calculation treats a parsed image and an inserted one alike.
+            plain_text.push('\u{FFFC}');
+            images.push(ImageAnchor {
+                byte_offset: byte_start,
+                name: image.src.clone(),
+                alt: image.alt.clone(),
+                width: image.width,
+                height: image.height,
+                quality: 100,
+                format: character_format_from_span(span, is_code_block),
+            });
+            continue;
+        }
+
         plain_text.push_str(&span.text);
         let byte_end = plain_text.len() as u32;
         if byte_start == byte_end {
@@ -1354,7 +1489,24 @@ pub fn format_runs_from_spans(
         });
     }
     coalesce_in_place(&mut runs);
-    (plain_text, runs)
+    ParsedInline {
+        plain_text,
+        runs,
+        images,
+    }
+}
+
+/// The three parallel things a block stores, as recovered from parsed spans.
+///
+/// Returned as a struct rather than a tuple because it grew a third member
+/// (images) after nine call sites already destructured a pair — and every one
+/// of those sites has to decide what to do with images, so a silent
+/// tuple-arity change would have been the wrong kind of easy.
+#[derive(Debug, Clone, Default)]
+pub struct ParsedInline {
+    pub plain_text: String,
+    pub runs: Vec<crate::format_runs::FormatRun>,
+    pub images: Vec<crate::format_runs::ImageAnchor>,
 }
 
 // ─── Djot parsing ────────────────────────────────────────────────────
@@ -1611,6 +1763,9 @@ pub fn parse_djot(djot: &str, options: &DjotImportOptions) -> Vec<ParsedElement>
     let mut superscript = false;
     let mut subscript = false;
     let mut link_href: Option<String> = None;
+    // Set between an image's Start and End. Its alt text arrives as ordinary
+    // `Str` events in between, so it has to be captured rather than emitted.
+    let mut pending_image: Option<ParsedImage> = None;
 
     // List nesting: each entry is (style, prefix, suffix); depth = indent + 1.
     let mut list_stack: Vec<(ListStyle, String, String)> = Vec::new();
@@ -1640,8 +1795,39 @@ pub fn parse_djot(djot: &str, options: &DjotImportOptions) -> Vec<ParsedElement>
     // state reads.
     macro_rules! push_text {
         ($t:expr) => {{
+            // Alt text belongs to the image, not to the paragraph. While an
+            // image is open every text event is diverted into its description,
+            // which is what keeps a photo's caption out of the manuscript's
+            // word count and out of the search corpus.
+            if let Some(img) = pending_image.as_mut() {
+                img.alt.push_str(($t).as_ref());
+            } else {
+                let sp = ParsedSpan {
+                    text: ($t).to_string(),
+                    bold,
+                    italic,
+                    underline,
+                    strikeout,
+                    code,
+                    superscript,
+                    subscript,
+                    link_href: link_href.clone(),
+                    image: None,
+                };
+                if in_table_cell {
+                    current_cell_spans.push(sp);
+                } else {
+                    current_spans.push(sp);
+                }
+            }
+        }};
+    }
+
+    // Push a completed inline image span into the active sink.
+    macro_rules! push_image {
+        ($img:expr) => {{
             let sp = ParsedSpan {
-                text: ($t).to_string(),
+                text: String::new(),
                 bold,
                 italic,
                 underline,
@@ -1650,6 +1836,7 @@ pub fn parse_djot(djot: &str, options: &DjotImportOptions) -> Vec<ParsedElement>
                 superscript,
                 subscript,
                 link_href: link_href.clone(),
+                image: Some($img),
             };
             if in_table_cell {
                 current_cell_spans.push(sp);
@@ -1908,8 +2095,31 @@ pub fn parse_djot(djot: &str, options: &DjotImportOptions) -> Vec<ParsedElement>
             E::Start(C::Span, _) | E::End(C::Span) => {}
             E::Start(C::Link(dst, _), _) => link_href = Some(dst.to_string()),
             E::End(C::Link(..)) => link_href = None,
-            // Inline images: keep alt text as plain text (image not modelled).
-            E::Start(C::Image(..), _) | E::End(C::Image(..)) => {}
+            // Inline images. Djot writes display size as inline attributes
+            // (`![alt](src){width=800 height=600}`), which jotdown hands over
+            // on the `Start` event — verified against jotdown 0.10, including
+            // quoted values and images mid-sentence.
+            E::Start(C::Image(src, _), attrs) => {
+                let attr_num = |key: &str| -> i64 {
+                    attrs
+                        .get_value(key)
+                        .map(|v| v.to_string())
+                        .and_then(|v| v.trim().parse::<i64>().ok())
+                        .filter(|n| *n > 0)
+                        .unwrap_or(0)
+                };
+                pending_image = Some(ParsedImage {
+                    src: src.to_string(),
+                    alt: String::new(),
+                    width: attr_num("width"),
+                    height: attr_num("height"),
+                });
+            }
+            E::End(C::Image(..)) => {
+                if let Some(img) = pending_image.take() {
+                    push_image!(img);
+                }
+            }
 
             // ── Unrepresentable containers: drop the entire subtree ──
             E::Start(

@@ -113,6 +113,7 @@ fn frag_block_state(fb: &FragmentBlock) -> (Vec<FormatRun>, Vec<ImageAnchor>) {
             }
             InlineContent::Image {
                 name,
+                alt,
                 width,
                 height,
                 quality,
@@ -120,6 +121,7 @@ fn frag_block_state(fb: &FragmentBlock) -> (Vec<FormatRun>, Vec<ImageAnchor>) {
                 images.push(ImageAnchor {
                     byte_offset,
                     name: name.clone(),
+                    alt: alt.clone(),
                     width: *width,
                     height: *height,
                     quality: *quality,

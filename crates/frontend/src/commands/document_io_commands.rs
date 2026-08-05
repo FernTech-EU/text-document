@@ -169,6 +169,18 @@ pub fn get_import_html_result(
 pub fn export_html(ctx: &AppContext) -> Result<ExportHtmlDto> {
     document_io_controller::export_html(&ctx.db_context, &ctx.event_hub).context("export_html")
 }
+/// HTML export with an explicit image policy.
+pub fn export_html_with_options(
+    ctx: &AppContext,
+    options: common::parser_tools::HtmlExportOptions,
+) -> Result<ExportHtmlDto> {
+    document_io::document_io_controller::export_html_with_options(
+        &ctx.db_context,
+        &ctx.event_hub,
+        options,
+    )
+}
+
 
 pub fn export_latex(ctx: &AppContext, dto: &ExportLatexDto) -> Result<ExportLatexResultDto> {
     document_io_controller::export_latex(&ctx.db_context, &ctx.event_hub, dto)

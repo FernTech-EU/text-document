@@ -900,7 +900,11 @@ impl TextCursor {
     }
 
     /// Insert an image at the cursor. Replaces selection if any.
-    pub fn insert_image(&self, name: &str, width: u32, height: u32) -> Result<()> {
+    ///
+    /// `name` keys the image's bytes in the document's resource table (see
+    /// [`crate::TextDocument::add_resource`]); `alt` is its accessible
+    /// description and its export representation, and may be empty.
+    pub fn insert_image(&self, name: &str, alt: &str, width: u32, height: u32) -> Result<()> {
         let (pos, anchor) = self.read_cursor();
         let queued = {
             let mut inner = self.doc.lock();
@@ -928,8 +932,10 @@ impl TextCursor {
                 position: to_i64(insert_pos),
                 anchor: to_i64(insert_pos),
                 image_name: name.into(),
+                alt: alt.into(),
                 width: width as i64,
                 height: height as i64,
+                quality: 100,
             };
             let result =
                 document_editing_commands::insert_image(&inner.ctx, Some(inner.stack_id), &dto)?;

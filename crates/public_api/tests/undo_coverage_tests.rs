@@ -66,7 +66,7 @@ fn undo_redo_insert_block() {
 fn undo_redo_insert_image() {
     let doc = new_doc("Hello");
     let c = doc.cursor_at(5);
-    c.insert_image("test.png", 100, 50).unwrap();
+    c.insert_image("test.png", "", 100, 50).unwrap();
     assert_eq!(doc.stats().image_count, 1);
     let char_count_after = doc.character_count();
 
@@ -85,7 +85,7 @@ fn undo_redo_insert_image() {
 fn insert_image_into_empty_doc() {
     let doc = TextDocument::new();
     let c = doc.cursor();
-    c.insert_image("img.png", 200, 100).unwrap();
+    c.insert_image("img.png", "", 200, 100).unwrap();
     assert_eq!(doc.stats().image_count, 1);
 }
 
@@ -95,9 +95,9 @@ fn insert_image_into_empty_doc() {
 fn insert_image_after_image() {
     let doc = TextDocument::new();
     let c = doc.cursor();
-    c.insert_image("img1.png", 100, 100).unwrap();
+    c.insert_image("img1.png", "", 100, 100).unwrap();
     // Now cursor is at position 1 (after the image)
-    c.insert_image("img2.png", 200, 200).unwrap();
+    c.insert_image("img2.png", "", 200, 200).unwrap();
     assert_eq!(doc.stats().image_count, 2);
 }
 

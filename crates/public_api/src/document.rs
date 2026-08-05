@@ -27,6 +27,7 @@ use crate::operation::{
     DjotImportResult, DocxExportResult, EpubExportResult, HtmlImportResult, MarkdownImportResult,
     Operation, PdfExportResult,
 };
+use crate::HtmlExportOptions;
 use crate::{BlockFormat, BlockInfo, DocumentStats, FindMatch, FindOptions, ReplaceRange};
 
 /// A rich text document.
@@ -420,9 +421,21 @@ impl TextDocument {
     }
 
     /// Export the entire document as HTML.
+    ///
+    /// Inline images keep whatever `src` the document stores; placing the files
+    /// those point at is the caller's business. Use
+    /// [`to_html_with_options`](Self::to_html_with_options) to inline them
+    /// instead, or to drop them.
     pub fn to_html(&self) -> Result<String> {
         let inner = self.inner.lock();
         let dto = document_io_commands::export_html(&inner.ctx)?;
+        Ok(dto.html_text)
+    }
+
+    /// Export as HTML, choosing how inline images are represented.
+    pub fn to_html_with_options(&self, options: HtmlExportOptions) -> Result<String> {
+        let inner = self.inner.lock();
+        let dto = document_io_commands::export_html_with_options(&inner.ctx, options)?;
         Ok(dto.html_text)
     }
 
@@ -782,7 +795,8 @@ impl TextDocument {
         drop(inner);
 
         let offset = position.saturating_sub(block_start);
-        let (start, end) = frontend::common::parser_tools::sentence_bounds(&text, offset, content_locale)?;
+        let (start, end) =
+            frontend::common::parser_tools::sentence_bounds(&text, offset, content_locale)?;
         Some((block_start + start, block_start + end))
     }
 

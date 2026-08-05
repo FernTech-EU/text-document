@@ -574,92 +574,35 @@ fn build_raw_fragments(
         (runs, images)
     };
 
-    let mut fragments = Vec::with_capacity(runs.len() + images.len() + 1);
+    // One shared weave of runs + image anchors (see
+    // `common::format_runs::merge_runs_and_images`). This used to be a second,
+    // hand-written copy of that algorithm, and the two disagreed on an image
+    // sitting exactly on a run boundary.
+    let pieces = frontend::common::format_runs::merge_runs_and_images(plain, &runs, &images);
+
+    let mut fragments = Vec::with_capacity(pieces.len());
     let mut char_offset: usize = 0;
-    let mut byte_cursor: u32 = 0;
-    let mut img_iter = images.iter().peekable();
 
-    // Helper to push an unformatted text fragment for bytes [a..b).
-    // Returns the new char_offset and updates byte_cursor.
-    fn emit_default_text(
-        fragments: &mut Vec<FragmentContent>,
-        plain: &str,
-        block_id: u64,
-        byte_a: u32,
-        byte_b: u32,
-        char_offset: &mut usize,
-        byte_cursor: &mut u32,
-    ) {
-        if byte_a >= byte_b {
-            return;
-        }
-        let text = &plain[byte_a as usize..byte_b as usize];
-        let length = text.chars().count();
-        let word_starts = compute_word_starts(text);
-        fragments.push(FragmentContent::Text {
-            text: text.to_string(),
-            format: TextFormat::default(),
-            offset: *char_offset,
-            length,
-            element_id: synth_element_id(block_id, byte_a),
-            word_starts,
-        });
-        *char_offset += length;
-        *byte_cursor = byte_b;
-    }
-
-    // Helper to push a formatted text fragment for bytes [a..b) with the
-    // given run's format. Used both for whole runs and for the
-    // before-image / after-image slices when an image sits inside a run.
-    #[allow(clippy::too_many_arguments)]
-    fn emit_run_text(
-        fragments: &mut Vec<FragmentContent>,
-        plain: &str,
-        block_id: u64,
-        byte_a: u32,
-        byte_b: u32,
-        run_format: &frontend::common::format_runs::CharacterFormat,
-        char_offset: &mut usize,
-        byte_cursor: &mut u32,
-    ) {
-        if byte_a >= byte_b {
-            return;
-        }
-        let text = &plain[byte_a as usize..byte_b as usize];
-        let length = text.chars().count();
-        let word_starts = compute_word_starts(text);
-        fragments.push(FragmentContent::Text {
-            text: text.to_string(),
-            format: TextFormat::from(run_format),
-            offset: *char_offset,
-            length,
-            element_id: synth_element_id(block_id, byte_a),
-            word_starts,
-        });
-        *char_offset += length;
-        *byte_cursor = byte_b;
-    }
-
-    for run in &runs {
-        let mut run_cursor = run.byte_start;
-
-        // Emit images that fall strictly before this run, then handle
-        // images that fall inside the run by splitting it at each
-        // image's byte_offset.
-        while let Some(img) = img_iter.peek() {
-            if img.byte_offset < run.byte_start {
-                // Image before the run — emit unformatted gap text, then image.
-                emit_default_text(
-                    &mut fragments,
-                    plain,
-                    block_id,
-                    byte_cursor,
-                    img.byte_offset,
-                    &mut char_offset,
-                    &mut byte_cursor,
-                );
+    for piece in pieces {
+        match piece {
+            frontend::common::format_runs::InlinePiece::Text { start, end, format } => {
+                let text = &plain[start as usize..end as usize];
+                let length = text.chars().count();
+                let word_starts = compute_word_starts(text);
+                fragments.push(FragmentContent::Text {
+                    text: text.to_string(),
+                    format: format.map(TextFormat::from).unwrap_or_default(),
+                    offset: char_offset,
+                    length,
+                    element_id: synth_element_id(block_id, start),
+                    word_starts,
+                });
+                char_offset += length;
+            }
+            frontend::common::format_runs::InlinePiece::Image(img) => {
                 fragments.push(FragmentContent::Image {
                     name: img.name.clone(),
+                    alt: img.alt.clone(),
                     width: img.width as u32,
                     height: img.height as u32,
                     quality: img.quality as u32,
@@ -667,108 +610,12 @@ fn build_raw_fragments(
                     offset: char_offset,
                     element_id: synth_element_id(block_id, img.byte_offset),
                 });
+                // An image contributes exactly one logical character and zero
+                // bytes; the U+FFFC sentinel in the rope holds its position.
                 char_offset += 1;
-                img_iter.next();
-            } else if img.byte_offset <= run.byte_end {
-                // Image at the run's start or inside the run.
-                // First close any unformatted gap upstream of the run.
-                emit_default_text(
-                    &mut fragments,
-                    plain,
-                    block_id,
-                    byte_cursor,
-                    run_cursor,
-                    &mut char_offset,
-                    &mut byte_cursor,
-                );
-                // Emit the formatted text slice [run_cursor..img.byte_offset).
-                emit_run_text(
-                    &mut fragments,
-                    plain,
-                    block_id,
-                    run_cursor,
-                    img.byte_offset,
-                    &run.format,
-                    &mut char_offset,
-                    &mut byte_cursor,
-                );
-                // Emit the image itself.
-                fragments.push(FragmentContent::Image {
-                    name: img.name.clone(),
-                    width: img.width as u32,
-                    height: img.height as u32,
-                    quality: img.quality as u32,
-                    format: TextFormat::from(&img.format),
-                    offset: char_offset,
-                    element_id: synth_element_id(block_id, img.byte_offset),
-                });
-                char_offset += 1;
-                run_cursor = img.byte_offset;
-                byte_cursor = img.byte_offset;
-                img_iter.next();
-            } else {
-                break;
             }
         }
-
-        // Unformatted gap between byte_cursor and the run's start (if
-        // the run starts past where we last emitted).
-        emit_default_text(
-            &mut fragments,
-            plain,
-            block_id,
-            byte_cursor,
-            run_cursor,
-            &mut char_offset,
-            &mut byte_cursor,
-        );
-
-        // Emit the remaining tail of the run [run_cursor..run.byte_end).
-        emit_run_text(
-            &mut fragments,
-            plain,
-            block_id,
-            run_cursor,
-            run.byte_end,
-            &run.format,
-            &mut char_offset,
-            &mut byte_cursor,
-        );
     }
-
-    // Any remaining images after the last run.
-    for img in img_iter {
-        emit_default_text(
-            &mut fragments,
-            plain,
-            block_id,
-            byte_cursor,
-            img.byte_offset,
-            &mut char_offset,
-            &mut byte_cursor,
-        );
-        fragments.push(FragmentContent::Image {
-            name: img.name.clone(),
-            width: img.width as u32,
-            height: img.height as u32,
-            quality: img.quality as u32,
-            format: TextFormat::from(&img.format),
-            offset: char_offset,
-            element_id: synth_element_id(block_id, img.byte_offset),
-        });
-        char_offset += 1;
-    }
-
-    // Trailing unformatted text after the last run / image.
-    emit_default_text(
-        &mut fragments,
-        plain,
-        block_id,
-        byte_cursor,
-        plain.len() as u32,
-        &mut char_offset,
-        &mut byte_cursor,
-    );
 
     fragments
 }

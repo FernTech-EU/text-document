@@ -51,8 +51,13 @@ pub struct InsertImageDto {
     pub position: i64,
     pub anchor: i64,
     pub image_name: String,
+    /// Alternative text describing the image. May be empty.
+    pub alt: String,
     pub width: i64,
     pub height: i64,
+    /// Render quality hint, 1..=100. `0` is read as "unspecified" and stored as
+    /// 100, which is what this use case hardcoded before the field existed.
+    pub quality: i64,
 }
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct InsertImageResultDto {

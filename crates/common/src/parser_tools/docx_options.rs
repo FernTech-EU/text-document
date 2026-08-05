@@ -133,6 +133,16 @@ pub struct DocxExportOptions {
     /// thing it must never do is leave the ids undefined for the reader to guess at.
     #[serde(default)]
     pub heading_styles: Vec<DocxHeadingStyle>,
+    /// Bytes for the document's inline images, keyed by their `src`.
+    ///
+    /// Supplied by the caller for the same reason [`PdfExportOptions::font_bytes`]
+    /// is: this crate resolves no paths and reads no files. An image whose `src`
+    /// is absent here is exported as its alt text instead of failing the export —
+    /// a missing picture must not cost the writer their manuscript.
+    ///
+    /// [`PdfExportOptions::font_bytes`]: super::pdf_options::PdfExportOptions::font_bytes
+    #[serde(default)]
+    pub images: super::image_options::ExportImages,
 }
 
 impl DocxExportOptions {

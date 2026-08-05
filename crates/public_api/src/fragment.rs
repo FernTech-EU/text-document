@@ -435,16 +435,28 @@ fn push_inline_html(out: &mut String, elements: &[FragmentElement]) {
             InlineContent::Text(t) => escape_html(t),
             InlineContent::Image {
                 name,
+                alt,
                 width,
                 height,
                 ..
             } => {
-                format!(
-                    "<img src=\"{}\" width=\"{}\" height=\"{}\">",
+                // This is the HTML written to the OS clipboard, so it is what
+                // another application receives on paste. It carried no `alt` at
+                // all, which made every copied image inaccessible in the target
+                // document.
+                let mut tag = format!(
+                    "<img src=\"{}\" alt=\"{}\"",
                     escape_html(name),
-                    width,
-                    height
-                )
+                    escape_html(alt)
+                );
+                if *width > 0 {
+                    tag.push_str(&format!(" width=\"{width}\""));
+                }
+                if *height > 0 {
+                    tag.push_str(&format!(" height=\"{height}\""));
+                }
+                tag.push('>');
+                tag
             }
             InlineContent::Empty => String::new(),
         };
@@ -552,7 +564,9 @@ fn render_inline_markdown(elements: &[FragmentElement]) -> String {
     for elem in elements {
         let raw_text = match &elem.content {
             InlineContent::Text(t) => t.clone(),
-            InlineContent::Image { name, .. } => format!("![{}]({})", name, name),
+            // `name` was used as both alt and source, so a pasted image
+            // described itself with its filename.
+            InlineContent::Image { name, alt, .. } => format!("![{alt}]({name})"),
             InlineContent::Empty => String::new(),
         };
 

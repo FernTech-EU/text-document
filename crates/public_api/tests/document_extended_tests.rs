@@ -418,6 +418,7 @@ fn inline_content_variants_are_accessible() {
     let empty = InlineContent::Empty;
     let text = InlineContent::Text("hello".into());
     let image = InlineContent::Image {
+        alt: String::new(),
         name: "img.png".into(),
         width: 100,
         height: 50,

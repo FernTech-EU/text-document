@@ -1,15 +1,17 @@
-use super::editing_helpers::{find_block_at_position, find_segment_at_offset};
+use super::editing_helpers::{collect_block_ids_recursive, find_block_at_position};
 use crate::InsertImageDto;
 use crate::InsertImageResultDto;
 use anyhow::{Result, anyhow};
 use common::database::CommandUnitOfWork;
 use common::database::rope_helpers::{block_content_via_store, rope_insert_in_block};
 use common::direct_access::document::document_repository::DocumentRelationshipField;
-use common::direct_access::frame::frame_repository::FrameRelationshipField;
 use common::direct_access::root::root_repository::RootRelationshipField;
-use common::entities::{Block, Document, Frame, Root};
-use common::format_runs::{ImageAnchor, InlineContent, synth_element_id};
-use common::format_runs_query::inline_segments_for_block;
+use common::direct_access::table::TableRelationshipField;
+use common::entities::{Block, Document, Frame, Root, TableCell};
+use common::format_runs::{
+    ImageAnchor, logical_offset_to_byte, shift_images_for_insert, shift_runs_for_insert,
+    synth_element_id,
+};
 use common::snapshot::EntityTreeSnapshot;
 use common::types::{EntityId, ROOT_ENTITY_ID};
 use common::undo_redo::UndoRedoCommand;
@@ -33,6 +35,8 @@ pub trait InsertImageUnitOfWorkFactoryTrait: Send + Sync {
 #[macros::uow_action(entity = "Block", action = "Update")]
 #[macros::uow_action(entity = "Block", action = "UpdateMulti")]
 #[macros::uow_action(entity = "Block", action = "GetRelationship")]
+#[macros::uow_action(entity = "Table", action = "GetRelationship")]
+#[macros::uow_action(entity = "TableCell", action = "GetMulti")]
 pub trait InsertImageUnitOfWorkTrait: CommandUnitOfWork {}
 
 pub struct InsertImageUseCase {
@@ -56,6 +60,13 @@ fn execute_insert_image(
             "Image dimensions must be positive (got {}x{})",
             dto.width,
             dto.height
+        ));
+    }
+
+    if dto.quality < 0 || dto.quality > 100 {
+        return Err(anyhow!(
+            "Image quality must be within 1..=100 (got {})",
+            dto.quality
         ));
     }
 
@@ -83,8 +94,27 @@ fn execute_insert_image(
         .first()
         .ok_or_else(|| anyhow!("Document has no frames"))?;
 
-    // Get block IDs from frame
-    let block_ids = uow.get_frame_relationship(&frame_id, &FrameRelationshipField::Blocks)?;
+    // Blocks in linear order, recursing into sub-frames.
+    //
+    // Reading only the top-level frame's blocks — which this did — mislocates
+    // any insertion inside a blockquote or a table cell: those blocks live in
+    // sub-frames, so `find_block_at_position` cannot match one and falls
+    // through to a scan that resolves the wrong block, or appends to the last
+    // top-level one. `insert_text`, `insert_block` and `delete_text` all
+    // already collect recursively; this is the same walk.
+    let get_table_cell_frames = |table_id: &EntityId| -> Result<Vec<EntityId>> {
+        let cell_ids = uow.get_table_relationship(table_id, &TableRelationshipField::Cells)?;
+        let cells_opt = uow.get_table_cell_multi(&cell_ids)?;
+        let mut cells: Vec<TableCell> = cells_opt.into_iter().flatten().collect();
+        cells.sort_by(|a, b| a.row.cmp(&b.row).then(a.column.cmp(&b.column)));
+        Ok(cells.into_iter().filter_map(|c| c.cell_frame).collect())
+    };
+    let block_ids = collect_block_ids_recursive(
+        &|id| uow.get_frame(id),
+        &|id, field| uow.get_frame_relationship(id, field),
+        &get_table_cell_frames,
+        &frame_id,
+    )?;
 
     // Get all blocks
     let blocks_opt = uow.get_block_multi(&block_ids)?;
@@ -94,40 +124,36 @@ fn execute_insert_image(
     // Find block at position
     let (block, block_idx, offset) = find_block_at_position(&blocks, position, &uow.store())?;
 
-    // Synthesize the inline-segment view of the target block from format_runs +
-    // block_images. This is read-only — we use it to locate the byte offset
-    // inside the block's content where the new image should be anchored.
+    // byte_offset = position inside the block's text where the new image is
+    // anchored.
+    //
+    // This is the same char→byte mapping every other editing use case uses, and
+    // for the same reason: an image occupies one character *and* the three
+    // bytes of its `U+FFFC` sentinel. The previous version walked the
+    // synthesized segments and added up only the `Text` ones, treating an image
+    // as zero bytes — so inserting an image after an existing image anchored it
+    // three bytes short of where it belonged, once per preceding image.
     let block_text = block_content_via_store(&block, &uow.store());
-    let segments = inline_segments_for_block(&uow.store(), block.id, &block_text);
-
-    // byte_offset = position inside `block.plain_text` where the new image is
-    // anchored. Empty blocks anchor at 0. Otherwise we walk the synthesized
-    // segments: each Text contributes its UTF-8 byte length; Image / Empty
-    // contribute zero.
-    let byte_offset: u32 = if segments.is_empty() {
-        0
-    } else {
-        let (segment, seg_idx, seg_offset) = find_segment_at_offset(&segments, offset)?;
-        let mut bo: u32 = 0;
-        for prev in &segments[..seg_idx] {
-            if let InlineContent::Text(s) = &prev.content {
-                bo += s.len() as u32;
-            }
-        }
-        match &segment.content {
-            InlineContent::Text(s) => {
-                let split_byte = s
-                    .char_indices()
-                    .nth(seg_offset as usize)
-                    .map(|(b, _)| b)
-                    .unwrap_or(s.len());
-                bo + split_byte as u32
-            }
-            InlineContent::Image { .. } | InlineContent::Empty => bo,
-        }
+    let images_before = {
+        let store = uow.store();
+        let map = store.block_images.read();
+        map.get(&block.id).cloned().unwrap_or_default()
     };
+    let byte_offset: u32 = logical_offset_to_byte(&block_text, &images_before, offset);
 
     let now = chrono::Utc::now();
+
+    // The sentinel mirrored into the rope below occupies real bytes, so
+    // everything anchored past the insertion point has to move by exactly that
+    // much — the same shift any text insertion performs.
+    //
+    // This was missing. `rope_insert_in_block` shifts *block* offsets, not the
+    // per-block format runs and image anchors, so inserting an image before
+    // existing formatting or before another image left those pointing three
+    // bytes short. Two images in one paragraph was enough to reproduce it: the
+    // second anchor still referenced the first image's sentinel, and the
+    // paragraph read back with a doubled image and a lost character.
+    const SENTINEL_BYTES: u32 = '\u{FFFC}'.len_utf8() as u32;
 
     // Insert ImageAnchor directly into block_images, maintaining sort order
     // (ascending by byte_offset; equal byte_offsets keep insertion order, so
@@ -136,6 +162,7 @@ fn execute_insert_image(
         let store = uow.store();
         let mut images_map = store.block_images.write();
         let images = images_map.entry(block.id).or_default();
+        shift_images_for_insert(images, byte_offset, SENTINEL_BYTES);
         let insert_idx = images
             .iter()
             .position(|a| a.byte_offset > byte_offset)
@@ -145,12 +172,21 @@ fn execute_insert_image(
             ImageAnchor {
                 byte_offset,
                 name: dto.image_name.clone(),
+                alt: dto.alt.clone(),
                 width: dto.width,
                 height: dto.height,
-                quality: 100,
+                quality: if dto.quality == 0 { 100 } else { dto.quality },
                 format: Default::default(),
             },
         );
+    }
+
+    {
+        let store = uow.store();
+        let mut runs_map = store.format_runs.write();
+        if let Some(runs) = runs_map.get_mut(&block.id) {
+            shift_runs_for_insert(runs, byte_offset, SENTINEL_BYTES);
+        }
     }
 
     // Mirror to the global rope: insert U+FFFC OBJECT REPLACEMENT

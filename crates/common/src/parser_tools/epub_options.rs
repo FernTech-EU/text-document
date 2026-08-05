@@ -27,4 +27,9 @@ pub struct EpubExportOptions {
     /// Right-to-left reading direction: sets the package's `page-progression-direction` to `rtl`
     /// and adds `dir="rtl"` to every chapter's `<html>` element.
     pub rtl: bool,
+    /// Bytes for the book's inline images, keyed by their `src`. Each one is
+    /// written into the package and listed in the OPF manifest; an image with no
+    /// entry here degrades to its alt text.
+    #[serde(default)]
+    pub images: super::image_options::ExportImages,
 }

@@ -243,6 +243,7 @@ fn epub_metadata_title_author_lang_land_in_the_opf() {
             author: "Ann Vane".to_string(),
             language: "fr".to_string(),
             rtl: false,
+            images: Default::default(),
         },
     );
     let opf = content_opf(&bytes);
@@ -328,6 +329,7 @@ fn rich_document_packs_to_a_valid_epub_file_on_disk() {
                 author: "Test Author".to_string(),
                 language: "en".to_string(),
                 rtl: false,
+                images: Default::default(),
             },
         },
     )

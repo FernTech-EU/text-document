@@ -48,7 +48,8 @@ pub use frontend::block::dtos::{CharVerticalAlignment, InlineContent, UnderlineS
 pub use frontend::common::format_runs::ReplaceFormatPolicy;
 pub use frontend::common::parser_tools::{
     CountMethod, DjotExportOptions, DjotImportOptions, DocxExportOptions, DocxHeadingStyle,
-    EpubExportOptions, MarkdownExportOptions, PdfExportOptions, PlainTextExportOptions, Sentence,
+    EpubExportOptions, ExportImage, ExportImages, HtmlExportOptions, HtmlImageMode,
+    MarkdownExportOptions, PdfExportOptions, PlainTextExportOptions, Sentence,
     TABLE_ANCHOR, WordCharCounts, count, count_djot, djot_to_plain_text, sentence_bounds,
     sentences,
 };

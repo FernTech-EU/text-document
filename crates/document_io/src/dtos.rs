@@ -53,6 +53,7 @@ pub struct ImportHtmlResultDto {
 pub struct ExportHtmlDto {
     pub html_text: String,
 }
+
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct ExportLatexDto {
     pub document_class: String,

@@ -11,6 +11,9 @@
 //! `typst-kit` system font scanning, no package resolution.
 
 use anyhow::{Context, anyhow, bail};
+use common::parser_tools::ExportImages;
+
+use crate::typst_markup::typst_image_paths;
 use typst::diag::{SourceDiagnostic, Warned};
 use typst::ecow::EcoVec;
 use typst::foundations::Bytes;
@@ -36,7 +39,11 @@ use typst_pdf::PdfOptions;
 /// than rejecting the export — rejecting would mean one unresolvable font family in a
 /// multi-language manuscript aborts the entire export, which is a worse failure mode than a
 /// visually-broken run of text the caller can notice and fix.
-pub fn compile_typst_pdf(markup: &str, fonts: Vec<Vec<u8>>) -> anyhow::Result<(Vec<u8>, usize)> {
+pub fn compile_typst_pdf(
+    markup: &str,
+    fonts: Vec<Vec<u8>>,
+    images: &ExportImages,
+) -> anyhow::Result<(Vec<u8>, usize)> {
     if fonts.is_empty() {
         bail!("no fonts supplied: at least one embedded font is required");
     }
@@ -60,9 +67,24 @@ pub fn compile_typst_pdf(markup: &str, fonts: Vec<Vec<u8>>) -> anyhow::Result<(V
         faces.extend(parsed);
     }
 
+    // Images are registered as in-memory virtual files under the same names the
+    // markup's `#image(..)` calls use. This is the same contract as fonts —
+    // caller-supplied bytes, never a filesystem read — which is what keeps a
+    // compile hermetic and reproducible.
+    let resolved_images: Vec<(String, Vec<u8>)> = typst_image_paths(images)
+        .into_iter()
+        .filter_map(|(src, path)| Some((path, images.get(&src)?.bytes.clone())))
+        .collect();
+
     let engine = TypstEngine::builder()
         .main_file(markup.to_string())
         .fonts(faces)
+        .with_static_file_resolver(
+            resolved_images
+                .iter()
+                .map(|(path, bytes)| (path.as_str(), bytes.clone()))
+                .collect::<Vec<_>>(),
+        )
         .build();
 
     let Warned { output, warnings } = engine.compile::<PagedDocument>();
@@ -142,7 +164,7 @@ mod tests {
     #[test]
     fn compiles_trivial_markup_to_a_pdf() {
         let markup = "#set page(width: 10cm, height: 10cm)\nHello, world.";
-        let (pdf, pages) = compile_typst_pdf(markup, vec![TEST_FONT.to_vec()]).expect("compiles");
+        let (pdf, pages) = compile_typst_pdf(markup, vec![TEST_FONT.to_vec()], &Default::default()).expect("compiles");
         assert!(pdf.starts_with(b"%PDF-"), "output must be a PDF");
         assert!(pdf.len() > 100, "a real PDF is not a handful of bytes");
         assert_eq!(pages, 1, "one short line lays out on a single page");
@@ -150,13 +172,13 @@ mod tests {
 
     #[test]
     fn empty_font_list_is_rejected() {
-        let err = compile_typst_pdf("Hello.", vec![]).unwrap_err();
+        let err = compile_typst_pdf("Hello.", vec![], &Default::default()).unwrap_err();
         assert!(err.to_string().contains("no fonts supplied"));
     }
 
     #[test]
     fn corrupt_font_bytes_are_rejected_not_silently_dropped() {
-        let err = compile_typst_pdf("Hello.", vec![vec![0u8; 16]]).unwrap_err();
+        let err = compile_typst_pdf("Hello.", vec![vec![0u8; 16]], &Default::default()).unwrap_err();
         assert!(
             err.to_string().contains("could not be parsed as a font"),
             "got: {err}"
@@ -166,7 +188,7 @@ mod tests {
     #[test]
     fn bad_markup_reports_a_readable_diagnostic() {
         let err =
-            compile_typst_pdf("#foo_bar_does_not_exist()", vec![TEST_FONT.to_vec()]).unwrap_err();
+            compile_typst_pdf("#foo_bar_does_not_exist()", vec![TEST_FONT.to_vec()], &Default::default()).unwrap_err();
         assert!(err.to_string().contains("unknown variable"), "got: {err}");
     }
 
@@ -176,7 +198,7 @@ mod tests {
         // compiles (with fallback glyphs), which is the behaviour `compile_typst_pdf` relies on
         // rather than escalating to a hard error.
         let markup = "#set text(font: \"Totally Not A Real Font\")\nHello.";
-        let (pdf, _) = compile_typst_pdf(markup, vec![TEST_FONT.to_vec()]).expect("still compiles");
+        let (pdf, _) = compile_typst_pdf(markup, vec![TEST_FONT.to_vec()], &Default::default()).expect("still compiles");
         assert!(pdf.starts_with(b"%PDF-"));
     }
 }

@@ -406,8 +406,10 @@ impl ExportMarkdownUseCase {
                         escape_markdown(t)
                     }
                 }
-                InlineContent::Image { name, .. } => {
-                    format!("![{}]({})", name, name)
+                InlineContent::Image { name, alt, .. } => {
+                    // Markdown has no attribute syntax, so display size cannot
+                    // survive here; alt and source do.
+                    format!("![{}]({})", alt, name)
                 }
                 InlineContent::Empty => String::new(),
             };

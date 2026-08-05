@@ -167,10 +167,17 @@ impl GetTextAtPositionUseCase {
                     }
                 }
 
-                // Advance byte offset (Text contributes its UTF-8 length, Image contributes 0)
+                // Advance the byte offset. An image occupies the three bytes of
+                // its `U+FFFC` sentinel in the block's text — the segment view
+                // hands back the surrounding text with the sentinel already
+                // stepped over, so treating an image as zero bytes here would
+                // make every synthesized element id after it point three bytes
+                // short of its run.
                 match &seg.content {
                     InlineContent::Text(s) => current_byte_offset += s.len() as u32,
-                    InlineContent::Image { .. } => {}
+                    InlineContent::Image { .. } => {
+                        current_byte_offset += '\u{FFFC}'.len_utf8() as u32
+                    }
                     InlineContent::Empty => {}
                 }
 

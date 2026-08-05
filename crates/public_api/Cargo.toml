@@ -32,6 +32,12 @@ frontend = { workspace = true }
 proptest = "1"
 criterion = { version = "0.8.2", features = ["html_reports"] }
 insta = { version = "1.40", features = ["yaml", "redactions"] }
+# Image-export tests unzip the DOCX/EPUB they produce and assert on the media
+# parts inside — the markup that references them was never the part that was
+# wrong, so checking it would not have caught a dangling reference.
+zip = { version = "6", default-features = false, features = ["deflate"] }
+png = "0.17"
+tempfile = "3"
 
 [features]
 # PDF export (via embedded Typst) — forwards to `frontend`'s (and thence `document_io`'s) own

@@ -82,6 +82,12 @@ pub enum FragmentContent {
     /// [`TextDocument::resource(name)`](crate::TextDocument::resource) method.
     Image {
         name: String,
+        /// Alternative text describing the image. May be empty.
+        ///
+        /// Carried through to layout so an accessibility layer can name the
+        /// image without a second lookup, in the same way `word_starts` is
+        /// precomputed for text runs.
+        alt: String,
         width: u32,
         height: u32,
         quality: u32,

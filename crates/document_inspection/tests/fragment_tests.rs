@@ -452,8 +452,10 @@ fn test_extract_insert_fragment_with_image() -> Result<()> {
             position: 6,
             anchor: 6,
             image_name: "photo.png".to_string(),
+            alt: String::new(),
             width: 200,
             height: 100,
+            quality: 100,
         },
     )?;
 

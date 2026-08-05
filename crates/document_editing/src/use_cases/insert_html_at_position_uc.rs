@@ -12,11 +12,11 @@ use common::direct_access::frame::frame_repository::FrameRelationshipField;
 use common::direct_access::root::root_repository::RootRelationshipField;
 use common::entities::{Block, Document, Frame, List, Root};
 use common::format_runs::{
-    FormatRun, coalesce_in_place, logical_offset_to_byte, shift_images_for_insert,
+    FormatRun, ImageAnchor, coalesce_in_place, logical_offset_to_byte, shift_images_for_insert,
     shift_runs_for_insert, splice_range, split_images_at, split_runs_at,
 };
 
-use common::parser_tools::content_parser::{self, ParsedBlock, format_runs_from_spans};
+use common::parser_tools::content_parser::{self, ParsedBlock, ParsedInline, format_runs_from_spans};
 use common::parser_tools::list_grouper::ListGrouper;
 use common::snapshot::EntityTreeSnapshot;
 use common::types::{EntityId, ROOT_ENTITY_ID};
@@ -77,8 +77,19 @@ fn write_block_state(
     }
 }
 
-fn parsed_block_payload(parsed: &ParsedBlock) -> (String, Vec<FormatRun>) {
+fn parsed_block_payload(parsed: &ParsedBlock) -> ParsedInline {
     format_runs_from_spans(&parsed.spans, parsed.is_code_block)
+}
+
+/// Rebase image anchors by `offset` bytes, preserving their order.
+fn images_at(images: Vec<ImageAnchor>, offset: u32) -> Vec<ImageAnchor> {
+    images
+        .into_iter()
+        .map(|a| ImageAnchor {
+            byte_offset: a.byte_offset + offset,
+            ..a
+        })
+        .collect()
 }
 
 fn execute_content_insert(
@@ -156,7 +167,11 @@ fn execute_content_insert(
     // ── Inline merge: single block with no block-level formatting ──
     if parsed_blocks.len() == 1 && parsed_blocks[0].is_inline_only() {
         let parsed = &parsed_blocks[0];
-        let (inserted_plain, inserted_runs_at_zero) = parsed_block_payload(parsed);
+        let ParsedInline {
+            plain_text: inserted_plain,
+            runs: inserted_runs_at_zero,
+            images: inserted_images,
+        } = parsed_block_payload(parsed);
         let inserted_len = inserted_plain.chars().count() as i64;
 
         if inserted_len == 0 {
@@ -188,6 +203,9 @@ fn execute_content_insert(
 
         let mut images = current_images.clone();
         shift_images_for_insert(&mut images, byte_offset, inserted_bytes);
+        // The parsed content's own images land in the hole the shift opened.
+        images.extend(images_at(inserted_images, byte_offset));
+        images.sort_by_key(|a| a.byte_offset);
 
         let mut updated_block = current_block.clone();
         updated_block.updated_at = now;
@@ -234,7 +252,11 @@ fn execute_content_insert(
         let merge_first = first_parsed.is_inline_only();
         let merge_last = last_parsed.is_inline_only();
 
-        let (first_plain, first_runs_at_zero) = parsed_block_payload(first_parsed);
+        let ParsedInline {
+            plain_text: first_plain,
+            runs: first_runs_at_zero,
+            images: first_images,
+        } = parsed_block_payload(first_parsed);
         let first_len = first_plain.chars().count() as i64;
 
         // When text_before is empty and we can't merge, overwrite the
@@ -293,8 +315,15 @@ fn execute_content_insert(
             updated_current.updated_at = now;
             uow.update_block_with_relationships(&updated_current)?;
             // The old inline_elements list for this block is now stale;
-            // rebuild from the new (plain_text, runs, images).
-            (first_plain.clone(), first_runs_at_zero.clone(), Vec::new())
+            // rebuild from the new (plain_text, runs, images). The head is
+            // replaced outright here, so it takes the parsed block's images
+            // unshifted — there is no surviving left-hand text to sit before
+            // them.
+            (
+                first_plain.clone(),
+                first_runs_at_zero.clone(),
+                first_images.clone(),
+            )
         } else if merge_first {
             let mut hp = String::with_capacity(text_before.len() + first_plain.len());
             hp.push_str(&text_before);
@@ -312,7 +341,10 @@ fn execute_content_insert(
             let _ = text_before_chars + first_len + left_image_count;
             updated_current.updated_at = now;
             uow.update_block(&updated_current)?;
-            (hp, runs, left_images.clone())
+            let mut images = left_images.clone();
+            images.extend(images_at(first_images.clone(), first_offset));
+            images.sort_by_key(|a| a.byte_offset);
+            (hp, runs, images)
         } else {
             updated_current.updated_at = now;
             uow.update_block(&updated_current)?;
@@ -355,7 +387,11 @@ fn execute_content_insert(
         };
 
         for parsed in &parsed_blocks[middle_start..middle_end] {
-            let (block_plain, block_runs) = parsed_block_payload(parsed);
+            let ParsedInline {
+                plain_text: block_plain,
+                runs: block_runs,
+                images: block_images,
+            } = parsed_block_payload(parsed);
             let block_text_len = block_plain.chars().count() as i64;
 
             let list_id = if let Some(ref list_style) = parsed.list_style {
@@ -409,7 +445,7 @@ fn execute_content_insert(
 
             let insert_index = (block_idx + 1 + new_block_ids.len()) as i32;
             let created_block = uow.create_block(&new_block, frame_id, insert_index)?;
-            write_block_state(uow, created_block.id, block_runs, Vec::new());
+            write_block_state(uow, created_block.id, block_runs, block_images);
 
             // Mirror the new middle block into the rope at the
             // running byte cursor (prepends a `\n` boundary). Skipped
@@ -424,7 +460,11 @@ fn execute_content_insert(
             running_position += block_text_len + 1;
         }
 
-        let (last_plain, last_runs_at_zero) = parsed_block_payload(last_parsed);
+        let ParsedInline {
+            plain_text: last_plain,
+            runs: last_runs_at_zero,
+            images: last_images,
+        } = parsed_block_payload(last_parsed);
         let last_len = last_plain.chars().count() as i64;
 
         let (tail_plain, tail_runs, tail_images, _tail_chars) = if merge_last {
@@ -441,7 +481,9 @@ fn execute_content_insert(
                 });
             }
             coalesce_in_place(&mut runs);
-            let mut images: Vec<common::format_runs::ImageAnchor> = Vec::new();
+            // The parsed block's own images sit at byte 0 of the tail; the
+            // pre-existing right-hand images shift past them.
+            let mut images: Vec<common::format_runs::ImageAnchor> = last_images;
             for img in right_images.iter().cloned() {
                 images.push(common::format_runs::ImageAnchor {
                     byte_offset: img.byte_offset + last_offset,
@@ -634,7 +676,11 @@ fn execute_content_insert(
     } else {
         // ── Single block with block-level formatting ──
         let parsed = &parsed_blocks[0];
-        let (block_plain, block_runs) = parsed_block_payload(parsed);
+        let ParsedInline {
+            plain_text: block_plain,
+            runs: block_runs,
+            images: block_images,
+        } = parsed_block_payload(parsed);
         let block_text_len = block_plain.chars().count() as i64;
 
         let overwrite_head = text_before.is_empty();
@@ -667,7 +713,7 @@ fn execute_content_insert(
             updated_current.fmt_background_color = parsed.background_color.clone();
             updated_current.updated_at = now;
             uow.update_block_with_relationships(&updated_current)?;
-            write_block_state(uow, current_block.id, block_runs, Vec::new());
+            write_block_state(uow, current_block.id, block_runs, block_images);
 
             // Mirror the head's new content into the rope (skipped
             // when the head wasn't in the rope, e.g. unseeded tests).
@@ -851,7 +897,7 @@ fn execute_content_insert(
             };
 
             let created_block = uow.create_block(&new_block, frame_id, (block_idx + 1) as i32)?;
-            write_block_state(uow, created_block.id, block_runs, Vec::new());
+            write_block_state(uow, created_block.id, block_runs, block_images);
 
             // Mirror the inserted block into the rope (skipped when
             // the head wasn't in the rope).

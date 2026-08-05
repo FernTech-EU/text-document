@@ -357,7 +357,7 @@ fn insert_markdown() {
 fn insert_image() {
     let doc = new_doc("Hello ");
     let c = doc.cursor_at(6);
-    c.insert_image("test.png", 100, 100).unwrap();
+    c.insert_image("test.png", "", 100, 100).unwrap();
     let stats = doc.stats();
     assert_eq!(stats.image_count, 1);
 }

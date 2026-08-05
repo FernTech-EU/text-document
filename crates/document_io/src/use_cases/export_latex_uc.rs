@@ -401,7 +401,10 @@ impl ExportLatexUseCase {
         for elem in &elements {
             match &elem.content {
                 InlineContent::Text(t) => text.push_str(t),
-                InlineContent::Image { name, .. } => text.push_str(name),
+                // Plain-text extraction of a block: an image has no textual
+                // form, so its description is the only honest substitute. The
+                // filename was being emitted here, which put a path into prose.
+                InlineContent::Image { alt, .. } => text.push_str(alt),
                 InlineContent::Empty => {}
             }
         }
@@ -426,8 +429,37 @@ impl ExportLatexUseCase {
         for elem in &elements {
             let text = match &elem.content {
                 InlineContent::Text(t) => escape_latex(t),
-                InlineContent::Image { name, .. } => {
-                    format!("\\includegraphics{{{}}}", escape_latex(name))
+                InlineContent::Image {
+                    name,
+                    width,
+                    height,
+                    ..
+                } => {
+                    // LaTeX resolves `\includegraphics` against the filesystem at
+                    // compile time, so the `src` is emitted as the document
+                    // stores it and placing the file beside the `.tex` is the
+                    // caller's job — this crate writes no files. `graphicx` is
+                    // already in the emitted preamble.
+                    //
+                    // Sizes are in `bp` (big points, 1/72") because the model's
+                    // dimensions are logical pixels at 96 dpi; LaTeX's own `pt`
+                    // is 1/72.27" and would be silently ~0.4% off.
+                    let mut opts = Vec::new();
+                    if *width > 0 {
+                        opts.push(format!("width={}bp", *width as f64 * 0.75));
+                    }
+                    if *height > 0 {
+                        opts.push(format!("height={}bp", *height as f64 * 0.75));
+                    }
+                    if opts.is_empty() {
+                        format!("\\includegraphics{{{}}}", escape_latex(name))
+                    } else {
+                        format!(
+                            "\\includegraphics[{}]{{{}}}",
+                            opts.join(","),
+                            escape_latex(name)
+                        )
+                    }
                 }
                 InlineContent::Empty => String::new(),
             };
