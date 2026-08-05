@@ -127,12 +127,51 @@ fn frag_block_state(fb: &FragmentBlock) -> (Vec<FormatRun>, Vec<ImageAnchor>) {
                     quality: *quality,
                     format: fmt,
                 });
+                // An image occupies one `U+FFFC` in the block's text — three
+                // bytes — which the fragment's own plain text carries (see
+                // `extract_fragment_uc`, which writes it). Not stepping over it
+                // leaves every run after the picture three bytes early, so the
+                // character following a pasted image inherits its formatting
+                // and the last three bytes of the block fall outside every run.
+                byte_offset += '\u{FFFC}'.len_utf8() as u32;
             }
         }
     }
 
     coalesce_in_place(&mut runs);
     (runs, images)
+}
+
+/// Whether the image anchored at `byte_offset` is mirrored by a `U+FFFC` in the
+/// block's own text.
+///
+/// Historically it was not: `insert_fragment` wrote anchors straight into a
+/// block and left the text alone, which is why every length computation below
+/// used to add one per image on top of the character count. Both the extract
+/// side and the Djot/Markdown/HTML parsers now write the sentinel, so adding it
+/// again double-counts — but a fragment deserialized from an older build's
+/// clipboard payload can still arrive without one, and that is a real
+/// cross-version case rather than a hypothetical: `FragmentData` goes onto the
+/// OS clipboard, where it outlives the build that wrote it.
+fn image_has_sentinel(text: &str, byte_offset: u32) -> bool {
+    text.get(byte_offset as usize..)
+        .is_some_and(|rest| rest.starts_with('\u{FFFC}'))
+}
+
+/// The logical (character) length of a block's text together with its images —
+/// the unit document positions are measured in.
+///
+/// One character per image, whether that character is already in `text` as a
+/// sentinel or has to be accounted for separately. Getting this wrong shifts
+/// every position after the block, which is why it is one function rather than
+/// the same two-line sum repeated at seven call sites (where it had already
+/// drifted into double-counting).
+fn logical_len(text: &str, images: &[ImageAnchor]) -> i64 {
+    let unmirrored = images
+        .iter()
+        .filter(|img| !image_has_sentinel(text, img.byte_offset))
+        .count();
+    text.chars().count() as i64 + unmirrored as i64
 }
 
 /// Write `format_runs` and `block_images` for `block_id`, then reverse-sync
@@ -541,8 +580,7 @@ fn insert_table_fragment(
             if !frag_cell.blocks.is_empty() {
                 let first_frag = &frag_cell.blocks[0];
                 let (runs, images) = frag_block_state(first_frag);
-                let first_chars = first_frag.plain_text.chars().count() as i64;
-                let first_len = first_chars + images.len() as i64;
+                let first_len = logical_len(&first_frag.plain_text, &images);
 
                 let mut updated_block = created_block.clone();
                 updated_block.document_position = current_pos;
@@ -557,8 +595,7 @@ fn insert_table_fragment(
 
                 for extra_frag in &frag_cell.blocks[1..] {
                     let (xruns, ximages) = frag_block_state(extra_frag);
-                    let extra_chars = extra_frag.plain_text.chars().count() as i64;
-                    let extra_len = extra_chars + ximages.len() as i64;
+                    let extra_len = logical_len(&extra_frag.plain_text, &ximages);
                     let extra_block = Block {
                         id: 0,
                         created_at: now,
@@ -1081,8 +1118,7 @@ fn insert_mixed_fragment(
                 }
 
                 let (runs, images) = frag_block_state(frag_block);
-                let block_chars = frag_block.plain_text.chars().count() as i64;
-                let block_text_len = block_chars + images.len() as i64;
+                let block_text_len = logical_len(&frag_block.plain_text, &images);
 
                 let list_id = if let Some(ref frag_list) = frag_block.list {
                     if let Some(existing_id) =
@@ -1189,8 +1225,7 @@ fn insert_mixed_fragment(
                     if !frag_cell.blocks.is_empty() {
                         let first_cb = &frag_cell.blocks[0];
                         let (runs, images) = frag_block_state(first_cb);
-                        let cb_chars = first_cb.plain_text.chars().count() as i64;
-                        let cb_len = cb_chars + images.len() as i64;
+                        let cb_len = logical_len(&first_cb.plain_text, &images);
 
                         let mut updated_block = created_block.clone();
                         updated_block.document_position = running_position;
@@ -1205,8 +1240,7 @@ fn insert_mixed_fragment(
 
                         for extra_frag in &frag_cell.blocks[1..] {
                             let (xruns, ximages) = frag_block_state(extra_frag);
-                            let extra_chars = extra_frag.plain_text.chars().count() as i64;
-                            let extra_len = extra_chars + ximages.len() as i64;
+                            let extra_len = logical_len(&extra_frag.plain_text, &ximages);
                             let extra_block = Block {
                                 id: 0,
                                 created_at: now,
@@ -1369,9 +1403,7 @@ fn insert_mixed_fragment(
 
     let (tail_plain, tail_runs, tail_images) =
         build_tail_state(&text_after, &right_runs, &right_images, last_frag);
-    let tail_chars = tail_plain.chars().count() as i64;
-    let tail_image_count = tail_images.len() as i64;
-    let tail_text_length = tail_chars + tail_image_count;
+    let tail_text_length = logical_len(&tail_plain, &tail_images);
 
     let skip_tail_block = tail_plain.is_empty() && last_frag.is_none() && right_image_count == 0;
 
@@ -1670,8 +1702,7 @@ fn execute_insert_fragment(
 
     let current_block_text =
         common::database::rope_helpers::block_content_via_store(&current_block, &store);
-    let original_current_char_length =
-        current_block_text.chars().count() as i64 + current_images.len() as i64;
+    let original_current_char_length = logical_len(&current_block_text, &current_images);
     let byte_offset = logical_offset_to_byte(&current_block_text, &current_images, offset);
     let now = chrono::Utc::now();
 
@@ -1680,8 +1711,7 @@ fn execute_insert_fragment(
         let frag_block = &fragment_data.blocks[0];
         let inserted_plain = &frag_block.plain_text;
         let (frag_runs, frag_images) = frag_block_state(frag_block);
-        let inserted_chars = inserted_plain.chars().count() as i64;
-        let inserted_len = inserted_chars + frag_images.len() as i64;
+        let inserted_len = logical_len(inserted_plain, &frag_images);
 
         if inserted_len == 0 {
             return Ok((
@@ -1958,9 +1988,7 @@ fn execute_insert_fragment(
             total_new_chars += last_chars;
         }
 
-        let tail_chars = tail_plain.chars().count() as i64;
-        let tail_image_count = tail_images.len() as i64;
-        let tail_text_length = tail_chars + tail_image_count;
+        let tail_text_length = logical_len(&tail_plain, &tail_images);
         let skip_tail = tail_plain.is_empty() && !merge_last && right_image_count == 0;
 
         let mut created_tail_id: Option<EntityId> = None;

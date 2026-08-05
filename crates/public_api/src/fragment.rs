@@ -646,8 +646,43 @@ fn render_table_markdown(table: &FragmentTable) -> String {
 
 /// Convert parsed blocks (from HTML or Markdown parser) into a `DocumentFragment`.
 /// Convert a `ParsedSpan` to a `FragmentElement`.
+/// The plain text of a run of parsed spans, with an image standing as its
+/// `U+FFFC` sentinel.
+///
+/// That sentinel is the convention the *extract* side already writes (see
+/// `extract_fragment_uc`), and it is what `insert_fragment_uc` positions each
+/// `ImageAnchor` against — an image with no character in the text has nothing
+/// to anchor to, and every format run after it lands three bytes early.
+fn spans_plain_text(spans: &[ParsedSpan]) -> String {
+    spans
+        .iter()
+        .map(|s| {
+            if s.image.is_some() {
+                "\u{FFFC}"
+            } else {
+                s.text.as_str()
+            }
+        })
+        .collect()
+}
+
 fn span_to_fragment_element(span: &ParsedSpan) -> FragmentElement {
-    let content = InlineContent::Text(span.text.clone());
+    // An image span carries no text — the picture *is* the content. Emitting
+    // `Text("")` for it, which is what this did, produced a fragment with an
+    // empty element and no image anywhere: `insert_djot` of an image markup
+    // returned `Ok` and inserted nothing at all.
+    let content = match &span.image {
+        Some(img) => InlineContent::Image {
+            name: img.src.clone(),
+            alt: img.alt.clone(),
+            width: img.width,
+            height: img.height,
+            // The source states a display size or it does not; nothing here
+            // re-encodes the image, so there is no quality to carry.
+            quality: 100,
+        },
+        None => InlineContent::Text(span.text.clone()),
+    };
     let fmt_font_family = if span.code {
         Some("monospace".into())
     } else {
@@ -697,7 +732,7 @@ fn parsed_elements_to_fragment(parsed: Vec<ParsedElement>) -> DocumentFragment {
             ParsedElement::Block(pb) => {
                 let elements: Vec<FragmentElement> =
                     pb.spans.iter().map(span_to_fragment_element).collect();
-                let plain_text: String = pb.spans.iter().map(|s| s.text.as_str()).collect();
+                let plain_text: String = spans_plain_text(&pb.spans);
                 let list = pb.list_style.map(|style| FragmentList {
                     style,
                     indent: pb.list_indent as i64,
@@ -740,8 +775,7 @@ fn parsed_elements_to_fragment(parsed: Vec<ParsedElement>) -> DocumentFragment {
                     for (col_idx, cell) in row.iter().enumerate() {
                         let cell_elements: Vec<FragmentElement> =
                             cell.spans.iter().map(span_to_fragment_element).collect();
-                        let cell_text: String =
-                            cell.spans.iter().map(|s| s.text.as_str()).collect();
+                        let cell_text: String = spans_plain_text(&cell.spans);
 
                         frag_cells.push(FragmentTableCell {
                             row: row_idx,

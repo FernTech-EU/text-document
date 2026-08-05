@@ -207,3 +207,105 @@ fn html_export_always_emits_an_alt_attribute() {
     assert!(html.contains("<img "), "no image emitted: {html:?}");
     assert!(html.contains("alt="), "no alt attribute: {html:?}");
 }
+
+// ── Inserting at the caret ──────────────────────────────────────────────
+//
+// A different code path from `set_djot` above, and it was completely broken:
+// `insert_djot` built a `DocumentFragment`, and the fragment builder mapped
+// every parsed span to `InlineContent::Text(span.text)` — which for an image
+// span is the empty string. So inserting an image returned `Ok` and put
+// nothing in the document at all. This is the path the editor's own
+// "Insert image…" uses, and the path a paste travels.
+
+/// The document text with an image at `offset`, inserted through the cursor.
+fn insert_at(doc: &TextDocument, offset: usize, djot: &str) {
+    let cursor = doc.cursor();
+    cursor.set_position(offset, text_document::MoveMode::MoveAnchor);
+    cursor.insert_djot(djot).expect("insert");
+}
+
+#[test]
+fn inserting_an_image_at_the_caret_actually_inserts_it() {
+    let doc = TextDocument::new();
+    doc.set_djot_sync("ab\n").expect("import");
+    insert_at(&doc, 2, "![](assets/x.png){width=10 height=10}");
+
+    let out = doc.to_djot().expect("export");
+    assert!(
+        out.contains("assets/x.png"),
+        "the image never arrived: {out:?}"
+    );
+    assert!(out.contains("width=10"), "size lost: {out:?}");
+}
+
+#[test]
+fn an_inserted_image_lands_where_the_caret_is() {
+    let doc = TextDocument::new();
+    doc.set_djot_sync("ab\n").expect("import");
+    insert_at(&doc, 1, "![a gull](assets/x.png)");
+
+    let out = doc.to_djot().expect("export");
+    let a = out.find('a').expect("a");
+    let img = out.find("assets/x.png").expect("image");
+    let b = out.rfind('b').expect("b");
+    assert!(
+        a < img && img < b,
+        "the image did not land mid-word: {out:?}"
+    );
+}
+
+#[test]
+fn an_inserted_image_costs_the_same_as_a_parsed_one() {
+    // Both paths must agree, or the caret drifts by one per image the moment a
+    // document is reloaded — and every comment anchored below it drifts too.
+    let inserted = TextDocument::new();
+    inserted.set_djot_sync("ab\n").expect("import");
+    insert_at(&inserted, 2, "![](assets/x.png){width=10 height=10}");
+
+    let parsed = TextDocument::new();
+    parsed
+        .set_djot_sync("ab![](assets/x.png){width=10 height=10}\n")
+        .expect("import");
+
+    assert_eq!(
+        inserted.character_count(),
+        parsed.character_count(),
+        "inserting an image and parsing one disagree about what it costs"
+    );
+    assert_eq!(
+        inserted.to_plain_text().unwrap(),
+        parsed.to_plain_text().unwrap()
+    );
+}
+
+#[test]
+fn text_after_an_inserted_image_keeps_its_own_formatting() {
+    // The image occupies three bytes of the block's text. A run-builder that
+    // does not step over them leaves every run after the picture three bytes
+    // early: the character following it inherits the image's formatting, and
+    // the tail of the block falls outside every run.
+    let doc = TextDocument::new();
+    doc.set_djot_sync("start\n").expect("import");
+    insert_at(&doc, 5, "![](assets/x.png) _slanted_");
+
+    let out = doc.to_djot().expect("export");
+    assert!(out.contains("assets/x.png"), "{out:?}");
+    assert!(
+        out.contains("_slanted_"),
+        "the emphasis after the image was lost or displaced: {out:?}"
+    );
+}
+
+#[test]
+fn inserting_an_image_twice_leaves_two_of_them() {
+    let doc = TextDocument::new();
+    doc.set_djot_sync("ab\n").expect("import");
+    insert_at(&doc, 2, "![one](assets/a.png)");
+    insert_at(&doc, doc.character_count(), "![two](assets/b.png)");
+
+    let out = doc.to_djot().expect("export");
+    let a = out.find("a.png").expect("first");
+    let b = out.find("b.png").expect("second");
+    assert!(a < b, "images out of order: {out:?}");
+    assert_eq!(doc.character_count(), 4, "two images, two characters");
+}
