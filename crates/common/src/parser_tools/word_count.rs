@@ -77,11 +77,27 @@ pub fn count(text: &str, method: CountMethod) -> WordCharCounts {
 /// sentinel, single-`\n` block joins) and fusing the parse-and-count into one AST walk is
 /// the easiest way to accidentally create a third, silently-diverging "what is the text".
 pub fn count_djot(djot: &str, method: CountMethod) -> WordCharCounts {
-    count(
-        &djot_to_plain_text(djot, &DjotImportOptions::default()),
-        method,
-    )
+    let text = djot_to_plain_text(djot, &DjotImportOptions::default());
+    // Drop the inline-object sentinels before counting.
+    //
+    // `djot_to_plain_text` is the **addressable** view: an image and a footnote
+    // reference each occupy one `U+FFFC` there, because anything that addresses
+    // the text by position — a caret, a search hit, a comment's anchor — has to
+    // agree with the document character for character.
+    //
+    // A word count is not addressing anything. It answers "how much has the
+    // writer written", and a picture is not a character they wrote: leaving the
+    // sentinel in makes a manuscript's character count tick up when someone
+    // inserts a photograph, and a pace target creep away from the prose it was
+    // set against. Same view, two questions — and this is the one that wants the
+    // objects gone.
+    let prose: String = text.chars().filter(|&c| c != OBJECT_REPLACEMENT).collect();
+    count(&prose, method)
 }
+
+/// U+FFFC OBJECT REPLACEMENT CHARACTER — one document character standing in for
+/// an inline object (an image, a footnote's marker).
+const OBJECT_REPLACEMENT: char = '\u{FFFC}';
 
 /// Han ideographs (incl. common extensions & compatibility) and Japanese kana. Excludes
 /// Hangul: Korean is space-delimited and counts by the UAX #29 word rule.

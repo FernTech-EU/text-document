@@ -342,18 +342,3 @@ fn a_reference_can_be_inserted_at_the_caret() {
         "insertion did not survive: {out:?}"
     );
 }
-
-/// Typst takes the note's text at the reference, like LaTeX, and numbers and
-/// places it itself.
-#[cfg(feature = "pdf")]
-#[test]
-fn typst_carries_the_body_at_the_reference() {
-    let doc = doc_from(WITH_NOTE);
-    let out = std::env::temp_dir().join("footnote_typst_probe.pdf");
-    // The PDF path is the only public route to the Typst markup, so this
-    // asserts on the compile succeeding with a footnote present — a malformed
-    // `#footnote[…]` fails Typst outright rather than rendering wrongly.
-    doc.to_pdf(&out).expect("pdf").wait().expect("pdf compile");
-    assert!(out.exists(), "no PDF produced");
-    let _ = std::fs::remove_file(&out);
-}

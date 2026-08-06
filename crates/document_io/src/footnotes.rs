@@ -112,14 +112,6 @@ impl Footnotes {
         self.definition_frames.contains(&frame_id)
     }
 
-    /// The frame holding `label`'s body, if this document has one.
-    ///
-    /// `None` is ordinary, not an error: a host that keeps note bodies in its
-    /// own store puts references in the prose and no definitions at all.
-    pub fn definition(&self, label: &str) -> Option<EntityId> {
-        self.definitions.get(label).copied()
-    }
-
     /// What `label`'s reference prints.
     ///
     /// Falls back to the label itself for a reference that somehow never

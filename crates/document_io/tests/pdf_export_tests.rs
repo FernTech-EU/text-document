@@ -484,3 +484,35 @@ fn several_images_each_resolve() {
     assert_eq!(&pdf[..5], b"%PDF-");
     assert_eq!(count_pdf_pages(&pdf), 1);
 }
+
+// --- footnotes ---------------------------------------------------------------
+
+/// Typst takes a note's body **at the reference** — like LaTeX, and unlike every
+/// other backend — then numbers it and places it at the foot of the page itself.
+///
+/// Compiling is the assertion. Typst rejects a malformed `#footnote[…]` outright
+/// rather than rendering it wrongly, so a PDF coming out the other side is proof
+/// the markup was well-formed with the body inside it. This test lives here, with
+/// the font harness, rather than beside the other footnote round-trip tests: the
+/// PDF path is the one exporter that cannot run without an embedded font, and a
+/// `to_pdf` test with none fails on "no fonts supplied" long before it reaches
+/// anything about notes.
+#[test]
+fn a_footnote_compiles_into_the_pdf() {
+    let djot = "The lighthouse stood alone.[^a]\n\n[^a]: Decommissioned in 1961.\n";
+    let bytes = pdf_from_djot(djot, pdf_options());
+    assert!(
+        bytes.starts_with(b"%PDF-"),
+        "a document carrying a footnote must still compile"
+    );
+    assert!(count_pdf_pages(&bytes) >= 1);
+}
+
+/// A reference whose definition was deleted must not take the export down with
+/// it. The body is simply absent; Typst is handed a note with nothing in it
+/// rather than a dangling command.
+#[test]
+fn a_footnote_with_no_body_still_compiles() {
+    let bytes = pdf_from_djot("Orphaned here.[^gone]\n", pdf_options());
+    assert!(bytes.starts_with(b"%PDF-"));
+}
