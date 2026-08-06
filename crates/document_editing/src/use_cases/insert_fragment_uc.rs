@@ -231,6 +231,13 @@ fn frag_block_state(fb: &FragmentBlock) -> BlockInline {
             // bytes, one logical character. The marker a reader sees is derived
             // at render time and is not in the text, so it costs nothing here.
             InlineContent::FootnoteRef { label } => {
+                // Raised, always — the same rule the parser applies when it
+                // reads `[^label]` off the wire. Both paths have to agree, or a
+                // note inserted at the caret sits on the baseline while an
+                // identical one that arrived through a save/reload is raised,
+                // and the difference survives in the file.
+                let mut fmt = fmt;
+                fmt.vertical_alignment = Some(common::entities::CharVerticalAlignment::SuperScript);
                 notes.push(FootnoteRefAnchor {
                     byte_offset,
                     label: label.clone(),

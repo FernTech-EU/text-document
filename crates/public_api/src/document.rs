@@ -678,10 +678,38 @@ impl TextDocument {
     /// continue a sequence this document cannot see. Leave it unset and the
     /// document numbers its own references in reading order, which is right when
     /// the document *is* the whole text.
+    /// Storing the map is only half of it: a marker is **shaped text**, so a
+    /// document already laid out keeps drawing the old one until something tells
+    /// it to reshape. Nothing else will — the map is presentation state and
+    /// changing it edits no block, so it emits no edit event of its own. Without
+    /// the notification below, a host that numbers a note the instant it is
+    /// created watches the raw label sit in the writer's prose until an unrelated
+    /// keystroke happens to force a relayout.
+    ///
+    /// `FormatChanged` over the whole document rather than a paint-only event:
+    /// the marker's width changes with its text (`9` and `10` are not the same
+    /// size), so the line has to be reshaped, not recoloured. Guarded on the map
+    /// actually differing, because a host pushes this on every refresh and a
+    /// full relayout per keystroke is not a thing to do by accident.
     pub fn set_footnote_markers(&self, markers: std::collections::HashMap<String, String>) {
-        let inner = self.inner.lock();
-        let store = inner.ctx.db_context.get_store();
-        *store.footnote_markers.write() = markers;
+        let queued = {
+            let mut inner = self.inner.lock();
+            {
+                let store = inner.ctx.db_context.get_store();
+                let mut current = store.footnote_markers.write();
+                if *current == markers {
+                    return;
+                }
+                *current = markers;
+            }
+            inner.queue_event(DocumentEvent::FormatChanged {
+                position: 0,
+                length: 0,
+                kind: crate::flow::FormatChangeKind::Character,
+            });
+            inner.take_queued_events()
+        };
+        crate::inner::dispatch_queued_events(queued);
     }
 
     /// Every footnote reference in the document, as `(position, label)`, in

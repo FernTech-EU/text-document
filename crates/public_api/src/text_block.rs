@@ -562,7 +562,7 @@ fn build_raw_fragments(
         }
     };
 
-    let (runs, images, notes) = {
+    let (runs, images, notes, markers) = {
         let store = inner.ctx.db_context.get_store();
         let runs: Vec<FormatRun> = store
             .format_runs
@@ -582,7 +582,15 @@ fn build_raw_fragments(
             .get(&block_id)
             .cloned()
             .unwrap_or_default();
-        (runs, images, notes)
+        // What the host says each label prints. Read once per block rather than
+        // per reference: it is a whole-document fact, and a block with three
+        // notes in it would otherwise take three locks to learn the same thing.
+        let markers = if notes.is_empty() {
+            std::collections::HashMap::new()
+        } else {
+            store.footnote_markers.read().clone()
+        };
+        (runs, images, notes, markers)
     };
 
     // One shared weave of runs + anchors (see
@@ -614,9 +622,22 @@ fn build_raw_fragments(
             frontend::common::format_runs::InlinePiece::FootnoteRef(note) => {
                 fragments.push(FragmentContent::FootnoteReference {
                     label: note.label.clone(),
-                    // The label stands in until a host supplies real numbering:
-                    // document order is not visible from inside one block.
-                    marker: note.label.clone(),
+                    // What the host says this note prints — a number, usually.
+                    //
+                    // It has to come from outside: which note this is depends on
+                    // how many references precede it in the *document*, and a
+                    // host that owns note storage (Skribisto keeps bodies in its
+                    // own store) knows more still — that this text is chapter
+                    // five of a book, and where its numbering starts.
+                    //
+                    // The label stands in when nothing was supplied, matching
+                    // what `document_io::Footnotes::marker` falls back to, so the
+                    // editor and the exporters degrade the same way rather than
+                    // disagreeing about a document nobody has numbered.
+                    marker: markers
+                        .get(&note.label)
+                        .cloned()
+                        .unwrap_or_else(|| note.label.clone()),
                     format: TextFormat::from(&note.format),
                     offset: char_offset,
                     element_id: synth_element_id(block_id, note.byte_offset),

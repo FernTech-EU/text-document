@@ -342,3 +342,83 @@ fn a_reference_can_be_inserted_at_the_caret() {
         "insertion did not survive: {out:?}"
     );
 }
+
+/// The marker a reader sees is what the **host** says it is.
+///
+/// Which note a reference is depends on how many precede it in the document —
+/// and a host that owns note storage knows more still: that this text is chapter
+/// five of a book, and where its numbering starts. So the marker is pushed in,
+/// and the fragment the editor lays out has to actually use it. It did not: the
+/// fragment builder drew `label` and the override was consulted only by the
+/// exporters, so the writer's prose showed `fn4` while the exported HTML showed
+/// `1`.
+#[test]
+fn the_host_decides_what_a_marker_prints() {
+    let doc = doc_from("Prose[^n1] here.\n");
+    let mut markers = std::collections::HashMap::new();
+    markers.insert("n1".to_string(), "17".to_string());
+    doc.set_footnote_markers(markers);
+
+    let drawn = doc
+        .flow()
+        .iter()
+        .filter_map(|e| match e {
+            text_document::FlowElement::Block(b) => Some(b),
+            _ => None,
+        })
+        .flat_map(|b| b.fragments())
+        .find_map(|f| match f {
+            text_document::FragmentContent::FootnoteReference { marker, label, .. } => {
+                Some((label.clone(), marker.clone()))
+            }
+            _ => None,
+        })
+        .expect("a reference fragment");
+    assert_eq!(drawn.0, "n1", "the label is what identifies the note");
+    assert_eq!(drawn.1, "17", "the marker is what the host supplied");
+}
+
+/// A reference is superscript however ordinary the prose around it is.
+///
+/// Both ways in have to agree — parsing `[^label]` off the wire and inserting
+/// one at a caret — or a note typed today sits on the baseline while an
+/// identical one that survived a save and reload is raised, and the difference
+/// is stored in the file.
+#[test]
+fn a_reference_is_raised_whichever_way_it_arrived() {
+    use text_document::CharVerticalAlignment::SuperScript;
+
+    let raised = |doc: &TextDocument| -> Option<bool> {
+        doc.flow()
+            .iter()
+            .filter_map(|e| match e {
+                text_document::FlowElement::Block(b) => Some(b),
+                _ => None,
+            })
+            .flat_map(|b| b.fragments())
+            .find_map(|f| match f {
+                text_document::FragmentContent::FootnoteReference { format, .. } => {
+                    Some(format.vertical_alignment == Some(SuperScript))
+                }
+                _ => None,
+            })
+    };
+
+    assert_eq!(
+        raised(&doc_from("Prose[^n1] here.\n")),
+        Some(true),
+        "a parsed reference must be superscript"
+    );
+
+    let typed = doc_from("Prose here.\n");
+    let cursor = typed.cursor();
+    cursor.set_position(5, text_document::MoveMode::MoveAnchor);
+    cursor
+        .insert_footnote_reference("typed")
+        .expect("insert a reference");
+    assert_eq!(
+        raised(&typed),
+        Some(true),
+        "a reference inserted at the caret must be superscript too"
+    );
+}

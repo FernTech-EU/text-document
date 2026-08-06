@@ -1487,10 +1487,26 @@ pub fn format_runs_from_spans(spans: &[ParsedSpan], is_code_block: bool) -> Pars
             // A reference occupies one U+FFFC, exactly as an image does, so
             // every downstream offset treats the two alike.
             plain_text.push('\u{FFFC}');
+            // Raised, always — whatever the surrounding run is doing.
+            //
+            // A footnote marker is superscript by definition, in every
+            // typographic tradition and in every reader that renders djot. The
+            // ambient `superscript` flag the span carries is the *prose's*, and
+            // prose is not superscript, so taking it verbatim sets a note's
+            // number on the baseline in the middle of a sentence — which reads
+            // as a stray digit the writer typed rather than as a reference.
+            //
+            // It is set here, on the anchor, rather than at render time so that
+            // every consumer agrees: the editor raises it, the exporters that
+            // carry character formatting carry it, and the djot writer knows to
+            // emit `[^label]` *without* wrapping it in `^…^` (see
+            // `a_reference_is_not_wrapped_in_superscript_markers`).
+            let mut format = character_format_from_span(span, is_code_block);
+            format.vertical_alignment = Some(crate::entities::CharVerticalAlignment::SuperScript);
             footnote_refs.push(FootnoteRefAnchor {
                 byte_offset: byte_start,
                 label: label.clone(),
-                format: character_format_from_span(span, is_code_block),
+                format,
             });
             continue;
         }
