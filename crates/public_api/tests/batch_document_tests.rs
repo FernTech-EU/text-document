@@ -116,7 +116,8 @@ fn process_thread_count() -> usize {
         type KernReturn = i32;
         type MachMsgTypeNumber = u32;
 
-        extern "C" {
+        // Edition 2024: FFI declarations live in `unsafe extern`.
+        unsafe extern "C" {
             static mut mach_task_self_: MachPort;
             fn task_threads(
                 target_task: MachPort,
@@ -164,7 +165,8 @@ fn process_thread_count() -> usize {
         const TH32CS_SNAPTHREAD: u32 = 0x0000_0004;
         const INVALID_HANDLE_VALUE: isize = -1;
 
-        extern "system" {
+        // Edition 2024: FFI declarations live in `unsafe extern`.
+        unsafe extern "system" {
             fn CreateToolhelp32Snapshot(flags: u32, process_id: u32) -> isize;
             fn Thread32First(snapshot: isize, entry: *mut ThreadEntry32) -> i32;
             fn Thread32Next(snapshot: isize, entry: *mut ThreadEntry32) -> i32;
