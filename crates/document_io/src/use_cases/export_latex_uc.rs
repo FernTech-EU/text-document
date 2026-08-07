@@ -340,7 +340,7 @@ impl ExportLatexUseCase {
                     // A run becomes one `itemize`/`enumerate`, so a page break inside
                     // it has nowhere to go — end the run and let the outer loop emit it.
                     if b_list.is_some()
-                        && !(b.fmt_page_break_before == Some(true) && !items.is_empty())
+                        && (b.fmt_page_break_before != Some(true) || items.is_empty())
                     {
                         let inline_latex = self.render_inline_latex(uow, b)?;
                         items.push(format!("\\item {}", inline_latex));

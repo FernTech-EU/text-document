@@ -170,7 +170,8 @@ fn markdown_import_keeps_the_image_instead_of_leaking_its_alt_text() {
     let doc = TextDocument::new();
     doc.set_markdown("Some prose ![a black cat](c.png) more.\n")
         .expect("import")
-        .wait();
+        .wait()
+        .expect("import");
     let plain = doc.to_plain_text().expect("plain");
     assert!(
         !plain.contains("a black cat"),
@@ -190,7 +191,8 @@ fn html_import_keeps_an_img_tag() {
         "<p>before <img src=\"c.png\" alt=\"a cat\" width=\"320\" height=\"240\"> after</p>",
     )
     .expect("import")
-    .wait();
+    .wait()
+    .expect("import");
     let html = doc.to_html().expect("export");
     assert!(html.contains("c.png"), "image dropped: {html:?}");
     assert!(html.contains("a cat"), "alt dropped: {html:?}");

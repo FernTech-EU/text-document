@@ -266,7 +266,7 @@ impl ExportPlainTextUseCase {
             Vec::new()
         };
         if !printed.is_empty() {
-            plain_text.push_str("\n");
+            plain_text.push('\n');
             for (number, _, frame_id) in printed {
                 let block_ids = uow.get_frame_relationship(
                     &frame_id,

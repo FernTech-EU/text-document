@@ -216,12 +216,110 @@ impl ParsedBlock {
 
 // ─── Markdown parsing ────────────────────────────────────────────────
 
+/// Labels referenced as `[^label]` in `markdown` with no `[^label]: ...`
+/// definition anywhere in the document.
+///
+/// pulldown-cmark's default footnote mode (`Options::ENABLE_FOOTNOTES`, i.e.
+/// GitHub's syntax) only emits `Event::FootnoteReference` for a label some
+/// `Tag::FootnoteDefinition` actually defines (verified against 0.13) — an
+/// undefined reference silently decomposes into three ordinary `Text` events
+/// (`"["`, `"^label"`, `"]"`) instead, indistinguishable from a reader having
+/// typed literal brackets. `Options::ENABLE_OLD_FOOTNOTES` recognises it, but
+/// as `parse_markdown`'s doc comment explains, trades away multi-paragraph
+/// definition bodies to get there. Neither flag alone gives both, so
+/// `parse_markdown` hands pulldown-cmark a synthetic empty definition for
+/// every such label instead — real enough for it to recognise the reference,
+/// thrown away again before `elements` is returned.
+///
+/// Finding "every such label" is two parts: which labels pulldown-cmark's own
+/// block scanner (a first pass, at the caller's `options`) already recognises
+/// as truly defined, and which `[^…]`-shaped spans exist in the raw text at
+/// all. The second part is a plain scan, not a parser — it can over-match
+/// (inside a code span, inside a fenced block, a coincidental `[^x]:` in the
+/// middle of a sentence that real block parsing would never treat as a
+/// definition), but over-matching only ever produces an unused synthetic
+/// definition: pulldown-cmark's real, correct parse of the augmented text is
+/// what decides whether any span actually becomes a reference, and
+/// `parse_markdown` drops every synthesized definition regardless of whether
+/// that happened.
+fn dangling_footnote_labels(
+    markdown: &str,
+    options: pulldown_cmark::Options,
+) -> std::collections::BTreeSet<String> {
+    use pulldown_cmark::{Event, Parser, Tag};
+
+    let mut defined: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for event in Parser::new_ext(markdown, options) {
+        if let Event::Start(Tag::FootnoteDefinition(label)) = event {
+            defined.insert(label.to_string());
+        }
+    }
+
+    let mut referenced: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    let bytes = markdown.as_bytes();
+    let mut search_from = 0usize;
+    while let Some(rel) = markdown[search_from..].find("[^") {
+        let open = search_from + rel;
+        let label_start = open + 2;
+        let Some(close_rel) = markdown[label_start..].find(']') else {
+            break;
+        };
+        let close = label_start + close_rel;
+        let label = &markdown[label_start..close];
+        // `]:` immediately after is definition syntax, not a reference —
+        // pulldown-cmark's own scan above already supplied the ground truth
+        // for which labels are truly defined; this only needs to avoid
+        // counting a definition's own label as a "reference" candidate.
+        let looks_like_definition = bytes.get(close + 1) == Some(&b':');
+        if !label.is_empty() && !looks_like_definition && !label.chars().any(char::is_whitespace) {
+            referenced.insert(label.to_string());
+        }
+        search_from = close + 1;
+    }
+
+    referenced.difference(&defined).cloned().collect()
+}
+
 pub fn parse_markdown(markdown: &str) -> Vec<ParsedElement> {
     use pulldown_cmark::{Event, Options, Parser, Tag, TagEnd};
 
-    let options =
-        Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TABLES | Options::ENABLE_TASKLISTS;
-    let parser = Parser::new_ext(markdown, options);
+    // ENABLE_FOOTNOTES is required for pulldown-cmark to parse `[^label]`
+    // references and `[^label]: body` definitions at all — without it both
+    // fall through as plain link-reference-shaped text. Deliberately NOT
+    // `ENABLE_OLD_FOOTNOTES` too: that variant makes a reference with no
+    // definition survive (see `dangling_footnote_labels`), but in exchange
+    // breaks multi-paragraph definition bodies — a blank line before an
+    // indented continuation escapes the definition and becomes a sibling
+    // code block, which is exactly the shape this crate's own Markdown
+    // exporter writes for a note with more than one paragraph. Getting both
+    // is `dangling_footnote_labels`'s job, not an `Options` flag's.
+    let options = Options::ENABLE_STRIKETHROUGH
+        | Options::ENABLE_TABLES
+        | Options::ENABLE_TASKLISTS
+        | Options::ENABLE_FOOTNOTES;
+
+    // See `dangling_footnote_labels`: pulldown-cmark's GFM-style footnotes
+    // only recognise `[^label]` as a reference when some definition exists
+    // for it anywhere in the document, so an undefined one — the normal
+    // state for a host that owns note bodies itself — has to be given a
+    // throwaway definition before parsing, or it silently becomes the
+    // literal text "[^label]" instead of surviving as a reference.
+    let dangling = dangling_footnote_labels(markdown, options);
+    let augmented_owner;
+    let source: &str = if dangling.is_empty() {
+        markdown
+    } else {
+        augmented_owner = dangling
+            .iter()
+            .fold(markdown.to_string(), |mut acc, label| {
+                acc.push_str("\n\n[^");
+                acc.push_str(label);
+                acc.push_str("]:\n");
+                acc
+            });
+        &augmented_owner
+    };
+    let parser = Parser::new_ext(source, options);
 
     let mut elements: Vec<ParsedElement> = Vec::new();
     let mut current_spans: Vec<ParsedSpan> = Vec::new();
@@ -239,6 +337,14 @@ pub fn parse_markdown(markdown: &str) -> Vec<ParsedElement> {
     let mut link_href: Option<String> = None;
     // Set between an image's Start and End; its alt text arrives as Text events.
     let mut pending_image: Option<ParsedImage> = None;
+
+    // The label and element index of the footnote definition currently open,
+    // if any. Mirrors `parse_djot`'s `footnote_open`: a definition's body is
+    // ordinary block content, parsed by the same machinery as everything
+    // else, then lifted back out at `End` into its own top-level element so
+    // it never becomes part of the flow it was written in. CommonMark
+    // footnote definitions cannot nest, so one slot suffices.
+    let mut footnote_open: Option<(String, usize)> = None;
 
     // List style stack for nested lists (also tracks nesting depth)
     let mut list_stack: Vec<Option<ListStyle>> = Vec::new();
@@ -636,6 +742,107 @@ pub fn parse_markdown(markdown: &str) -> Vec<ParsedElement> {
             Event::End(TagEnd::BlockQuote(_)) => {
                 blockquote_depth = blockquote_depth.saturating_sub(1);
             }
+            // ── Footnote definitions ──
+            //
+            // `[^label]: body` opens a block-level container; its body is
+            // ordinary paragraphs/lists/etc., pushed onto `elements` by the
+            // ordinary machinery above. `End` drains everything pushed since
+            // `Start` back out into one `FootnoteDefinition`, exactly as
+            // `parse_djot` does for the same `[^label]: body` syntax.
+            // Flushing any spans left open by an interrupted block first
+            // matches every other container boundary in this parser
+            // (List/Item/BlockQuote).
+            Event::Start(Tag::FootnoteDefinition(label)) => {
+                if !current_spans.is_empty() {
+                    elements.push(ParsedElement::Block(ParsedBlock {
+                        spans: std::mem::take(&mut current_spans),
+                        heading_level: current_heading.take(),
+                        list_style: current_list_style.clone(),
+                        list_indent: current_list_indent,
+                        list_prefix: String::new(),
+                        list_suffix: String::new(),
+                        marker: None,
+                        is_code_block: false,
+                        code_language: None,
+                        blockquote_depth,
+                        line_height: None,
+                        non_breakable_lines: None,
+                        page_break_before: None,
+                        direction: None,
+                        background_color: None,
+                        alignment: None,
+                        top_margin: None,
+                        text_indent: None,
+                        semantic_role: None,
+                    }));
+                }
+                footnote_open = Some((label.to_string(), elements.len()));
+            }
+            Event::End(TagEnd::FootnoteDefinition) => {
+                if !current_spans.is_empty() {
+                    elements.push(ParsedElement::Block(ParsedBlock {
+                        spans: std::mem::take(&mut current_spans),
+                        heading_level: current_heading.take(),
+                        list_style: current_list_style.clone(),
+                        list_indent: current_list_indent,
+                        list_prefix: String::new(),
+                        list_suffix: String::new(),
+                        marker: None,
+                        is_code_block: false,
+                        code_language: None,
+                        blockquote_depth,
+                        line_height: None,
+                        non_breakable_lines: None,
+                        page_break_before: None,
+                        direction: None,
+                        background_color: None,
+                        alignment: None,
+                        top_margin: None,
+                        text_indent: None,
+                        semantic_role: None,
+                    }));
+                }
+                if let Some((label, start)) = footnote_open.take() {
+                    let blocks: Vec<ParsedBlock> = elements
+                        .drain(start..)
+                        .filter_map(|e| match e {
+                            ParsedElement::Block(b) => Some(b),
+                            // A table inside a footnote is not representable
+                            // as note content, same limitation as djot.
+                            _ => None,
+                        })
+                        .collect();
+                    elements.push(ParsedElement::FootnoteDefinition { label, blocks });
+                }
+            }
+            // A footnote reference. pulldown-cmark emits this whether or not
+            // a matching `[^label]:` definition exists anywhere in the
+            // document — a dangling reference (the normal state for a host
+            // that owns note bodies itself) must survive just the same,
+            // mirroring `parse_djot`'s `E::FootnoteReference` handling.
+            Event::FootnoteReference(label) => {
+                let span = ParsedSpan {
+                    text: String::new(),
+                    bold,
+                    italic,
+                    underline: false,
+                    strikeout,
+                    code: false,
+                    superscript: false,
+                    subscript: false,
+                    link_href: link_href.clone(),
+                    image: None,
+                    footnote_ref: Some(label.to_string()),
+                };
+                if in_table {
+                    current_cell_spans.push(span);
+                } else {
+                    if !in_block {
+                        in_block = true;
+                    }
+                    current_spans.push(span);
+                }
+            }
             _ => {}
         }
     }
@@ -663,6 +870,18 @@ pub fn parse_markdown(markdown: &str) -> Vec<ParsedElement> {
             text_indent: None,
             semantic_role: None,
         }));
+    }
+
+    // Drop the throwaway definitions `dangling_footnote_labels` asked for —
+    // they exist only to make pulldown-cmark recognise the reference as
+    // real, never to become a note the document owns. `elements` cannot
+    // become empty from this: a label reached `dangling` only via a
+    // reference actually present in `markdown`, so its surrounding block
+    // survives even with the synthetic definition gone.
+    if !dangling.is_empty() {
+        elements.retain(
+            |e| !matches!(e, ParsedElement::FootnoteDefinition { label, .. } if dangling.contains(label)),
+        );
     }
 
     // If no elements were parsed, create a single empty paragraph

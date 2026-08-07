@@ -196,10 +196,90 @@ fn import_parsed_elements(
         }
 
         match parsed_element {
-            // Neither importer's parser emits a definition yet — the HTML and
-            // Markdown footnote syntaxes are a separate pass. Dropping it here
-            // is therefore unreachable today, and stated rather than assumed.
-            ParsedElement::FootnoteDefinition { .. } => {}
+            // A footnote definition becomes a **detached** frame carrying the
+            // label: owned by the document, in no frame's `child_order`, so it
+            // never appears in the flow the editor lays out. Writers reach it by
+            // label when they place the note. The frame is the same shape a
+            // table cell gets — arbitrary block content needs a frame — but
+            // deliberately not mirrored into the rope, because a note's body is
+            // not part of the prose whose offsets the document addresses.
+            // Mirrors `import_djot_uc`'s handling exactly, since `parse_markdown`
+            // produces the same `ParsedElement::FootnoteDefinition` shape.
+            ParsedElement::FootnoteDefinition { label, blocks } => {
+                let note_frame = uow.create_frame(
+                    &Frame {
+                        footnote_label: Some(label.clone()),
+                        ..Frame::default()
+                    },
+                    doc_id,
+                    -1,
+                )?;
+
+                let mut child_order: Vec<i64> = Vec::with_capacity(blocks.len());
+                for nb in blocks.iter() {
+                    let ParsedInline {
+                        plain_text,
+                        runs: format_runs,
+                        images: block_images,
+                        footnote_refs: block_footnote_refs,
+                    } = format_runs_from_spans(&nb.spans, nb.is_code_block);
+
+                    // The document-wide running position, not an index within
+                    // the note. `document_position` keys the block-offset index
+                    // that `block_content_via_store` reads through, so a
+                    // definition restarting at 0 collides with the prose and the
+                    // index hands back byte ranges belonging to another block —
+                    // which slices mid-`U+FFFC` and panics the rope.
+                    let line_len = plain_text.chars().count() as i64;
+                    let block = Block {
+                        document_position,
+                        fmt_heading_level: nb.heading_level,
+                        fmt_marker: nb.marker.clone(),
+                        fmt_is_code_block: Some(nb.is_code_block),
+                        fmt_code_language: nb.code_language.clone(),
+                        ..Block::default()
+                    };
+                    let created = uow.create_block(&block, note_frame.id, -1)?;
+                    child_order.push(created.id as i64);
+
+                    // Mirrored into the rope like any other block: a definition
+                    // is real document content, and `block_content_via_store` is
+                    // the only way its text is ever read back.
+                    //
+                    // The boundary `\n` first, exactly as the main walk does.
+                    // `rope_append_block` writes no separator of its own, so
+                    // without this the preceding block's range runs straight
+                    // into the note — and since a block's content is its range
+                    // minus one trailing byte, the prose gets sliced one byte
+                    // short, landing inside the three bytes of a `U+FFFC` and
+                    // panicking the rope.
+                    if emitted_any_main_block {
+                        rope_insert_block_boundary(&uow.store());
+                        document_position += 1;
+                    }
+                    rope_append_block(&uow.store(), created.id, &plain_text);
+                    emitted_any_main_block = true;
+                    document_position += line_len;
+
+                    let store = uow.store();
+                    if !format_runs.is_empty() {
+                        store.format_runs.write().insert(created.id, format_runs);
+                    }
+                    if !block_images.is_empty() {
+                        store.block_images.write().insert(created.id, block_images);
+                    }
+                    if !block_footnote_refs.is_empty() {
+                        store
+                            .block_footnote_refs
+                            .write()
+                            .insert(created.id, block_footnote_refs);
+                    }
+                }
+
+                let mut updated = note_frame.clone();
+                updated.child_order = child_order;
+                uow.update_frame(&updated)?;
+            }
             ParsedElement::Block(parsed_block) => {
                 transition_bq_depth(
                     uow,

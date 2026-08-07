@@ -684,8 +684,7 @@ const HIGH: Color = Color {
 fn background_at(doc: &TextDocument, at: usize) -> Option<Color> {
     masked_paint_spans(doc, &HighlightMask::all())
         .into_iter()
-        .filter(|s| at >= s.start && at < s.start + s.length)
-        .next_back()
+        .rfind(|s| at >= s.start && at < s.start + s.length)
         .and_then(|s| s.background_color)
 }
 

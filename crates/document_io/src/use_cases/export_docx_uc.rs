@@ -273,7 +273,7 @@ impl ExportDocxUseCase {
                 let mut paragraphs = Vec::with_capacity(blocks.len());
                 for block in &blocks {
                     paragraphs.push(self.render_block(
-                        &*uow,
+                        uow,
                         block,
                         0,
                         None,

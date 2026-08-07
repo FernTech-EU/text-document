@@ -507,13 +507,11 @@ pub fn sentences<'a>(text: &'a str, locale: Option<&str>) -> Vec<Sentence<'a>> {
     // is one pass: slicing each sentence with `.chars().skip(n)` would be quadratic.
     let mut byte_at: Vec<usize> = Vec::with_capacity(char_breaks.len());
     let mut next = 0usize;
-    let mut chars = 0usize;
-    for (byte, _) in text.char_indices() {
+    for (chars, (byte, _)) in text.char_indices().enumerate() {
         while next < char_breaks.len() && char_breaks[next] == chars {
             byte_at.push(byte);
             next += 1;
         }
-        chars += 1;
     }
     while next < char_breaks.len() {
         byte_at.push(text.len());

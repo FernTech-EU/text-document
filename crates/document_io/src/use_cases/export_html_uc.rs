@@ -167,7 +167,7 @@ impl ExportHtmlUseCase {
 
         // Table anchor frame — render the table instead of blocks
         if let Some(table_id) = frame.table {
-            return html_render::render_table_html(&uow.store(), table_id, image_policy, &notes);
+            return html_render::render_table_html(&uow.store(), table_id, image_policy, notes);
         }
 
         // If child_order is populated, use it to interleave blocks and sub-frames
@@ -193,7 +193,7 @@ impl ExportHtmlUseCase {
             &uow.store(),
             &blocks,
             image_policy,
-            &notes,
+            notes,
         ))
     }
 
@@ -226,7 +226,7 @@ impl ExportHtmlUseCase {
                         &uow.store(),
                         &pending_blocks,
                         image_policy,
-                        &notes,
+                        notes,
                     );
                     if !html.is_empty() {
                         parts.push(html);
@@ -275,12 +275,8 @@ impl ExportHtmlUseCase {
 
         // Flush remaining blocks
         if !pending_blocks.is_empty() {
-            let html = html_render::render_blocks_html(
-                &uow.store(),
-                &pending_blocks,
-                image_policy,
-                &notes,
-            );
+            let html =
+                html_render::render_blocks_html(&uow.store(), &pending_blocks, image_policy, notes);
             if !html.is_empty() {
                 parts.push(html);
             }

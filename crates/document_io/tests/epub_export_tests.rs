@@ -232,6 +232,165 @@ Chapter one prose.
     assert!(ch1.contains("Chapter one prose"));
 }
 
+// --- footnotes -----------------------------------------------------------------
+//
+// These assert on the real, packaged `.xhtml` entries inside the zip — not on an
+// in-memory HTML string, and not only on the referencing markup. That second part
+// matters here specifically: `export_epub_uc` used to render a footnote's
+// *reference* correctly (via the `html_render` module it shares with the plain-HTML
+// backend) while never emitting the matching `<aside>` at all, because — unlike
+// `export_html_uc`/`export_docx_uc` — it never skipped a note-body frame in its main
+// walk and never appended a definition's rendering anywhere. A test asserting only
+// on the `doc-noteref` marker would have kept passing throughout — the exact
+// false-confidence shape the image work ran into, asserting on markup that referenced
+// an artifact rather than on the artifact itself.
+
+/// One note referenced twice — once from each of two chapters — plus one dangling
+/// reference (no matching definition) in the second chapter.
+const FOOTNOTE_DJOT: &str = "\
+# Chapter One
+
+Opening prose with a shared note[^shared] and one just for here[^only-one].
+
+[^shared]: Shared note body.
+
+[^only-one]: A note owned by chapter one alone.
+
+# Chapter Two
+
+More prose citing the shared note again[^shared], plus a dangling one[^gone].
+";
+
+#[test]
+fn epub_footnote_reference_and_its_aside_share_one_chapter_file() {
+    let bytes = epub_from_djot(FOOTNOTE_DJOT, EpubExportOptions::default());
+    let ch1 = read_zip_entry(&bytes, "OEBPS/chapter_001.xhtml");
+
+    // The reference: reading-system idiom (`epub:type`/`role` pair — `epub:type`
+    // alone reaches no assistive technology), numbered 1 (first reference in
+    // reading order).
+    assert!(
+        ch1.contains(r#"epub:type="noteref" role="doc-noteref""#),
+        "no noteref marker in chapter one: {ch1}"
+    );
+    assert!(
+        ch1.contains("id=\"fnref-shared\""),
+        "reference anchor missing its id: {ch1}"
+    );
+    assert!(ch1.contains("<sup>1</sup>"), "wrong/missing marker: {ch1}");
+
+    // The aside, in the SAME file — an EPUB fragment identifier does not resolve
+    // across spine files, so a reference and its note have to share a document.
+    assert!(
+        ch1.contains(r#"epub:type="footnote" role="doc-footnote""#),
+        "no footnote aside in chapter one: {ch1}"
+    );
+    assert!(
+        ch1.contains("id=\"fn-shared\""),
+        "aside is missing its id: {ch1}"
+    );
+    assert!(
+        ch1.contains("Shared note body."),
+        "the note's body never rendered: {ch1}"
+    );
+    // The back-link returns to the reference in the same document.
+    assert!(
+        ch1.contains(r##"href="#fnref-shared" role="doc-backlink""##),
+        "aside has no back-link to its reference: {ch1}"
+    );
+
+    // A second, distinct note in the same chapter gets its own pair too.
+    assert!(ch1.contains("<sup>2</sup>"), "second marker missing: {ch1}");
+    assert!(
+        ch1.contains("id=\"fn-only-one\"") && ch1.contains("A note owned by chapter one alone."),
+        "second note's aside missing: {ch1}"
+    );
+}
+
+#[test]
+fn epub_note_referenced_from_two_chapters_gets_an_aside_in_each() {
+    let bytes = epub_from_djot(FOOTNOTE_DJOT, EpubExportOptions::default());
+    let ch1 = read_zip_entry(&bytes, "OEBPS/chapter_001.xhtml");
+    let ch2 = read_zip_entry(&bytes, "OEBPS/chapter_002.xhtml");
+
+    // Chapter two cites the SAME label ("shared") a second time — it must carry
+    // its own copy of the aside rather than link back to chapter one's, which a
+    // reading system may not resolve as a same-page popup across files.
+    assert!(
+        ch2.contains(r#"epub:type="noteref" role="doc-noteref""#),
+        "no noteref marker in chapter two: {ch2}"
+    );
+    assert!(
+        ch2.contains("id=\"fnref-shared\""),
+        "chapter two's own reference anchor is missing: {ch2}"
+    );
+    // One note referenced twice keeps one number.
+    assert!(
+        ch2.contains("<sup>1</sup>"),
+        "the shared note must keep the same number everywhere: {ch2}"
+    );
+    assert!(
+        ch2.contains(r#"epub:type="footnote" role="doc-footnote""#)
+            && ch2.contains("id=\"fn-shared\"")
+            && ch2.contains("Shared note body."),
+        "chapter two must carry its own copy of the shared note's aside: {ch2}"
+    );
+
+    // And chapter one's own copy is still there, independently.
+    assert!(ch1.contains("id=\"fn-shared\"") && ch1.contains("Shared note body."));
+
+    // The note not referenced from chapter two must not leak an aside into it.
+    assert!(
+        !ch2.contains("id=\"fn-only-one\""),
+        "chapter two must not carry an aside for a note it never cites: {ch2}"
+    );
+}
+
+#[test]
+fn epub_dangling_footnote_reference_survives_with_no_aside_anywhere() {
+    // "[^gone]" in FOOTNOTE_DJOT names no definition — the normal state for a host
+    // that owns note bodies itself. The reference must still render (with SOME
+    // marker — which number it gets is not the point of this test), and no aside
+    // must appear anywhere in the package for a body that does not exist.
+    let bytes = epub_from_djot(FOOTNOTE_DJOT, EpubExportOptions::default());
+    let ch2 = read_zip_entry(&bytes, "OEBPS/chapter_002.xhtml");
+
+    assert!(
+        ch2.contains("id=\"fnref-gone\""),
+        "the dangling reference must still render: {ch2}"
+    );
+    assert!(
+        !ch2.contains("id=\"fn-gone\""),
+        "no aside can exist for a note with no body: {ch2}"
+    );
+
+    let names = zip_entry_names(&bytes);
+    for name in names.iter().filter(|n| n.ends_with(".xhtml")) {
+        let xhtml = read_zip_entry(&bytes, name);
+        assert!(
+            !xhtml.contains("id=\"fn-gone\""),
+            "a dangling reference produced an aside somewhere ({name}): {xhtml}"
+        );
+    }
+}
+
+#[test]
+fn epub_note_body_is_not_rendered_inline_as_ordinary_prose() {
+    // A definition is a detached top-level frame; without skipping it in the main
+    // walk (`notes.is_definition`) it renders in the middle of whichever chapter it
+    // was typed in, in addition to (not instead of) its aside.
+    let bytes = epub_from_djot(FOOTNOTE_DJOT, EpubExportOptions::default());
+    let ch1 = read_zip_entry(&bytes, "OEBPS/chapter_001.xhtml");
+
+    // "Shared note body." appears exactly once in chapter one: inside its aside,
+    // never also inline as a stray paragraph at the point the definition was typed.
+    assert_eq!(
+        ch1.matches("Shared note body.").count(),
+        1,
+        "the note body must appear exactly once (in its aside), not also inline: {ch1}"
+    );
+}
+
 // --- metadata ----------------------------------------------------------------
 
 #[test]

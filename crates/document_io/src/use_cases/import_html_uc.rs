@@ -211,9 +211,12 @@ impl LongOperation for ImportHtmlUseCase {
             }
 
             match parsed_element {
-                // Neither importer's parser emits a definition yet — the HTML and
-                // Markdown footnote syntaxes are a separate pass. Dropping it here
-                // is therefore unreachable today, and stated rather than assumed.
+                // `parse_html_elements` has no footnote syntax to recognise (HTML has
+                // none of its own — `[^label]`/`[^label]:` are a Markdown/Djot
+                // convention), so it never emits this variant. Dropping it here is
+                // therefore unreachable today, and stated rather than assumed. Markdown
+                // and Djot both build a detached `footnote_label` frame instead — see
+                // `import_markdown_uc`/`import_djot_uc`.
                 ParsedElement::FootnoteDefinition { .. } => {}
                 ParsedElement::Block(parsed_block) => {
                     transition_bq_depth(

@@ -1,10 +1,12 @@
 //! Feature tests for the DOCX exporter.
 //!
-//! Documents are built with the (well-tested) djot importer, then exported via
-//! the file-less builder [`document_io_controller::build_docx_document`], and
-//! the resulting [`docx_rs::Docx`] structure is asserted directly. This
-//! exercises the exact builder used to write `.docx` files without touching the
-//! filesystem.
+//! Documents are built with the (well-tested) djot importer. Most tests export via the
+//! file-less builder [`document_io_controller::build_docx_document`] and assert on the
+//! resulting [`docx_rs::Docx`] structure directly — the exact builder used to write `.docx`
+//! files, without touching the filesystem. The footnote tests are the exception: they pack
+//! all the way to a real file (`docx_bytes_from_djot`) and unzip it, because the fact this
+//! file is checking — a footnote reference resolving to a real body — is decided by
+//! `docx-rs`'s `build()`/`pack()` step, which the in-memory struct never reaches.
 
 extern crate text_document_io as document_io;
 
@@ -56,6 +58,67 @@ fn docx_from_djot(djot: &str) -> Docx {
     import_djot(&db, &ev, djot);
     document_io_controller::build_docx_document(&db, &ExportDocxDto::default())
         .expect("build_docx_document")
+}
+
+/// Import `djot` and export it all the way to a real `.docx` file on disk, then read the
+/// packed bytes back — the same real `export_docx` path `rich_document_packs_to_a_valid_docx_file`
+/// exercises, factored out so the footnote tests below can unzip the actual container instead
+/// of asserting on the in-memory [`Docx`] builder struct `docx_from_djot` returns.
+///
+/// That distinction is the whole point of these tests: `docx-rs`'s `build()`/`pack()` step is
+/// where footnote references actually get collected into a separate `word/footnotes.xml` part
+/// (see `Docx::build`'s `collect_footnotes()`) and registered in `[Content_Types].xml` and the
+/// document relationships — none of which the bare in-memory struct exercises. Asserting only on
+/// the struct would be exactly the false-confidence mistake the image work ran into: markup that
+/// *looks* like a footnote reference, never proven to survive packing into a real, openable file.
+fn docx_bytes_from_djot(djot: &str) -> Vec<u8> {
+    let (db, ev, _) = setup().expect("setup");
+    import_djot(&db, &ev, djot);
+
+    let dir = std::env::temp_dir();
+    let path = dir.join(format!(
+        "docx_export_footnotes_{}_{}.docx",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or_default()
+    ));
+    let path_str = path.to_string_lossy().to_string();
+
+    let mut mgr = LongOperationManager::new();
+    let op = document_io_controller::export_docx(
+        &db,
+        &ev,
+        &mut mgr,
+        &ExportDocxDto {
+            output_path: path_str.clone(),
+            options: Default::default(),
+        },
+    )
+    .expect("export_docx");
+    wait(&mgr, &op);
+    assert_eq!(
+        mgr.get_operation_status(&op),
+        Some(OperationStatus::Completed),
+        "export of {djot:?} did not complete"
+    );
+
+    let bytes = std::fs::read(&path).expect("output file exists");
+    let _ = std::fs::remove_file(&path);
+    bytes
+}
+
+/// Read one whole entry out of a packed `.docx`/zip container, by exact name.
+fn read_zip_entry(bytes: &[u8], name: &str) -> String {
+    let mut archive =
+        zip::ZipArchive::new(std::io::Cursor::new(bytes)).expect("packaged DOCX is a valid zip");
+    let mut file = archive
+        .by_name(name)
+        .unwrap_or_else(|_| panic!("entry {name:?} present in the DOCX package"));
+    let mut contents = String::new();
+    std::io::Read::read_to_string(&mut file, &mut contents).expect("entry is valid utf-8");
+    contents
 }
 
 fn import_djot(db: &test_harness::DbContext, ev: &Arc<EventHub>, djot: &str) {
@@ -556,6 +619,113 @@ fn rich_document_packs_to_a_valid_docx_file() {
     );
 
     let _ = std::fs::remove_file(&path);
+}
+
+// --- footnotes (real packaged parts) ----------------------------------------
+//
+// `word/footnotes.xml` is written on every export, even with zero footnotes
+// (`docx-rs` still emits an empty `<w:footnotes .../>` stub) — so "the part
+// exists" proves nothing. These assert on its actual content, and on the
+// matching `<w:footnoteReference w:id="…"/>` in `word/document.xml` sharing
+// the SAME id as the `<w:footnote w:id="…">` that carries the note's body:
+// two independently-true-looking facts that only together prove the
+// reference really resolves to that body inside the real, packaged file.
+
+const FOOTNOTE_DJOT: &str = "\
+Prose with a note[^n1] in it.
+
+[^n1]: The note body for Word.
+";
+
+/// Extract every `w:id="N"` a `<w:footnoteReference .../>` element carries, in document order.
+fn footnote_reference_ids(document_xml: &str) -> Vec<&str> {
+    document_xml
+        .match_indices("<w:footnoteReference ")
+        .filter_map(|(i, _)| {
+            let tail = &document_xml[i..];
+            let id_start = tail.find("w:id=\"")? + "w:id=\"".len();
+            let id_end = id_start + tail[id_start..].find('"')?;
+            Some(&tail[id_start..id_end])
+        })
+        .collect()
+}
+
+/// Extract every `w:id="N"` a `<w:footnote w:id="…">` element opens, in document order.
+fn footnote_body_ids(footnotes_xml: &str) -> Vec<&str> {
+    footnotes_xml
+        .match_indices("<w:footnote ")
+        .filter_map(|(i, _)| {
+            let tail = &footnotes_xml[i..];
+            let id_start = tail.find("w:id=\"")? + "w:id=\"".len();
+            let id_end = id_start + tail[id_start..].find('"')?;
+            Some(&tail[id_start..id_end])
+        })
+        .collect()
+}
+
+#[test]
+fn docx_footnote_reference_resolves_to_a_real_body_in_footnotes_xml() {
+    let bytes = docx_bytes_from_djot(FOOTNOTE_DJOT);
+
+    let document_xml = read_zip_entry(&bytes, "word/document.xml");
+    let footnotes_xml = read_zip_entry(&bytes, "word/footnotes.xml");
+
+    let ref_ids = footnote_reference_ids(&document_xml);
+    assert_eq!(
+        ref_ids.len(),
+        1,
+        "expected exactly one footnote reference in document.xml, got {ref_ids:?}: {document_xml}"
+    );
+
+    let body_ids = footnote_body_ids(&footnotes_xml);
+    assert!(
+        body_ids.contains(&ref_ids[0]),
+        "document.xml references footnote id {:?}, but footnotes.xml only defines {body_ids:?}: {footnotes_xml}",
+        ref_ids[0]
+    );
+
+    // The real body text, in the real packaged part — not merely a reference to it.
+    assert!(
+        footnotes_xml.contains("The note body for Word."),
+        "the note's body never reached footnotes.xml: {footnotes_xml}"
+    );
+}
+
+#[test]
+fn docx_note_body_is_not_also_rendered_as_prose() {
+    // A definition is a detached top-level frame; without skipping it in the main walk
+    // (`notes.is_definition`) it would render in the middle of the document as an ordinary
+    // paragraph, in addition to becoming the footnote's real body.
+    let bytes = docx_bytes_from_djot(FOOTNOTE_DJOT);
+    let document_xml = read_zip_entry(&bytes, "word/document.xml");
+    assert!(
+        !document_xml.contains("The note body for Word."),
+        "the note body must not appear inline in document.xml, only inside the footnote: {document_xml}"
+    );
+}
+
+#[test]
+fn docx_dangling_footnote_reference_still_produces_a_note() {
+    // "[^solo]" here names no definition anywhere — the normal state for a host that owns
+    // note bodies itself. The marker must not be silently dropped from the sentence: Word
+    // still gets a real (if body-less) footnote, matching `build_run`'s own documented
+    // choice ("dropping the run entirely would delete the marker from the sentence").
+    let bytes = docx_bytes_from_djot("Text with a note[^solo] in it.\n");
+
+    let document_xml = read_zip_entry(&bytes, "word/document.xml");
+    let ref_ids = footnote_reference_ids(&document_xml);
+    assert_eq!(
+        ref_ids.len(),
+        1,
+        "the dangling reference must still produce a real footnote reference: {document_xml}"
+    );
+
+    let footnotes_xml = read_zip_entry(&bytes, "word/footnotes.xml");
+    let body_ids = footnote_body_ids(&footnotes_xml);
+    assert!(
+        body_ids.contains(&ref_ids[0]),
+        "the reference's id must resolve to a real (even if empty) footnote: {footnotes_xml}"
+    );
 }
 
 #[test]

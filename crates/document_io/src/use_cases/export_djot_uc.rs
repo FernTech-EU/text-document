@@ -308,6 +308,7 @@ impl ExportDjotUseCase {
 
     /// Render a single block into a djot line string.
     /// Returns (rendered_line, is_list_item).
+    #[allow(clippy::too_many_arguments)]
     fn render_block_line(
         &self,
         uow: &dyn ExportDjotUnitOfWorkTrait,

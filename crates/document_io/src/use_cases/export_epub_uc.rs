@@ -226,6 +226,15 @@ impl ExportEpubUseCase {
             if cell_frame_ids.contains(frame_id) {
                 continue;
             }
+            // Skip note bodies: a definition is a top-level frame, so this walk would
+            // otherwise render it as ordinary prose in the middle of a chapter, at the
+            // point the definition happened to be typed. Each note's own aside is
+            // appended below, to whichever chapter(s) actually reference it, once
+            // `chapters` exists — mirrors `export_html_uc`/`export_docx_uc`'s identical
+            // skip, adapted for a book split across several files instead of one page.
+            if notes.is_definition(*frame_id) {
+                continue;
+            }
             // Skip sub-frames (parent_frame != None) — recursively rendered by their parent's
             // walk; rendering them again at the top level would duplicate their content.
             if let Some(f) = uow.get_frame(frame_id)?
@@ -259,7 +268,52 @@ impl ExportEpubUseCase {
             Some("Splitting into chapters...".to_string()),
         ));
 
-        Ok(split_into_chapters(units, &self.dto.options))
+        let mut chapters = split_into_chapters(units, &self.dto.options);
+
+        // Append each chapter's own footnote asides, once file boundaries are known.
+        //
+        // A note's aside has to land in the *same* XHTML document as its reference:
+        // EPUB fragment identifiers (`href="#fn-…"`, exactly what `render_inline_html`
+        // already emits) don't resolve across spine files without a full relative
+        // href, and this document's chapters are separate files. Rather than compute
+        // that href — which would need the note's target chapter decided before the
+        // reference is rendered, and the split that decides chapter boundaries only
+        // runs after every reference already is — the note's small body is rendered
+        // once per chapter that actually cites it. A label referenced from more than
+        // one chapter is rare, and duplicating a short note is far simpler and more
+        // robust than a cross-file link a reading system might not resolve.
+        if !notes.is_empty() {
+            let in_print_order = notes.in_print_order();
+            for chapter in &mut chapters {
+                if chapter.footnote_labels.is_empty() {
+                    continue;
+                }
+                let mut aside_html = String::new();
+                for (number, label, frame_id) in &in_print_order {
+                    if !chapter.footnote_labels.contains(label) {
+                        continue;
+                    }
+                    let mut inner: Vec<RenderUnit> = Vec::new();
+                    self.render_frame_units(
+                        uow,
+                        frame_id,
+                        &cell_frame_ids,
+                        &notes,
+                        image_policy,
+                        &mut inner,
+                    )?;
+                    let body: String = inner.into_iter().map(|u| u.html).collect();
+                    let id = html_render::escape_html(label);
+                    aside_html.push_str(&format!(
+                        "<aside epub:type=\"footnote\" role=\"doc-footnote\" id=\"fn-{id}\">\
+                         <a href=\"#fnref-{id}\" role=\"doc-backlink\">{number}</a>. {body}</aside>"
+                    ));
+                }
+                chapter.body_html.push_str(&aside_html);
+            }
+        }
+
+        Ok(chapters)
     }
 
     /// Render a frame's content into [`RenderUnit`]s, walking its `child_order` to interleave
@@ -281,10 +335,10 @@ impl ExportEpubUseCase {
         // Table anchor frame — render the table instead of blocks. A table is always one
         // opaque unit: it never opens a new chapter.
         if let Some(table_id) = frame.table {
-            let html =
-                html_render::render_table_html(&uow.store(), table_id, image_policy, &notes)?;
+            let html = html_render::render_table_html(&uow.store(), table_id, image_policy, notes)?;
             if !html.is_empty() {
-                out.push(RenderUnit::content(html));
+                let footnote_labels = table_footnote_labels(uow, table_id)?;
+                out.push(RenderUnit::content_with_labels(html, footnote_labels));
             }
             return Ok(());
         }
@@ -370,6 +424,8 @@ impl ExportEpubUseCase {
                             image_policy,
                             &mut inner,
                         )?;
+                        let inner_labels =
+                            dedup_labels(inner.iter().flat_map(|u| &u.footnote_labels));
                         let inner_html: String = inner.into_iter().map(|u| u.html).collect();
                         if !inner_html.is_empty() {
                             // EPUB is the format that can actually say what this is:
@@ -382,10 +438,10 @@ impl ExportEpubUseCase {
                                 }
                                 None => "",
                             };
-                            out.push(RenderUnit::content(format!(
-                                "<blockquote{}>{}</blockquote>",
-                                semantics, inner_html
-                            )));
+                            out.push(RenderUnit::content_with_labels(
+                                format!("<blockquote{}>{}</blockquote>", semantics, inner_html),
+                                inner_labels,
+                            ));
                         }
                     } else {
                         // Non-blockquote sub-frame: render normally, into the same stream —
@@ -418,6 +474,11 @@ impl ExportEpubUseCase {
 pub(crate) struct Chapter {
     title: String,
     body_html: String,
+    /// Footnote labels referenced anywhere in `body_html`, deduplicated and in first-seen
+    /// order. `build_chapters` uses this, after splitting, to append this chapter's own
+    /// footnote asides to `body_html` — see the comment above that pass for why each
+    /// referencing chapter gets its own copy rather than one shared notes section.
+    footnote_labels: Vec<String>,
 }
 
 /// One renderable, chapter-splittable unit of document content in flow order.
@@ -431,16 +492,88 @@ struct RenderUnit {
     heading_level: Option<i64>,
     heading_text: Option<String>,
     html: String,
+    /// Footnote labels referenced within `html`, deduplicated and in first-seen order —
+    /// propagated into whichever [`Chapter`] this unit ends up in, so `build_chapters`
+    /// knows which asides that chapter's file must carry.
+    footnote_labels: Vec<String>,
 }
 
 impl RenderUnit {
-    fn content(html: String) -> Self {
+    fn content_with_labels(html: String, footnote_labels: Vec<String>) -> Self {
         RenderUnit {
             heading_level: None,
             heading_text: None,
             html,
+            footnote_labels,
         }
     }
+}
+
+/// Deduplicate an iterator of footnote labels, keeping first-seen order — the shape every
+/// "which notes does this unit/chapter reference" accumulation in this module needs, written
+/// once rather than open-coded at each call site.
+fn dedup_labels<'a, I: IntoIterator<Item = &'a String>>(labels: I) -> Vec<String> {
+    let mut seen: HashSet<&str> = HashSet::new();
+    let mut out = Vec::new();
+    for label in labels {
+        if seen.insert(label.as_str()) {
+            out.push(label.clone());
+        }
+    }
+    out
+}
+
+/// Footnote labels referenced anywhere in `blocks`, deduplicated and in block/byte order — the
+/// set whichever [`RenderUnit`] these blocks become must carry, so [`Chapter::footnote_labels`]
+/// ends up complete once the unit lands in one.
+fn footnote_labels_in_blocks(store: &Store, blocks: &[Block]) -> Vec<String> {
+    let refs = store.block_footnote_refs.read();
+    let mut raw: Vec<String> = Vec::new();
+    for block in blocks {
+        let Some(anchors) = refs.get(&block.id) else {
+            continue;
+        };
+        let mut anchors: Vec<_> = anchors.iter().collect();
+        anchors.sort_by_key(|a| a.byte_offset);
+        raw.extend(anchors.into_iter().map(|a| a.label.clone()));
+    }
+    dedup_labels(&raw)
+}
+
+/// Footnote labels referenced anywhere in `table_id`'s cells.
+///
+/// A table is one opaque [`RenderUnit`] (see [`ExportEpubUseCase::render_frame_units`]), so its
+/// label set can't be built from a block slice like [`footnote_labels_in_blocks`] — it has to
+/// walk cells the same way `build_chapters` walks them for `cell_frame_ids`, then look each
+/// cell's block(s) up in the same `block_footnote_refs` map directly (skipping
+/// `get_block_multi`, since only the id is needed to key that map, not the block itself).
+fn table_footnote_labels(
+    uow: &dyn ExportEpubUnitOfWorkTrait,
+    table_id: EntityId,
+) -> Result<Vec<String>> {
+    let cell_ids = uow.get_table_relationship(
+        &table_id,
+        &common::direct_access::table::TableRelationshipField::Cells,
+    )?;
+    let cells_opt = uow.get_table_cell_multi(&cell_ids)?;
+    let store = uow.store();
+    let refs = store.block_footnote_refs.read();
+    let mut raw: Vec<String> = Vec::new();
+    for cell in cells_opt.into_iter().flatten() {
+        let Some(cf_id) = cell.cell_frame else {
+            continue;
+        };
+        let block_ids = uow.get_frame_relationship(
+            &cf_id,
+            &common::direct_access::frame::FrameRelationshipField::Blocks,
+        )?;
+        for block_id in block_ids {
+            if let Some(anchors) = refs.get(&block_id) {
+                raw.extend(anchors.iter().map(|a| a.label.clone()));
+            }
+        }
+    }
+    Ok(dedup_labels(&raw))
 }
 
 /// A block counts as a chapter-splittable heading only when it actually renders as `<hN>` —
@@ -483,10 +616,13 @@ fn push_block_run_units(
                 notes,
             );
             let text = html_render::block_plain_text(store, &blocks[i]);
+            let footnote_labels =
+                footnote_labels_in_blocks(store, std::slice::from_ref(&blocks[i]));
             out.push(RenderUnit {
                 heading_level: Some(level),
                 heading_text: Some(text),
                 html,
+                footnote_labels,
             });
             i += 1;
             continue;
@@ -498,7 +634,8 @@ fn push_block_run_units(
         }
         let html = html_render::render_blocks_html(store, &blocks[start..i], image_policy, notes);
         if !html.is_empty() {
-            out.push(RenderUnit::content(html));
+            let footnote_labels = footnote_labels_in_blocks(store, &blocks[start..i]);
+            out.push(RenderUnit::content_with_labels(html, footnote_labels));
         }
     }
 }
@@ -532,16 +669,19 @@ fn split_into_chapters(units: Vec<RenderUnit>, options: &EpubExportOptions) -> V
 
     let Some(target_level) = units.iter().filter_map(|u| u.heading_level).min() else {
         // No headings anywhere: the whole document is one chapter.
+        let footnote_labels = dedup_labels(units.iter().flat_map(|u| &u.footnote_labels));
         let body_html: String = units.into_iter().map(|u| u.html).collect();
         return vec![Chapter {
             title: front_title,
             body_html,
+            footnote_labels,
         }];
     };
 
     let mut chapters: Vec<Chapter> = Vec::new();
     let mut current_title: Option<String> = None;
     let mut current_html = String::new();
+    let mut current_labels: Vec<String> = Vec::new();
 
     for unit in units {
         if unit.heading_level == Some(target_level) {
@@ -549,10 +689,13 @@ fn split_into_chapters(units: Vec<RenderUnit>, options: &EpubExportOptions) -> V
                 chapters.push(Chapter {
                     title: current_title.take().unwrap_or_else(|| front_title.clone()),
                     body_html: std::mem::take(&mut current_html),
+                    footnote_labels: dedup_labels(&current_labels),
                 });
+                current_labels.clear();
             }
             current_title = unit.heading_text.clone();
         }
+        current_labels.extend(unit.footnote_labels.iter().cloned());
         current_html.push_str(&unit.html);
     }
 
@@ -560,6 +703,7 @@ fn split_into_chapters(units: Vec<RenderUnit>, options: &EpubExportOptions) -> V
         chapters.push(Chapter {
             title: current_title.unwrap_or(front_title),
             body_html: current_html,
+            footnote_labels: dedup_labels(&current_labels),
         });
     }
 

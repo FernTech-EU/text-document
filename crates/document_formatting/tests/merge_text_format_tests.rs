@@ -285,9 +285,7 @@ fn test_merge_text_format_carries_vertical_alignment() -> Result<()> {
     };
 
     assert!(
-        read(&db)?
-            .iter()
-            .any(|v| *v == Some(common::entities::CharVerticalAlignment::SuperScript)),
+        read(&db)?.contains(&Some(common::entities::CharVerticalAlignment::SuperScript)),
         "the merged run must carry SuperScript, not silently drop it"
     );
 

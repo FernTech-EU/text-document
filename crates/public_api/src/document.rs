@@ -749,7 +749,7 @@ impl TextDocument {
                 continue;
             };
             let text =
-                frontend::common::database::rope_helpers::block_content_via_store(&block, &store);
+                frontend::common::database::rope_helpers::block_content_via_store(&block, store);
             let mut ordered: Vec<_> = anchors.iter().collect();
             ordered.sort_by_key(|a| a.byte_offset);
             for anchor in ordered {
