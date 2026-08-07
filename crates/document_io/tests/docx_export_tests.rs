@@ -3,10 +3,11 @@
 //! Documents are built with the (well-tested) djot importer. Most tests export via the
 //! file-less builder [`document_io_controller::build_docx_document`] and assert on the
 //! resulting [`docx_rs::Docx`] structure directly — the exact builder used to write `.docx`
-//! files, without touching the filesystem. The footnote tests are the exception: they pack
-//! all the way to a real file (`docx_bytes_from_djot`) and unzip it, because the fact this
-//! file is checking — a footnote reference resolving to a real body — is decided by
-//! `docx-rs`'s `build()`/`pack()` step, which the in-memory struct never reaches.
+//! files, without touching the filesystem. The footnote tests are the exception: they run
+//! the same builder through `docx-rs`'s `build()`/`pack()` into an in-memory zip
+//! (`docx_bytes_from_djot`) and unzip it, because the fact they are checking — a footnote
+//! reference resolving to a real body — is decided by that pack step, which the bare
+//! in-memory struct never reaches.
 
 extern crate text_document_io as document_io;
 
@@ -60,53 +61,29 @@ fn docx_from_djot(djot: &str) -> Docx {
         .expect("build_docx_document")
 }
 
-/// Import `djot` and export it all the way to a real `.docx` file on disk, then read the
-/// packed bytes back — the same real `export_docx` path `rich_document_packs_to_a_valid_docx_file`
-/// exercises, factored out so the footnote tests below can unzip the actual container instead
-/// of asserting on the in-memory [`Docx`] builder struct `docx_from_djot` returns.
+/// Import `djot`, run the same builder `export_docx` uses, and pack it through
+/// `docx-rs`'s `build()`/`pack()` into an in-memory zip — so the footnote tests can unzip the
+/// real container instead of asserting on the bare [`Docx`] builder struct.
 ///
-/// That distinction is the whole point of these tests: `docx-rs`'s `build()`/`pack()` step is
-/// where footnote references actually get collected into a separate `word/footnotes.xml` part
-/// (see `Docx::build`'s `collect_footnotes()`) and registered in `[Content_Types].xml` and the
-/// document relationships — none of which the bare in-memory struct exercises. Asserting only on
-/// the struct would be exactly the false-confidence mistake the image work ran into: markup that
-/// *looks* like a footnote reference, never proven to survive packing into a real, openable file.
+/// That distinction is the whole point of these tests: `docx-rs`'s pack step is where
+/// footnote references get collected into a separate `word/footnotes.xml` part (see
+/// `Docx::build`'s `collect_footnotes()`) and registered in `[Content_Types].xml` and the
+/// document relationships — none of which the bare in-memory struct exercises. Asserting only
+/// on the struct would be the false-confidence mistake the image work ran into: markup that
+/// *looks* like a footnote reference, never proven to survive packing.
+///
+/// Packed in memory rather than via a shared temp-dir path: several of these tests run in
+/// parallel, and Windows `SystemTime` resolution is coarse enough that
+/// `pid + nanos`-named files collide — one test truncates another's zip mid-write
+/// (`Invalid CDFH offset in EOCD`) or deletes it before the other can read it (`NotFound`).
+/// The on-disk `export_docx` path is covered by `rich_document_packs_to_a_valid_docx_file`.
 fn docx_bytes_from_djot(djot: &str) -> Vec<u8> {
-    let (db, ev, _) = setup().expect("setup");
-    import_djot(&db, &ev, djot);
-
-    let dir = std::env::temp_dir();
-    let path = dir.join(format!(
-        "docx_export_footnotes_{}_{}.docx",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or_default()
-    ));
-    let path_str = path.to_string_lossy().to_string();
-
-    let mut mgr = LongOperationManager::new();
-    let op = document_io_controller::export_docx(
-        &db,
-        &ev,
-        &mut mgr,
-        &ExportDocxDto {
-            output_path: path_str.clone(),
-            options: Default::default(),
-        },
-    )
-    .expect("export_docx");
-    wait(&mgr, &op);
-    assert_eq!(
-        mgr.get_operation_status(&op),
-        Some(OperationStatus::Completed),
-        "export of {djot:?} did not complete"
-    );
-
-    let bytes = std::fs::read(&path).expect("output file exists");
-    let _ = std::fs::remove_file(&path);
-    bytes
+    let docx = docx_from_djot(djot);
+    let mut buf = std::io::Cursor::new(Vec::new());
+    docx.build()
+        .pack(&mut buf)
+        .expect("docx-rs pack into memory");
+    buf.into_inner()
 }
 
 /// Read one whole entry out of a packed `.docx`/zip container, by exact name.
