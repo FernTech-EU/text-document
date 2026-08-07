@@ -495,8 +495,11 @@ impl TextCursor {
     /// The language this cursor reads its text as, for the sentence operations. A BCP-47-ish
     /// tag (`"en"`, `"fr-FR"`); `None` — the default — means untailored UAX #29.
     ///
-    /// See [`CursorData::content_locale`](crate::inner::CursorData) for why this is cursor
-    /// state rather than an argument.
+    /// Transient, per-cursor and non-persisted: it never reaches an entity, an undo command or
+    /// an export. The enum-driven [`select`](Self::select) / [`move_position`](Self::move_position)
+    /// have nowhere to take a locale argument, so it is set once on the cursor instead —
+    /// [`TextDocument::sentence_at`](crate::TextDocument::sentence_at) takes the same value per
+    /// call for callers that would rather not hold a cursor at all.
     pub fn set_content_locale(&self, locale: Option<&str>) {
         self.data.lock().content_locale = locale.map(str::to_string);
     }

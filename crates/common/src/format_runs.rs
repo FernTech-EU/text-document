@@ -952,7 +952,7 @@ pub fn apply_character_format_to_segment(seg: &mut InlineSegment, fmt: &Characte
 
 /// One ordered piece of a block's inline content: a run of text, or an image.
 ///
-/// Produced by [`merge_runs_and_images`] and mapped by each caller into its own
+/// Produced by [`merge_runs_and_anchors`] and mapped by each caller into its own
 /// output type.
 #[derive(Debug, Clone, PartialEq)]
 pub enum InlinePiece<'a> {
@@ -1172,7 +1172,7 @@ mod tests {
         debug_assert_well_formed(&[], 100);
     }
 
-    // ── merge_runs_and_images ────────────────────────────────────────────
+    // ── merge_runs_and_anchors ────────────────────────────────────────────
 
     fn anchor(at: u32, name: &str) -> ImageAnchor {
         ImageAnchor {

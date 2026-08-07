@@ -6,7 +6,7 @@
 //! caret's block.
 //!
 //! Both queries here are pure functions over `&str` — no document, no store, no threads — for
-//! the same reason [`crate::document_search::matching`] is: a host app measuring sentence
+//! the same reason `document_search::matching` is: a host app measuring sentence
 //! length across a whole manuscript cannot afford to build a document per scene just to ask
 //! how long its sentences are, and an app that rolled its own splitter would disagree with
 //! this crate's caret navigation about where a sentence ends.
@@ -28,7 +28,7 @@
 //! prose that is nearly always a title before a name — `Mr. Smith`, `M. Dupont`, `Dr. Ayşe`,
 //! `Sr. García`, `Sig. Rossi`, `prof. Nowak`, `κ. Παπαδόπουλος`, `د. أحمد` — plus a short tail
 //! of reference abbreviations that precede a capitalised noun (`Vgl. Abb.`, `Kap. Zwei`).
-//! [`Profile::abbreviations`] is that list and nothing more, which is what keeps it reviewable:
+//! `Profile::abbreviations` is that list and nothing more, which is what keeps it reviewable:
 //! a term that can legitimately *end* a sentence must never appear in it. `etc.` is the
 //! cautionary example — "…pears, etc. Then he left." is two sentences, so suppressing `etc.`
 //! would silently weld them together.
@@ -39,12 +39,12 @@
 //! (rules SB9/SB10 admit `Close*` after a terminator), so English `?"`, German `?«` and Polish
 //! `?”` all need no help. French is the exception, because it writes a space before the closing
 //! guillemet: `« Vraiment ? »` strands the `»` at the head of the next sentence.
-//! [`Profile::spaced_closers`] is that narrow repair, and it is deliberately per-language — `"`
+//! `Profile::spaced_closers` is that narrow repair, and it is deliberately per-language — `"`
 //! opens as often as it closes, so a general rule here would weld `He left. "Come," she said.`
 //! into one sentence.
 //!
 //! *Extra terminators.* Greek asks questions with `;` — an ordinary ASCII semicolon, which UAX
-//! #29 quite correctly does not treat as a sentence ending. [`Profile::extra_terminators`] adds
+//! #29 quite correctly does not treat as a sentence ending. `Profile::extra_terminators` adds
 //! it back for Greek only. (Its `·` is the Greek *semicolon* and rightly keeps not terminating.)
 //!
 //! A language with no profile falls back to plain UAX #29. That is a real fallback rather than a

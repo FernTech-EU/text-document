@@ -15,3 +15,12 @@ opf = "opf"
 teh = "teh"
 # "mis-" prefix in hyphenated compounds
 mis = "mis"
+# Sentence-splitter locale fixtures / abbreviation lists (not English typos)
+oll = "oll"       # Irish: an t-oll
+sur = "sur"       # Maltese honorific
+elment = "elment" # Hungarian: left
+sie = "sie"       # German: she / they
+Sie = "Sie"       # German: formal you
+vas = "vas"       # Spanish: you go
+# Image format short codes
+fo = "fo"
