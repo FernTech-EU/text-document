@@ -17,6 +17,24 @@
 //! work — which is what keeps this from being re-derived per writer. The
 //! `cell_frame_ids` computation next door is written out seven times; this is
 //! deliberately written once.
+//!
+//! **A reference cited only from inside another note's own body is refused, not
+//! numbered.** [`Footnotes::build`]'s numbering walk already excludes definition
+//! frames (see its own doc for why: numbering by where the *definition* sits
+//! would be wrong). That means such a label never gets a number, never appears
+//! in [`Footnotes::in_print_order`], and no writer ever renders its aside/body —
+//! so a writer that still linked the reference (an HTML `href`, a Markdown
+//! `[^label]`) would point at a target nothing emits.
+//! [`Footnotes::is_nested_reference`] is how a writer tells this case apart from
+//! an ordinary **dangling** reference (no definition anywhere — the normal
+//! state for a host that owns note bodies itself, see `FootnoteRefAnchor`'s doc
+//! in `common::format_runs`): a dangling label still gets a number here (the
+//! main-flow walk does not care whether a definition exists) and keeps
+//! whatever a writer already does for it; only the nested case newly degrades
+//! to a bare, unlinked marker. LaTeX, Typst and DOCX need no such check — their
+//! own "no body" fallback (`\footnotemark`, a bare raised label, an empty
+//! native footnote) already covers both cases without ever emitting a dangling
+//! target.
 
 use std::collections::{HashMap, HashSet};
 
@@ -112,6 +130,21 @@ impl Footnotes {
         self.definition_frames.contains(&frame_id)
     }
 
+    /// Is `label` cited only from inside another note's own body?
+    ///
+    /// `label` has a definition (someone wrote `[^label]: …` somewhere in this
+    /// document) but never earned a number, which — given [`build`](Self::build)
+    /// assigns one to every label its main-flow walk sees — can only mean every
+    /// citation of it lives inside a definition frame, excluded from that walk
+    /// by design. A writer must not link such a reference: nothing will ever
+    /// render this label's aside, so an `href`/`[^label]` pointing at it would
+    /// dangle. `false` for an ordinary **dangling** reference (no definition at
+    /// all) — that one keeps its number and whatever a writer already does with
+    /// it; see the module doc for why the two are not the same thing.
+    pub fn is_nested_reference(&self, label: &str) -> bool {
+        !self.numbers.contains_key(label) && self.definitions.contains_key(label)
+    }
+
     /// What `label`'s reference prints.
     ///
     /// Falls back to the label itself for a reference that somehow never
@@ -153,5 +186,62 @@ impl Footnotes {
             .collect();
         out.sort_unstable();
         out
+    }
+}
+
+/// A deterministic, format-safe identifier for a footnote `label`, for the two backends whose
+/// own repeat-citation syntax needs a bare identifier — LaTeX's `\label{…}`/`\getrefnumber{…}`,
+/// Typst's `<…>` — rather than the arbitrary text a Djot `[^label]` may actually carry (any
+/// character but `]`, per the importer; no relation to what LaTeX/Typst accept in a label token).
+///
+/// Keeps the label's own ASCII letters/digits, so the common case (`"n1"`, `"fn3"`) stays
+/// legible in the emitted markup, and folds a hash of the **full, original** label on the end —
+/// not to disambiguate collisions among the kept characters alone (`"fn.1"` and `"fn-1"` would
+/// otherwise both fold to `"fn1"` and collide onto one LaTeX/Typst footnote), but so two labels
+/// differing only in punctuation can never be confused for a repeat citation of one note.
+/// `DefaultHasher` rather than `HashMap`'s `RandomState`: its seed is fixed, not randomized per
+/// process, which is what makes the same label produce the same id on every run — required,
+/// since the first and a later citation of one label must resolve to the same id in the same
+/// export.
+pub fn safe_label_id(label: &str) -> String {
+    use std::hash::{Hash, Hasher};
+
+    let kept: String = label
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .collect();
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    label.hash(&mut hasher);
+    format!("fn{kept}{:016x}", hasher.finish())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn safe_label_id_is_deterministic() {
+        assert_eq!(safe_label_id("n1"), safe_label_id("n1"));
+    }
+
+    #[test]
+    fn safe_label_id_differs_for_different_labels() {
+        assert_ne!(safe_label_id("n1"), safe_label_id("n2"));
+    }
+
+    #[test]
+    fn safe_label_id_does_not_collide_on_shared_alphanumerics() {
+        // "fn.1" and "fn-1" keep the identical alphanumeric characters ("fn1"); only the
+        // hash suffix (computed over the whole original label) can tell them apart.
+        assert_ne!(safe_label_id("fn.1"), safe_label_id("fn-1"));
+    }
+
+    #[test]
+    fn safe_label_id_is_ascii_and_starts_with_a_letter() {
+        // A LaTeX \label / Typst <label> must not start with a digit, and must contain
+        // nothing a label/reference token in either language would choke on.
+        let id = safe_label_id("héllo Wörld! 42");
+        assert!(id.chars().next().unwrap().is_ascii_alphabetic());
+        assert!(id.chars().all(|c| c.is_ascii_alphanumeric()));
     }
 }

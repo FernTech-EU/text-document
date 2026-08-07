@@ -2,8 +2,11 @@
 use crate::ExportPlainTextDto;
 use anyhow::{Result, anyhow};
 use common::database::QueryUnitOfWork;
+use common::database::Store;
 use common::database::rope_helpers::{block_content_via_store, rope_flat_text_if_simple};
 use common::entities::{Block, Document, Frame, Root};
+use common::format_runs::InlineContent;
+use common::format_runs_query::inline_segments_for_block;
 use common::parser_tools::{FORM_FEED, PlainTextExportOptions};
 use common::types::{EntityId, ROOT_ENTITY_ID};
 use std::collections::HashMap;
@@ -88,12 +91,66 @@ pub trait ExportPlainTextUnitOfWorkTrait: QueryUnitOfWork {}
 /// the document counts, so an addressable view that stripped it would hand every
 /// caller — search, a cursor, a comment's anchor — offsets that drift one place
 /// per image. See `PlainTextExportOptions::strip_images`.
+///
+/// **Only safe when `text` holds no footnote-reference sentinel.** A footnote
+/// reference occupies the identical `U+FFFC` codepoint (see
+/// `common::format_runs::FootnoteRefAnchor`'s doc) and this is a blind
+/// string replace with no way to tell the two apart — used only by the
+/// rope fast path below, which refuses to run at all when the document has
+/// any footnotes and `strip_images`/`endnote_footnotes` might act on them.
+/// The general (slow, per-block) path uses [`render_block_plain_text`]
+/// instead, which walks typed inline segments and so never confuses the two.
 fn strip_image_sentinels(text: &str, strip: bool) -> String {
     if strip && text.contains('\u{FFFC}') {
         text.replace('\u{FFFC}', "")
     } else {
         text.to_string()
     }
+}
+
+/// Render one block's plain-text form, resolving its `U+FFFC` inline anchors instead of
+/// leaving both kinds of anchor as the identical, indistinguishable control character
+/// [`strip_image_sentinels`] cannot tell apart.
+///
+/// An image's sentinel is dropped when `strip_images` asks for it — there is no way to draw a
+/// picture in a `.txt` — exactly as `strip_image_sentinels` already did. A footnote reference's
+/// sentinel becomes its printed marker (`[1]`, matching the endnote list `execute` appends)
+/// when `mark_footnotes` asks for it: `endnote_footnotes`, since a citation left as a bare
+/// invisible sentinel while its body moves to a numbered list at the end of the file is a
+/// citation with no visible point at all — the export's own `endnote_footnotes` presentation
+/// choice, not `strip_images`, decides whether that citation point should be described in
+/// words. Neither flag active reproduces `block_content_via_store`'s text byte for byte, which
+/// the addressable view (`PlainTextExportOptions::addressable`) requires character-for-
+/// character.
+fn render_block_plain_text(
+    store: &Store,
+    block: &Block,
+    block_text: &str,
+    strip_images: bool,
+    mark_footnotes: bool,
+    notes: &crate::footnotes::Footnotes,
+) -> String {
+    let elements = inline_segments_for_block(store, block.id, block_text);
+    let mut out = String::with_capacity(block_text.len());
+    for elem in &elements {
+        match &elem.content {
+            InlineContent::Text(t) => out.push_str(t),
+            InlineContent::Image { .. } => {
+                if !strip_images {
+                    out.push('\u{FFFC}');
+                }
+            }
+            InlineContent::FootnoteRef { label } => {
+                if mark_footnotes {
+                    out.push_str(&format!("[{}]", notes.marker(label)));
+                } else {
+                    out.push('\u{FFFC}');
+                }
+            }
+            InlineContent::Empty => {}
+        }
+    }
+    out
 }
 
 pub struct ExportPlainTextUseCase {
@@ -154,9 +211,18 @@ impl ExportPlainTextUseCase {
         //
         // Short-circuit on purpose: `Footnotes::build` walks every block and
         // frame in the document, which is exactly the work this fast path exists
-        // to avoid. It runs only when notes would actually have to move.
+        // to avoid. It runs only when notes would actually have to move —
+        // AND, since `strip_image_sentinels` cannot tell a footnote's `U+FFFC`
+        // from an image's, only when no footnote-sensitive option is even
+        // asking this pass to act on that sentinel. `strip_images` alone,
+        // with footnotes present, must fall through to the slow path too:
+        // otherwise it would blindly strip a citation's sentinel right along
+        // with any image's, exactly the bug `render_block_plain_text` exists
+        // to fix.
+        let footnote_sentinel_at_risk = (strip_images || endnote_footnotes)
+            && !crate::footnotes::Footnotes::build(&store).is_empty();
         if !page_breaks
-            && (!endnote_footnotes || crate::footnotes::Footnotes::build(&store).is_empty())
+            && !footnote_sentinel_at_risk
             && let Some(plain_text) = rope_flat_text_if_simple(&store, frame_ids.len())
         {
             uow.end_transaction()?;
@@ -237,8 +303,15 @@ impl ExportPlainTextUseCase {
         let plain_text = blocks
             .iter()
             .map(|block| {
-                let text =
-                    strip_image_sentinels(&block_content_via_store(block, &store), strip_images);
+                let block_text = block_content_via_store(block, &store);
+                let text = render_block_plain_text(
+                    &store,
+                    block,
+                    &block_text,
+                    strip_images,
+                    endnote_footnotes,
+                    &notes,
+                );
                 let text = match quote_depth.get(&block.id) {
                     Some(&depth) => indent_quoted(&text, depth),
                     None => text,

@@ -42,6 +42,41 @@ pub trait ExportDocxUnitOfWorkTrait: QueryUnitOfWork + Send + Sync {}
 /// LaTeX has, and why both pre-render rather than emitting at a definition site.
 type NoteParagraphs = std::collections::HashMap<String, Vec<docx_rs::Paragraph>>;
 
+/// What `build_run` needs to render a footnote reference correctly the
+/// *second* time a label is cited.
+///
+/// OOXML has no construct for "the same footnote, cited again" through this
+/// library: `docx-rs`'s `Docx::collect_footnotes()` turns *every*
+/// `<w:footnoteReference>` it finds anywhere in the run tree into its own
+/// `<w:footnote>` entry, unconditionally — so a second `add_footnote_reference`
+/// call for a label already defined would not reuse that note, it would emit a
+/// **second** `<w:footnote>` (duplicating the body) and, worse, share the first
+/// one's `w:id`, which OOXML does not allow two definitions to share. So only
+/// the label's first citation becomes a real, native footnote; a repeat prints
+/// a plain run carrying the same number that citation already earned —
+/// `numbers`' own reading-order marker table, styled with Word's built-in
+/// `"FootnoteReference"` character style so it still *looks* like a footnote
+/// mark, just without a second, duplicate definition underneath it.
+struct FootnoteRefState<'a> {
+    numbers: &'a crate::footnotes::Footnotes,
+    /// Labels whose real `<w:footnoteReference>` has already been emitted —
+    /// scoped to ONE pass over the document (a fresh, throwaway state per note
+    /// while pre-rendering note bodies, the shared one for the main walk — see
+    /// `build_docx`) so a nested citation inside one note's body can never be
+    /// mistaken for the label's real, resolved citation out in the manuscript,
+    /// which would silently swap a note's real content for a bare marker.
+    emitted: std::cell::RefCell<std::collections::HashSet<String>>,
+}
+
+impl<'a> FootnoteRefState<'a> {
+    fn new(numbers: &'a crate::footnotes::Footnotes) -> Self {
+        FootnoteRefState {
+            numbers,
+            emitted: std::cell::RefCell::new(std::collections::HashSet::new()),
+        }
+    }
+}
+
 pub struct ExportDocxUseCase {
     uow_factory: Box<dyn ExportDocxUnitOfWorkFactoryTrait>,
     dto: ExportDocxDto,
@@ -271,6 +306,14 @@ impl ExportDocxUseCase {
                 let mut blocks: Vec<Block> = blocks_opt.into_iter().flatten().collect();
                 blocks.sort_by_key(|b| b.document_position);
                 let mut paragraphs = Vec::with_capacity(blocks.len());
+                // A throwaway state, scoped to this ONE note's own body — never
+                // the shared main-walk state below. A citation found in here is
+                // necessarily nested (inside a definition frame), so it must
+                // never be marked "emitted" against the label's real, resolved
+                // citation out in the manuscript; doing so would make that real
+                // citation look like a repeat and silently swap its footnote for
+                // a bare marker with no note underneath it.
+                let body_footnote_state = FootnoteRefState::new(&notes);
                 for block in &blocks {
                     paragraphs.push(self.render_block(
                         uow,
@@ -279,6 +322,7 @@ impl ExportDocxUseCase {
                         None,
                         &mut note_numbering,
                         &std::collections::HashMap::new(),
+                        &body_footnote_state,
                     )?);
                 }
                 built.insert(label, paragraphs);
@@ -288,6 +332,10 @@ impl ExportDocxUseCase {
 
         let mut numbering = NumberingBuilder::default();
         let mut elements: Vec<DocxElement> = Vec::new();
+        // Shared across the WHOLE main walk (every top-level frame, every
+        // table cell reached from it): a label's real footnote must be
+        // defined at most once across the entire document, not once per frame.
+        let footnote_state = FootnoteRefState::new(&notes);
 
         let total_frames = frame_ids.len().max(1);
         for (frame_idx, frame_id) in frame_ids.iter().enumerate() {
@@ -319,8 +367,13 @@ impl ExportDocxUseCase {
 
             // A table anchor frame contributes one table.
             if let Some(table_id) = frame.table {
-                let table =
-                    self.render_table_docx(uow, &table_id, &mut numbering, &note_paragraphs)?;
+                let table = self.render_table_docx(
+                    uow,
+                    &table_id,
+                    &mut numbering,
+                    &note_paragraphs,
+                    &footnote_state,
+                )?;
                 elements.push(DocxElement::Table(Box::new(table)));
                 continue;
             }
@@ -335,6 +388,7 @@ impl ExportDocxUseCase {
                 &note_paragraphs,
                 cancel_flag,
                 &mut elements,
+                &footnote_state,
             )?;
 
             let pct = 10.0 + (frame_idx as f32 / total_frames as f32) * 70.0;
@@ -480,6 +534,7 @@ impl ExportDocxUseCase {
         notes: &NoteParagraphs,
         cancel_flag: Option<&AtomicBool>,
         out: &mut Vec<DocxElement>,
+        footnote_state: &FootnoteRefState,
     ) -> Result<()> {
         if !frame.child_order.is_empty() {
             for &entry in &frame.child_order {
@@ -501,6 +556,7 @@ impl ExportDocxUseCase {
                             semantic,
                             numbering,
                             notes,
+                            footnote_state,
                         )?;
                         out.push(DocxElement::Paragraph(Box::new(paragraph)));
                     }
@@ -513,7 +569,13 @@ impl ExportDocxUseCase {
                     if let Some(sub_frame) = uow.get_frame(&sub_frame_id)? {
                         // Table anchor sub-frame.
                         if let Some(table_id) = sub_frame.table {
-                            let table = self.render_table_docx(uow, &table_id, numbering, notes)?;
+                            let table = self.render_table_docx(
+                                uow,
+                                &table_id,
+                                numbering,
+                                notes,
+                                footnote_state,
+                            )?;
                             out.push(DocxElement::Table(Box::new(table)));
                             continue;
                         }
@@ -539,6 +601,7 @@ impl ExportDocxUseCase {
                             notes,
                             cancel_flag,
                             out,
+                            footnote_state,
                         )?;
                     }
                 }
@@ -558,8 +621,15 @@ impl ExportDocxUseCase {
             blocks.sort_by_key(|b| b.document_position);
             for block in &blocks {
                 check_cancelled(cancel_flag)?;
-                let paragraph =
-                    self.render_block(uow, block, quote_depth, semantic, numbering, notes)?;
+                let paragraph = self.render_block(
+                    uow,
+                    block,
+                    quote_depth,
+                    semantic,
+                    numbering,
+                    notes,
+                    footnote_state,
+                )?;
                 out.push(DocxElement::Paragraph(Box::new(paragraph)));
             }
         }
@@ -570,6 +640,7 @@ impl ExportDocxUseCase {
     ///
     /// Dispatch priority mirrors the djot exporter: code block, then heading,
     /// then list item, then plain paragraph.
+    #[allow(clippy::too_many_arguments)]
     fn render_block(
         &self,
         uow: &dyn ExportDocxUnitOfWorkTrait,
@@ -578,6 +649,7 @@ impl ExportDocxUseCase {
         semantic: Option<&SemanticRole>,
         numbering: &mut NumberingBuilder,
         notes: &NoteParagraphs,
+        footnote_state: &FootnoteRefState,
     ) -> Result<docx_rs::Paragraph> {
         use docx_rs::*;
 
@@ -722,6 +794,7 @@ impl ExportDocxUseCase {
             &elements,
             &self.dto.options.images,
             notes,
+            footnote_state,
         ))
     }
 
@@ -804,6 +877,7 @@ impl ExportDocxUseCase {
         table_id: &EntityId,
         numbering: &mut NumberingBuilder,
         notes: &NoteParagraphs,
+        footnote_state: &FootnoteRefState,
     ) -> Result<docx_rs::Table> {
         use docx_rs::*;
 
@@ -889,6 +963,7 @@ impl ExportDocxUseCase {
                             notes,
                             None,
                             &mut cell_elements,
+                            footnote_state,
                         )?;
                         for element in cell_elements {
                             docx_cell = match element {
@@ -1094,6 +1169,7 @@ fn build_run(
     elem: &InlineSegment,
     images: &ExportImages,
     notes: &std::collections::HashMap<String, Vec<docx_rs::Paragraph>>,
+    footnote_state: &FootnoteRefState,
 ) -> Option<docx_rs::Run> {
     use docx_rs::*;
 
@@ -1101,12 +1177,25 @@ fn build_run(
     // it lands on, and renumbers when the text reflows. A reference whose body
     // this document does not hold still gets its note — an empty one — because
     // dropping the run entirely would delete the marker from the sentence.
+    //
+    // That is the FIRST citation of a label. A repeat must not go through here
+    // again — see `FootnoteRefState`'s doc for why a second
+    // `add_footnote_reference` call would corrupt, not duplicate, the package.
+    // It gets a plain run instead, carrying the number the first citation
+    // already earned, styled as "FootnoteReference" so it still reads as a
+    // footnote mark even though it opens no second note.
     if let InlineContent::FootnoteRef { label } = &elem.content {
-        let mut footnote = Footnote::new();
-        for paragraph in notes.get(label).cloned().unwrap_or_default() {
-            footnote = footnote.add_content(paragraph);
+        if footnote_state.emitted.borrow_mut().insert(label.clone()) {
+            let mut footnote = Footnote::new();
+            for paragraph in notes.get(label).cloned().unwrap_or_default() {
+                footnote = footnote.add_content(paragraph);
+            }
+            return Some(Run::new().add_footnote_reference(footnote));
         }
-        return Some(Run::new().add_footnote_reference(footnote));
+        let marker = footnote_state.numbers.marker(label);
+        let mut run = Run::new().add_text(marker);
+        run.run_property = run.run_property.style("FootnoteReference");
+        return Some(run);
     }
 
     let text = match &elem.content {
@@ -1163,6 +1252,7 @@ fn add_inline_content(
     elements: &[InlineSegment],
     images: &ExportImages,
     notes: &std::collections::HashMap<String, Vec<docx_rs::Paragraph>>,
+    footnote_state: &FootnoteRefState,
 ) -> docx_rs::Paragraph {
     use docx_rs::*;
 
@@ -1175,7 +1265,7 @@ fn add_inline_content(
 
     let mut pieces: Vec<Piece> = Vec::new();
     for elem in elements {
-        let Some(run) = build_run(elem, images, notes) else {
+        let Some(run) = build_run(elem, images, notes, footnote_state) else {
             continue;
         };
         match &elem.fmt_anchor_href {

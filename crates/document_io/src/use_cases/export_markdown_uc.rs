@@ -32,6 +32,13 @@ pub trait ExportMarkdownUnitOfWorkTrait: QueryUnitOfWork {}
 pub struct ExportMarkdownUseCase {
     uow_factory: Box<dyn ExportMarkdownUnitOfWorkFactoryTrait>,
     options: MarkdownExportOptions,
+    /// The document's resolved footnotes, set at the top of `execute` — a
+    /// field, not a local, because `render_inline_segments` (the one place
+    /// that needs to tell a nested-only citation from an ordinary one, see
+    /// its own doc) sits several calls down a walk that threads only the uow
+    /// and the block. Mirrors `ExportLatexUseCase::note_bodies`, which holds
+    /// its own footnote state as a field for the identical reason.
+    notes: crate::footnotes::Footnotes,
 }
 
 impl ExportMarkdownUseCase {
@@ -42,6 +49,7 @@ impl ExportMarkdownUseCase {
         ExportMarkdownUseCase {
             uow_factory,
             options,
+            notes: crate::footnotes::Footnotes::default(),
         }
     }
 
@@ -88,7 +96,7 @@ impl ExportMarkdownUseCase {
 
         let mut output_parts: Vec<String> = Vec::new();
 
-        let notes = crate::footnotes::Footnotes::build(&uow.store());
+        self.notes = crate::footnotes::Footnotes::build(&uow.store());
 
         for frame_id in &frame_ids {
             // Skip cell frames — they're rendered as part of their table
@@ -100,7 +108,7 @@ impl ExportMarkdownUseCase {
             // Skip note bodies: a definition is a top-level frame, so this
             // walk would otherwise render it as ordinary prose in the middle of
             // the chapter, at the point the definition happened to be typed.
-            if notes.is_definition(*frame_id) {
+            if self.notes.is_definition(*frame_id) {
                 continue;
             }
             let frame = uow.get_frame(frame_id)?;
@@ -142,7 +150,7 @@ impl ExportMarkdownUseCase {
         //
         // Continuation lines are indented four spaces, which is what keeps a
         // multi-paragraph note attached to its definition instead of ending it.
-        for (_, label, frame_id) in notes.in_print_order() {
+        for (_, label, frame_id) in self.notes.in_print_order() {
             let frame = uow.get_frame(&frame_id)?;
             let Some(ref f) = frame else { continue };
             let body = self.render_frame_content(&*uow, f, &cell_frame_ids, "")?;
@@ -443,8 +451,25 @@ impl ExportMarkdownUseCase {
                 // Markdown's own footnote-reference syntax, the same shape djot
                 // uses. Emitted and done — it must not fall through into the
                 // emphasis wrapping below.
+                //
+                // Unless the label is cited only from inside another note's own
+                // body (`Footnotes::is_nested_reference` — see its doc, and
+                // `footnotes.rs`'s module doc for why that citation is refused
+                // rather than numbered): the notes loop below walks
+                // `in_print_order()`, which never includes such a label, so its
+                // `[^label]:` definition is never written. Emitting the
+                // `[^label]` syntax anyway would leave a dangling reference in
+                // the file — plain, escaped text instead, same as `Footnotes::
+                // marker`'s own "visible and traceable" fallback. An ordinary
+                // **dangling** reference (no definition anywhere) is not this:
+                // it keeps the live `[^label]` syntax exactly as before, for
+                // whatever host resolves it outside this document.
                 InlineContent::FootnoteRef { label } => {
-                    inline_md.push_str(&format!("[^{label}]"));
+                    if self.notes.is_nested_reference(label) {
+                        inline_md.push_str(&escape_markdown(label));
+                    } else {
+                        inline_md.push_str(&format!("[^{label}]"));
+                    }
                     continue;
                 }
                 InlineContent::Text(t) => {

@@ -492,3 +492,119 @@ fn check_cancelled(cancel_flag: Option<&AtomicBool>) -> Result<()> {
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    //! Asserts on the raw Typst *source* `build_markup` produces, not the compiled PDF.
+    //!
+    //! `pdf_export_tests.rs`'s footnote tests ("compiling is the assertion") only prove the
+    //! specific `#footnote(<label>)` reference syntax this exporter emits resolves to a real,
+    //! existing label — they do NOT prove there is only one `#footnote[…]` definition. Typst
+    //! happily compiles two *independent* elements that carry the identical `<label>`, as long
+    //! as nothing ever queries it ambiguously (confirmed by hand against `typst_compile`), so a
+    //! regression that re-defined the footnote on every citation instead of reusing it via
+    //! `mark_emitted` would still produce a valid PDF and keep every existing PDF test green.
+    //! Only the source markup can show the actual count of `#footnote[…]` definitions.
+
+    use super::*;
+    use crate::ImportDjotDto;
+    use crate::document_io_controller;
+    use crate::units_of_work::export_pdf_uow::ExportPdfUnitOfWorkFactory;
+    use common::parser_tools::PdfExportOptions;
+
+    /// Import `djot` into a fresh store and return the Typst source `build_markup` produces for
+    /// it — no font, no compile: `build_markup` never touches either.
+    fn markup_from_djot(djot: &str) -> String {
+        let (db, ev, _) = test_harness::setup().expect("setup");
+        document_io_controller::import_djot_sync(
+            &db,
+            &ev,
+            &ImportDjotDto {
+                djot_text: djot.to_string(),
+                options: Default::default(),
+            },
+        )
+        .expect("import_djot_sync");
+
+        let dto = ExportPdfDto {
+            output_path: String::new(),
+            options: PdfExportOptions::default(),
+        };
+        let uc = ExportPdfUseCase::new(Box::new(ExportPdfUnitOfWorkFactory::new(&db)), &dto);
+        let uow = uc.uow_factory.create();
+        uow.begin_transaction().expect("begin_transaction");
+        let markup = uc
+            .build_markup(&*uow, &|_progress| {}, None)
+            .expect("build_markup");
+        uow.end_transaction().expect("end_transaction");
+        markup
+    }
+
+    /// Citing the same label twice must define exactly ONE `#footnote[…]`, carrying the note's
+    /// body once, and reuse it a second time via Typst's own reference form —
+    /// `#footnote(<anchor>)` — pointing at the SAME `<anchor>` the definition labels itself
+    /// with. `footnotes.rs`'s own invariant ("a label referenced twice keeps one number — it is
+    /// one note"), proven here against the exact markup the PDF is compiled from.
+    #[test]
+    fn repeat_citation_defines_one_footnote_and_references_it_once() {
+        let markup =
+            markup_from_djot("First[^n1] and second[^n1] citation.\n\n[^n1]: The note body.\n");
+        let anchor = crate::footnotes::safe_label_id("n1");
+
+        assert_eq!(
+            markup.matches("The note body.").count(),
+            1,
+            "the note's body must not be duplicated: {markup}"
+        );
+        assert_eq!(
+            markup.matches("#footnote[").count(),
+            1,
+            "only the first citation may define a #footnote[...]: {markup}"
+        );
+        assert_eq!(
+            markup.matches("#footnote(<").count(),
+            1,
+            "the second citation must reuse the note via #footnote(<label>), not redefine it: {markup}"
+        );
+        assert!(
+            markup.contains(&format!("#footnote[The note body.] <{anchor}>")),
+            "the definition must label itself with the citation's own anchor: {markup}"
+        );
+        assert!(
+            markup.contains(&format!("#footnote(<{anchor}>)")),
+            "the repeat citation must reference that SAME anchor: {markup}"
+        );
+    }
+
+    /// Two distinct labels, each cited twice, exercises `TypstNotes::mark_emitted`'s
+    /// per-label bookkeeping independently — a shared/mis-scoped flag would either dedupe
+    /// across labels (silently dropping a real second note) or never dedupe at all.
+    #[test]
+    fn independently_repeated_labels_each_get_their_own_one_definition() {
+        let markup = markup_from_djot(
+            "One[^a] two[^a] three[^b] four[^b].\n\n[^a]: Body A.\n\n[^b]: Body B.\n",
+        );
+        let anchor_a = crate::footnotes::safe_label_id("a");
+        let anchor_b = crate::footnotes::safe_label_id("b");
+
+        assert_eq!(
+            markup.matches("Body A.").count(),
+            1,
+            "note A duplicated: {markup}"
+        );
+        assert_eq!(
+            markup.matches("Body B.").count(),
+            1,
+            "note B duplicated: {markup}"
+        );
+        assert_eq!(
+            markup.matches("#footnote[").count(),
+            2,
+            "exactly one definition per label: {markup}"
+        );
+        assert!(markup.contains(&format!("#footnote[Body A.] <{anchor_a}>")));
+        assert!(markup.contains(&format!("#footnote(<{anchor_a}>)")));
+        assert!(markup.contains(&format!("#footnote[Body B.] <{anchor_b}>")));
+        assert!(markup.contains(&format!("#footnote(<{anchor_b}>)")));
+    }
+}

@@ -522,6 +522,72 @@ pub(crate) fn build_fragments_with_text(
     fragments
 }
 
+/// Every footnote label's number, counted the document numbers its own
+/// references in reading order — blocks by `document_position`, then within a
+/// block by byte offset, first appearance of a label wins, 1-based. A
+/// definition frame's own blocks are excluded from the walk (a note that
+/// itself cites another note must not number the inner reference by where the
+/// *definition* sits).
+///
+/// This is `document_io::footnotes::Footnotes::build`'s `numbers` computation,
+/// duplicated rather than shared: `document_io` is a backend/export crate this
+/// one (`public_api`, i.e. the live editor) does not — and should not —
+/// depend on, since it pulls in every exporter for what is, here, a handful
+/// of lines over `common::database::Store`, which both crates already depend
+/// on directly. If the numbering rule ever changes, it has to change in both
+/// places — grep `Footnotes::build` in `document_io` before touching this.
+///
+/// The fallback tier `TextDocument::set_footnote_markers`'s doc promises
+/// ("Leave it unset and the document numbers its own references in reading
+/// order, which is right when the document *is* the whole text") and that
+/// `document_io::Footnotes::marker` actually implements as ITS fallback
+/// before finally falling back to the raw label — the exact tier
+/// `build_raw_fragments` was missing, which is why a host that never calls
+/// `set_footnote_markers` (the documented, supported "unset" case — every
+/// host does not manage its own note numbering the way Skribisto does) saw
+/// the live editor draw raw labels while every export numbered correctly.
+fn document_self_footnote_numbers(
+    store: &common::database::Store,
+) -> std::collections::HashMap<String, usize> {
+    let definition_blocks: std::collections::HashSet<common::types::EntityId> = store
+        .frames
+        .read()
+        .values()
+        .filter(|f| f.footnote_label.is_some())
+        .flat_map(|f| f.child_order.iter().copied())
+        .filter(|child| *child > 0)
+        .map(|child| child as common::types::EntityId)
+        .collect();
+
+    let mut ordered: Vec<(i64, common::types::EntityId)> = store
+        .blocks
+        .read()
+        .values()
+        .filter(|b| !definition_blocks.contains(&b.id))
+        .map(|b| (b.document_position, b.id))
+        .collect();
+    ordered.sort_unstable();
+
+    let refs = store.block_footnote_refs.read();
+    let mut numbers: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    let mut next = 1usize;
+    for (_, block_id) in ordered {
+        let Some(anchors) = refs.get(&block_id) else {
+            continue;
+        };
+        let mut in_block: Vec<_> = anchors.iter().collect();
+        in_block.sort_by_key(|a| a.byte_offset);
+        for anchor in in_block {
+            numbers.entry(anchor.label.clone()).or_insert_with(|| {
+                let n = next;
+                next += 1;
+                n
+            });
+        }
+    }
+    numbers
+}
+
 /// Build raw fragments from the block's format_runs and block_images
 /// tables (Phase 1 of the rope migration). Reads the per-block plain_text
 /// from the Block DTO and uses the format-run byte ranges + image
@@ -602,6 +668,11 @@ fn build_raw_fragments(
 
     let mut fragments = Vec::with_capacity(pieces.len());
     let mut char_offset: usize = 0;
+    // Lazily computed — the common case (a host that manages its own
+    // numbering, like Skribisto, always pushes a full marker map before any
+    // document paints) never runs a whole-document scan just to draw one
+    // block.
+    let mut self_numbers: Option<std::collections::HashMap<String, usize>> = None;
 
     for piece in pieces {
         match piece {
@@ -630,14 +701,23 @@ fn build_raw_fragments(
                     // own store) knows more still — that this text is chapter
                     // five of a book, and where its numbering starts.
                     //
-                    // The label stands in when nothing was supplied, matching
-                    // what `document_io::Footnotes::marker` falls back to, so the
-                    // editor and the exporters degrade the same way rather than
-                    // disagreeing about a document nobody has numbered.
-                    marker: markers
-                        .get(&note.label)
-                        .cloned()
-                        .unwrap_or_else(|| note.label.clone()),
+                    // Falls back, in order: the host's override map; then this
+                    // document's OWN reading-order count (`document_self_
+                    // footnote_numbers` — the tier `document_io::Footnotes::
+                    // marker` implements and `set_footnote_markers` documents,
+                    // "right when the document *is* the whole text"); then,
+                    // only for a reference that resolves in neither, the raw
+                    // label — visible and traceable rather than a blank
+                    // marker, matching `Footnotes::marker`'s own last resort.
+                    marker: markers.get(&note.label).cloned().unwrap_or_else(|| {
+                        self_numbers
+                            .get_or_insert_with(|| {
+                                document_self_footnote_numbers(inner.ctx.db_context.get_store())
+                            })
+                            .get(&note.label)
+                            .map(|n| n.to_string())
+                            .unwrap_or_else(|| note.label.clone())
+                    }),
                     format: TextFormat::from(&note.format),
                     offset: char_offset,
                     element_id: synth_element_id(block_id, note.byte_offset),

@@ -12,7 +12,7 @@
 //! That is not a degenerate input to tolerate; it is the normal state, and if it
 //! did not round-trip the writer's references would vanish on the next save.
 
-use text_document::{DjotImportOptions, TextDocument, djot_to_plain_text};
+use text_document::{DjotImportOptions, PlainTextExportOptions, TextDocument, djot_to_plain_text};
 
 fn doc_from(djot: &str) -> TextDocument {
     let doc = TextDocument::new();
@@ -420,5 +420,252 @@ fn a_reference_is_raised_whichever_way_it_arrived() {
         raised(&typed),
         Some(true),
         "a reference inserted at the caret must be superscript too"
+    );
+}
+
+// --- repeat citations: one note, one number, no duplicated body -----------
+
+const REPEAT_NOTE: &str = "First[^n1] and second[^n1] citation.\n\n[^n1]: The note body.\n";
+
+/// `footnotes.rs`'s own invariant ("a label referenced twice keeps one
+/// number — it is one note") must hold in the LaTeX writer's own idiom: the
+/// first citation defines the footnote, a repeat reuses it via
+/// `\footnotemark[\getrefnumber{…}]` rather than opening — and duplicating
+/// the body of — a second one.
+#[test]
+fn latex_repeat_citation_reuses_one_footnote() {
+    let latex = doc_from(REPEAT_NOTE)
+        .to_latex("article", true)
+        .expect("latex");
+    assert_eq!(
+        latex.matches("The note body").count(),
+        1,
+        "the body must not be duplicated under a second footnote: {latex}"
+    );
+    assert_eq!(
+        latex.matches("\\footnote{").count(),
+        1,
+        "only the first citation may define the footnote: {latex}"
+    );
+    assert!(
+        latex.contains("\\footnotemark[\\getrefnumber{"),
+        "the repeat citation must reuse the first footnote's number: {latex}"
+    );
+
+    // It is not enough that SOME `\label{…}`/`\getrefnumber{…}` pair exists — the repeat
+    // citation's `\getrefnumber{…}` must point at the SAME anchor the footnote's own
+    // `\label{…}` defines, or the two markers resolve to different (or nonexistent) targets.
+    let label_start = latex.find("\\label{").expect("no \\label{...} in output") + "\\label{".len();
+    let label_end = label_start
+        + latex[label_start..]
+            .find('}')
+            .expect("unterminated \\label{");
+    let label_anchor = &latex[label_start..label_end];
+
+    let getref_start = latex
+        .find("\\getrefnumber{")
+        .expect("no \\getrefnumber{...} in output")
+        + "\\getrefnumber{".len();
+    let getref_end = getref_start
+        + latex[getref_start..]
+            .find('}')
+            .expect("unterminated \\getrefnumber{");
+    let getref_anchor = &latex[getref_start..getref_end];
+
+    assert_eq!(
+        label_anchor, getref_anchor,
+        "the repeat citation's \\getrefnumber must reference the SAME anchor the \
+         footnote's own \\label defines, not a different or stray one: {latex}"
+    );
+}
+
+// DOCX's own idiom for the same invariant (only the first citation becomes a
+// real `<w:footnoteReference>`, proven against the packaged
+// `word/footnotes.xml`) is covered in `docx_export_tests.rs`, the container
+// text-document-io owns the `docx_rs` types to inspect it with — this crate
+// exposes only the file-writing `to_docx`, not the in-memory builder.
+
+// --- nested citations: refused, not left dangling --------------------------
+
+const NESTED_NOTE: &str = "Prose[^a] here.\n\n[^a]: See also[^b].\n\n[^b]: Extra detail about b.\n";
+
+/// A footnote cited only from inside another note's own body
+/// (`Footnotes::is_nested_reference` — see its doc for why this is refused
+/// rather than numbered) must never be linked: HTML must not emit an `href`
+/// to a `#fn-b` that nothing ever writes, in either the plain-HTML or the
+/// (shared-renderer) EPUB writer.
+#[test]
+fn html_nested_citation_is_not_a_dangling_link() {
+    let html = doc_from(NESTED_NOTE).to_html().expect("html");
+
+    // Note "a" is cited from real prose — fully resolved, and unaffected.
+    assert!(
+        html.contains("id=\"fn-a\"") && html.contains("See also"),
+        "the resolved outer note must still render normally: {html}"
+    );
+
+    // Note "b" is cited only from inside "a"'s body: no aside is ever built
+    // for it (`in_print_order` excludes it), so nothing may link to it.
+    assert!(
+        !html.contains("href=\"#fn-b\""),
+        "a nested citation must not carry a dangling href: {html}"
+    );
+    assert!(
+        !html.contains("id=\"fn-b\""),
+        "no aside may exist for a note nothing numbers: {html}"
+    );
+    assert!(
+        !html.contains("Extra detail about b"),
+        "a nested note's body must never be emitted anywhere: {html}"
+    );
+    // The citation itself still shows something, just not a link.
+    assert!(
+        html.contains("<sup>b</sup>"),
+        "the nested citation must still show a visible, traceable marker: {html}"
+    );
+}
+
+/// The same nested case in Markdown: the reference syntax must not survive
+/// without its definition, or a reader/tool sees a dangling `[^b]`.
+#[test]
+fn markdown_nested_citation_does_not_leave_a_dangling_reference() {
+    let md = doc_from(NESTED_NOTE).to_markdown().expect("markdown");
+
+    assert!(
+        md.contains("[^a]") && md.contains("[^a]:"),
+        "outer note lost: {md}"
+    );
+    assert!(
+        !md.contains("[^b]"),
+        "a nested citation must not keep the live [^label] syntax: {md}"
+    );
+    assert!(
+        !md.contains("[^b]:"),
+        "no definition may exist for a note nothing numbers: {md}"
+    );
+    assert!(
+        !md.contains("Extra detail about b"),
+        "a nested note's body must never be emitted anywhere: {md}"
+    );
+}
+
+/// An ordinary DANGLING reference (no definition anywhere — the documented,
+/// supported "a host owns note storage itself" case) is NOT the nested case
+/// above and must be left exactly as before in both formats: still linked in
+/// HTML, still live `[^label]` syntax in Markdown.
+#[test]
+fn a_genuinely_dangling_reference_keeps_its_ordinary_rendering() {
+    let doc = doc_from("Text with a note[^solo] in it.\n");
+
+    let html = doc.to_html().expect("html");
+    assert!(
+        html.contains("href=\"#fn-solo\""),
+        "a dangling reference must keep its ordinary href, unlike a nested one: {html}"
+    );
+
+    let md = doc.to_markdown().expect("markdown");
+    assert!(
+        md.contains("[^solo]"),
+        "a dangling reference must keep its live syntax, unlike a nested one: {md}"
+    );
+}
+
+// --- plain text: the citation point must stay visible ----------------------
+
+/// `strip_image_sentinels` used to strip every `U+FFFC` it found, and a
+/// footnote reference shares that exact codepoint with an image — so asking
+/// only to drop images silently erased citation points too, with nothing
+/// left in their place.
+#[test]
+fn plain_text_presentation_view_shows_the_citation_marker() {
+    let presented = doc_from(WITH_NOTE)
+        .to_plain_text_with(PlainTextExportOptions::presentation())
+        .expect("presentation");
+    assert!(
+        presented.contains("Prose[1] here."),
+        "the citation point must show its printed marker: {presented:?}"
+    );
+    assert!(
+        !presented.contains('\u{FFFC}'),
+        "no raw sentinel should remain once its marker was printed: {presented:?}"
+    );
+}
+
+/// `endnote_footnotes` alone (without `strip_images`) must also print the
+/// citation marker — the two options are independent, and the marker's
+/// whole point is to match the endnote list this same flag appends.
+#[test]
+fn endnote_footnotes_alone_still_prints_the_citation_marker() {
+    let doc = doc_from(WITH_NOTE);
+    let options = PlainTextExportOptions {
+        strip_images: false,
+        endnote_footnotes: true,
+        ..Default::default()
+    };
+    let out = doc.to_plain_text_with(options).expect("export");
+    assert!(
+        out.contains("Prose[1] here."),
+        "the citation marker must print even without strip_images: {out:?}"
+    );
+}
+
+/// `strip_images` alone, on a single-frame document with a DANGLING
+/// reference (so the rope fast path is eligible — see
+/// `rope_flat_text_if_simple`), must not blindly erase the reference's
+/// sentinel along with any image's: the fast path shares the same
+/// blind-replace helper the slow path used to, and needs the same guard.
+#[test]
+fn strip_images_alone_does_not_eat_a_dangling_footnote_sentinel_on_the_fast_path() {
+    let doc = doc_from("Text with a note[^solo] in it.\n");
+    let options = PlainTextExportOptions {
+        strip_images: true,
+        ..Default::default()
+    };
+    let out = doc.to_plain_text_with(options).expect("export");
+    assert!(
+        out.contains('\u{FFFC}'),
+        "a dangling reference's sentinel must survive a strip-images-only export: {out:?}"
+    );
+}
+
+// --- the editor's own numbering fallback (finding 8) ------------------------
+
+/// `TextDocument::set_footnote_markers`'s own doc promises: "Leave it unset
+/// and the document numbers its own references in reading order, which is
+/// right when the document *is* the whole text." `document_io::Footnotes::
+/// marker` already implemented that fallback tier for every exporter;
+/// `build_raw_fragments` (the live editor's own fragment builder) skipped
+/// straight from "no host override" to the raw label, so a host that never
+/// calls `set_footnote_markers` — the documented, supported "unset" case —
+/// saw the live view draw raw labels while every export numbered correctly.
+#[test]
+fn the_editor_numbers_its_own_references_when_no_host_markers_are_set() {
+    let doc = doc_from("First[^b] then second[^a].\n\n[^a]: x.\n\n[^b]: y.\n");
+
+    let markers: Vec<(String, String)> = doc
+        .flow()
+        .iter()
+        .filter_map(|e| match e {
+            text_document::FlowElement::Block(b) => Some(b),
+            _ => None,
+        })
+        .flat_map(|b| b.fragments())
+        .filter_map(|f| match f {
+            text_document::FragmentContent::FootnoteReference { label, marker, .. } => {
+                Some((label.clone(), marker.clone()))
+            }
+            _ => None,
+        })
+        .collect();
+
+    assert_eq!(
+        markers,
+        vec![
+            ("b".to_string(), "1".to_string()),
+            ("a".to_string(), "2".to_string()),
+        ],
+        "the editor must count its own references in reading order rather \
+         than drawing raw labels, matching document_io::Footnotes::marker's \
+         fallback: {markers:?}"
     );
 }

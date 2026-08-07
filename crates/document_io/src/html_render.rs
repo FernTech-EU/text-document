@@ -240,13 +240,26 @@ pub fn render_inline_html(
             // work settled on. Reading systems render this pair as a pop-up,
             // which is a reflowable book's own idiom for a footnote — there is
             // no page bottom to put one at.
+            //
+            // Unless the label is cited only from inside another note's own
+            // body (`Footnotes::is_nested_reference` — see its doc, and
+            // `footnotes.rs`'s module doc for why that citation is refused
+            // rather than numbered): no writer ever gives that label a number
+            // or an aside, so a live link here would carry an `href` to a
+            // `#fn-…` id nothing emits. An ordinary **dangling** reference (no
+            // definition anywhere) is not this — it keeps the full noteref
+            // treatment exactly as before.
             InlineContent::FootnoteRef { label } => {
-                let id = escape_html(label);
                 let marker = escape_html(&notes.marker(label));
-                html.push_str(&format!(
-                    "<a epub:type=\"noteref\" role=\"doc-noteref\" href=\"#fn-{id}\" \
-                     id=\"fnref-{id}\"><sup>{marker}</sup></a>"
-                ));
+                if notes.is_nested_reference(label) {
+                    html.push_str(&format!("<sup>{marker}</sup>"));
+                } else {
+                    let id = escape_html(label);
+                    html.push_str(&format!(
+                        "<a epub:type=\"noteref\" role=\"doc-noteref\" href=\"#fn-{id}\" \
+                         id=\"fnref-{id}\"><sup>{marker}</sup></a>"
+                    ));
+                }
                 continue;
             }
             InlineContent::Image {

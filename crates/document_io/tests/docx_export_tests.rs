@@ -728,6 +728,65 @@ fn docx_dangling_footnote_reference_still_produces_a_note() {
     );
 }
 
+const REPEAT_FOOTNOTE_DJOT: &str =
+    "First[^n1] and second[^n1] citation.\n\n[^n1]: The note body for Word.\n";
+
+/// Citing the same label twice must produce exactly ONE real
+/// `<w:footnoteReference>`/`<w:footnote>` pair, not two — `docx-rs`'s
+/// `collect_footnotes()` turns every reference it finds into its own
+/// `<w:footnote>` entry, so a naive second `add_footnote_reference` call
+/// would both duplicate the body and share the first one's `w:id`, which
+/// OOXML does not allow two definitions to. `build_run`'s fix: only the
+/// first citation opens a real footnote; a repeat prints a plain run
+/// instead (proven end to end here, against the packaged files, not just
+/// the in-memory `Docx` struct — the same reasoning `docx_footnote_
+/// reference_resolves_to_a_real_body_in_footnotes_xml`'s own doc comment
+/// gives for testing this way).
+#[test]
+fn docx_repeat_citation_reuses_one_footnote_not_two() {
+    let bytes = docx_bytes_from_djot(REPEAT_FOOTNOTE_DJOT);
+
+    let document_xml = read_zip_entry(&bytes, "word/document.xml");
+    let footnotes_xml = read_zip_entry(&bytes, "word/footnotes.xml");
+
+    let ref_ids = footnote_reference_ids(&document_xml);
+    assert_eq!(
+        ref_ids.len(),
+        1,
+        "only the FIRST citation may become a real <w:footnoteReference>: {document_xml}"
+    );
+
+    let body_ids = footnote_body_ids(&footnotes_xml);
+    assert_eq!(
+        body_ids.len(),
+        1,
+        "citing one label twice must define exactly one <w:footnote>: {footnotes_xml}"
+    );
+    assert!(
+        body_ids.contains(&ref_ids[0]),
+        "the one reference must resolve to the one body: {footnotes_xml}"
+    );
+
+    assert_eq!(
+        footnotes_xml.matches("The note body for Word.").count(),
+        1,
+        "the note body must not be duplicated: {footnotes_xml}"
+    );
+
+    // The repeat citation still reads as a footnote mark (Word's built-in
+    // "FootnoteReference" character style) even though it opens no second
+    // note — one occurrence from the real reference's own run properties,
+    // one from the repeat's plain, styled-only run.
+    assert_eq!(
+        document_xml
+            .matches("w:rStyle w:val=\"FootnoteReference\"")
+            .count(),
+        2,
+        "both the real reference and the repeat's plain marker must carry \
+         the FootnoteReference character style: {document_xml}"
+    );
+}
+
 #[test]
 fn bold_run_is_marked_bold() {
     let docx = docx_from_djot("normal *bolded* normal");

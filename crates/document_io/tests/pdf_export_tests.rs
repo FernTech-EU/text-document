@@ -516,3 +516,36 @@ fn a_footnote_with_no_body_still_compiles() {
     let bytes = pdf_from_djot("Orphaned here.[^gone]\n", pdf_options());
     assert!(bytes.starts_with(b"%PDF-"));
 }
+
+/// Citing the same label twice must not emit a second `#footnote[…]` for it —
+/// see `TypstNotes::mark_emitted`'s doc: Typst would count that as a second,
+/// independently-numbered note, duplicating the body. The repeat citation
+/// instead uses Typst's own reference form, `#footnote(<label>)`, pointing at
+/// a `<label>` the first citation defines.
+///
+/// Compiling is the assertion, same reasoning as `a_footnote_compiles_into_
+/// the_pdf`: Typst rejects a malformed `#footnote(<…>)` — an unlabeled
+/// target, a label used before it exists — outright, so a PDF coming out the
+/// other side proves both the defining call's `<label>` and the reference
+/// call's `(<label>)` were well-formed and consistent.
+#[test]
+fn a_repeat_footnote_citation_reuses_one_note_and_compiles() {
+    let djot = "First[^n1] and second[^n1] citation.\n\n[^n1]: The note body.\n";
+    let bytes = pdf_from_djot(djot, pdf_options());
+    assert!(
+        bytes.starts_with(b"%PDF-"),
+        "a repeat citation of one label must still compile"
+    );
+    assert!(count_pdf_pages(&bytes) >= 1);
+}
+
+/// Two DIFFERENT labels, each cited twice, exercises the per-label `emitted`
+/// bookkeeping independently — a shared, mis-scoped flag would either dedupe
+/// across labels (dropping a real second note) or fail to dedupe at all.
+#[test]
+fn independently_repeated_footnotes_all_compile() {
+    let djot = "One[^a] two[^a] three[^b] four[^b].\n\n[^a]: Body A.\n\n[^b]: Body B.\n";
+    let bytes = pdf_from_djot(djot, pdf_options());
+    assert!(bytes.starts_with(b"%PDF-"));
+    assert!(count_pdf_pages(&bytes) >= 1);
+}

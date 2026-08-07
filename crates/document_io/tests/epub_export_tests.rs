@@ -346,6 +346,59 @@ fn epub_note_referenced_from_two_chapters_gets_an_aside_in_each() {
     );
 }
 
+const REPEAT_IN_ONE_CHAPTER_DJOT: &str =
+    "First[^n1] and second[^n1] citation, in the SAME chapter.\n\n[^n1]: The shared body.\n";
+
+/// One label cited TWICE from the SAME chapter — unlike `FOOTNOTE_DJOT`'s cross-chapter case
+/// above (which legitimately duplicates the aside once per *file*, since an EPUB fragment
+/// identifier can't reach across spine files), citing a label twice within one file must NOT
+/// duplicate the aside: `chapter.footnote_labels` is a deduplicated set and the aside loop
+/// walks it once per label, so both citations must point at the one copy. Proven against the
+/// real, packaged `.xhtml`, not merely the referencing markup — same reasoning
+/// `epub_footnote_reference_and_its_aside_share_one_chapter_file`'s own module doc gives.
+#[test]
+fn epub_repeat_citation_in_one_chapter_reuses_one_aside_not_two() {
+    let bytes = epub_from_djot(REPEAT_IN_ONE_CHAPTER_DJOT, EpubExportOptions::default());
+    let ch1 = read_zip_entry(&bytes, "OEBPS/chapter_001.xhtml");
+
+    // TWO markers, both citing the label...
+    assert_eq!(
+        ch1.matches(r#"epub:type="noteref" role="doc-noteref""#)
+            .count(),
+        2,
+        "both citations must render their own noteref marker: {ch1}"
+    );
+    assert_eq!(
+        ch1.matches("id=\"fnref-n1\"").count(),
+        2,
+        "both citations must anchor as fnref-n1: {ch1}"
+    );
+    // ...both printing the SAME number: one note, one number, cited twice.
+    assert_eq!(
+        ch1.matches("<sup>1</sup>").count(),
+        2,
+        "both citations must carry the same marker number: {ch1}"
+    );
+
+    // ...but exactly ONE aside (one note body) for that label in the file.
+    assert_eq!(
+        ch1.matches(r#"epub:type="footnote" role="doc-footnote""#)
+            .count(),
+        1,
+        "one label cited twice in one chapter must produce exactly one aside: {ch1}"
+    );
+    assert_eq!(
+        ch1.matches("id=\"fn-n1\"").count(),
+        1,
+        "the aside must not be duplicated: {ch1}"
+    );
+    assert_eq!(
+        ch1.matches("The shared body.").count(),
+        1,
+        "the note's body text must not be duplicated: {ch1}"
+    );
+}
+
 #[test]
 fn epub_dangling_footnote_reference_survives_with_no_aside_anywhere() {
     // "[^gone]" in FOOTNOTE_DJOT names no definition — the normal state for a host
@@ -389,6 +442,52 @@ fn epub_note_body_is_not_rendered_inline_as_ordinary_prose() {
         1,
         "the note body must appear exactly once (in its aside), not also inline: {ch1}"
     );
+}
+
+const NESTED_FOOTNOTE_DJOT: &str = "\
+# Chapter One
+
+Opening prose citing an outer note[^outer].
+
+[^outer]: This note itself cites another[^inner].
+
+[^inner]: Detail that only the outer note points at.
+";
+
+/// "[^inner]" is cited only from inside "[^outer]"'s own body — the ONE case
+/// `footnotes.rs` documents as refused rather than numbered (see
+/// `Footnotes::is_nested_reference`'s doc): it never gets a number, never
+/// appears in `in_print_order`, and — since `export_epub_uc`'s per-chapter
+/// aside pass shares `html_render::render_inline_html` with the plain-HTML
+/// writer — must never be linked either. Checks the whole package, not just
+/// one chapter file: nothing should ever attempt an aside for it anywhere.
+#[test]
+fn epub_nested_citation_does_not_dangle_anywhere_in_the_package() {
+    let bytes = epub_from_djot(NESTED_FOOTNOTE_DJOT, EpubExportOptions::default());
+    let ch1 = read_zip_entry(&bytes, "OEBPS/chapter_001.xhtml");
+
+    // The outer note is fully resolved and renders exactly as usual.
+    assert!(
+        ch1.contains("id=\"fnref-outer\"") && ch1.contains("id=\"fn-outer\""),
+        "the resolved outer note must render its normal reference+aside pair: {ch1}"
+    );
+
+    let names = zip_entry_names(&bytes);
+    for name in names.iter().filter(|n| n.ends_with(".xhtml")) {
+        let xhtml = read_zip_entry(&bytes, name);
+        assert!(
+            !xhtml.contains("href=\"#fn-inner\""),
+            "a nested citation must not carry a dangling href ({name}): {xhtml}"
+        );
+        assert!(
+            !xhtml.contains("id=\"fn-inner\""),
+            "no aside may exist for a note nothing numbers ({name}): {xhtml}"
+        );
+        assert!(
+            !xhtml.contains("Detail that only the outer note points at"),
+            "a nested note's body must never be emitted anywhere ({name}): {xhtml}"
+        );
+    }
 }
 
 // --- metadata ----------------------------------------------------------------

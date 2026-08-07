@@ -302,6 +302,21 @@ impl ExportEpubUseCase {
                         image_policy,
                         &mut inner,
                     )?;
+                    // `inner`'s own `footnote_labels` (any label found while
+                    // rendering label's frame body, i.e. a note this note itself
+                    // cites) are deliberately dropped here, not folded into
+                    // `chapter.footnote_labels`. That is only safe BECAUSE such a
+                    // label — cited solely from inside another note's own body —
+                    // is exactly `Footnotes::is_nested_reference`'s case, which
+                    // `footnotes.rs` documents as refused rather than numbered:
+                    // it never gets a number, never appears in `in_print_order`,
+                    // and `render_inline_html` renders its citation unlinked (no
+                    // `href`, so nothing here needs an aside to exist for it). If
+                    // that numbering decision ever changes, this drop stops being
+                    // inert and starts silently losing real asides — propagating
+                    // `inner`'s labels into `chapter.footnote_labels` (and every
+                    // chapter, transitively, that ends up citing this one) would
+                    // have to change alongside it.
                     let body: String = inner.into_iter().map(|u| u.html).collect();
                     let id = html_render::escape_html(label);
                     aside_html.push_str(&format!(

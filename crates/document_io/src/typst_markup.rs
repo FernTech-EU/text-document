@@ -31,14 +31,6 @@ use common::types::EntityId;
 
 // ─────────────────────────── Escaping ───────────────────────────
 
-/// Escapes literal author prose for safe embedding directly in Typst markup (never inside a
-/// `#raw(...)`/string-literal argument — use [`escape_typst_string`] there instead).
-///
-/// Over-escapes some characters outside their strictly-dangerous context (every literal hyphen,
-/// for instance) — the same trade-off `escape_latex` already makes for `&%$#_{}~^`. This is the
-/// only rule that is unconditionally injection-proof without per-context parsing, which matters
-/// here specifically because author prose must never be able to inject Typst code.
-
 /// Virtual-file path for each supplied image, keyed by the document's `src`.
 ///
 /// Both the markup emitter and the compiler's file resolver call this, so the
@@ -61,6 +53,13 @@ pub(crate) fn typst_image_paths(
         .collect()
 }
 
+/// Escapes literal author prose for safe embedding directly in Typst markup (never inside a
+/// `#raw(...)`/string-literal argument — use [`escape_typst_string`] there instead).
+///
+/// Over-escapes some characters outside their strictly-dangerous context (every literal hyphen,
+/// for instance) — the same trade-off `escape_latex` already makes for `&%$#_{}~^`. This is the
+/// only rule that is unconditionally injection-proof without per-context parsing, which matters
+/// here specifically because author prose must never be able to inject Typst code.
 pub fn escape_typst(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for ch in s.chars() {
@@ -257,8 +256,45 @@ pub fn hoist_leading_pagebreak(body: &str) -> (Option<&'static str>, &str) {
     }
 }
 
-/// Each note's body, already rendered to Typst markup, by label.
-pub type TypstNotes = std::collections::HashMap<String, String>;
+/// Each note's body, already rendered to Typst markup, by label — plus which labels have
+/// already had that body emitted as a real `#footnote[…]` this export.
+///
+/// Typst assigns a footnote's number wherever `#footnote[…]` first appears, and offers its own
+/// construct for a repeat citation: label the defining call (`#footnote[…] <label>`) and refer
+/// back to it (`#footnote(<label>)`) — see `render_inline_typst`. A **second** `#footnote[…]`
+/// for the same label would not reuse the first note; Typst would count it as a brand-new one,
+/// duplicating the body under a second, wrongly different number, which is exactly the "one
+/// note, one number" invariant `footnotes.rs` documents. `emitted` is the "have we already
+/// defined this one" bookkeeping that decision needs. `RefCell`, not a plain field: every
+/// render function here only holds `&TypstNotes` (mirrors `ExportLatexUseCase::footnoted_labels`
+/// for the identical LaTeX-side problem).
+#[derive(Debug, Default)]
+pub struct TypstNotes {
+    bodies: std::collections::HashMap<String, String>,
+    emitted: std::cell::RefCell<std::collections::HashSet<String>>,
+}
+
+impl TypstNotes {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn insert(&mut self, label: String, body: String) {
+        self.bodies.insert(label, body);
+    }
+
+    /// The label's pre-rendered body, if this document holds one.
+    pub fn get(&self, label: &str) -> Option<&String> {
+        self.bodies.get(label)
+    }
+
+    /// True the first time this label is asked about; `false` on every later call — the
+    /// caller's signal to switch from defining the footnote (`#footnote[…] <label>`) to just
+    /// referencing the one already defined (`#footnote(<label>)`).
+    fn mark_emitted(&self, label: &str) -> bool {
+        self.emitted.borrow_mut().insert(label.to_string())
+    }
+}
 
 pub fn render_blocks_typst(
     store: &Store,
@@ -326,7 +362,7 @@ pub fn render_blocks_typst(
                 // A run is collapsed into ONE `#enum`/`#list` call, so a page break
                 // inside it has nowhere to go. End the run instead and let the outer
                 // loop emit the break and open a fresh list after it.
-                if b_is_listed && !(b.fmt_page_break_before == Some(true) && !items.is_empty()) {
+                if (items.is_empty() || b.fmt_page_break_before != Some(true)) && b_is_listed {
                     let inline = render_inline_typst(store, b, &image_paths, notes);
                     items.push(format!("[{inline}]"));
                     i += 1;
@@ -507,9 +543,25 @@ pub fn render_inline_typst(
             // raised marker. Not `#footnote[]`, which would print an empty note
             // at the foot of the page and number it — a note that says nothing
             // is worse than a marker pointing outward.
+            //
+            // A label that DOES have a body only gets `#footnote[…]` — which
+            // defines a new note and numbers it — on its FIRST citation. A
+            // repeat reuses that same note via Typst's own reference form,
+            // `#footnote(<label>)`, labeling the defining call so the second
+            // (and any later) citation has something to point at. See
+            // `TypstNotes::mark_emitted`'s doc for why a second `#footnote[…]`
+            // would be wrong. `safe_label_id` turns the note's (arbitrary)
+            // label into the identifier-only token Typst's `<…>` syntax needs.
             InlineContent::FootnoteRef { label } => {
                 match notes.get(label.as_str()) {
-                    Some(body) => out.push_str(&format!("#footnote[{body}]")),
+                    Some(body) => {
+                        let anchor = crate::footnotes::safe_label_id(label);
+                        if notes.mark_emitted(label) {
+                            out.push_str(&format!("#footnote[{body}] <{anchor}>"));
+                        } else {
+                            out.push_str(&format!("#footnote(<{anchor}>)"));
+                        }
+                    }
                     None => out.push_str(&format!("#super[{}]", escape_typst(label))),
                 }
                 continue;

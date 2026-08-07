@@ -47,6 +47,13 @@ pub struct ExportLatexUseCase {
     /// That inverts the arrangement DOCX and HTML use and is why this is
     /// pre-rendered rather than emitted where the definition sits.
     note_bodies: std::collections::HashMap<String, String>,
+    /// Labels that have already had their real `\footnote{…}` emitted this
+    /// export — so a **second** citation of the same label (`footnotes.rs`'s
+    /// own invariant: "a label referenced twice keeps one number — it is one
+    /// note") reuses that footnote instead of opening a second one under a
+    /// second, LaTeX-auto-numbered, duplicated-body footnote. `RefCell`
+    /// because `render_inline_latex` only holds `&self`.
+    footnoted_labels: std::cell::RefCell<std::collections::HashSet<String>>,
 }
 
 impl ExportLatexUseCase {
@@ -55,6 +62,7 @@ impl ExportLatexUseCase {
             uow_factory,
             omit_images: false,
             note_bodies: std::collections::HashMap::new(),
+            footnoted_labels: std::cell::RefCell::new(std::collections::HashSet::new()),
         }
     }
 
@@ -109,6 +117,7 @@ impl ExportLatexUseCase {
         // back to a bare `\footnotemark` instead of recursing — LaTeX has no
         // nested footnote anyway, and a stack overflow is a poor way to find out.
         self.note_bodies.clear();
+        self.footnoted_labels.borrow_mut().clear();
         let mut bodies = std::collections::HashMap::new();
         for (_, label, frame_id) in notes.in_print_order() {
             let body = self.render_frame_latex(&*uow, &frame_id, &cell_frame_ids)?;
@@ -499,9 +508,30 @@ impl ExportLatexUseCase {
                 // to `\footnotemark`, LaTeX's own primitive for a marker whose
                 // text is supplied elsewhere: it still auto-numbers, so the
                 // sequence a reader sees stays right.
+                //
+                // A **second** citation of a label that does have a body must
+                // not open a second `\footnote{…}`: LaTeX would auto-number that
+                // as a brand-new note, duplicating the text under two different
+                // numbers — exactly the "one note, one number" invariant
+                // `footnotes.rs` documents. So only the first sighting defines
+                // the footnote (and `\label`s it under a safe, collision-proof
+                // id — see `safe_label_id`); every later sighting reuses it via
+                // `\footnotemark[\getrefnumber{…}]`, the standard `hyperref`
+                // idiom for "the mark of a footnote defined elsewhere" (already
+                // a dependency here for `\href`, so this adds no new package).
                 InlineContent::FootnoteRef { label } => {
                     match self.note_bodies.get(label) {
-                        Some(body) => latex.push_str(&format!("\\footnote{{{body}}}")),
+                        Some(body) => {
+                            let anchor = crate::footnotes::safe_label_id(label);
+                            if self.footnoted_labels.borrow_mut().insert(label.clone()) {
+                                let body_with_label = format!("{body}\\label{{{anchor}}}");
+                                latex.push_str(&format!("\\footnote{{{body_with_label}}}"));
+                            } else {
+                                latex.push_str(&format!(
+                                    "\\footnotemark[\\getrefnumber{{{anchor}}}]"
+                                ));
+                            }
+                        }
                         None => latex.push_str("\\footnotemark{}"),
                     }
                     continue;
