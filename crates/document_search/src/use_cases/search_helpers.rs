@@ -45,9 +45,11 @@ pub fn build_full_text_via_store(blocks: &[Block], store: &Store) -> String {
 /// - With folding on, the query is not the matched text. `cafe` matches `café`; `strasse`
 ///   matches `straße`. A caller that echoed the query back would show the writer a word that
 ///   is not in their book.
-/// - The only other whole-document string a caller can reach is `to_plain_text`, which does
+/// - The whole-document string a caller reaches for first is `to_plain_text`, which does
 ///   not share this offset space — it carries no `U+FFFC` anchor for an embedded table, so
-///   slicing it with these offsets is wrong by two chars per preceding table.
+///   slicing it with these offsets is wrong by two chars per preceding table. (The string
+///   that *does* share it is served by `addressable_text_uc`, for the callers that need
+///   text and offsets to travel together.)
 ///
 /// The chars are collected **once** for the whole match list, not re-walked per match, which
 /// would be quadratic on a document where the query occurs often — exactly the document

@@ -347,9 +347,10 @@ pub struct FindMatch {
     /// Carried here so no caller ever slices it themselves — and with folding on, that is no
     /// longer a convenience. A search for `cafe` matches `café`; a search for `strasse`
     /// matches `straße`. The query is **not** the matched text, `length` is not the query's
-    /// length, and the only other whole-document string a caller can reach
+    /// length, and the whole-document string a caller reaches for first
     /// ([`TextDocument::to_plain_text`]) does not even use the same offset space — it drops
-    /// the `U+FFFC` anchor an embedded table occupies.
+    /// the `U+FFFC` anchor an embedded table occupies. (The string that does share this
+    /// offset space is [`TextDocument::to_addressable_text`].)
     pub matched_text: String,
 }
 

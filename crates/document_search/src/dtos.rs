@@ -44,13 +44,28 @@ pub struct FindAllResultDto {
     pub lengths: Vec<i64>,
     /// The matched **text** of each occurrence, sliced from the document's own search text.
     ///
-    /// Returned so a caller never has to slice it themselves. The only other whole-document
-    /// string available to them is `to_plain_text`, which is the human-readable view and does
+    /// Returned so a caller never has to slice it themselves. The tempting whole-document
+    /// string to slice instead is `to_plain_text`, which is the human-readable view and does
     /// **not** carry the `U+FFFC` anchor an embedded table occupies — so slicing that with
-    /// these offsets is wrong by two characters per preceding table.
+    /// these offsets is wrong by two characters per preceding table. (A caller that truly
+    /// needs the sliceable string can ask for [`AddressableTextResultDto`], which shares
+    /// this offset space.)
     pub matched_texts: Vec<String>,
     pub count: i64,
 }
+/// The document's **addressable text**: the exact string every document offset is an
+/// index into — `find_all`/`find_text` match positions, `replace_ranges` ranges, a
+/// block's `document_position`, a cursor or selection offset from an editor widget.
+///
+/// Built by the same code path `find_all` uses to build the text it searches
+/// (`build_full_text`), so the two cannot diverge. This is **not** the export view:
+/// an embedded table occupies its `U+FFFC` anchor here (one char plus its `\n`
+/// separator), exactly as the document holds it, where `to_plain_text` omits it.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+pub struct AddressableTextResultDto {
+    pub text: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct ReplaceTextDto {
     pub query: String,

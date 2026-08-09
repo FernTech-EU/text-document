@@ -3258,41 +3258,6 @@ mod djot_tests {
 /// document really holds there.
 pub const TABLE_ANCHOR: &str = "\u{FFFC}";
 
-/// The prose of a Djot document, with no entities, no store, and no threads.
-///
-/// [`parse_djot`] and [`ParsedElement::flatten_to_blocks`] were both already `pub`;
-/// nothing chained them. This does, and that is the whole trick: it stops at the
-/// *parse*, where a full import goes on to create a `Block` entity per paragraph, list
-/// item and table cell, mirror each into the rope, and write its format runs.
-///
-/// # Why a project-wide search needs this
-///
-/// A host app searching a manuscript must ask "does this scene contain that word" of
-/// **thousands** of Djot rows, on every keystroke. Doing that by importing each one into
-/// a document is not a slow feature, it is a frozen app.
-///
-/// And searching the Djot *source* instead — the tempting shortcut — is simply wrong:
-/// the source is markup. `http` matches inside a link's URL, `*` matches an emphasis
-/// marker, and an occurrence count taken from the source does not agree with what a
-/// replace re-derives inside the parsed document. Where a replace guards itself with
-/// "the text moved under me, skip this field", a count taken from markup makes that
-/// guard fire on perfectly good rows.
-///
-/// # The contract
-///
-/// The result is **byte-identical to the text the document searches** for the same Djot:
-/// each block's spans concatenated, blocks joined by a single `\n`, and a table announced
-/// by its [`TABLE_ANCHOR`] sentinel — exactly the string the import mirrors into the rope
-/// and that `build_full_text_via_store` recomposes. So an offset found here is an offset
-/// the document agrees with.
-///
-/// A property in `djot_roundtrip_tests` pins that across the whole generated feature set;
-/// without it this would be a second, silently-diverging definition of "the text".
-///
-/// ⚠ It is **not** the same as `TextDocument::to_plain_text()`, which walks frames and
-/// therefore orders a blockquote's prose differently (`"> a0\n\na"` exports as `"a\na0"`
-/// but is *searched* as `"a0\na"`). The authority is what a search sees, because that is
-/// what a replace edits. See `claude_reviews/text-document-plain-text-ordering.md`.
 /// One span's contribution to the addressable text.
 ///
 /// An inline object carries no prose but **does** occupy one `U+FFFC` in the
@@ -3324,6 +3289,54 @@ fn cell_prose(cell: &ParsedTableCell) -> String {
     prose
 }
 
+/// The prose of a Djot document, with no entities, no store, and no threads.
+///
+/// [`parse_djot`] and [`ParsedElement::flatten_to_blocks`] were both already `pub`;
+/// nothing chained them. This does, and that is the whole trick: it stops at the
+/// *parse*, where a full import goes on to create a `Block` entity per paragraph, list
+/// item and table cell, mirror each into the rope, and write its format runs.
+///
+/// # Why a project-wide search needs this
+///
+/// A host app searching a manuscript must ask "does this scene contain that word" of
+/// **thousands** of Djot rows, on every keystroke. Doing that by importing each one into
+/// a document is not a slow feature, it is a frozen app.
+///
+/// And searching the Djot *source* instead — the tempting shortcut — is simply wrong:
+/// the source is markup. `http` matches inside a link's URL, `*` matches an emphasis
+/// marker, and an occurrence count taken from the source does not agree with what a
+/// replace re-derives inside the parsed document. Where a replace guards itself with
+/// "the text moved under me, skip this field", a count taken from markup makes that
+/// guard fire on perfectly good rows.
+///
+/// # The contract
+///
+/// The result is **byte-identical to the text the document searches** for the same Djot:
+/// each block's spans concatenated, blocks joined by a single `\n`, and a table announced
+/// by its [`TABLE_ANCHOR`] sentinel — exactly the string the import mirrors into the rope
+/// and that `build_full_text_via_store` recomposes. So an offset found here is an offset
+/// the document agrees with. On a live document the same string is served by
+/// `TextDocument::to_addressable_text()`, which reads it off the search plumbing itself.
+///
+/// A property in `djot_roundtrip_tests` pins that across the whole generated feature set;
+/// without it this would be a second, silently-diverging definition of "the text".
+///
+/// **Known exception: a footnote *definition*'s body.** This function treats it as out of
+/// flow and omits it — matching `character_count()`, which does not count it — but the
+/// live document mirrors its blocks into the rope, so today an in-document search DOES
+/// run over the note's body and `to_addressable_text()` includes it. On a document with
+/// footnote definitions the two strings differ by exactly those bodies; which side is
+/// wrong is an open product question (should search see notes?), pinned as current
+/// behaviour in `addressable_text_tests::footnote_bodies_are_searched_in_the_live_document`.
+///
+/// ⚠ It is **not** the same as `TextDocument::to_plain_text()`. That is the human-readable
+/// *export* — same prose, same order, but with every object anchor omitted, so its offsets
+/// drift by two characters per preceding table. The authority is what a search sees,
+/// because that is what a replace edits.
+/// (`to_plain_text` once also *ordered* a blockquote's prose differently; that was a bug,
+/// fixed and pinned by `plain_text_order_tests` — see
+/// `claude_reviews/text-document-plain-text-ordering.md`. The anchors are now the two
+/// views' only difference.)
 pub fn djot_to_plain_text(djot: &str, options: &DjotImportOptions) -> String {
     // Deliberately NOT `ParsedElement::flatten_to_blocks`: that helper drops a table's
     // anchor and yields only its cells, which would silently shift every offset in a

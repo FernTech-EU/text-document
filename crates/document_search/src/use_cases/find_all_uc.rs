@@ -24,7 +24,12 @@ pub trait FindAllUnitOfWorkFactoryTrait: Send + Sync {
 pub trait FindAllUnitOfWorkTrait: QueryUnitOfWork {}
 
 /// Fetch all blocks from the document via the UoW, sort them, and build the full text.
-fn build_full_text(uow: &dyn FindAllUnitOfWorkTrait) -> Result<String> {
+///
+/// `pub(crate)` on purpose: `addressable_text_uc` exposes this very string to the public
+/// API, and it does so by calling **this function through this UoW type** rather than by
+/// reimplementing the walk — so "the text a search runs against" and "the text a caller
+/// can ask the document for" are one definition, not two that agree today.
+pub(crate) fn build_full_text(uow: &dyn FindAllUnitOfWorkTrait) -> Result<String> {
     let root = uow
         .get_root(&ROOT_ENTITY_ID)?
         .ok_or_else(|| anyhow!("Root entity not found"))?;

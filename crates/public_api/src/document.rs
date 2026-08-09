@@ -201,10 +201,11 @@ impl TextDocument {
     /// **Do not compute offsets from this string.** It is deliberately not
     /// character-for-character the text a search runs against: that text carries the object
     /// anchors, so a position taken here is short by two characters per preceding table. For
-    /// an addressable view — one whose offsets [`find_all`](Self::find_all) and
-    /// [`replace_text`](Self::replace_text) agree with — use
-    /// [`djot_to_plain_text`](crate::djot_to_plain_text), which is pinned to match the
-    /// document's own search text exactly.
+    /// an addressable view — one whose offsets [`find_all`](Self::find_all),
+    /// [`replace_text`](Self::replace_text), a block's
+    /// [`position()`](crate::TextBlock::position) and a cursor all agree with — use
+    /// [`to_addressable_text`](Self::to_addressable_text) on a live document, or
+    /// [`djot_to_plain_text`](crate::djot_to_plain_text) when all you hold is Djot source.
     ///
     /// The two are allowed to differ in that one respect and no other; in particular they
     /// agree on **order**. They did not always: this export used to hoist every blockquote's
@@ -221,11 +222,11 @@ impl TextDocument {
     /// quotation still reads as set-off matter in a format with no markup to say so.
     ///
     /// **Not** interchangeable with [`to_plain_text`](Self::to_plain_text), and not cached.
-    /// That one is pinned character-for-character to the document's addressable text — the
-    /// text [`find_all`](Self::find_all) and [`replace_text`](Self::replace_text) compute
-    /// offsets against — so indenting it would shift every offset inside a quote and
-    /// desynchronise search from the document. Use this only for output nobody addresses
-    /// back into the document.
+    /// That one is pinned to the document's addressable text — the text
+    /// [`find_all`](Self::find_all) and [`replace_text`](Self::replace_text) compute
+    /// offsets against — in everything but the object anchors, so indenting it would shift
+    /// every offset inside a quote and desynchronise search from the document. Use this
+    /// only for output nobody addresses back into the document.
     pub fn to_plain_text_indented(&self) -> Result<String> {
         let inner = self.inner.lock();
         let dto = document_io_commands::export_plain_text_indented(&inner.ctx)?;
@@ -243,6 +244,34 @@ impl TextDocument {
         let inner = self.inner.lock();
         let dto = document_io_commands::export_plain_text_with(&inner.ctx, options)?;
         Ok(dto.plain_text)
+    }
+
+    /// The document's **addressable text**: the exact string every offset this document
+    /// deals out is an index into.
+    ///
+    /// One char space runs through the whole API — [`find_all`](Self::find_all) match
+    /// positions, [`replace_ranges`](Self::replace_ranges) ranges, a block's
+    /// [`position()`](crate::TextBlock::position), a cursor, an editor widget's selection.
+    /// This is the string that space addresses, character for character: an embedded
+    /// table occupies its `U+FFFC` [`TABLE_ANCHOR`](crate::TABLE_ANCHOR) here (plus its
+    /// `\n` separator), exactly as the document holds it.
+    ///
+    /// Use it whenever a document offset and a document string travel together — capturing
+    /// the quoted text under a selection, pairing block starts with the text they index,
+    /// slicing context around a search hit. Pairing an offset with
+    /// [`to_plain_text`](Self::to_plain_text) instead is the classic form of this bug: that
+    /// is the human-readable **export**, it omits the anchors, and every offset after a
+    /// table lands two characters off in it.
+    ///
+    /// Built by the same code path [`find_all`](Self::find_all) uses to build the text it
+    /// searches, so the two cannot diverge. For the same view of bare Djot source — no live
+    /// document at hand — use [`djot_to_plain_text`](crate::djot_to_plain_text), which is
+    /// pinned to produce this very string for the same content. Not cached; it is a fresh
+    /// read of the document each call.
+    pub fn to_addressable_text(&self) -> Result<String> {
+        let inner = self.inner.lock();
+        let dto = document_search_commands::addressable_text(&inner.ctx)?;
+        Ok(dto.text)
     }
 
     /// Replace the entire document with Markdown. Clears undo history.
