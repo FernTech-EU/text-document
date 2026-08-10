@@ -1008,7 +1008,7 @@ pub(crate) fn merge_highlight_spans(
                         // that synthetic NodeIds for highlighted
                         // sub-runs collide unless the caller further
                         // disambiguates.
-                        // The bastyde-widgets layer handles that by
+                        // The teksilo-widgets layer handles that by
                         // mixing the `offset` into the synthetic-id
                         // hash alongside `element_id`.
                         element_id,

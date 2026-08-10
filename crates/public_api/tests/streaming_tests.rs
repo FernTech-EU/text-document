@@ -653,7 +653,7 @@ fn truncation_reports_a_front_removal() {
 // ── on_change delivery ──────────────────────────────────────────
 
 /// Streaming appends must reach `on_change` subscribers, not only the
-/// `poll_events` path — a reactive view (the `LogView` in Bastyde) drives its
+/// `poll_events` path — a reactive view (the `LogView` in Teksilo) drives its
 /// updates off a callback, and before the dispatch was wired it saw nothing at
 /// all while `block_count()` grew underneath it.
 #[test]

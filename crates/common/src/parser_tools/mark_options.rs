@@ -80,6 +80,12 @@ pub struct DocumentMark {
     ///
     /// The producer knows the intended order and nothing else can recover it, so the producer
     /// says: set this from the same sequence the comments are built in.
+    ///
+    /// `#[serde(default)]` because this field was added after the type shipped: a payload
+    /// serialized before it exists has no `ordinal`, and reading it back must give 0 rather
+    /// than fail. The default is also the correct answer for such a payload — it was written
+    /// by a producer that stated no order.
+    #[serde(default)]
     pub ordinal: u32,
 }
 
@@ -320,6 +326,20 @@ mod tests {
             .map(|m| m.name.as_str())
             .collect();
         assert_eq!(order, vec!["zzz_first", "aaa_second"]);
+    }
+
+    /// A payload written before `ordinal` existed still reads back.
+    ///
+    /// The field was added to a type that had already shipped in a public crate, so a stored
+    /// payload has no `ordinal` key. Without `#[serde(default)]` that is a hard
+    /// `missing field` error rather than the 0 it should be.
+    #[test]
+    fn a_mark_serialized_before_the_ordinal_existed_still_deserializes() {
+        let old = r#"{"start":4,"end":9,"name":"skrb_c0000000000000001"}"#;
+        let mark: DocumentMark = serde_json::from_str(old).expect("an older payload still reads");
+        assert_eq!(mark.ordinal, 0);
+        assert_eq!(mark.start, 4);
+        assert_eq!(mark.name, "skrb_c0000000000000001");
     }
 
     /// With no ordinal stated, the name still decides — so a producer that never emits two
