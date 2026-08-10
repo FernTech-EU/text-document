@@ -1090,6 +1090,102 @@ pub fn merge_runs_and_anchors<'a>(
     out
 }
 
+/// [`InlinePiece`], but positioned in the document's own **addressable character space**
+/// rather than as byte offsets local to the block's `plain_text`.
+///
+/// `InlinePiece::Text { start, end, .. }` is a byte range good for slicing `plain_text` and
+/// nothing else: it carries no notion of where in the *document* that range sits. Every
+/// offset the rest of this crate deals out — `TextDocument::to_addressable_text()`, `find_all`
+/// match positions, a block's own `document_position` — lives in one **character** space, and
+/// a caller that reconstructs a document position by summing `InlinePiece` text lengths drifts
+/// the moment a block holds a multi-byte character before the point in question, or an inline
+/// image/footnote reference at all — their `U+FFFC` sentinel is three bytes but one char (see
+/// [`sentinel_len`]). That is the same "offset from one space, string from another" bug class
+/// the public API's `TextDocument::to_addressable_text()` exists to close for whole-document
+/// offsets (see its doc comment), one level down, inside a single block.
+///
+/// Built by [`addressable_inline_pieces`] (pure — block-local character space, `base_char_offset`
+/// left at `0`) or [`crate::format_runs_query::addressable_inline_pieces_for_block`]
+/// (store-aware — adds the block's own `document_position` so `start`/`end` land in the
+/// *document's* space). Every downstream consumer that needs a piece boundary in that space —
+/// a comment's stored quote, a DOCX/ODT comment marker split at an arbitrary character — reads
+/// `start`/`end` straight off this type instead of re-deriving them by hand.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AddressableInlinePiece {
+    /// `[start, end)` in the addressable character space. `end - start` is always `1` for
+    /// [`InlineContent::Image`] and [`InlineContent::FootnoteRef`] — the sentinel counts as
+    /// exactly one character, matching how the document itself counts it — and equals the
+    /// piece's own text's `chars().count()` for [`InlineContent::Text`].
+    pub start: u32,
+    pub end: u32,
+    pub content: InlineContent,
+    pub format: CharacterFormat,
+}
+
+/// Build a block's [`AddressableInlinePiece`]s from its `plain_text`, format runs, and
+/// anchors, offset by `base_char_offset` — the character position this block's own first
+/// piece should start at.
+///
+/// Layered on [`merge_runs_and_anchors`] rather than duplicating its weave: the only thing
+/// added here is the byte→char conversion (`plain_text[start..end].chars().count()` is the
+/// only correct way to size a UTF-8 slice in the character space every other offset in this
+/// crate uses — NOT `end - start`, which is a byte count) and a running `base_char_offset`
+/// accumulator. Pass `0` to get offsets relative to this block alone, which is what this
+/// module's own tests do; [`crate::format_runs_query::addressable_inline_pieces_for_block`]
+/// passes the block's own `document_position` instead, to land in document-wide space.
+pub fn addressable_inline_pieces(
+    plain_text: &str,
+    runs: &[FormatRun],
+    anchors: &[BlockAnchor<'_>],
+    base_char_offset: u32,
+) -> Vec<AddressableInlinePiece> {
+    let pieces = merge_runs_and_anchors(plain_text, runs, anchors);
+    let mut out = Vec::with_capacity(pieces.len());
+    let mut cursor = base_char_offset;
+    for piece in pieces {
+        match piece {
+            InlinePiece::Text { start, end, format } => {
+                let text = &plain_text[start as usize..end as usize];
+                let len = text.chars().count() as u32;
+                out.push(AddressableInlinePiece {
+                    start: cursor,
+                    end: cursor + len,
+                    content: InlineContent::Text(text.to_string()),
+                    format: format.cloned().unwrap_or_default(),
+                });
+                cursor += len;
+            }
+            InlinePiece::Image(anchor) => {
+                out.push(AddressableInlinePiece {
+                    start: cursor,
+                    end: cursor + 1,
+                    content: InlineContent::Image {
+                        name: anchor.name.clone(),
+                        alt: anchor.alt.clone(),
+                        width: anchor.width,
+                        height: anchor.height,
+                        quality: anchor.quality,
+                    },
+                    format: anchor.format.clone(),
+                });
+                cursor += 1;
+            }
+            InlinePiece::FootnoteRef(anchor) => {
+                out.push(AddressableInlinePiece {
+                    start: cursor,
+                    end: cursor + 1,
+                    content: InlineContent::FootnoteRef {
+                        label: anchor.label.clone(),
+                    },
+                    format: anchor.format.clone(),
+                });
+                cursor += 1;
+            }
+        }
+    }
+    out
+}
+
 /// Synthesize a `Vec<InlineSegment>` view of a block from its
 /// `plain_text`, `format_runs`, and `block_images`. Returns segments
 /// in document order: a Text segment per format run (with a fallback
@@ -1391,6 +1487,126 @@ mod tests {
             _ => None,
         });
         assert_eq!(alt.as_deref(), Some("a black cat"));
+    }
+
+    // ── addressable_inline_pieces ───────────────────────────────────────
+
+    /// Render an `addressable_inline_pieces` result as `(start, end, label)` triples, so a
+    /// failing assertion shows the whole span list at once instead of one field at a time.
+    fn pieces_shape(out: &[AddressableInlinePiece]) -> Vec<(u32, u32, String)> {
+        out.iter()
+            .map(|p| {
+                let label = match &p.content {
+                    InlineContent::Text(t) => t.clone(),
+                    InlineContent::Image { name, .. } => format!("[{name}]"),
+                    InlineContent::FootnoteRef { label } => format!("^{label}^"),
+                    InlineContent::Empty => String::new(),
+                };
+                (p.start, p.end, label)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_lone_text_piece_spans_its_char_length() {
+        let out = addressable_inline_pieces("hello", &[], &[], 0);
+        assert_eq!(pieces_shape(&out), vec![(0, 5, "hello".to_string())]);
+    }
+
+    #[test]
+    fn base_char_offset_shifts_every_piece_by_the_same_amount() {
+        let out = addressable_inline_pieces("hello", &[], &[], 100);
+        assert_eq!(pieces_shape(&out), vec![(100, 105, "hello".to_string())]);
+    }
+
+    /// The regression this type exists to prevent: a multi-byte character before an anchor
+    /// must not leak its extra BYTE into the anchor's CHAR position. "café" is 5 bytes (é is
+    /// 2 bytes in UTF-8) but 4 chars — code that summed byte lengths instead of counting
+    /// chars would place the image at char 5, one past where it actually sits, and every
+    /// offset after it would carry the same one-character drift.
+    #[test]
+    fn a_multibyte_character_before_an_image_does_not_leak_its_extra_byte_into_the_char_position() {
+        let text = "café";
+        assert_eq!(text.len(), 5, "test assumes café is 5 bytes");
+        assert_eq!(text.chars().count(), 4, "test assumes café is 4 chars");
+        let images = [anchor(5, "pic")]; // byte_offset 5 == right after "café"'s 5 bytes
+        let anchors = block_anchors(&images, &[]);
+        let out = addressable_inline_pieces(text, &[], &anchors, 0);
+        assert_eq!(
+            pieces_shape(&out),
+            vec![(0, 4, "café".to_string()), (4, 5, "[pic]".to_string())]
+        );
+    }
+
+    /// An image sitting inside a formatted run gets its own one-char span, and the text
+    /// before/after it still lands at the right char offsets — the boundary this milestone's
+    /// comment-export use case cares about most: "a comment boundary landing immediately
+    /// after an inline image."
+    #[test]
+    fn an_image_mid_run_gets_a_one_char_span_and_the_trailing_text_resumes_right_after_it() {
+        let text = "abcdef";
+        let runs = [run(0, 6, true)];
+        let images = [anchor(3, "img")];
+        let anchors = block_anchors(&images, &[]);
+        let out = addressable_inline_pieces(text, &runs, &anchors, 0);
+        assert_eq!(
+            pieces_shape(&out),
+            vec![
+                (0, 3, "abc".to_string()),
+                (3, 4, "[img]".to_string()),
+                (4, 7, "def".to_string()),
+            ]
+        );
+    }
+
+    /// A footnote reference gets a one-char span exactly like an image — the boundary
+    /// case "a comment boundary landing immediately after a footnote reference."
+    #[test]
+    fn a_footnote_reference_gets_a_one_char_span_too() {
+        let text = "abcdef";
+        let notes = [fn_anchor(3, "n1")];
+        let anchors = block_anchors(&[], &notes);
+        let out = addressable_inline_pieces(text, &[], &anchors, 0);
+        assert_eq!(
+            pieces_shape(&out),
+            vec![
+                (0, 3, "abc".to_string()),
+                (3, 4, "^n1^".to_string()),
+                (4, 7, "def".to_string()),
+            ]
+        );
+    }
+
+    /// Whatever the arrangement of runs and anchors, the pieces must tile the block's char
+    /// space with no gap, no overlap, and no dropped anchor — the char-space analogue of
+    /// `every_byte_is_emitted_exactly_once_and_in_order` above.
+    #[test]
+    fn pieces_are_contiguous_in_char_space_with_no_gaps_or_overlaps() {
+        let text = "abcdefghij";
+        let arrangements: [(&[FormatRun], &[ImageAnchor]); 4] = [
+            (&[], &[]),
+            (&[run(0, 10, true)], &[anchor(5, "m")]),
+            (&[run(2, 5, true), run(5, 8, false)], &[anchor(5, "m")]),
+            (&[run(1, 4, true), run(4, 9, false)], &[anchor(9, "c")]),
+        ];
+        for (i, (runs, images)) in arrangements.iter().enumerate() {
+            let anchors = block_anchors(images, &[]);
+            let out = addressable_inline_pieces(text, runs, &anchors, 7);
+            let mut cursor = 7u32;
+            for piece in &out {
+                assert_eq!(piece.start, cursor, "arrangement {i}: gap or overlap");
+                assert!(piece.start < piece.end, "arrangement {i}: empty piece");
+                cursor = piece.end;
+            }
+            // Each anchor is a logical character with no bytes of its own in `text`, so
+            // it adds one char beyond `text`'s own count — same accounting `block_char_length`
+            // uses for a real (sentinel-bearing) block, just without a sentinel to count here.
+            assert_eq!(
+                cursor,
+                7 + text.chars().count() as u32 + images.len() as u32,
+                "arrangement {i}: did not tile the whole block"
+            );
+        }
     }
 
     #[test]

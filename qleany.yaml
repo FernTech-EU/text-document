@@ -1327,6 +1327,18 @@ features:
             - name: djot_text
               type: string
 
+      # NOTE (M-T3): `ExportLatexDto` no longer has flat `document_class`/`include_preamble`
+      # fields in the generated code — they, plus a hand-added `omit_images: bool` that was
+      # never declared here, were folded into one hand-maintained
+      # `options: common::parser_tools::LatexExportOptions` field, matching
+      # `ExportDocxDto.options`/`ExportEpubDto.options`/`ExportOdtDto.options`/
+      # `ExportPdfDto.options`. `LatexExportOptions` cannot be declared here — same reason as
+      # `replace_text`'s `format_policy` above: this manifest only expresses scalars and lists of
+      # scalars, not struct fields. The two scalar fields below are kept as historical
+      # documentation of what this use case takes as input; if this section is regenerated, drop
+      # them from the emitted `ExportLatexDto` and re-add `options` by hand instead — keeping
+      # both would fork the DTO's shape from what the use case/controller/frontend/public_api
+      # actually read.
       - name: export_latex
         undoable: false
         read_only: true

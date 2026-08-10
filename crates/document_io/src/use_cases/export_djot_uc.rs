@@ -9,6 +9,12 @@ use common::entities::{
 };
 use common::format_runs::{InlineContent, InlineSegment};
 use common::parser_tools::DjotExportOptions;
+// The single definition of both, shared with anything else converting plain text to Djot
+// (a host app promoting a stored plain-text field, for one). Kept as aliases so this
+// exporter's call sites read as they always did, while there is only one escaper to be
+// wrong about the awkward strings.
+use common::parser_tools::escape_djot_inline as escape_djot;
+use common::parser_tools::guard_djot_block_start as guard_block_start;
 use common::types::{EntityId, ROOT_ENTITY_ID};
 use std::collections::HashSet;
 
@@ -771,50 +777,6 @@ fn prepend_block_attrs(attr_line: &str, quote_prefix: &str, body: String) -> Str
 fn djot_attr_value(value: &str) -> String {
     let escaped = value.replace('\\', "\\\\").replace('"', "\\\"");
     format!("\"{escaped}\"")
-}
-
-/// Backslash-escape every character that can trigger djot *inline* markup, so
-/// arbitrary text survives a re-parse verbatim. jotdown turns `\x` into an
-/// `Escape` event followed by the literal char, so over-escaping is always
-/// round-trip-safe. Block-start markers (`#`, `>`, `-`, …) are handled
-/// separately by [`guard_block_start`], which only fires at the start of a
-/// paragraph line.
-fn escape_djot(s: &str) -> String {
-    let mut result = String::with_capacity(s.len());
-    for c in s.chars() {
-        match c {
-            '\\' | '*' | '_' | '`' | '~' | '^' | '[' | ']' | '(' | ')' | '{' | '}' | '|' | '<' => {
-                result.push('\\');
-                result.push(c);
-            }
-            _ => result.push(c),
-        }
-    }
-    result
-}
-
-/// Neutralise a paragraph's leading characters so they are not parsed as a
-/// block-construct marker once placed at the start of a line. Inline-format
-/// specials are already escaped by [`escape_djot`]; this covers the remaining
-/// block-only markers (`#`, `>`, `-`, `+`, `:`) and the ordered-list form
-/// `<digits>.`/`<digits>)`.
-fn guard_block_start(s: &str) -> String {
-    let Some(first) = s.chars().next() else {
-        return s.to_string();
-    };
-    if matches!(first, '#' | '>' | '-' | '+' | ':') {
-        return format!("\\{s}");
-    }
-    if first.is_ascii_digit() {
-        let rest = s.trim_start_matches(|c: char| c.is_ascii_digit());
-        if rest.starts_with('.') || rest.starts_with(')') {
-            let digits_len = s.len() - rest.len();
-            // Escape the delimiter (`.`/`)`), which is a valid djot escape,
-            // rather than the digit (backslash before a digit is literal).
-            return format!("{}\\{}", &s[..digits_len], &s[digits_len..]);
-        }
-    }
-    s.to_string()
 }
 
 /// Bullet character for an unordered/task list style (inverse of the importer's

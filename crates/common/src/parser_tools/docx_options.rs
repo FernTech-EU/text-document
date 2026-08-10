@@ -143,6 +143,16 @@ pub struct DocxExportOptions {
     /// [`PdfExportOptions::font_bytes`]: super::pdf_options::PdfExportOptions::font_bytes
     #[serde(default)]
     pub images: super::image_options::ExportImages,
+    /// Comment threads to anchor into the exported `.docx` as real, native Word comments
+    /// (`w:commentRangeStart`/`w:commentRangeEnd` around the anchored text, `w15:done` for a
+    /// resolved thread, replies threaded via `w15:paraIdParent`). Empty ⇒ no comments are
+    /// written, matching plain `to_docx`.
+    ///
+    /// Ranges are in the document's addressable character space — see
+    /// [`super::comment_options::DocumentComment`]'s doc comment for what that means and why
+    /// it is not the same space `FormatRun` byte offsets live in.
+    #[serde(default)]
+    pub comments: super::comment_options::DocumentComments,
 }
 
 impl DocxExportOptions {

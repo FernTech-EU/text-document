@@ -6,10 +6,10 @@ use crate::app_context::AppContext;
 use anyhow::{Context, Result};
 use document_io::{
     ExportDjotDto, ExportDocxDto, ExportDocxResultDto, ExportEpubDto, ExportEpubResultDto,
-    ExportHtmlDto, ExportLatexDto, ExportLatexResultDto, ExportMarkdownDto, ExportPdfDto,
-    ExportPdfResultDto, ExportPlainTextDto, ImportDjotDto, ImportDjotResultDto, ImportHtmlDto,
-    ImportHtmlResultDto, ImportMarkdownDto, ImportMarkdownResultDto, ImportPlainTextDto,
-    document_io_controller,
+    ExportHtmlDto, ExportLatexDto, ExportLatexResultDto, ExportMarkdownDto, ExportOdtDto,
+    ExportOdtResultDto, ExportPdfDto, ExportPdfResultDto, ExportPlainTextDto, ImportDjotDto,
+    ImportDjotResultDto, ImportHtmlDto, ImportHtmlResultDto, ImportMarkdownDto,
+    ImportMarkdownResultDto, ImportPlainTextDto, document_io_controller,
 };
 
 use common::long_operation::OperationProgress;
@@ -240,6 +240,34 @@ pub fn get_export_epub_result(
 ) -> Result<Option<ExportEpubResultDto>> {
     document_io_controller::get_export_epub_result(&ctx.long_operation_manager.lock(), operation_id)
         .context("getting export_epub result")
+}
+
+/// export_odt (long operation)
+pub fn export_odt(ctx: &AppContext, dto: &ExportOdtDto) -> Result<String> {
+    document_io_controller::export_odt(
+        &ctx.db_context,
+        &ctx.event_hub,
+        &mut ctx.long_operation_manager.lock(),
+        dto,
+    )
+    .context("export_odt")
+}
+
+/// Get the progress of a export_odt operation
+pub fn get_export_odt_progress(ctx: &AppContext, operation_id: &str) -> Option<OperationProgress> {
+    document_io_controller::get_export_odt_progress(
+        &ctx.long_operation_manager.lock(),
+        operation_id,
+    )
+}
+
+/// Get the result of a export_odt operation
+pub fn get_export_odt_result(
+    ctx: &AppContext,
+    operation_id: &str,
+) -> Result<Option<ExportOdtResultDto>> {
+    document_io_controller::get_export_odt_result(&ctx.long_operation_manager.lock(), operation_id)
+        .context("getting export_odt result")
 }
 
 /// export_pdf (long operation).

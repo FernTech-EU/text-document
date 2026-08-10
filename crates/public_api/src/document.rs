@@ -26,7 +26,7 @@ use crate::flow::FormatChangeKind;
 use crate::inner::TextDocumentInner;
 use crate::operation::{
     DjotImportResult, DocxExportResult, EpubExportResult, HtmlImportResult, MarkdownImportResult,
-    Operation, PdfExportResult,
+    OdtExportResult, Operation, PdfExportResult,
 };
 use crate::{BlockFormat, BlockInfo, DocumentStats, FindMatch, FindOptions, ReplaceRange};
 
@@ -476,22 +476,20 @@ impl TextDocument {
     /// [`to_latex_with_options`](Self::to_latex_with_options) to drop them
     /// instead.
     pub fn to_latex(&self, document_class: &str, include_preamble: bool) -> Result<String> {
-        self.to_latex_with_options(document_class, include_preamble, false)
-    }
-
-    /// [`to_latex`](Self::to_latex), with the choice of dropping inline images.
-    pub fn to_latex_with_options(
-        &self,
-        document_class: &str,
-        include_preamble: bool,
-        omit_images: bool,
-    ) -> Result<String> {
-        let inner = self.inner.lock();
-        let dto = frontend::document_io::ExportLatexDto {
+        self.to_latex_with_options(crate::LatexExportOptions {
             document_class: document_class.into(),
             include_preamble,
-            omit_images,
-        };
+            omit_images: false,
+        })
+    }
+
+    /// As [`to_latex`](Self::to_latex), but taking the full
+    /// [`LatexExportOptions`](crate::LatexExportOptions) — the same document class and preamble
+    /// knobs `to_latex` takes positionally, plus the choice of dropping inline images instead of
+    /// emitting `\includegraphics{…}` for them.
+    pub fn to_latex_with_options(&self, options: crate::LatexExportOptions) -> Result<String> {
+        let inner = self.inner.lock();
+        let dto = frontend::document_io::ExportLatexDto { options };
         let result = document_io_commands::export_latex(&inner.ctx, &dto)?;
         Ok(result.latex_text)
     }
@@ -568,6 +566,45 @@ impl TextDocument {
                         Ok(EpubExportResult {
                             file_path: r.file_path,
                             chapter_count: to_usize(r.chapter_count),
+                        })
+                    })
+            }),
+        ))
+    }
+
+    /// Export the entire document as ODT (OpenDocument Text) to a file path.
+    ///
+    /// This is a **long operation**. Returns a typed [`Operation`] handle.
+    pub fn to_odt(&self, output_path: &str) -> Result<Operation<OdtExportResult>> {
+        self.to_odt_with_options(output_path, crate::OdtExportOptions::default())
+    }
+
+    /// As [`to_odt`](Self::to_odt), but with page geometry + base typography overrides — the ODT
+    /// analog of [`to_docx_with_options`](Self::to_docx_with_options), same units and same
+    /// per-block-RTL-is-automatic behaviour (see [`OdtExportOptions`](crate::OdtExportOptions)'s
+    /// own doc comment).
+    pub fn to_odt_with_options(
+        &self,
+        output_path: &str,
+        options: crate::OdtExportOptions,
+    ) -> Result<Operation<OdtExportResult>> {
+        let inner = self.inner.lock();
+        let dto = frontend::document_io::ExportOdtDto {
+            output_path: output_path.into(),
+            options,
+        };
+        let op_id = document_io_commands::export_odt(&inner.ctx, &dto)?;
+        Ok(Operation::new(
+            op_id,
+            &inner.ctx,
+            Box::new(|ctx, id| {
+                document_io_commands::get_export_odt_result(ctx, id)
+                    .ok()
+                    .flatten()
+                    .map(|r| {
+                        Ok(OdtExportResult {
+                            file_path: r.file_path,
+                            paragraph_count: to_usize(r.paragraph_count),
                         })
                     })
             }),

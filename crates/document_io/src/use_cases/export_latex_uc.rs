@@ -33,7 +33,7 @@ pub trait ExportLatexUnitOfWorkTrait: QueryUnitOfWork {}
 
 pub struct ExportLatexUseCase {
     uow_factory: Box<dyn ExportLatexUnitOfWorkFactoryTrait>,
-    /// Copied off the DTO at the top of `execute`, because the inline renderer
+    /// Copied off `dto.options` at the top of `execute`, because the inline renderer
     /// that needs it sits four calls down a walk that threads only the uow and
     /// the block. Mirrors `ExportMarkdownUseCase::options`, which holds its
     /// export settings as a field for the same reason.
@@ -67,7 +67,7 @@ impl ExportLatexUseCase {
     }
 
     pub fn execute(&mut self, dto: &ExportLatexDto) -> Result<ExportLatexResultDto> {
-        self.omit_images = dto.omit_images;
+        self.omit_images = dto.options.omit_images;
         let uow = self.uow_factory.create();
         uow.begin_transaction()?;
 
@@ -155,11 +155,11 @@ impl ExportLatexUseCase {
 
         let body = body_parts.join("\n\n");
 
-        let latex_text = if dto.include_preamble {
-            let doc_class = if dto.document_class.is_empty() {
+        let latex_text = if dto.options.include_preamble {
+            let doc_class = if dto.options.document_class.is_empty() {
                 "article"
             } else {
-                &dto.document_class
+                &dto.options.document_class
             };
             // `secnumdepth = -1` turns off LaTeX's own section numbering.
             //

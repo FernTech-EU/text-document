@@ -3,15 +3,16 @@ use crate::ExportDocxDto;
 use crate::ExportDocxResultDto;
 use anyhow::{Result, anyhow};
 use common::database::QueryUnitOfWork;
-use common::database::rope_helpers::block_content_via_store;
+use common::database::rope_helpers::{block_content_via_store, block_document_position};
 use common::entities::{
     Alignment, Block, Document, Frame, List, ListStyle, MarkerType, Root, SemanticRole, Table,
     TableCell,
 };
 use common::format_runs::{InlineContent, InlineSegment};
 use common::long_operation::LongOperation;
-use common::parser_tools::ExportImages;
+use common::parser_tools::{DocumentComments, ExportImages};
 use common::types::{EntityId, ROOT_ENTITY_ID};
+use regex::Regex;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -77,6 +78,492 @@ impl<'a> FootnoteRefState<'a> {
     }
 }
 
+// ── Comment ranges (M-T1) ────────────────────────────────────────────────────────────
+//
+// A `common::parser_tools::DocumentComment` carries a character range in the document's
+// addressable space plus a flat list of replies. Turning that into real DOCX comments takes
+// three separate pieces of machinery:
+//
+//  1. `prepare_comments` resolves every thread (root + each reply, since a reply anchors to
+//     the exact same range as the comment it answers — see `DocumentComment`'s own doc
+//     comment) into a `PreparedComment`: a docx-rs numeric id, a deterministic paragraph id
+//     for its one-paragraph body, and the built `docx_rs::Comment` itself.
+//  2. `CommentEmitState` (built from that list) is threaded through the block-rendering walk
+//     so `render_block`/`add_inline_content` can ask "which comments open or close inside
+//     *this* block" and split whichever run or hyperlink child straddles a boundary.
+//  3. `patch_comment_extras` fixes up three fields `docx-rs` 0.4.22's builder API cannot set
+//     at all (`w15:done`, `w:initials`, and a durable uid) by rewriting the raw
+//     `word/comments.xml` / `word/commentsExtended.xml` bytes `Docx::build()` hands back,
+//     before those bytes are packed to the zip.
+
+/// One comment or reply, resolved to what `docx-rs` needs to place and later identify it.
+///
+/// A comment thread with N replies produces N+1 of these, all sharing the thread's own
+/// `start`/`end` — see this module's `DocumentComment` note above for why a reply has no range
+/// of its own. Each one gets its own `CommentRangeStart`/`CommentRangeEnd` pair anchored at
+/// that shared range: real Word output does the same thing (a thread with replies has as many
+/// stacked range markers in the body as it has comments), and it is the only way to get a
+/// reply into `comments.xml` at all — see `patch_comment_extras`'s doc comment for why.
+pub(crate) struct PreparedComment {
+    /// The plain, sequentially-assigned `usize` docx-rs uses for `w:id` /
+    /// `w:commentRangeStart`/`w:commentRangeEnd`/`w:commentReference`. Never touched by
+    /// `Docx::build()`'s paragraph-id dedup pass (that only rewrites `Paragraph::id`, a
+    /// completely different id space) — safe to use as a stable lookup key after `build()`.
+    id: usize,
+    /// The uid this comment/reply carries — `DocumentComment::uid` for the root,
+    /// `CommentReply::uid` for a reply.
+    uid: String,
+    author_initials: String,
+    /// Only meaningful on the root (`DocumentComment::resolved`); always `false` for a reply,
+    /// which carries no resolved state of its own.
+    resolved: bool,
+    /// `[start, end)` in the document's addressable character space — the thread's own range,
+    /// shared by every `PreparedComment` in the same thread.
+    start: u32,
+    end: u32,
+    /// The built `docx_rs::Comment`, ready to hand to `Paragraph`/`Hyperlink::add_comment_start`.
+    /// Cloned exactly once (each id opens exactly one range), but `Comment` is cheap and the
+    /// clone keeps `PreparedComment` itself immutable through the whole render walk.
+    comment: docx_rs::Comment,
+}
+
+/// FNV-1a (32-bit) — a small, dependency-free, deterministic hash used only to turn a
+/// comment's own uid into a paragraph id (see `prepare_comments`). Not a security boundary;
+/// picked for being tiny and stable across Rust versions, unlike `DefaultHasher`.
+fn fnv1a32(s: &str) -> u32 {
+    let mut hash: u32 = 0x811c_9dc5;
+    for b in s.bytes() {
+        hash ^= b as u32;
+        hash = hash.wrapping_mul(0x0100_0193);
+    }
+    hash
+}
+
+/// Resolve every comment thread in `comments` into its flat `PreparedComment` list, in
+/// document order (root immediately followed by its own replies, in the order they were
+/// authored).
+///
+/// # Why the paragraph id is hashed rather than sequential
+///
+/// Each body gets `Paragraph::id(..)` set to an 8-hex-digit id derived from its own uid,
+/// deterministic and reproducible across identical exports — but the actual reason it is a
+/// *hash* rather than, say, `"00000001"`, `"00000002"`, ... is collision avoidance:
+/// `docx-rs` hands out exactly that small sequential range (reset to 1 at the top of every
+/// `build()`) to every OTHER paragraph in the document that never had `.id(..)` called on it.
+/// Landing in a disjoint part of the id space keeps `Docx::build()`'s own dedup pass
+/// (`refresh_duplicate_para_ids`) from ever needing to touch these — though the writer does
+/// not *rely* on that being guaranteed (see `patch_comment_extras`'s doc comment for the code
+/// path that stays correct even if it collides anyway).
+fn prepare_comments(comments: &DocumentComments) -> Vec<PreparedComment> {
+    let mut out = Vec::new();
+    let mut used_para_ids: HashSet<String> = HashSet::new();
+    let mut next_id: usize = 1;
+
+    fn para_id_for(seed: &str, used: &mut HashSet<String>) -> String {
+        let mut h = fnv1a32(seed);
+        loop {
+            let candidate = format!("{h:08x}");
+            if used.insert(candidate.clone()) {
+                return candidate;
+            }
+            h = h.wrapping_add(1);
+        }
+    }
+
+    for c in comments.in_document_order() {
+        let root_id = next_id;
+        next_id += 1;
+        let root_para_id = para_id_for(&c.uid, &mut used_para_ids);
+        let root_comment = docx_rs::Comment::new(root_id)
+            .author(c.author.clone())
+            .date(c.date.clone())
+            .add_paragraph(render_comment_body(&c.body).id(root_para_id.clone()));
+        out.push(PreparedComment {
+            id: root_id,
+            uid: c.uid.clone(),
+            author_initials: c.author_initials.clone(),
+            resolved: c.resolved,
+            start: c.start,
+            end: c.end,
+            comment: root_comment,
+        });
+
+        for reply in &c.replies {
+            let reply_id = next_id;
+            next_id += 1;
+            let reply_para_id = para_id_for(&reply.uid, &mut used_para_ids);
+            let reply_comment = docx_rs::Comment::new(reply_id)
+                .author(reply.author.clone())
+                .date(reply.date.clone())
+                .add_paragraph(render_comment_body(&reply.body).id(reply_para_id.clone()))
+                .parent_comment_id(root_id);
+            out.push(PreparedComment {
+                id: reply_id,
+                uid: reply.uid.clone(),
+                author_initials: reply.author_initials.clone(),
+                // A reply carries no resolved state of its own — only the thread it belongs
+                // to (`DocumentComment::resolved`) does.
+                resolved: false,
+                start: c.start,
+                end: c.end,
+                comment: reply_comment,
+            });
+        }
+    }
+    out
+}
+
+/// Render a comment or reply body's Djot source into exactly **one** `docx_rs::Paragraph`.
+///
+/// Exactly one, never more, even when the source has several block-level paragraphs — this is
+/// load-bearing, not a simplification for its own sake. `docx-rs` 0.4.22's auto-collector
+/// (`push_comment_and_comment_extended` in `documents/mod.rs`) walks `comment.children` and,
+/// for *every* `CommentChild::Paragraph` it finds, pushes the **whole** `Comment` into
+/// `comments.xml` again and mints another `commentEx` entry for it. A two-paragraph body would
+/// therefore silently duplicate its entire `<w:comment>` element and produce two conflicting
+/// `w15:paraId`s for what is supposed to be one thread. A block break in the source becomes a
+/// `<w:br/>` inside this one paragraph instead, exactly the way `render_code_block` folds a
+/// fenced block's embedded newlines into line breaks within one paragraph.
+///
+/// Formatting support is deliberately narrow: bold, italic, underline, strikethrough, and
+/// paragraph/line breaks — plain text for everything else (links, images, lists, tables,
+/// footnotes, code spans). A margin note is short annotation prose, not manuscript content;
+/// nothing here panics or drops text on an unsupported construct, it just renders as plain
+/// text, so an unusual comment body degrades gracefully instead of failing the export.
+fn render_comment_body(djot: &str) -> docx_rs::Paragraph {
+    use docx_rs::*;
+    use jotdown::{Container as C, Event as E, Parser};
+
+    let mut paragraph = Paragraph::new();
+    let mut bold = false;
+    let mut italic = false;
+    let mut underline = false;
+    let mut strikeout = false;
+    let mut buffer = String::new();
+    let mut buf_bold = false;
+    let mut buf_italic = false;
+    let mut buf_underline = false;
+    let mut buf_strikeout = false;
+    let mut wrote_any_block = false;
+
+    macro_rules! flush {
+        () => {
+            if !buffer.is_empty() {
+                paragraph = append_formatted_text(
+                    paragraph,
+                    &buffer,
+                    buf_bold,
+                    buf_italic,
+                    buf_underline,
+                    buf_strikeout,
+                );
+                buffer.clear();
+            }
+        };
+    }
+
+    for event in Parser::new(djot) {
+        match event {
+            E::Start(C::Paragraph, _) | E::Start(C::Heading { .. }, _) => {
+                if wrote_any_block {
+                    flush!();
+                    paragraph = paragraph.add_run(Run::new().add_break(BreakType::TextWrapping));
+                }
+            }
+            E::End(C::Paragraph) | E::End(C::Heading { .. }) => {
+                flush!();
+                wrote_any_block = true;
+            }
+            E::Start(C::Strong, _) => {
+                flush!();
+                bold = true;
+            }
+            E::End(C::Strong) => {
+                flush!();
+                bold = false;
+            }
+            E::Start(C::Emphasis, _) => {
+                flush!();
+                italic = true;
+            }
+            E::End(C::Emphasis) => {
+                flush!();
+                italic = false;
+            }
+            E::Start(C::Insert, _) => {
+                flush!();
+                underline = true;
+            }
+            E::End(C::Insert) => {
+                flush!();
+                underline = false;
+            }
+            E::Start(C::Delete, _) => {
+                flush!();
+                strikeout = true;
+            }
+            E::End(C::Delete) => {
+                flush!();
+                strikeout = false;
+            }
+            E::Str(s) => {
+                if buffer.is_empty() {
+                    buf_bold = bold;
+                    buf_italic = italic;
+                    buf_underline = underline;
+                    buf_strikeout = strikeout;
+                }
+                buffer.push_str(s.as_ref());
+            }
+            E::LeftSingleQuote => buffer.push('\u{2018}'),
+            E::RightSingleQuote => buffer.push('\u{2019}'),
+            E::LeftDoubleQuote => buffer.push('\u{201C}'),
+            E::RightDoubleQuote => buffer.push('\u{201D}'),
+            E::Ellipsis => buffer.push('\u{2026}'),
+            E::EnDash => buffer.push('\u{2013}'),
+            E::EmDash => buffer.push('\u{2014}'),
+            E::NonBreakingSpace => buffer.push('\u{00A0}'),
+            // Exotic djot constructs (images, tables, footnotes, links, code blocks, ...)
+            // contribute no text of their own here — see this function's doc comment.
+            _ => {}
+        }
+    }
+    flush!();
+    paragraph
+}
+
+/// Append `text` to `paragraph` as one or more runs, splitting on embedded `\n` into
+/// `<w:br/>`-separated runs — the same pattern `render_code_block` uses for a fenced block's
+/// own line breaks.
+fn append_formatted_text(
+    mut paragraph: docx_rs::Paragraph,
+    text: &str,
+    bold: bool,
+    italic: bool,
+    underline: bool,
+    strikeout: bool,
+) -> docx_rs::Paragraph {
+    use docx_rs::*;
+    for (i, line) in text.split('\n').enumerate() {
+        let mut run = Run::new();
+        if i > 0 {
+            run = run.add_break(BreakType::TextWrapping);
+        }
+        if !line.is_empty() {
+            run = run.add_text(line);
+        }
+        if bold {
+            run = run.bold();
+        }
+        if italic {
+            run = run.italic();
+        }
+        if underline {
+            run = run.underline("single");
+        }
+        if strikeout {
+            run = run.strike();
+        }
+        paragraph = paragraph.add_run(run);
+    }
+    paragraph
+}
+
+/// One comment boundary event, resolved to a local character index inside the one inline
+/// piece it falls in — see `markers_for_piece`.
+enum Marker<'a> {
+    Start(&'a PreparedComment),
+    End(&'a PreparedComment),
+}
+
+/// The comments open or closing somewhere inside one block, and the bookkeeping needed to
+/// prove every prepared comment found a home by the end of the document walk.
+///
+/// Built once per export (`build_docx`) and threaded by shared reference through
+/// `render_frame_content`/`render_block` — `None` at call sites that render content outside
+/// the document's addressable text (footnote bodies, table cells; see `render_block`'s doc
+/// comment for why those are out of scope for comment ranges).
+struct CommentEmitState<'a> {
+    prepared: &'a [PreparedComment],
+    started: std::cell::RefCell<HashSet<usize>>,
+    ended: std::cell::RefCell<HashSet<usize>>,
+}
+
+/// The prepared comments whose range starts, respectively ends, somewhere inside one block —
+/// see `CommentEmitState::window_for_block`.
+struct BlockCommentWindow<'a> {
+    starts: Vec<&'a PreparedComment>,
+    ends: Vec<&'a PreparedComment>,
+}
+
+impl<'a> CommentEmitState<'a> {
+    fn new(prepared: &'a [PreparedComment]) -> Self {
+        Self {
+            prepared,
+            started: std::cell::RefCell::new(HashSet::new()),
+            ended: std::cell::RefCell::new(HashSet::new()),
+        }
+    }
+
+    /// Comments whose start, respectively end, falls inside `[block_start, block_end)` — or,
+    /// for a genuinely empty block (`block_start == block_end`, e.g. a blank paragraph),
+    /// comments collapsed to exactly that point. Blocks are visited in non-decreasing
+    /// document-position order by every call site that passes `Some(state)`, so a thread
+    /// spanning several blocks (its start block and end block differ) opens in the first and
+    /// closes in the last with nothing to do in between — no extra state needed beyond this
+    /// per-block filter.
+    fn window_for_block(&self, block_start: u32, block_end: u32) -> BlockCommentWindow<'a> {
+        let empty = block_start == block_end;
+        let mut starts: Vec<&'a PreparedComment> = self
+            .prepared
+            .iter()
+            .filter(|c| {
+                (block_start <= c.start && c.start < block_end) || (empty && c.start == block_start)
+            })
+            .collect();
+        starts.sort_by_key(|c| (c.start, c.id));
+        let mut ends: Vec<&'a PreparedComment> = self
+            .prepared
+            .iter()
+            .filter(|c| {
+                (block_start < c.end && c.end <= block_end) || (empty && c.end == block_end)
+            })
+            .collect();
+        ends.sort_by_key(|c| (c.end, c.id));
+        BlockCommentWindow { starts, ends }
+    }
+
+    fn mark_started(&self, id: usize) {
+        self.started.borrow_mut().insert(id);
+    }
+
+    fn mark_ended(&self, id: usize) {
+        self.ended.borrow_mut().insert(id);
+    }
+
+    /// Every prepared comment must have been both opened and closed exactly once by the time
+    /// the whole document walk finishes, or its range never intersected any block this writer
+    /// visited — out of bounds, or targeting a footnote body/table cell (deliberately outside
+    /// the addressable-text walk; see `render_block`'s doc comment) — and it would otherwise
+    /// vanish from the output with no trace at all. Surfaced here as one loud, actionable
+    /// `Err` naming every orphan, rather than a `.docx` that silently opens with fewer
+    /// comments than the caller asked for.
+    fn ensure_all_anchored(&self) -> Result<()> {
+        let started = self.started.borrow();
+        let ended = self.ended.borrow();
+        let missing: Vec<String> = self
+            .prepared
+            .iter()
+            .filter(|c| !started.contains(&c.id) || !ended.contains(&c.id))
+            .map(|c| format!("{} [{}, {})", c.uid, c.start, c.end))
+            .collect();
+        if missing.is_empty() {
+            Ok(())
+        } else {
+            Err(anyhow!(
+                "{} comment(s) could not be anchored to any exported text (range outside the \
+                 document, or targeting a footnote body/table cell, neither of which carries \
+                 comment ranges): {}",
+                missing.len(),
+                missing.join(", ")
+            ))
+        }
+    }
+}
+
+/// Comment markers landing inside one inline piece spanning `[piece_start, piece_end)`,
+/// resolved to a local index (`0..=piece_end-piece_start`) into that piece's own content —
+/// the same offset a `Run`'s text has to be split at (via `.chars()`, never a byte index).
+///
+/// A `Start` marker's local index only ever lands in `0..piece_len` (never `piece_len` itself
+/// — `window_for_block`'s `starts` test is `c.start < block_end`, strictly-less, and the same
+/// strictness carries down per piece here); an `End` marker's only ever lands in `1..=piece_len`
+/// (never `0`). So for an atomic one-character piece (an image or footnote reference — see
+/// `AddressableInlinePiece`'s doc comment for why those are always exactly one character),
+/// every marker sits at either `0` (before the piece) or `1` (after it) — there is never a
+/// true *mid*-piece split to perform for one of those, only placement around it.
+///
+/// Sorted by `(local index, End-before-Start, comment id)`: at an exact tie — a thread ending
+/// right where another starts, or two replies of the same thread opening/closing together —
+/// closing what is ending before opening what is starting keeps the emitted XML from nesting
+/// one comment's range inside another's for zero shared characters.
+fn markers_for_piece<'a>(
+    window: &BlockCommentWindow<'a>,
+    piece_start: u32,
+    piece_end: u32,
+) -> Vec<(u32, Marker<'a>)> {
+    let mut out: Vec<(u32, Marker<'a>)> = Vec::new();
+    for &c in &window.starts {
+        if piece_start <= c.start && c.start < piece_end {
+            out.push((c.start - piece_start, Marker::Start(c)));
+        }
+    }
+    for &c in &window.ends {
+        if piece_start < c.end && c.end <= piece_end {
+            out.push((c.end - piece_start, Marker::End(c)));
+        }
+    }
+    out.sort_by_key(|(idx, m)| {
+        let (kind_rank, id) = match m {
+            Marker::End(c) => (0u8, c.id),
+            Marker::Start(c) => (1u8, c.id),
+        };
+        (*idx, kind_rank, id)
+    });
+    out
+}
+
+/// Common surface between `docx_rs::Paragraph` and `docx_rs::Hyperlink`: both accept the same
+/// three child kinds this writer interleaves (runs and comment range markers), through
+/// identically-named but differently-typed builder methods with no shared trait in `docx-rs`
+/// itself. A comment boundary can land inside a hyperlink's own text —
+/// `Docx::update_dependencies` (the auto-collector) walks a `Hyperlink`'s own children for
+/// `CommentStart` exactly as it walks a `Paragraph`'s — so the run splitter below has to build
+/// into either container, and this trait is what lets it do that with one function instead of
+/// two near-duplicate copies.
+trait InlineHost: Sized {
+    fn host_add_run(self, run: docx_rs::Run) -> Self;
+    fn host_add_comment_start(self, comment: docx_rs::Comment) -> Self;
+    fn host_add_comment_end(self, id: usize) -> Self;
+}
+
+impl InlineHost for docx_rs::Paragraph {
+    fn host_add_run(self, run: docx_rs::Run) -> Self {
+        self.add_run(run)
+    }
+    fn host_add_comment_start(self, comment: docx_rs::Comment) -> Self {
+        self.add_comment_start(comment)
+    }
+    fn host_add_comment_end(self, id: usize) -> Self {
+        self.add_comment_end(id)
+    }
+}
+
+impl InlineHost for docx_rs::Hyperlink {
+    fn host_add_run(self, run: docx_rs::Run) -> Self {
+        self.add_run(run)
+    }
+    fn host_add_comment_start(self, comment: docx_rs::Comment) -> Self {
+        self.add_comment_start(comment)
+    }
+    fn host_add_comment_end(self, id: usize) -> Self {
+        self.add_comment_end(id)
+    }
+}
+
+fn apply_marker<H: InlineHost>(host: H, marker: &Marker<'_>, state: &CommentEmitState<'_>) -> H {
+    match marker {
+        Marker::Start(c) => {
+            state.mark_started(c.id);
+            host.host_add_comment_start(c.comment.clone())
+        }
+        Marker::End(c) => {
+            state.mark_ended(c.id);
+            host.host_add_comment_end(c.id)
+        }
+    }
+}
+
 pub struct ExportDocxUseCase {
     uow_factory: Box<dyn ExportDocxUnitOfWorkFactoryTrait>,
     dto: ExportDocxDto,
@@ -130,7 +617,7 @@ impl LongOperation for ExportDocxUseCase {
 
         uow.end_transaction()?;
 
-        let (docx, paragraph_count) = build_result?;
+        let (docx, paragraph_count, prepared_comments) = build_result?;
 
         progress_callback(common::long_operation::OperationProgress::new(
             90.0,
@@ -145,7 +632,9 @@ impl LongOperation for ExportDocxUseCase {
                 e
             )
         })?;
-        docx.build()
+        let mut xml_docx = docx.build();
+        patch_comment_extras(&mut xml_docx, &prepared_comments)?;
+        xml_docx
             .pack(file)
             .map_err(|e| anyhow!("Failed to write DOCX: {}", e))?;
 
@@ -234,7 +723,10 @@ impl NumberingBuilder {
 impl ExportDocxUseCase {
     /// Assemble the in-memory DOCX document from the store, performing no file
     /// I/O. Returns the document together with the number of top-level elements
-    /// (paragraphs and tables) emitted, which is reported as `paragraph_count`.
+    /// (paragraphs and tables) emitted, which is reported as `paragraph_count`, and every
+    /// prepared comment thread — `execute` needs the latter for `patch_comment_extras`, which
+    /// runs after `Docx::build()` (this function stops short of that; see this module's
+    /// "Comment ranges" note at the top for why the raw-XML step has to come after `build()`).
     ///
     /// `execute` uses it and then packs the result to disk; the controller
     /// exposes a file-less variant for tests via [`Self::build_document`].
@@ -243,7 +735,7 @@ impl ExportDocxUseCase {
         uow: &dyn ExportDocxUnitOfWorkTrait,
         progress_callback: &dyn Fn(common::long_operation::OperationProgress),
         cancel_flag: Option<&AtomicBool>,
-    ) -> Result<(docx_rs::Docx, i64)> {
+    ) -> Result<(docx_rs::Docx, i64, Vec<PreparedComment>)> {
         use docx_rs::*;
 
         // Step 1: Get Root and Document
@@ -291,6 +783,17 @@ impl ExportDocxUseCase {
 
         let notes = crate::footnotes::Footnotes::build(&uow.store());
 
+        // Resolved once, up front, so every render call below shares the exact same id
+        // assignment. `None` when the caller supplied no comments at all — every render call
+        // site threads that straight through, so a plain export (no `comments` option set)
+        // never pays for the per-block window computation.
+        let prepared_comments = prepare_comments(&self.dto.options.comments);
+        let comment_state: Option<CommentEmitState<'_>> = if prepared_comments.is_empty() {
+            None
+        } else {
+            Some(CommentEmitState::new(&prepared_comments))
+        };
+
         // Render every note's body first, while `note_paragraphs` is still
         // empty — so a note that cites another note produces an empty inner
         // footnote rather than recursing. Word has no nested footnote either.
@@ -323,6 +826,13 @@ impl ExportDocxUseCase {
                         &mut note_numbering,
                         &std::collections::HashMap::new(),
                         &body_footnote_state,
+                        // Footnote bodies render in this separate pre-pass, before the main
+                        // walk even starts, and are not part of the document's addressable
+                        // text (`to_addressable_text` never descends into a note definition)
+                        // — so a comment's char offset could never legitimately resolve
+                        // inside one. Deliberately out of scope; see `render_block`'s doc
+                        // comment.
+                        None,
                     )?);
                 }
                 built.insert(label, paragraphs);
@@ -389,6 +899,7 @@ impl ExportDocxUseCase {
                 cancel_flag,
                 &mut elements,
                 &footnote_state,
+                comment_state.as_ref(),
             )?;
 
             let pct = 10.0 + (frame_idx as f32 / total_frames as f32) * 70.0;
@@ -400,6 +911,12 @@ impl ExportDocxUseCase {
                     total_frames
                 )),
             ));
+        }
+
+        // Every prepared comment must have found a home somewhere in the walk just finished —
+        // see `CommentEmitState::ensure_all_anchored`'s doc comment for what "must" buys here.
+        if let Some(state) = &comment_state {
+            state.ensure_all_anchored()?;
         }
 
         progress_callback(common::long_operation::OperationProgress::new(
@@ -455,7 +972,7 @@ impl ExportDocxUseCase {
         // Page geometry + base typography + running header, from the caller's options.
         docx = self.apply_document_options(docx);
 
-        Ok((docx, paragraph_count))
+        Ok((docx, paragraph_count, prepared_comments))
     }
 
     /// Apply the document-wide export options (page size, margins, default font/size, and an
@@ -516,12 +1033,35 @@ impl ExportDocxUseCase {
         uow.begin_transaction()?;
         let result = self.build_docx(&*uow, &|_progress| {}, None);
         uow.end_transaction()?;
-        result
+        let (docx, paragraph_count, _prepared_comments) = result?;
+        Ok((docx, paragraph_count))
+    }
+
+    /// As [`Self::build_document`], but also runs the post-`build()` raw-XML comment patch
+    /// (`w15:done`, `w:initials`, the uid attribute — see this module's "Comment ranges" note)
+    /// and returns the packable [`docx_rs::XMLDocx`] instead of the pre-`build()`
+    /// [`docx_rs::Docx`]. Intended for tests that assert on those three fields, none of which
+    /// the bare builder struct exposes — they only exist in the packed XML bytes.
+    pub(crate) fn build_document_xml(&self) -> Result<docx_rs::XMLDocx> {
+        let uow = self.uow_factory.create();
+        uow.begin_transaction()?;
+        let result = self.build_docx(&*uow, &|_progress| {}, None);
+        uow.end_transaction()?;
+        let (docx, _paragraph_count, prepared_comments) = result?;
+        let mut xml_docx = docx.build();
+        patch_comment_extras(&mut xml_docx, &prepared_comments)?;
+        Ok(xml_docx)
     }
 
     /// Walk a frame's `child_order`, appending rendered paragraphs/tables to
     /// `out`. `quote_depth` is the current blockquote nesting level (0 at the
     /// document body), used to compute left indentation.
+    ///
+    /// `comments` is threaded straight through every recursive call — including into a
+    /// blockquote sub-frame, which *is* part of the document's addressable text — but is
+    /// never passed down into `render_table_docx`'s own cell walk (that call always hands
+    /// its cells `None`; see `render_block`'s doc comment for why table cells are out of
+    /// scope for comment ranges).
     #[allow(clippy::too_many_arguments)]
     fn render_frame_content(
         &self,
@@ -535,6 +1075,7 @@ impl ExportDocxUseCase {
         cancel_flag: Option<&AtomicBool>,
         out: &mut Vec<DocxElement>,
         footnote_state: &FootnoteRefState,
+        comments: Option<&CommentEmitState<'_>>,
     ) -> Result<()> {
         if !frame.child_order.is_empty() {
             for &entry in &frame.child_order {
@@ -557,6 +1098,7 @@ impl ExportDocxUseCase {
                             numbering,
                             notes,
                             footnote_state,
+                            comments,
                         )?;
                         out.push(DocxElement::Paragraph(Box::new(paragraph)));
                     }
@@ -602,6 +1144,7 @@ impl ExportDocxUseCase {
                             cancel_flag,
                             out,
                             footnote_state,
+                            comments,
                         )?;
                     }
                 }
@@ -629,6 +1172,7 @@ impl ExportDocxUseCase {
                     numbering,
                     notes,
                     footnote_state,
+                    comments,
                 )?;
                 out.push(DocxElement::Paragraph(Box::new(paragraph)));
             }
@@ -640,6 +1184,20 @@ impl ExportDocxUseCase {
     ///
     /// Dispatch priority mirrors the djot exporter: code block, then heading,
     /// then list item, then plain paragraph.
+    ///
+    /// `comments` is `Some` only from call sites reached while walking the document's
+    /// addressable text — the main body walk and, recursively, its blockquote sub-frames.
+    /// It is always `None` for a footnote body (rendered in a separate pre-pass, before the
+    /// main walk starts, over content `to_addressable_text` never descends into) and for
+    /// table-cell content (represented in the addressable text by the table's one
+    /// `TABLE_ANCHOR` sentinel, never by the cells' own prose) — a `DocumentComment`'s
+    /// character offset can therefore never legitimately resolve inside either, and this
+    /// writer does not pretend otherwise. A code block is also out of scope: it renders
+    /// through `render_code_block` below, which builds its own runs directly from `pieces`
+    /// and never reaches `add_inline_content`, the only place comment markers are placed —
+    /// inline comments on a fenced code block are not a case the app this crate was built for
+    /// asks for, and folding one in would mean re-deriving `render_code_block`'s line-joining
+    /// under the same split logic used by `add_inline_content` for no exercised caller.
     #[allow(clippy::too_many_arguments)]
     fn render_block(
         &self,
@@ -650,6 +1208,7 @@ impl ExportDocxUseCase {
         numbering: &mut NumberingBuilder,
         notes: &NoteParagraphs,
         footnote_state: &FootnoteRefState,
+        comments: Option<&CommentEmitState<'_>>,
     ) -> Result<docx_rs::Paragraph> {
         use docx_rs::*;
 
@@ -659,13 +1218,48 @@ impl ExportDocxUseCase {
             block.id,
             &block_text,
         );
+        // `elements` and `addressable` are built from the exact same `merge_runs_and_anchors`
+        // pieces, one InlineSegment/AddressableInlinePiece per piece, in the same order — see
+        // `addressable_inline_pieces_for_block`'s own doc comment. Zipping them is what lets
+        // every downstream call reach a piece's char-space `[start, end)` without re-deriving
+        // it from format-run byte offsets (exactly the bug class that accessor exists to
+        // close).
+        let addressable = common::format_runs_query::addressable_inline_pieces_for_block(
+            &uow.store(),
+            block,
+            &block_text,
+        );
+        debug_assert_eq!(
+            elements.len(),
+            addressable.len(),
+            "inline_segments_for_block and addressable_inline_pieces_for_block must stay in \
+             lockstep — both are views over the same merge_runs_and_anchors() pieces"
+        );
+        let pieces: Vec<(InlineSegment, u32, u32)> = elements
+            .into_iter()
+            .zip(addressable.iter())
+            .map(|(elem, piece)| (elem, piece.start, piece.end))
+            .collect();
 
         let quote_indent = quote_depth as i32 * INDENT_STEP_TWIPS;
 
         // --- Code block ------------------------------------------------------
         if block.fmt_is_code_block == Some(true) {
-            return Ok(render_code_block(&elements, quote_indent));
+            return Ok(render_code_block(&pieces, quote_indent));
         }
+
+        // The comments whose range opens or closes somewhere inside this one block —
+        // computed once per block, then narrowed further per inline piece inside
+        // `add_inline_content`. `None` when this call site is out of scope (see this
+        // function's doc comment) or the export carries no comments at all.
+        let comment_window = comments.map(|state| {
+            // Same cast `addressable_inline_pieces_for_block` makes on this exact value, and
+            // for the same reason: a document large enough to overflow `u32` chars would
+            // already have overflowed the rope it lives in.
+            let block_start = block_document_position(block, &uow.store()) as u32;
+            let block_end = block_start + block_text.chars().count() as u32;
+            (state, state.window_for_block(block_start, block_end))
+        });
 
         // --- Resolve list membership ----------------------------------------
         let list_ids = uow.get_block_relationship(
@@ -791,10 +1385,13 @@ impl ExportDocxUseCase {
 
         Ok(add_inline_content(
             paragraph,
-            &elements,
+            &pieces,
             &self.dto.options.images,
             notes,
             footnote_state,
+            comment_window
+                .as_ref()
+                .map(|(state, window)| (*state, window)),
         ))
     }
 
@@ -964,6 +1561,12 @@ impl ExportDocxUseCase {
                             None,
                             &mut cell_elements,
                             footnote_state,
+                            // Table cell content is not part of the document's addressable
+                            // text (`to_addressable_text` represents a whole table as one
+                            // `TABLE_ANCHOR` sentinel, never its cells' own prose) — see
+                            // `render_block`'s doc comment for why comment ranges therefore
+                            // never reach inside a cell.
+                            None,
                         )?;
                         for element in cell_elements {
                             docx_cell = match element {
@@ -1076,11 +1679,20 @@ fn heading_style(level: usize, h: &common::parser_tools::DocxHeadingStyle) -> do
 /// Inline formatting is dropped (only the raw text matters, mirroring djot).
 /// Embedded newlines become soft line breaks so a multi-line block stays one
 /// paragraph.
-fn render_code_block(elements: &[InlineSegment], quote_indent: i32) -> docx_rs::Paragraph {
+///
+/// Takes the same `(InlineSegment, start, end)` pieces `add_inline_content` does, but ignores
+/// the char-space bounds entirely — a code block never reaches `add_inline_content` (see
+/// `render_block`'s doc comment on why comment ranges do not extend to code blocks), so
+/// nothing here ever reads the two offset fields. Sharing the tuple's shape just keeps
+/// `render_block` from maintaining two differently-shaped element lists per block.
+fn render_code_block(
+    pieces: &[(InlineSegment, u32, u32)],
+    quote_indent: i32,
+) -> docx_rs::Paragraph {
     use docx_rs::*;
 
     let mut raw = String::new();
-    for elem in elements {
+    for (elem, _, _) in pieces {
         if let InlineContent::Text(t) = &elem.content {
             raw.push_str(t);
         }
@@ -1225,7 +1837,17 @@ fn build_run(
     if text.is_empty() {
         return None;
     }
+    Some(text_run_with_format(&text, elem))
+}
 
+/// Build a run carrying `text`, formatted per `elem`'s `fmt_*` fields.
+///
+/// Split out of [`build_run`]'s tail so `add_inline_content` can call it directly for a
+/// *substring* of a text segment — the piece straddling a comment boundary — without routing
+/// back through `build_run`'s footnote/image handling, neither of which a plain text segment
+/// ever touches anyway.
+fn text_run_with_format(text: &str, elem: &InlineSegment) -> docx_rs::Run {
+    use docx_rs::*;
     let mut run = Run::new().add_text(text);
     if elem.fmt_font_bold == Some(true) {
         run = run.bold();
@@ -1242,60 +1864,184 @@ fn build_run(
     if elem.fmt_font_family.as_deref() == Some("monospace") {
         run = run.fonts(RunFonts::new().ascii("Courier New").hi_ansi("Courier New"));
     }
-    Some(run)
+    run
 }
 
-/// Append the inline content of a block to `paragraph`, wrapping runs that
-/// share a hyperlink `href` in a single `<w:hyperlink>`.
+/// One inline piece, resolved to whether/how it contributes a run.
+struct RenderedPiece<'p> {
+    elem: &'p InlineSegment,
+    start: u32,
+    end: u32,
+    /// The run `build_run` would emit for the whole piece — `None` for content it drops
+    /// entirely (e.g. an inline image with neither embeddable bytes nor alt text). Kept even
+    /// when `None`: a comment boundary sitting exactly at a run-less piece's position still
+    /// needs somewhere to attach its marker, and dropping the piece outright would silently
+    /// lose that comment instead of anchoring it (`CommentEmitState::ensure_all_anchored`
+    /// exists specifically to catch the alternative — a comment that reaches no piece at all).
+    run: Option<docx_rs::Run>,
+}
+
+/// Append the inline content of a block to `paragraph`: build one [`RenderedPiece`] per
+/// source piece (applying `build_run`'s footnote/image side effects exactly once each, same
+/// as before comment support existed), group consecutive same-`href` pieces under one
+/// `<w:hyperlink>`, and — when `comments` is `Some` — split whichever run or hyperlink child
+/// straddles a comment boundary, interleaving `CommentRangeStart`/`CommentRangeEnd` at the
+/// right point.
+///
+/// A comment boundary can land: **mid-run** (a `Start`/`End` index strictly between two chars
+/// of one text piece — the general case `markers_for_piece` resolves per piece); **inside a
+/// hyperlink's own children** (a marker for a piece that happens to share an `href` with its
+/// neighbours goes through `Hyperlink::add_comment_start`/`add_comment_end`, exactly mirroring
+/// `Paragraph`'s own methods — see [`InlineHost`]); and two comments can **overlap** in one
+/// block, including sharing the exact same range (a thread's replies always do — see
+/// `PreparedComment`'s doc comment) — `markers_for_piece` already returns every marker that
+/// falls in a piece, in a stable order, so overlapping ranges just interleave correctly with
+/// no special-casing here.
 fn add_inline_content(
     mut paragraph: docx_rs::Paragraph,
-    elements: &[InlineSegment],
+    pieces: &[(InlineSegment, u32, u32)],
     images: &ExportImages,
     notes: &std::collections::HashMap<String, Vec<docx_rs::Paragraph>>,
     footnote_state: &FootnoteRefState,
+    comments: Option<(&CommentEmitState<'_>, &BlockCommentWindow<'_>)>,
 ) -> docx_rs::Paragraph {
     use docx_rs::*;
 
-    // Coalesce consecutive segments with the same href into one piece so a
-    // link spanning multiple format runs renders as a single hyperlink.
-    enum Piece {
-        Run(Box<Run>),
-        Link(String, Vec<Run>),
+    let rendered: Vec<RenderedPiece<'_>> = pieces
+        .iter()
+        .map(|(elem, start, end)| RenderedPiece {
+            elem,
+            start: *start,
+            end: *end,
+            run: build_run(elem, images, notes, footnote_state),
+        })
+        .collect();
+
+    if rendered.is_empty() {
+        // A genuinely empty block (e.g. a blank paragraph) has no piece to wrap a marker
+        // around. A comment collapsed to exactly this point (`start == end == this block's
+        // position` — the only way `window_for_block` puts anything in `starts`/`ends` for an
+        // empty block) still needs to be anchored, or `ensure_all_anchored` fails the export
+        // for a thread that had every right to exist.
+        if let Some((state, window)) = comments {
+            for &c in &window.starts {
+                state.mark_started(c.id);
+                paragraph = paragraph.add_comment_start(c.comment.clone());
+            }
+            // Closed from `ends`, NOT from `starts`. They are different sets: a comment can
+            // start in this block and end in a later one, or end here having started earlier.
+            // Closing whatever happens to start here emits `commentRangeEnd` for a range that
+            // is still open — and, worse, never emits one for a range that really did end
+            // here, leaving it unterminated in the file.
+            for &c in window.ends.iter().rev() {
+                state.mark_ended(c.id);
+                paragraph = paragraph.add_comment_end(c.id);
+            }
+        }
+        return paragraph;
     }
 
-    let mut pieces: Vec<Piece> = Vec::new();
-    for elem in elements {
-        let Some(run) = build_run(elem, images, notes, footnote_state) else {
-            continue;
-        };
-        match &elem.fmt_anchor_href {
+    // Coalesce consecutive pieces sharing the same href into one hyperlink group, the same
+    // grouping `add_inline_content` always did — a run-less piece (see `RenderedPiece::run`)
+    // still participates by its own `href`, same as any other.
+    enum Group {
+        Plain(usize),
+        Link(String, std::ops::Range<usize>),
+    }
+    let mut groups: Vec<Group> = Vec::new();
+    for (i, piece) in rendered.iter().enumerate() {
+        match &piece.elem.fmt_anchor_href {
             Some(href) if !href.is_empty() => {
-                if let Some(Piece::Link(open_href, runs)) = pieces.last_mut()
+                if let Some(Group::Link(open_href, range)) = groups.last_mut()
                     && open_href == href
                 {
-                    runs.push(run);
+                    range.end = i + 1;
                     continue;
                 }
-                pieces.push(Piece::Link(href.clone(), vec![run]));
+                groups.push(Group::Link(href.clone(), i..i + 1));
             }
-            _ => pieces.push(Piece::Run(Box::new(run))),
+            _ => groups.push(Group::Plain(i)),
         }
     }
 
-    for piece in pieces {
-        paragraph = match piece {
-            Piece::Run(run) => paragraph.add_run(*run),
-            Piece::Link(href, runs) => {
-                let mut link = Hyperlink::new(href, HyperlinkType::External);
-                for run in runs {
-                    link = link.add_run(run);
-                }
-                paragraph.add_hyperlink(link)
+    for group in groups {
+        match group {
+            Group::Plain(i) => {
+                paragraph = append_piece(paragraph, &rendered[i], comments);
             }
-        };
+            Group::Link(href, range) => {
+                let mut link = Hyperlink::new(href, HyperlinkType::External);
+                for i in range {
+                    link = append_piece(link, &rendered[i], comments);
+                }
+                paragraph = paragraph.add_hyperlink(link);
+            }
+        }
     }
 
     paragraph
+}
+
+/// Append one [`RenderedPiece`] to `host` (a paragraph, or a hyperlink being built up inside
+/// one), splitting its run at any comment boundary `markers_for_piece` finds inside it.
+fn append_piece<H: InlineHost>(
+    mut host: H,
+    piece: &RenderedPiece<'_>,
+    comments: Option<(&CommentEmitState<'_>, &BlockCommentWindow<'_>)>,
+) -> H {
+    let Some((state, window)) = comments else {
+        return match &piece.run {
+            Some(run) => host.host_add_run(run.clone()),
+            None => host,
+        };
+    };
+    let markers = markers_for_piece(window, piece.start, piece.end);
+    if markers.is_empty() {
+        return match &piece.run {
+            Some(run) => host.host_add_run(run.clone()),
+            None => host,
+        };
+    }
+
+    if let InlineContent::Text(text) = &piece.elem.content {
+        // The general, mid-run case: slice the text at each marker's local char index —
+        // `.chars()`, never a byte index, since `markers_for_piece`'s indices are character
+        // offsets and this text can hold any UTF-8.
+        let chars: Vec<char> = text.chars().collect();
+        let mut cursor = 0usize;
+        for (idx, marker) in &markers {
+            let local = (*idx as usize).min(chars.len());
+            if local > cursor {
+                let slice: String = chars[cursor..local].iter().collect();
+                host = host.host_add_run(text_run_with_format(&slice, piece.elem));
+                cursor = local;
+            }
+            host = apply_marker(host, marker, state);
+        }
+        if cursor < chars.len() {
+            let slice: String = chars[cursor..].iter().collect();
+            host = host.host_add_run(text_run_with_format(&slice, piece.elem));
+        }
+    } else {
+        // Atomic content (image, footnote reference, or a run-less piece): every marker sits
+        // at local index `0` (before) or the piece's own length (after) — see
+        // `markers_for_piece`'s doc comment — so there is only ever placement around the one
+        // run, never a true split.
+        for (idx, marker) in &markers {
+            if *idx == 0 {
+                host = apply_marker(host, marker, state);
+            }
+        }
+        if let Some(run) = &piece.run {
+            host = host.host_add_run(run.clone());
+        }
+        for (idx, marker) in &markers {
+            if *idx != 0 {
+                host = apply_marker(host, marker, state);
+            }
+        }
+    }
+    host
 }
 
 /// Build a complete abstract-numbering definition (levels 0..=8) for `list`.
@@ -1350,4 +2096,178 @@ fn ordered_level_text(level: usize, list: &List) -> String {
         list.suffix.as_str()
     };
     format!("{}%{}{}", list.prefix, level + 1, suffix)
+}
+
+// ── Raw-XML comment patch ────────────────────────────────────────────────────────────
+//
+// Three things this writer needs are unreachable through `docx-rs` 0.4.22's public builder
+// API — verified against its actual source, not assumed (see each patch's own comment below
+// for the exact line of reasoning):
+//
+//  - `w15:done` (the resolved flag): `Docx::build()`'s auto-collector
+//    (`push_comment_and_comment_extended` in `documents/mod.rs`) always constructs
+//    `CommentExtended::new(para_id)`, which starts `done: false`, and never calls the type's
+//    own `.done()`. There is no way to hand the collector a resolved thread.
+//  - `w:initials`: `docx_rs::Comment` carries no such field at all, and its `BuildXML` impl
+//    hardcodes the empty string (`.open_comment(&self.id.to_string(), &self.author, &self.date,
+//    "")` in `documents/elements/comment.rs`).
+//  - The uid: there is no extension point on `Comment`/`CommentExtended` for arbitrary
+//    caller data at all.
+//
+// So this module builds ordinary `docx_rs::Comment`s (author, date, one body paragraph) through
+// the public API, then rewrites the raw `word/comments.xml` / `word/commentsExtended.xml`
+// bytes `Docx::build()` hands back — `XMLDocx::comments`/`comments_extended` are `pub Vec<u8>`,
+// already fully serialized, and `XMLDocx::pack` writes them out completely unconditionally
+// (`zipper::zip`), so a patch here reaches the packed file with nothing further downstream
+// able to overwrite it.
+
+/// The three raw-XML gaps closed here, keyed as described in each field's own doc comment.
+/// See this module's "Raw-XML comment patch" note above for why `docx-rs` leaves them closed
+/// through its public API at all.
+fn patch_comment_extras(
+    xml_docx: &mut docx_rs::XMLDocx,
+    prepared: &[PreparedComment],
+) -> Result<()> {
+    if prepared.is_empty() {
+        return Ok(());
+    }
+
+    let comments_text = String::from_utf8(std::mem::take(&mut xml_docx.comments))
+        .map_err(|e| anyhow!("word/comments.xml was not valid UTF-8: {e}"))?;
+    let comments_extended_text = String::from_utf8(std::mem::take(&mut xml_docx.comments_extended))
+        .map_err(|e| anyhow!("word/commentsExtended.xml was not valid UTF-8: {e}"))?;
+
+    let by_id: HashMap<usize, &PreparedComment> = prepared.iter().map(|c| (c.id, c)).collect();
+
+    // A private-namespace attribute in an undeclared prefix is well-formed XML but a
+    // namespace *error* — strict readers (LibreOffice included) reject the whole part rather
+    // than merely ignoring the one attribute they don't recognise — so the prefix has to be
+    // declared on the root element before anything below can use it.
+    let comments_text = declare_skrb_namespace(comments_text)?;
+
+    // Correlate each comment's stable `w:id` to its body paragraph's *actual* `w14:paraId` —
+    // see this function's doc comment on the uid/`w15:done` patches below for why the actual
+    // value, not the one `prepare_comments` originally asked for, is what has to be used.
+    // Every prepared comment has exactly one body paragraph (`render_comment_body`'s doc
+    // comment explains why more than one would corrupt the file), so a lazy `.*?` search for
+    // the first `w14:paraId` after each comment's own opening tag always lands on the right
+    // one — never a later comment's.
+    let id_and_para_re =
+        Regex::new(r#"(?s)<w:comment\s+w:id="(\d+)"[^>]*>.*?w14:paraId="([0-9a-fA-F]{8})""#)
+            .expect("static regex is valid");
+    let mut actual_para_id: HashMap<usize, String> = HashMap::new();
+    for caps in id_and_para_re.captures_iter(&comments_text) {
+        let id: usize = caps[1]
+            .parse()
+            .expect("\\d+ capture is always a valid usize");
+        actual_para_id.insert(id, caps[2].to_string());
+    }
+    if actual_para_id.len() != prepared.len() {
+        return Err(anyhow!(
+            "expected {} comment(s) in word/comments.xml, found {} well-formed enough to \
+             correlate a w:id to a body paragraph's w14:paraId — the raw-XML patch step \
+             (w15:done / w:initials / uid) cannot proceed on a shape it doesn't recognise",
+            prepared.len(),
+            actual_para_id.len()
+        ));
+    }
+
+    // `w:initials` + the uid attribute, keyed by `w:id` — a plain `usize` `docx-rs` never
+    // rewrites (unlike a paragraph id; see `prepare_comments`'s doc comment), so no read-back
+    // is needed for this half.
+    let initials_re = Regex::new(r#"(<w:comment\s+w:id="(\d+)"[^>]*?)w:initials="""#)
+        .expect("static regex is valid");
+    let comments_text = initials_re
+        .replace_all(&comments_text, |caps: &regex::Captures<'_>| {
+            let id: usize = caps[2]
+                .parse()
+                .expect("\\d+ capture is always a valid usize");
+            let pc = by_id
+                .get(&id)
+                .expect("every w:id captured here was assigned by prepare_comments");
+            format!(
+                r#"{}w:initials="{}" skrb:uid="{}""#,
+                &caps[1],
+                xml_attr_escape(&pc.author_initials),
+                xml_attr_escape(&pc.uid),
+            )
+        })
+        .into_owned();
+
+    // `w15:done`, keyed by the *actual* paraId read back above — this is the field the
+    // paraId-rewrite hazard actually bites: a `commentEx` entry is matched to its `<w:comment>`
+    // purely by `w15:paraId` equalling the body paragraph's real `w14:paraId`, and that is
+    // exactly the value `Docx::build()` may have reassigned.
+    let resolved_para_ids: HashSet<&str> = prepared
+        .iter()
+        .filter(|c| c.resolved)
+        .filter_map(|c| actual_para_id.get(&c.id).map(String::as_str))
+        .collect();
+    let done_re =
+        Regex::new(r#"(<w15:commentEx\s+w15:paraId="([0-9a-fA-F]{8})"[^>]*?)w15:done="0""#)
+            .expect("static regex is valid");
+    let comments_extended_text = done_re
+        .replace_all(&comments_extended_text, |caps: &regex::Captures<'_>| {
+            let done = if resolved_para_ids.contains(&caps[2]) {
+                "1"
+            } else {
+                "0"
+            };
+            format!(r#"{}w15:done="{}""#, &caps[1], done)
+        })
+        .into_owned();
+
+    xml_docx.comments = comments_text.into_bytes();
+    xml_docx.comments_extended = comments_extended_text.into_bytes();
+    Ok(())
+}
+
+/// Skribisto's own extension namespace, used only to carry [`DocumentComment::uid`] on a
+/// `<w:comment>` — see `patch_comment_extras`. Versioned so a future incompatible shape change
+/// does not get misread as the current one by an older writer or reader sharing this crate.
+const SKRB_NAMESPACE_URI: &str = "urn:ferntech:text-document:comment:1";
+
+/// Declare [`SKRB_NAMESPACE_URI`] under the `skrb` prefix on `comments.xml`'s root element —
+/// the same element that already declares `xmlns:o`, `xmlns:w`, etc. (see `Comments::build_to`
+/// in `docx-rs`, `xml_builder/comments.rs`). Errors rather than silently no-opping if the root
+/// tag is not found in the expected shape, since a silent no-op here would leave every
+/// `skrb:uid` attribute a namespace error nothing downstream would explain.
+fn declare_skrb_namespace(comments_text: String) -> Result<String> {
+    let patched = comments_text.replacen(
+        "<w:comments ",
+        &format!(r#"<w:comments xmlns:skrb="{SKRB_NAMESPACE_URI}" "#),
+        1,
+    );
+    if patched == comments_text {
+        return Err(anyhow!(
+            "word/comments.xml did not start with the expected '<w:comments ' root element — \
+             cannot declare the skrb: namespace the uid attribute needs"
+        ));
+    }
+    Ok(patched)
+}
+
+/// Escape `s` for use inside a double-quoted XML attribute value. `docx-rs`'s own writer
+/// (`xml-rs`) escapes everything it writes; this hand-rolled escaper exists only for the two
+/// attribute values this module injects directly as text (`w:initials`, `skrb:uid`) rather
+/// than through that writer.
+fn xml_attr_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            // Dropped, not escaped. These are illegal in XML 1.0 *in any form* — there is no
+            // character reference that makes them legal — so emitting one produces a file no
+            // parser will open, and `&#x1;` would be just as fatal as the raw byte. Word will
+            // happily let an author paste one into a comment, and `w:initials` is written
+            // from exactly that text. `odt_render::xml_escape` already drops them; this is the
+            // same rule, and the two must not disagree about which files they can write.
+            '\u{0}'..='\u{8}' | '\u{b}' | '\u{c}' | '\u{e}'..='\u{1f}' => {}
+            _ => out.push(c),
+        }
+    }
+    out
 }

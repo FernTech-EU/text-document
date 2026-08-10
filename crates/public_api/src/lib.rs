@@ -47,10 +47,13 @@ pub use frontend::block::dtos::{Alignment, MarkerType};
 pub use frontend::block::dtos::{CharVerticalAlignment, InlineContent, UnderlineStyle};
 pub use frontend::common::format_runs::ReplaceFormatPolicy;
 pub use frontend::common::parser_tools::{
-    CountMethod, DjotExportOptions, DjotImportOptions, DocxExportOptions, DocxHeadingStyle,
-    EpubExportOptions, ExportImage, ExportImages, HtmlExportOptions, HtmlImageMode,
-    MarkdownExportOptions, PdfExportOptions, PlainTextExportOptions, Sentence, TABLE_ANCHOR,
-    WordCharCounts, count, count_djot, djot_to_plain_text, sentence_bounds, sentences,
+    CommentReply, CountMethod, DjotExportOptions, DjotImportOptions, DocumentComment,
+    DocumentComments, DocxExportOptions, DocxHeadingStyle, EpubExportOptions, ExportImage,
+    ExportImages, HtmlExportOptions, HtmlImageMode, LatexExportOptions, MarkdownExportOptions,
+    OdtExportOptions, OdtHeadingStyle, PdfExportOptions, PlainTextExportOptions, Sentence,
+    TABLE_ANCHOR, WordCharCounts, count, count_djot, djot_round_trip_is_lossy, djot_to_plain_text,
+    escape_djot_inline, guard_djot_block_start, needs_djot_escaping, plain_text_to_djot,
+    sentence_bounds, sentences,
 };
 
 /// The matcher, as a pure function over `&str` — no document, no store, no threads.
@@ -94,16 +97,16 @@ pub use highlight::{
     SyntaxHighlighter,
 };
 pub use operation::{
-    DocxExportResult, EpubExportResult, HtmlImportResult, MarkdownImportResult, Operation,
-    PdfExportResult,
+    DocxExportResult, EpubExportResult, HtmlImportResult, MarkdownImportResult, OdtExportResult,
+    Operation, PdfExportResult,
 };
 
 // ── Layout engine API types ─────────────────────────────────────
 pub use flow::{
-    BlockSnapshot, CellFormat, CellRange, CellSnapshot, CellVerticalAlignment, FlowElement,
-    FlowElementSnapshot, FlowSnapshot, FormatChangeKind, FragmentContent, FrameRef, FrameSnapshot,
-    ListInfo, PaintHighlightSpan, SelectionKind, TableCellContext, TableCellRef, TableFormat,
-    TableSnapshot,
+    AddressablePiece, BlockSnapshot, CellFormat, CellRange, CellSnapshot, CellVerticalAlignment,
+    FlowElement, FlowElementSnapshot, FlowSnapshot, FormatChangeKind, FragmentContent, FrameRef,
+    FrameSnapshot, ListInfo, PaintHighlightSpan, SelectionKind, TableCellContext, TableCellRef,
+    TableFormat, TableSnapshot,
 };
 pub use text_block::TextBlock;
 pub use text_frame::TextFrame;

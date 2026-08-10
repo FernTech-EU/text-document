@@ -9,6 +9,8 @@ use crate::ExportHtmlDto;
 use crate::ExportLatexDto;
 use crate::ExportLatexResultDto;
 use crate::ExportMarkdownDto;
+use crate::ExportOdtDto;
+use crate::ExportOdtResultDto;
 use crate::ExportPdfDto;
 use crate::ExportPdfResultDto;
 use crate::ExportPlainTextDto;
@@ -25,6 +27,7 @@ use crate::units_of_work::export_epub_uow::ExportEpubUnitOfWorkFactory;
 use crate::units_of_work::export_html_uow::ExportHtmlUnitOfWorkFactory;
 use crate::units_of_work::export_latex_uow::ExportLatexUnitOfWorkFactory;
 use crate::units_of_work::export_markdown_uow::ExportMarkdownUnitOfWorkFactory;
+use crate::units_of_work::export_odt_uow::ExportOdtUnitOfWorkFactory;
 #[cfg(feature = "pdf")]
 use crate::units_of_work::export_pdf_uow::ExportPdfUnitOfWorkFactory;
 use crate::units_of_work::export_plain_text_uow::ExportPlainTextUnitOfWorkFactory;
@@ -38,6 +41,7 @@ use crate::use_cases::export_epub_uc::ExportEpubUseCase;
 use crate::use_cases::export_html_uc::ExportHtmlUseCase;
 use crate::use_cases::export_latex_uc::ExportLatexUseCase;
 use crate::use_cases::export_markdown_uc::ExportMarkdownUseCase;
+use crate::use_cases::export_odt_uc::ExportOdtUseCase;
 #[cfg(feature = "pdf")]
 use crate::use_cases::export_pdf_uc::ExportPdfUseCase;
 use crate::use_cases::export_plain_text_uc::ExportPlainTextUseCase;
@@ -359,6 +363,23 @@ pub fn build_docx_document(db_context: &DbContext, dto: &ExportDocxDto) -> Resul
     Ok(docx)
 }
 
+/// As [`build_docx_document`], but also runs the post-`build()` raw-XML comment patch
+/// (`w15:done`, `w:initials`, the uid attribute) and returns the packable
+/// [`docx_rs::XMLDocx`] instead of the pre-`build()` [`docx_rs::Docx`]. Intended for tests
+/// asserting on those three fields, none of which the bare builder struct exposes — they only
+/// exist in the packed XML bytes. Also used to produce a real, on-disk `.docx` for the
+/// golden-fixture LibreOffice conversion test, since `docx_rs::Docx::build().pack(..)` alone
+/// would skip the patch entirely.
+#[doc(hidden)]
+pub fn build_docx_xml_document(
+    db_context: &DbContext,
+    dto: &ExportDocxDto,
+) -> Result<docx_rs::XMLDocx> {
+    let uow_context = ExportDocxUnitOfWorkFactory::new(db_context);
+    let uc = ExportDocxUseCase::new(Box::new(uow_context), dto);
+    uc.build_document_xml()
+}
+
 pub fn get_export_docx_progress(
     long_operation_manager: &LongOperationManager,
     operation_id: &str,
@@ -429,6 +450,50 @@ pub fn get_export_epub_result(
     // Parse the JSON string into a ExportEpubResultDto
     let result_dto: ExportEpubResultDto = serde_json::from_str(&result_json.unwrap())?;
 
+    Ok(Some(result_dto))
+}
+
+pub fn export_odt(
+    db_context: &DbContext,
+    _event_hub: &Arc<EventHub>,
+    long_operation_manager: &mut LongOperationManager,
+    dto: &ExportOdtDto,
+) -> Result<String> {
+    let uow_context = ExportOdtUnitOfWorkFactory::new(db_context);
+    let uc = ExportOdtUseCase::new(Box::new(uow_context), dto);
+    let operation_id = long_operation_manager.start_operation(uc);
+    Ok(operation_id)
+}
+
+/// Build the packaged ODT bytes for `db_context` without writing a file.
+///
+/// This runs the exact same builder used by [`export_odt`] but returns the assembled `.odt` zip
+/// archive as bytes instead of writing it to disk, so callers (tests, notably) can inspect the
+/// produced package directly — the ODT analog of [`build_epub_document`].
+#[doc(hidden)]
+pub fn build_odt_document(db_context: &DbContext, dto: &ExportOdtDto) -> Result<Vec<u8>> {
+    let uow_context = ExportOdtUnitOfWorkFactory::new(db_context);
+    let uc = ExportOdtUseCase::new(Box::new(uow_context), dto);
+    let (odt_bytes, _paragraph_count) = uc.build_document()?;
+    Ok(odt_bytes)
+}
+
+pub fn get_export_odt_progress(
+    long_operation_manager: &LongOperationManager,
+    operation_id: &str,
+) -> Option<OperationProgress> {
+    long_operation_manager.get_operation_progress(operation_id)
+}
+
+pub fn get_export_odt_result(
+    long_operation_manager: &LongOperationManager,
+    operation_id: &str,
+) -> Result<Option<ExportOdtResultDto>> {
+    let result_json = long_operation_manager.get_operation_result(operation_id);
+    if result_json.is_none() {
+        return Ok(None);
+    }
+    let result_dto: ExportOdtResultDto = serde_json::from_str(&result_json.unwrap())?;
     Ok(Some(result_dto))
 }
 

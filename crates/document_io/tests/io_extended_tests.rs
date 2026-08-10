@@ -1,6 +1,7 @@
 extern crate text_document_io as document_io;
 use anyhow::Result;
 use common::long_operation::{LongOperationManager, OperationStatus};
+use common::parser_tools::LatexExportOptions;
 
 use test_harness::{setup, setup_with_text};
 
@@ -213,9 +214,11 @@ fn test_export_latex_simple() -> Result<()> {
         &db_context,
         &event_hub,
         &ExportLatexDto {
-            document_class: String::new(),
-            include_preamble: false,
-            omit_images: false,
+            options: LatexExportOptions {
+                document_class: String::new(),
+                include_preamble: false,
+                omit_images: false,
+            },
         },
     )?;
     assert!(result.latex_text.contains("Hello World"));
@@ -231,9 +234,11 @@ fn test_export_latex_with_preamble() -> Result<()> {
         &db_context,
         &event_hub,
         &ExportLatexDto {
-            document_class: "article".to_string(),
-            include_preamble: true,
-            omit_images: false,
+            options: LatexExportOptions {
+                document_class: "article".to_string(),
+                include_preamble: true,
+                omit_images: false,
+            },
         },
     )?;
     assert!(result.latex_text.contains("\\documentclass{article}"));
@@ -261,9 +266,11 @@ fn test_export_latex_without_preamble() -> Result<()> {
         &db_context,
         &event_hub,
         &ExportLatexDto {
-            document_class: String::new(),
-            include_preamble: false,
-            omit_images: false,
+            options: LatexExportOptions {
+                document_class: String::new(),
+                include_preamble: false,
+                omit_images: false,
+            },
         },
     )?;
     assert!(!result.latex_text.contains("\\documentclass"));
@@ -360,9 +367,11 @@ fn test_export_latex_escapes_special_chars() -> Result<()> {
         &db_context,
         &event_hub,
         &ExportLatexDto {
-            document_class: String::new(),
-            include_preamble: false,
-            omit_images: false,
+            options: LatexExportOptions {
+                document_class: String::new(),
+                include_preamble: false,
+                omit_images: false,
+            },
         },
     )?;
 
@@ -455,9 +464,11 @@ fn test_export_latex_heading() -> Result<()> {
         &db_context,
         &event_hub,
         &ExportLatexDto {
-            document_class: "article".to_string(),
-            include_preamble: true,
-            omit_images: false,
+            options: LatexExportOptions {
+                document_class: "article".to_string(),
+                include_preamble: true,
+                omit_images: false,
+            },
         },
     )?;
 

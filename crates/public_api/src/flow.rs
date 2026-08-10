@@ -6,7 +6,7 @@
 use crate::text_block::TextBlock;
 use crate::text_frame::TextFrame;
 use crate::text_table::TextTable;
-use crate::{Alignment, BlockFormat, FrameFormat, ListStyle, TextFormat};
+use crate::{Alignment, BlockFormat, FrameFormat, InlineContent, ListStyle, TextFormat};
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 // FlowElement
@@ -119,6 +119,41 @@ pub enum FragmentContent {
         /// (see [`synth_element_id`](common::format_runs::synth_element_id)).
         element_id: u64,
     },
+}
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// AddressablePiece
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+/// One piece of a block's inline content — a text run, an image, or a footnote
+/// reference — addressed in the document's own **addressable character space**: the
+/// space [`TextDocument::to_addressable_text`](crate::TextDocument::to_addressable_text),
+/// `find_all` match positions, and [`TextBlock::position`] all share.
+///
+/// [`FragmentContent`]'s `offset` is deliberately **block-relative** (0 at the block's own
+/// start) — it feeds the layout engine, which lays out one block at a time and has no use
+/// for a document-wide number. `AddressablePiece` is the other half: `start`/`end` are
+/// **document-relative**, for a caller correlating a piece boundary against something that
+/// *is* addressed in the document's own space — a comment's stored character range, another
+/// block's [`position()`](TextBlock::position), a [`find_all`](crate::TextDocument::find_all)
+/// match. Pairing a block-relative offset with a document-relative string (or the reverse)
+/// is exactly the "offset from one space, string from another" bug
+/// [`to_addressable_text`](crate::TextDocument::to_addressable_text)'s doc comment describes
+/// for whole-document offsets — this type exists so a caller never has to do that
+/// arithmetic, and never gets it wrong, one level down inside a single block.
+///
+/// `end - start` is always `1` for [`InlineContent::Image`] and [`InlineContent::
+/// FootnoteRef`] — the `U+FFFC` sentinel counts as one character, matching how the document
+/// itself counts it — and equals `content`'s own char count for [`InlineContent::Text`].
+///
+/// Obtained from [`TextBlock::addressable_inline_pieces`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct AddressablePiece {
+    /// `[start, end)` in the document's addressable character space.
+    pub start: usize,
+    pub end: usize,
+    pub content: InlineContent,
+    pub format: TextFormat,
 }
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━

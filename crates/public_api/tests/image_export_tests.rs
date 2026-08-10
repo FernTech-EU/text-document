@@ -11,8 +11,8 @@
 use std::io::Read;
 
 use text_document::{
-    EpubExportOptions, ExportImage, ExportImages, HtmlExportOptions, HtmlImageMode, ResourceType,
-    TextDocument,
+    EpubExportOptions, ExportImage, ExportImages, HtmlExportOptions, HtmlImageMode,
+    LatexExportOptions, ResourceType, TextDocument,
 };
 
 /// A real 4×3 PNG, encoded by the `png` crate so the bytes are a decodable
@@ -150,7 +150,11 @@ fn latex_can_omit_images() {
     // filesystem, so an export whose caller will not place the files beside the
     // `.tex` has to leave the command out or the build fails outright.
     let tex = doc_with_image()
-        .to_latex_with_options("article", true, true)
+        .to_latex_with_options(LatexExportOptions {
+            document_class: "article".into(),
+            include_preamble: true,
+            omit_images: true,
+        })
         .expect("latex");
     assert!(!tex.contains("\\includegraphics"), "{tex}");
     assert!(tex.contains("before") && tex.contains("after"), "{tex}");

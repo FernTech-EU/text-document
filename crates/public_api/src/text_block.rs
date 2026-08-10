@@ -9,7 +9,9 @@ use frontend::common::format_runs::{FormatRun, ImageAnchor, synth_element_id};
 use frontend::common::types::EntityId;
 
 use crate::convert::to_usize;
-use crate::flow::{BlockSnapshot, FragmentContent, ListInfo, TableCellContext, TableCellRef};
+use crate::flow::{
+    AddressablePiece, BlockSnapshot, FragmentContent, ListInfo, TableCellContext, TableCellRef,
+};
 use crate::inner::TextDocumentInner;
 use crate::text_frame::TextFrame;
 use crate::text_list::TextList;
@@ -325,6 +327,45 @@ impl TextBlock {
             return crate::highlight::merge_highlight_spans(fragments, &spans);
         }
         fragments
+    }
+
+    // ── Addressable Inline Pieces ─────────────────────────────
+
+    /// The block's inline pieces (text runs, images, footnote references), addressed in
+    /// the document's own addressable character space rather than block-relative — see
+    /// [`AddressablePiece`]. **O(k)** where k = format runs + image anchors + footnote
+    /// references in this block.
+    ///
+    /// Reach for this instead of [`fragments`](Self::fragments) /
+    /// [`display_fragments`](Self::display_fragments) — whose `offset` is block-relative,
+    /// fine for the layout engine that consumes them one block at a time — whenever a piece
+    /// boundary needs comparing against something addressed in the *document's* own space:
+    /// a comment's stored character range, a [`TextDocument::find_all`](crate::TextDocument::
+    /// find_all) match position, another block's [`position()`](Self::position).
+    ///
+    /// Thin wrapper over [`common::format_runs_query::addressable_inline_pieces_for_block`]
+    /// — the same accessor a DOCX/ODT export writer reaches for below the public API, so a
+    /// piece boundary computed here and one computed there can never disagree.
+    pub fn addressable_inline_pieces(&self) -> Vec<AddressablePiece> {
+        let inner = self.doc.lock();
+        let Some(block_dto) = block_commands::get_block(&inner.ctx, &(self.block_id as u64))
+            .ok()
+            .flatten()
+        else {
+            return Vec::new();
+        };
+        let entity: common::entities::Block = block_dto.into();
+        let store = inner.ctx.db_context.get_store();
+        let plain_text = common::database::rope_helpers::block_content_via_store(&entity, store);
+        common::format_runs_query::addressable_inline_pieces_for_block(store, &entity, &plain_text)
+            .into_iter()
+            .map(|p| AddressablePiece {
+                start: to_usize(p.start as i64),
+                end: to_usize(p.end as i64),
+                content: p.content,
+                format: TextFormat::from(&p.format),
+            })
+            .collect()
     }
 
     // ── List Membership ─────────────────────────────────────

@@ -215,6 +215,13 @@ pub struct EpubExportResult {
     pub chapter_count: usize,
 }
 
+/// Result of an ODT export (`to_odt`).
+#[derive(Debug, Clone)]
+pub struct OdtExportResult {
+    pub file_path: String,
+    pub paragraph_count: usize,
+}
+
 /// Result of a PDF export (`to_pdf`).
 #[derive(Debug, Clone)]
 pub struct PdfExportResult {
