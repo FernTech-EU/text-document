@@ -10,7 +10,7 @@ use common::entities::{
 };
 use common::format_runs::{InlineContent, InlineSegment};
 use common::long_operation::LongOperation;
-use common::parser_tools::{DocumentComments, ExportImages};
+use common::parser_tools::{DocumentComments, DocumentMarks, ExportImages};
 use common::types::{EntityId, ROOT_ENTITY_ID};
 use regex::Regex;
 use std::collections::{HashMap, HashSet};
@@ -86,7 +86,7 @@ impl<'a> FootnoteRefState<'a> {
 //
 //  1. `prepare_comments` resolves every thread (root + each reply, since a reply anchors to
 //     the exact same range as the comment it answers — see `DocumentComment`'s own doc
-//     comment) into a `PreparedComment`: a docx-rs numeric id, a deterministic paragraph id
+//     comment) into a `PreparedSpan`: a docx-rs numeric id, a deterministic paragraph id
 //     for its one-paragraph body, and the built `docx_rs::Comment` itself.
 //  2. `CommentEmitState` (built from that list) is threaded through the block-rendering walk
 //     so `render_block`/`add_inline_content` can ask "which comments open or close inside
@@ -104,27 +104,78 @@ impl<'a> FootnoteRefState<'a> {
 /// that shared range: real Word output does the same thing (a thread with replies has as many
 /// stacked range markers in the body as it has comments), and it is the only way to get a
 /// reply into `comments.xml` at all — see `patch_comment_extras`'s doc comment for why.
-pub(crate) struct PreparedComment {
+pub(crate) struct PreparedSpan {
     /// The plain, sequentially-assigned `usize` docx-rs uses for `w:id` /
     /// `w:commentRangeStart`/`w:commentRangeEnd`/`w:commentReference`. Never touched by
     /// `Docx::build()`'s paragraph-id dedup pass (that only rewrites `Paragraph::id`, a
     /// completely different id space) — safe to use as a stable lookup key after `build()`.
+    ///
+    /// Shared by comments and marks, because [`CommentEmitState`]'s started/ended sets are keyed
+    /// by it alone and two spans sharing one would mark each other placed. A mark's *bookmark*
+    /// id is a separate OOXML id space and lives in [`SpanEmit::Mark`].
     id: usize,
-    /// The uid this comment/reply carries — `DocumentComment::uid` for the root,
-    /// `CommentReply::uid` for a reply.
+    /// The uid this span carries — `DocumentComment::uid` for a comment root,
+    /// `CommentReply::uid` for a reply, and the bookmark's own name for a mark.
     uid: String,
-    author_initials: String,
-    /// Only meaningful on the root (`DocumentComment::resolved`); always `false` for a reply,
-    /// which carries no resolved state of its own.
-    resolved: bool,
-    /// `[start, end)` in the document's addressable character space — the thread's own range,
-    /// shared by every `PreparedComment` in the same thread.
+    /// `[start, end)` in the document's addressable character space — for a comment, the
+    /// thread's own range, shared by every `PreparedSpan` in the same thread.
     start: u32,
     end: u32,
-    /// The built `docx_rs::Comment`, ready to hand to `Paragraph`/`Hyperlink::add_comment_start`.
-    /// Cloned exactly once (each id opens exactly one range), but `Comment` is cheap and the
-    /// clone keeps `PreparedComment` itself immutable through the whole render walk.
-    comment: docx_rs::Comment,
+    /// Whether failing to anchor this span fails the export. True for comments (a note the
+    /// caller asked for that is silently missing is data loss); false for marks, which are an
+    /// aid to reading the file back rather than content — see the ODF writer's
+    /// `PreparedSpan::required` for the full reasoning, which is identical here.
+    required: bool,
+    /// What this span actually writes at its two boundaries.
+    emit: SpanEmit,
+}
+
+/// The kind-specific half of a [`PreparedSpan`].
+///
+/// Comments and marks share every bit of the range arithmetic — block windowing, per-piece
+/// marker resolution, run splitting — and differ only in the builder calls at the boundary and
+/// in the post-`build()` patch pass, which is comment-only. Keeping the difference in one enum
+/// rather than in two parallel pipelines is what stops the two from drifting.
+enum SpanEmit {
+    Comment {
+        author_initials: String,
+        /// Only meaningful on the root (`DocumentComment::resolved`); always `false` for a
+        /// reply, which carries no resolved state of its own.
+        resolved: bool,
+        /// The built `docx_rs::Comment`, ready to hand to
+        /// `Paragraph`/`Hyperlink::add_comment_start`. Cloned exactly once (each id opens
+        /// exactly one range), but `Comment` is cheap and the clone keeps `PreparedSpan` itself
+        /// immutable through the whole render walk.
+        comment: docx_rs::Comment,
+    },
+    Mark {
+        /// OOXML's own bookmark id space, which is unrelated to `w:id` on a comment. Named only
+        /// on `w:bookmarkStart`; `w:bookmarkEnd` carries the id alone, which is why this has to
+        /// be kept rather than re-derived from the name at the closing boundary.
+        bookmark_id: usize,
+        name: String,
+        /// A zero-length bookmark. OOXML has no self-closing spelling the way ODF's
+        /// `<text:bookmark/>` does, so a point mark is a `bookmarkStart` immediately followed by
+        /// its `bookmarkEnd`, both emitted at the opening boundary — the closing one is never
+        /// reached, since `window_for_block`'s strictly-greater `ends` test never selects an
+        /// empty range.
+        point: bool,
+    },
+}
+
+impl PreparedSpan {
+    /// The comment-specific fields, for the passes that only apply to comments (the
+    /// `word/comments.xml` patch). `None` for a mark.
+    fn as_comment(&self) -> Option<(&str, bool, &docx_rs::Comment)> {
+        match &self.emit {
+            SpanEmit::Comment {
+                author_initials,
+                resolved,
+                comment,
+            } => Some((author_initials, *resolved, comment)),
+            SpanEmit::Mark { .. } => None,
+        }
+    }
 }
 
 /// FNV-1a (32-bit) — a small, dependency-free, deterministic hash used only to turn a
@@ -139,7 +190,7 @@ fn fnv1a32(s: &str) -> u32 {
     hash
 }
 
-/// Resolve every comment thread in `comments` into its flat `PreparedComment` list, in
+/// Resolve every comment thread in `comments` into its flat `PreparedSpan` list, in
 /// document order (root immediately followed by its own replies, in the order they were
 /// authored).
 ///
@@ -154,7 +205,7 @@ fn fnv1a32(s: &str) -> u32 {
 /// (`refresh_duplicate_para_ids`) from ever needing to touch these — though the writer does
 /// not *rely* on that being guaranteed (see `patch_comment_extras`'s doc comment for the code
 /// path that stays correct even if it collides anyway).
-fn prepare_comments(comments: &DocumentComments) -> Vec<PreparedComment> {
+fn prepare_comments(comments: &DocumentComments) -> Vec<PreparedSpan> {
     let mut out = Vec::new();
     let mut used_para_ids: HashSet<String> = HashSet::new();
     let mut next_id: usize = 1;
@@ -178,14 +229,17 @@ fn prepare_comments(comments: &DocumentComments) -> Vec<PreparedComment> {
             .author(c.author.clone())
             .date(c.date.clone())
             .add_paragraph(render_comment_body(&c.body).id(root_para_id.clone()));
-        out.push(PreparedComment {
+        out.push(PreparedSpan {
             id: root_id,
             uid: c.uid.clone(),
-            author_initials: c.author_initials.clone(),
-            resolved: c.resolved,
             start: c.start,
             end: c.end,
-            comment: root_comment,
+            required: true,
+            emit: SpanEmit::Comment {
+                author_initials: c.author_initials.clone(),
+                resolved: c.resolved,
+                comment: root_comment,
+            },
         });
 
         for reply in &c.replies {
@@ -197,20 +251,64 @@ fn prepare_comments(comments: &DocumentComments) -> Vec<PreparedComment> {
                 .date(reply.date.clone())
                 .add_paragraph(render_comment_body(&reply.body).id(reply_para_id.clone()))
                 .parent_comment_id(root_id);
-            out.push(PreparedComment {
+            out.push(PreparedSpan {
                 id: reply_id,
                 uid: reply.uid.clone(),
-                author_initials: reply.author_initials.clone(),
-                // A reply carries no resolved state of its own — only the thread it belongs
-                // to (`DocumentComment::resolved`) does.
-                resolved: false,
                 start: c.start,
                 end: c.end,
-                comment: reply_comment,
+                required: true,
+                emit: SpanEmit::Comment {
+                    author_initials: reply.author_initials.clone(),
+                    // A reply carries no resolved state of its own — only the thread it belongs
+                    // to (`DocumentComment::resolved`) does.
+                    resolved: false,
+                    comment: reply_comment,
+                },
             });
         }
     }
     out
+}
+
+/// Resolve every comment thread *and* every round-trip mark into one ordered
+/// [`PreparedSpan`] list — the OOXML twin of `export_odt_uc::prepare_spans`.
+fn prepare_spans(comments: &DocumentComments, marks: &DocumentMarks) -> Result<Vec<PreparedSpan>> {
+    let mut out = prepare_comments(comments);
+    let first_span_id = out.len() + 1;
+    out.extend(prepare_marks(marks, first_span_id)?);
+    Ok(out)
+}
+
+/// Resolve every round-trip mark into a [`PreparedSpan`].
+///
+/// Refuses the whole export on an invalid name rather than dropping the offender, for the same
+/// reason `export_odt_uc::prepare_marks` does: these names are minted by the host from its own
+/// identifiers, so a bad one is a caller bug, and a silently missing mark surfaces much later as
+/// a returning file that mysteriously fails to match.
+///
+/// Bookmark ids start at 0 and are their own OOXML id space, unrelated to `w:id` on a comment.
+fn prepare_marks(marks: &DocumentMarks, first_span_id: usize) -> Result<Vec<PreparedSpan>> {
+    marks
+        .validate()
+        .map_err(|e| anyhow!("invalid round-trip mark(s): {e}"))?;
+
+    Ok(marks
+        .in_document_order()
+        .into_iter()
+        .enumerate()
+        .map(|(i, m)| PreparedSpan {
+            id: first_span_id + i,
+            uid: m.name.clone(),
+            start: m.start,
+            end: m.end,
+            required: false,
+            emit: SpanEmit::Mark {
+                bookmark_id: i,
+                name: m.name.clone(),
+                point: m.is_point(),
+            },
+        })
+        .collect())
 }
 
 /// Render a comment or reply body's Djot source into exactly **one** `docx_rs::Paragraph`.
@@ -372,8 +470,8 @@ fn append_formatted_text(
 /// One comment boundary event, resolved to a local character index inside the one inline
 /// piece it falls in — see `markers_for_piece`.
 enum Marker<'a> {
-    Start(&'a PreparedComment),
-    End(&'a PreparedComment),
+    Start(&'a PreparedSpan),
+    End(&'a PreparedSpan),
 }
 
 /// The comments open or closing somewhere inside one block, and the bookkeeping needed to
@@ -384,7 +482,7 @@ enum Marker<'a> {
 /// the document's addressable text (footnote bodies, table cells; see `render_block`'s doc
 /// comment for why those are out of scope for comment ranges).
 struct CommentEmitState<'a> {
-    prepared: &'a [PreparedComment],
+    prepared: &'a [PreparedSpan],
     started: std::cell::RefCell<HashSet<usize>>,
     ended: std::cell::RefCell<HashSet<usize>>,
 }
@@ -392,12 +490,12 @@ struct CommentEmitState<'a> {
 /// The prepared comments whose range starts, respectively ends, somewhere inside one block —
 /// see `CommentEmitState::window_for_block`.
 struct BlockCommentWindow<'a> {
-    starts: Vec<&'a PreparedComment>,
-    ends: Vec<&'a PreparedComment>,
+    starts: Vec<&'a PreparedSpan>,
+    ends: Vec<&'a PreparedSpan>,
 }
 
 impl<'a> CommentEmitState<'a> {
-    fn new(prepared: &'a [PreparedComment]) -> Self {
+    fn new(prepared: &'a [PreparedSpan]) -> Self {
         Self {
             prepared,
             started: std::cell::RefCell::new(HashSet::new()),
@@ -414,7 +512,7 @@ impl<'a> CommentEmitState<'a> {
     /// per-block filter.
     fn window_for_block(&self, block_start: u32, block_end: u32) -> BlockCommentWindow<'a> {
         let empty = block_start == block_end;
-        let mut starts: Vec<&'a PreparedComment> = self
+        let mut starts: Vec<&'a PreparedSpan> = self
             .prepared
             .iter()
             .filter(|c| {
@@ -422,7 +520,7 @@ impl<'a> CommentEmitState<'a> {
             })
             .collect();
         starts.sort_by_key(|c| (c.start, c.id));
-        let mut ends: Vec<&'a PreparedComment> = self
+        let mut ends: Vec<&'a PreparedSpan> = self
             .prepared
             .iter()
             .filter(|c| {
@@ -451,10 +549,15 @@ impl<'a> CommentEmitState<'a> {
     fn ensure_all_anchored(&self) -> Result<()> {
         let started = self.started.borrow();
         let ended = self.ended.borrow();
+        // `required` only. A round-trip mark that found no home degrades re-import to matching
+        // by type and title, a designed fallback, and is not worth refusing to write the
+        // manuscript over — see `PreparedSpan::required`. A *point* mark additionally never
+        // reaches a closing boundary at all (`apply_marker` emits both halves at the start), so
+        // it would be reported here on every single export if this did not filter.
         let missing: Vec<String> = self
             .prepared
             .iter()
-            .filter(|c| !started.contains(&c.id) || !ended.contains(&c.id))
+            .filter(|c| c.required && (!started.contains(&c.id) || !ended.contains(&c.id)))
             .map(|c| format!("{} [{}, {})", c.uid, c.start, c.end))
             .collect();
         if missing.is_empty() {
@@ -503,10 +606,14 @@ fn markers_for_piece<'a>(
             out.push((c.end - piece_start, Marker::End(c)));
         }
     }
+    // Three ranks, not two. `End` before `Start` at an exact tie is the original rule; the split
+    // within `Start` puts a row's point mark at the front of its paragraph rather than inside a
+    // comment range that opens on the same character. Mirrors `export_odt_uc::markers_for_piece`.
     out.sort_by_key(|(idx, m)| {
         let (kind_rank, id) = match m {
             Marker::End(c) => (0u8, c.id),
-            Marker::Start(c) => (1u8, c.id),
+            Marker::Start(c) if !c.required => (1u8, c.id),
+            Marker::Start(c) => (2u8, c.id),
         };
         (*idx, kind_rank, id)
     });
@@ -525,6 +632,8 @@ trait InlineHost: Sized {
     fn host_add_run(self, run: docx_rs::Run) -> Self;
     fn host_add_comment_start(self, comment: docx_rs::Comment) -> Self;
     fn host_add_comment_end(self, id: usize) -> Self;
+    fn host_add_bookmark_start(self, id: usize, name: &str) -> Self;
+    fn host_add_bookmark_end(self, id: usize) -> Self;
 }
 
 impl InlineHost for docx_rs::Paragraph {
@@ -536,6 +645,12 @@ impl InlineHost for docx_rs::Paragraph {
     }
     fn host_add_comment_end(self, id: usize) -> Self {
         self.add_comment_end(id)
+    }
+    fn host_add_bookmark_start(self, id: usize, name: &str) -> Self {
+        self.add_bookmark_start(id, name)
+    }
+    fn host_add_bookmark_end(self, id: usize) -> Self {
+        self.add_bookmark_end(id)
     }
 }
 
@@ -549,17 +664,45 @@ impl InlineHost for docx_rs::Hyperlink {
     fn host_add_comment_end(self, id: usize) -> Self {
         self.add_comment_end(id)
     }
+    fn host_add_bookmark_start(self, id: usize, name: &str) -> Self {
+        self.add_bookmark_start(id, name)
+    }
+    fn host_add_bookmark_end(self, id: usize) -> Self {
+        self.add_bookmark_end(id)
+    }
 }
 
 fn apply_marker<H: InlineHost>(host: H, marker: &Marker<'_>, state: &CommentEmitState<'_>) -> H {
     match marker {
         Marker::Start(c) => {
             state.mark_started(c.id);
-            host.host_add_comment_start(c.comment.clone())
+            match &c.emit {
+                SpanEmit::Comment { comment, .. } => host.host_add_comment_start(comment.clone()),
+                SpanEmit::Mark {
+                    bookmark_id,
+                    name,
+                    point,
+                } => {
+                    let host = host.host_add_bookmark_start(*bookmark_id, name);
+                    // OOXML has no self-closing bookmark: a zero-length one is its start
+                    // immediately followed by its end. Emitted here rather than waiting for a
+                    // closing boundary that never comes — `window_for_block`'s `ends` test is
+                    // strictly greater than `block_start`, so an empty range is only ever
+                    // selected as a start.
+                    if *point {
+                        host.host_add_bookmark_end(*bookmark_id)
+                    } else {
+                        host
+                    }
+                }
+            }
         }
         Marker::End(c) => {
             state.mark_ended(c.id);
-            host.host_add_comment_end(c.id)
+            match &c.emit {
+                SpanEmit::Comment { .. } => host.host_add_comment_end(c.id),
+                SpanEmit::Mark { bookmark_id, .. } => host.host_add_bookmark_end(*bookmark_id),
+            }
         }
     }
 }
@@ -735,7 +878,7 @@ impl ExportDocxUseCase {
         uow: &dyn ExportDocxUnitOfWorkTrait,
         progress_callback: &dyn Fn(common::long_operation::OperationProgress),
         cancel_flag: Option<&AtomicBool>,
-    ) -> Result<(docx_rs::Docx, i64, Vec<PreparedComment>)> {
+    ) -> Result<(docx_rs::Docx, i64, Vec<PreparedSpan>)> {
         use docx_rs::*;
 
         // Step 1: Get Root and Document
@@ -787,7 +930,7 @@ impl ExportDocxUseCase {
         // assignment. `None` when the caller supplied no comments at all — every render call
         // site threads that straight through, so a plain export (no `comments` option set)
         // never pays for the per-block window computation.
-        let prepared_comments = prepare_comments(&self.dto.options.comments);
+        let prepared_comments = prepare_spans(&self.dto.options.comments, &self.dto.options.marks)?;
         let comment_state: Option<CommentEmitState<'_>> = if prepared_comments.is_empty() {
             None
         } else {
@@ -1894,7 +2037,7 @@ struct RenderedPiece<'p> {
 /// neighbours goes through `Hyperlink::add_comment_start`/`add_comment_end`, exactly mirroring
 /// `Paragraph`'s own methods — see [`InlineHost`]); and two comments can **overlap** in one
 /// block, including sharing the exact same range (a thread's replies always do — see
-/// `PreparedComment`'s doc comment) — `markers_for_piece` already returns every marker that
+/// `PreparedSpan`'s doc comment) — `markers_for_piece` already returns every marker that
 /// falls in a piece, in a stable order, so overlapping ranges just interleave correctly with
 /// no special-casing here.
 fn add_inline_content(
@@ -1924,9 +2067,11 @@ fn add_inline_content(
         // empty block) still needs to be anchored, or `ensure_all_anchored` fails the export
         // for a thread that had every right to exist.
         if let Some((state, window)) = comments {
+            // Through `apply_marker` rather than calling the builder directly, so this branch
+            // cannot forget a span kind: a round-trip mark landing on a blank paragraph writes
+            // its bookmark here exactly as it would mid-run.
             for &c in &window.starts {
-                state.mark_started(c.id);
-                paragraph = paragraph.add_comment_start(c.comment.clone());
+                paragraph = apply_marker(paragraph, &Marker::Start(c), state);
             }
             // Closed from `ends`, NOT from `starts`. They are different sets: a comment can
             // start in this block and end in a later one, or end here having started earlier.
@@ -1934,8 +2079,7 @@ fn add_inline_content(
             // is still open — and, worse, never emits one for a range that really did end
             // here, leaving it unterminated in the file.
             for &c in window.ends.iter().rev() {
-                state.mark_ended(c.id);
-                paragraph = paragraph.add_comment_end(c.id);
+                paragraph = apply_marker(paragraph, &Marker::End(c), state);
             }
         }
         return paragraph;
@@ -2124,10 +2268,11 @@ fn ordered_level_text(level: usize, list: &List) -> String {
 /// The three raw-XML gaps closed here, keyed as described in each field's own doc comment.
 /// See this module's "Raw-XML comment patch" note above for why `docx-rs` leaves them closed
 /// through its public API at all.
-fn patch_comment_extras(
-    xml_docx: &mut docx_rs::XMLDocx,
-    prepared: &[PreparedComment],
-) -> Result<()> {
+fn patch_comment_extras(xml_docx: &mut docx_rs::XMLDocx, spans: &[PreparedSpan]) -> Result<()> {
+    // Comments only. Round-trip marks share the prepared list (see `PreparedSpan`) but write
+    // bookmarks in the body, contribute nothing to `word/comments.xml`, and would otherwise
+    // throw off the count check below by exactly the number of marks in the export.
+    let prepared: Vec<&PreparedSpan> = spans.iter().filter(|s| s.as_comment().is_some()).collect();
     if prepared.is_empty() {
         return Ok(());
     }
@@ -2137,7 +2282,7 @@ fn patch_comment_extras(
     let comments_extended_text = String::from_utf8(std::mem::take(&mut xml_docx.comments_extended))
         .map_err(|e| anyhow!("word/commentsExtended.xml was not valid UTF-8: {e}"))?;
 
-    let by_id: HashMap<usize, &PreparedComment> = prepared.iter().map(|c| (c.id, c)).collect();
+    let by_id: HashMap<usize, &PreparedSpan> = prepared.iter().map(|c| (c.id, *c)).collect();
 
     // A private-namespace attribute in an undeclared prefix is well-formed XML but a
     // namespace *error* — strict readers (LibreOffice included) reject the whole part rather
@@ -2185,10 +2330,13 @@ fn patch_comment_extras(
             let pc = by_id
                 .get(&id)
                 .expect("every w:id captured here was assigned by prepare_comments");
+            let (author_initials, _, _) = pc
+                .as_comment()
+                .expect("by_id holds comments only — marks are filtered out above");
             format!(
                 r#"{}w:initials="{}" skrb:uid="{}""#,
                 &caps[1],
-                xml_attr_escape(&pc.author_initials),
+                xml_attr_escape(author_initials),
                 xml_attr_escape(&pc.uid),
             )
         })
@@ -2200,7 +2348,7 @@ fn patch_comment_extras(
     // exactly the value `Docx::build()` may have reassigned.
     let resolved_para_ids: HashSet<&str> = prepared
         .iter()
-        .filter(|c| c.resolved)
+        .filter(|c| c.as_comment().is_some_and(|(_, resolved, _)| resolved))
         .filter_map(|c| actual_para_id.get(&c.id).map(String::as_str))
         .collect();
     let done_re =

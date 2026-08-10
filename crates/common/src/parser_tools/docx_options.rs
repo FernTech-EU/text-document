@@ -153,6 +153,15 @@ pub struct DocxExportOptions {
     /// it is not the same space `FormatRun` byte offsets live in.
     #[serde(default)]
     pub comments: super::comment_options::DocumentComments,
+    /// Named positions and ranges to anchor into the exported `.docx` as
+    /// `w:bookmarkStart`/`w:bookmarkEnd` — the carrier a host uses to recognise its own rows and
+    /// comments when the file comes back from an editor. Empty ⇒ none are written.
+    ///
+    /// Bookmarks and not a private attribute, because Word does not preserve a private attribute
+    /// on `<w:comment>` — see [`super::mark_options`]'s module doc for the measurement. Same
+    /// addressable character space as [`comments`](Self::comments).
+    #[serde(default)]
+    pub marks: super::mark_options::DocumentMarks,
 }
 
 impl DocxExportOptions {

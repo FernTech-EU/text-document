@@ -2,7 +2,7 @@
 // SPDX-FileCopyrightText: 2026 FernTech
 
 //! Feature tests for M-T1 — DOCX comment-range export
-//! (`export_docx_uc.rs`'s comment machinery: `PreparedComment`, `CommentEmitState`,
+//! (`export_docx_uc.rs`'s comment machinery: `PreparedSpan`, `CommentEmitState`,
 //! `add_inline_content`'s run splitter, and `patch_comment_extras`'s raw-XML patch).
 //!
 //! Four things are proven here, matching the milestone's own requirements:

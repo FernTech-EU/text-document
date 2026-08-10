@@ -113,7 +113,8 @@ fn build_odt(db: &DbContext, comments: DocumentComments) -> Vec<u8> {
 }
 
 fn content_xml(bytes: &[u8]) -> String {
-    let mut archive = zip::ZipArchive::new(Cursor::new(bytes)).expect("packaged ODT is a valid zip");
+    let mut archive =
+        zip::ZipArchive::new(Cursor::new(bytes)).expect("packaged ODT is a valid zip");
     let mut file = archive
         .by_name("content.xml")
         .expect("content.xml entry present");
@@ -334,10 +335,16 @@ fn comment_boundary_splits_a_run_mid_hyperlink() {
     // hyperlink's own BODY (after its opening tag), never the tag itself — `<text:a ...
     // xlink:href="...">`'s attributes contain the substring "link" (inside "xlink"), which would
     // otherwise give a false match ahead of the real word.
-    let body_start = link_inner.find('>').map(|i| i + 1).expect("text:a has a body");
+    let body_start = link_inner
+        .find('>')
+        .map(|i| i + 1)
+        .expect("text:a has a body");
     let body = &link_inner[body_start..];
     let website_at = body.find("website").expect("website");
-    let link_at = body.find(">link<").map(|i| i + 1).expect("the split-off \"link\" word");
+    let link_at = body
+        .find(">link<")
+        .map(|i| i + 1)
+        .expect("the split-off \"link\" word");
     let here_at = body.rfind("here").expect("here");
     assert!(website_at < link_at, "{body}");
     assert!(link_at < here_at, "{body}");
@@ -422,7 +429,9 @@ fn a_multi_paragraph_body_becomes_real_multiple_text_p_elements() {
 
     let content = content_xml(&build_odt(&db, comments));
 
-    let ann_start = content.find("<office:annotation ").expect("annotation exists");
+    let ann_start = content
+        .find("<office:annotation ")
+        .expect("annotation exists");
     let ann_end = content[ann_start..]
         .find("</office:annotation>")
         .map(|i| i + ann_start)

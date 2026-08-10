@@ -448,6 +448,37 @@ fn every_known_scene_break_preset_glyph_is_recognised() {
     }
 }
 
+/// A paragraph that is a single mark of sentence punctuation is prose, and survives.
+///
+/// Found on a real 90 000-word manuscript: a paragraph containing only `!` — a beat of
+/// dialogue — was written out as a horizontal rule, and the character was gone from the file.
+/// A lone `…` is if anything more common, an ordinary silence in fiction. Neither is furniture.
+///
+/// The counter-example matters as much: the *same* mark repeated is still a break, because
+/// `. . .` is a real thematic-break glyph in Russian editorial practice.
+#[test]
+fn a_lone_mark_of_sentence_punctuation_is_prose_not_a_rule() {
+    for mark in ["!", "?", ".", "\u{2026}", ",", ";", ":"] {
+        let bytes = odt_from_plain_text(mark, OdtExportOptions::default());
+        let content = content_xml(&bytes);
+        assert!(
+            !content.contains("<text:p text:style-name=\"Rule\"/>"),
+            "a lone {mark:?} was swallowed by the rule heuristic: {content}"
+        );
+        assert!(
+            content.contains(mark),
+            "a lone {mark:?} vanished from the exported file: {content}"
+        );
+    }
+
+    // Repeated, it is a break again — `. . .` is a real glyph, not an accident.
+    let bytes = odt_from_plain_text(". . .", OdtExportOptions::default());
+    assert!(
+        content_xml(&bytes).contains("<text:p text:style-name=\"Rule\"/>"),
+        "a repeated mark must still be recognised"
+    );
+}
+
 #[test]
 fn an_ordinary_short_line_is_not_mistaken_for_a_scene_break() {
     // A single real word is not "one non-alphanumeric character repeated" and must render as

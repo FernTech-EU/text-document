@@ -135,7 +135,7 @@ use common::entities::{
 use common::format_runs::{InlineContent, InlineSegment};
 use common::format_runs_query::{addressable_inline_pieces_for_block, inline_segments_for_block};
 use common::long_operation::LongOperation;
-use common::parser_tools::{DocumentComments, ExportImages};
+use common::parser_tools::{DocumentComments, DocumentMarks, ExportImages};
 use common::types::{EntityId, ROOT_ENTITY_ID};
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -228,7 +228,7 @@ struct WalkCtx<'a> {
 // See this module's own doc comment for the encoding this section produces. The shape mirrors
 // `export_docx_uc`'s three-part machinery (`prepare_comments`, `CommentEmitState`, the run
 // splitter), but simplified by one whole layer: DOCX resolves everything into `docx_rs` builder
-// calls that only *become* XML once `Docx::build()` runs, so its `PreparedComment` carries a
+// calls that only *become* XML once `Docx::build()` runs, so its `PreparedSpan` carries a
 // half-built `docx_rs::Comment` and its `InlineHost` trait exists to target either of two
 // distinct builder types (`Paragraph`/`Hyperlink`). This writer has no builder at all — every
 // other part of it already assembles `content.xml`'s body as one `String` — so a "prepared"
@@ -236,35 +236,52 @@ struct WalkCtx<'a> {
 // will splice in, computed once, and "applying a marker" is nothing more than
 // `String::push_str`. One function (`append_piece`) suffices where DOCX needed a host trait.
 
-/// One comment or reply, resolved to what this writer needs to place its range and later prove
-/// it found a home. The ODF analog of `export_docx_uc::PreparedComment` — but unlike that type,
-/// `open_xml` is not assembled later by a builder: it already **is** the complete
-/// `<office:annotation>` element (author, date, resolved flag, uid, parent link and rendered
-/// body all resolved up front by [`prepare_comments`]), spliced in verbatim the instant this
-/// comment's range starts.
-struct PreparedComment {
+/// One anchored span this writer has to place: a comment, a reply, or a round-trip
+/// [mark](common::parser_tools::DocumentMark). The ODF analog of `export_docx_uc::PreparedSpan`
+/// — but unlike that type, `open_xml` is not assembled later by a builder: it already **is** the
+/// finished element (for a comment: author, date, resolved flag, uid, parent link and rendered
+/// body all resolved up front by [`prepare_spans`]), spliced in verbatim the instant the span's
+/// range starts.
+///
+/// The three kinds differ only in the two strings they splice and in whether failing to place
+/// them is an error, which is why one type covers all of them: the block windowing, the
+/// per-piece marker resolution and the run splitting are all pure range arithmetic and could not
+/// care what element the boundary eventually spells.
+struct PreparedSpan {
     /// Sequential id, scoped to one export. Purely internal bookkeeping for
     /// [`CommentEmitState`]'s started/ended sets — never written to the file itself (`name` is
     /// what the file spells); the ODF analog of `docx-rs`'s numeric comment id, minted the same
     /// way (root, then each reply, in document order).
     id: usize,
     /// The uid this comment/reply carries — `DocumentComment::uid` for the root,
-    /// `CommentReply::uid` for a reply. Reported by [`CommentEmitState::ensure_all_anchored`]
-    /// when a comment never finds a home; the file's own uid carrier is `skrb:uid`, already
-    /// baked into `open_xml`.
+    /// `CommentReply::uid` for a reply, and the bookmark's own name for a mark. Reported by
+    /// [`CommentEmitState::ensure_all_anchored`] when a comment never finds a home.
     uid: String,
-    /// The `office:name` this annotation was assigned — needed to close it
-    /// (`<office:annotation-end office:name="…"/>`), and, for a thread's root, also referenced
-    /// by every reply's own `open_xml` as its `loext:parent-name`.
-    name: String,
-    /// `[start, end)` in the document's addressable character space, shared by every comment
-    /// and reply in one thread — see `DocumentComment`'s own doc comment for why a reply has no
-    /// range of its own.
+    /// `[start, end)` in the document's addressable character space. For a comment thread this
+    /// is shared by every reply in it (see `DocumentComment`'s own doc comment for why a reply
+    /// has no range of its own); for a mark it is the mark's own span, possibly empty.
     start: u32,
     end: u32,
-    /// The complete `<office:annotation …>…</office:annotation>` element, built once by
-    /// [`prepare_comments`] and cloned into the body XML wherever this comment's range starts.
+    /// Spliced in where the span starts. A comment's complete
+    /// `<office:annotation …>…</office:annotation>`; a range mark's `<text:bookmark-start/>`; a
+    /// point mark's entire `<text:bookmark/>`, which has no second half.
     open_xml: String,
+    /// Spliced in where the span ends. Empty for a point mark — whose `end` equals its `start`,
+    /// so `window_for_block`'s strictly-greater `ends` test never selects it and this is never
+    /// reached. Precomputed rather than formatted at the boundary so the emit path is a splice
+    /// and nothing else, for every kind alike.
+    close_xml: String,
+    /// Whether failing to anchor this span fails the export.
+    ///
+    /// True for comments: a note the caller asked to be written that silently is not in the file
+    /// is data loss, and [`CommentEmitState::ensure_all_anchored`] exists to make it loud.
+    ///
+    /// False for marks: a mark is an aid to reading the file *back*, not content. A row whose
+    /// mark could not be placed (its position fell in a footnote body, a fenced code block or
+    /// table content — the regions this writer cannot anchor into) is still fully exported, and
+    /// re-import falls back to matching it by type and title. Refusing to write the manuscript
+    /// over that would trade a complete export for a convenience.
+    required: bool,
 }
 
 /// FNV-1a (32-bit) is not needed here the way `export_docx_uc::fnv1a32` is (that hash derives a
@@ -278,16 +295,72 @@ fn comment_range_name(id: usize) -> String {
     format!("__Comment__{id}")
 }
 
-/// Resolve every comment thread in `comments` into its flat [`PreparedComment`] list, in
+/// Resolve every comment thread in `comments` into its flat [`PreparedSpan`] list, in
 /// document order (root immediately followed by its own replies, in the order they were
 /// authored) — the ODF analog of `export_docx_uc::prepare_comments`. Takes `styles` because,
 /// unlike DOCX's comment body (built directly as `docx_rs::Run`s with no shared style table), a
 /// bold or italic word inside a comment body needs the same interned automatic character style
 /// every other bold/italic run in this document uses — see [`render_comment_body_odt`].
-fn prepare_comments(
+fn prepare_spans(
     comments: &DocumentComments,
+    marks: &DocumentMarks,
     styles: &mut OdtStyleSheet,
-) -> Vec<PreparedComment> {
+) -> Result<Vec<PreparedSpan>> {
+    let mut out = prepare_comments(comments, styles);
+    // Marks continue the same id space rather than starting a second one: the started/ended
+    // sets in `CommentEmitState` are keyed by id alone, and two spans sharing an id would mark
+    // each other as placed.
+    let first_mark_id = out.len() + 1;
+    out.extend(prepare_marks(marks, first_mark_id)?);
+    Ok(out)
+}
+
+/// Resolve every round-trip mark into a [`PreparedSpan`].
+///
+/// Validates first, and refuses the whole export on a bad name rather than dropping the offender:
+/// these names are minted by the host from its own identifiers, so an invalid one is a bug in the
+/// caller, and a silently missing mark would surface much later as a returning file that
+/// mysteriously fails to match — the hardest possible place to notice it. See
+/// [`DocumentMark::validate`](common::parser_tools::DocumentMark::validate).
+fn prepare_marks(marks: &DocumentMarks, first_id: usize) -> Result<Vec<PreparedSpan>> {
+    marks
+        .validate()
+        .map_err(|e| anyhow!("invalid round-trip mark(s): {e}"))?;
+
+    Ok(marks
+        .in_document_order()
+        .into_iter()
+        .enumerate()
+        .map(|(i, m)| {
+            let escaped = odt_render::xml_escape(&m.name);
+            // A point mark is one self-closing `<text:bookmark>`; a range mark is a
+            // start/end pair. ODF spells the name on both halves of a pair, unlike OOXML,
+            // which names only the start and closes by numeric id.
+            let (open_xml, close_xml) = if m.is_point() {
+                (
+                    format!("<text:bookmark text:name=\"{escaped}\"/>"),
+                    String::new(),
+                )
+            } else {
+                (
+                    format!("<text:bookmark-start text:name=\"{escaped}\"/>"),
+                    format!("<text:bookmark-end text:name=\"{escaped}\"/>"),
+                )
+            };
+            PreparedSpan {
+                id: first_id + i,
+                uid: m.name.clone(),
+                start: m.start,
+                end: m.end,
+                open_xml,
+                close_xml,
+                required: false,
+            }
+        })
+        .collect())
+}
+
+fn prepare_comments(comments: &DocumentComments, styles: &mut OdtStyleSheet) -> Vec<PreparedSpan> {
     let mut out = Vec::new();
     let mut next_id: usize = 1;
 
@@ -299,13 +372,14 @@ fn prepare_comments(
         let open_xml = annotation_open_xml(
             &root_name, &c.uid, &c.author, &c.date, c.resolved, None, &body_xml,
         );
-        out.push(PreparedComment {
+        out.push(PreparedSpan {
             id: root_id,
             uid: c.uid.clone(),
-            name: root_name.clone(),
             start: c.start,
             end: c.end,
             open_xml,
+            close_xml: annotation_close_xml(&root_name),
+            required: true,
         });
 
         for reply in &c.replies {
@@ -320,18 +394,19 @@ fn prepare_comments(
                 &reply.date,
                 // A reply carries no resolved state of its own — only the thread it belongs to
                 // (`DocumentComment::resolved`) does, exactly as `export_docx_uc::prepare_comments`
-                // documents for its own `PreparedComment::resolved`.
+                // documents for its own `PreparedSpan::resolved`.
                 false,
                 Some(&root_name),
                 &reply_body_xml,
             );
-            out.push(PreparedComment {
+            out.push(PreparedSpan {
                 id: reply_id,
                 uid: reply.uid.clone(),
-                name: reply_name,
                 start: c.start,
                 end: c.end,
                 open_xml: reply_open_xml,
+                close_xml: annotation_close_xml(&reply_name),
+                required: true,
             });
         }
     }
@@ -343,6 +418,15 @@ fn prepare_comments(
 /// why it is not `office:name`), `loext:resolved`, an optional `loext:parent-name` (a reply
 /// only), `dc:creator`/`dc:date`, and finally `body_xml` — already-rendered `<text:p>` elements
 /// from [`render_comment_body_odt`].
+/// The `<office:annotation-end>` that closes an annotation opened under `name`. ODF pairs the two
+/// halves by `office:name`, so this is the only thing the close tag needs.
+fn annotation_close_xml(name: &str) -> String {
+    format!(
+        "<office:annotation-end office:name=\"{}\"/>",
+        odt_render::xml_escape(name)
+    )
+}
+
 fn annotation_open_xml(
     name: &str,
     uid: &str,
@@ -576,15 +660,15 @@ fn character_style_attrs_from_flags(
 /// One comment boundary event, resolved to a local character index inside the one inline piece
 /// it falls in — see `markers_for_piece`. The ODF analog of `export_docx_uc::Marker`.
 enum Marker<'a> {
-    Start(&'a PreparedComment),
-    End(&'a PreparedComment),
+    Start(&'a PreparedSpan),
+    End(&'a PreparedSpan),
 }
 
 /// The comments open or closing somewhere inside one block — the ODF analog of
 /// `export_docx_uc::BlockCommentWindow`.
 struct BlockCommentWindow<'a> {
-    starts: Vec<&'a PreparedComment>,
-    ends: Vec<&'a PreparedComment>,
+    starts: Vec<&'a PreparedSpan>,
+    ends: Vec<&'a PreparedSpan>,
 }
 
 /// The comments whose range opens or closes somewhere inside one block, and the bookkeeping
@@ -594,13 +678,13 @@ struct BlockCommentWindow<'a> {
 /// at call sites outside the document's addressable text — see this module's own doc comment for
 /// which those are.
 struct CommentEmitState<'a> {
-    prepared: &'a [PreparedComment],
+    prepared: &'a [PreparedSpan],
     started: RefCell<HashSet<usize>>,
     ended: RefCell<HashSet<usize>>,
 }
 
 impl<'a> CommentEmitState<'a> {
-    fn new(prepared: &'a [PreparedComment]) -> Self {
+    fn new(prepared: &'a [PreparedSpan]) -> Self {
         Self {
             prepared,
             started: RefCell::new(HashSet::new()),
@@ -617,7 +701,7 @@ impl<'a> CommentEmitState<'a> {
     /// per-block filter. Identical logic to `export_docx_uc::CommentEmitState::window_for_block`.
     fn window_for_block(&self, block_start: u32, block_end: u32) -> BlockCommentWindow<'a> {
         let empty = block_start == block_end;
-        let mut starts: Vec<&'a PreparedComment> = self
+        let mut starts: Vec<&'a PreparedSpan> = self
             .prepared
             .iter()
             .filter(|c| {
@@ -625,7 +709,7 @@ impl<'a> CommentEmitState<'a> {
             })
             .collect();
         starts.sort_by_key(|c| (c.start, c.id));
-        let mut ends: Vec<&'a PreparedComment> = self
+        let mut ends: Vec<&'a PreparedSpan> = self
             .prepared
             .iter()
             .filter(|c| {
@@ -655,10 +739,13 @@ impl<'a> CommentEmitState<'a> {
     fn ensure_all_anchored(&self) -> Result<()> {
         let started = self.started.borrow();
         let ended = self.ended.borrow();
+        // `required` only — a round-trip mark that found no home degrades re-import to matching
+        // by type and title, which is a designed fallback, and is not worth refusing to write
+        // the manuscript over. See `PreparedSpan::required`.
         let missing: Vec<String> = self
             .prepared
             .iter()
-            .filter(|c| !started.contains(&c.id) || !ended.contains(&c.id))
+            .filter(|c| c.required && (!started.contains(&c.id) || !ended.contains(&c.id)))
             .map(|c| format!("{} [{}, {})", c.uid, c.start, c.end))
             .collect();
         if missing.is_empty() {
@@ -696,10 +783,17 @@ fn markers_for_piece<'a>(
             out.push((c.end - piece_start, Marker::End(c)));
         }
     }
+    // Three ranks, not two. `End` before `Start` at an exact tie is the original rule (see
+    // `export_docx_uc::markers_for_piece`); the split within `Start` is what puts a row's
+    // point mark at the very front of its paragraph rather than after an annotation that
+    // happens to open on the same character. A mark whose whole purpose is to say "this
+    // paragraph begins row X" reads wrong sitting inside a comment's range, and a reader
+    // resolving the row it belongs to would have to look past the annotation to find it.
     out.sort_by_key(|(idx, m)| {
         let (kind_rank, id) = match m {
             Marker::End(c) => (0u8, c.id),
-            Marker::Start(c) => (1u8, c.id),
+            Marker::Start(c) if !c.required => (1u8, c.id),
+            Marker::Start(c) => (2u8, c.id),
         };
         (*idx, kind_rank, id)
     });
@@ -707,7 +801,7 @@ fn markers_for_piece<'a>(
 }
 
 /// Push one comment boundary's XML: a `Start` splices in the comment's whole precomputed
-/// `open_xml` (see `PreparedComment`'s doc comment for why the body travels with the start, not
+/// `open_xml` (see `PreparedSpan`'s doc comment for why the body travels with the start, not
 /// separately); an `End` writes the matching close tag. No `InlineHost`-style trait is needed
 /// the way `export_docx_uc::apply_marker` needs one — every call site here is already building
 /// into a plain `String`, whether that string is the paragraph's own body or a `<text:a>` group's
@@ -720,10 +814,7 @@ fn apply_marker(out: &mut String, marker: &Marker<'_>, state: &CommentEmitState<
         }
         Marker::End(c) => {
             state.mark_ended(c.id);
-            out.push_str(&format!(
-                "<office:annotation-end office:name=\"{}\"/>",
-                odt_render::xml_escape(&c.name)
-            ));
+            out.push_str(&c.close_xml);
         }
     }
 }
@@ -875,11 +966,15 @@ impl ExportOdtUseCase {
         // because a bold/italic run inside a comment body interns the same automatic character
         // style any other bold/italic run in the document does — see
         // `render_comment_body_odt`'s doc comment.
-        let prepared_comments = prepare_comments(&self.dto.options.comments, &mut styles);
-        let comment_state: Option<CommentEmitState<'_>> = if prepared_comments.is_empty() {
+        let prepared_spans = prepare_spans(
+            &self.dto.options.comments,
+            &self.dto.options.marks,
+            &mut styles,
+        )?;
+        let comment_state: Option<CommentEmitState<'_>> = if prepared_spans.is_empty() {
             None
         } else {
-            Some(CommentEmitState::new(&prepared_comments))
+            Some(CommentEmitState::new(&prepared_spans))
         };
 
         // Render every note's body first, while `note_bodies` is still empty — mirrors
@@ -1684,14 +1779,30 @@ fn looks_like_rule_glyph(pieces: &[(InlineSegment, u32, u32)]) -> bool {
             InlineContent::Image { .. } | InlineContent::FootnoteRef { .. } => return false,
         }
     }
-    let mut chars = text.chars().filter(|c| !c.is_whitespace());
-    let Some(first) = chars.next() else {
+    let stripped: Vec<char> = text.chars().filter(|c| !c.is_whitespace()).collect();
+    let Some(&first) = stripped.first() else {
         return false;
     };
     if first.is_alphanumeric() {
         return false;
     }
-    chars.all(|c| c == first)
+    // A **lone** mark of sentence punctuation is prose, not furniture.
+    //
+    // Found on a real manuscript: a paragraph containing only `!` — a beat of dialogue — was
+    // being replaced by a horizontal rule, and the character was simply gone from the exported
+    // file. The same would happen to a lone `…`, which is if anything more common: an ellipsis
+    // alone on a line is an ordinary silence in fiction, and the host this crate was built for
+    // says so in as many words, deliberately refusing to treat one as a scene break.
+    //
+    // Every glyph a break is actually typed with is either repeated (`* * *`, `###`, `. . .`)
+    // or is a symbol no one ends a sentence with (`＊`, `⁂`, `◇`, `§`, `—`). Requiring one of
+    // those two keeps every real break working and stops a writer's punctuation from
+    // evaporating.
+    const SENTENCE_PUNCTUATION: &[char] = &['!', '?', '.', '\u{2026}', ',', ';', ':'];
+    if stripped.len() == 1 && SENTENCE_PUNCTUATION.contains(&first) {
+        return false;
+    }
+    stripped[1..].iter().all(|&c| c == first)
 }
 
 /// Build a `<text:list-style>` for `list`, with all nine levels sharing the same
@@ -1995,10 +2106,7 @@ fn add_inline_content(
             // `starts` would never close it at all.
             for &c in window.ends.iter().rev() {
                 state.mark_ended(c.id);
-                out.push_str(&format!(
-                    "<office:annotation-end office:name=\"{}\"/>",
-                    odt_render::xml_escape(&c.name)
-                ));
+                out.push_str(&c.close_xml);
             }
         }
         return out;
