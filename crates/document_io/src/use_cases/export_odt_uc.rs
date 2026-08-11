@@ -1498,6 +1498,11 @@ impl ExportOdtUseCase {
             }
         }
 
+        // An epigraph's two named styles, an ordinary quotation's one, or nothing. The
+        // quote arm keys off `quote_depth` rather than the block, so every paragraph
+        // inside a quotation is named at any nesting level; the deeper `fo:margin-left`
+        // `common_para_attrs` already put in the automatic style still overrides the
+        // named style's own, so a nested quote stays visibly deeper.
         let parent = match semantic {
             Some(SemanticRole::Epigraph) => {
                 if block.fmt_alignment == Some(Alignment::Right) {
@@ -1506,6 +1511,7 @@ impl ExportOdtUseCase {
                     "Epigraph"
                 }
             }
+            None if quote_depth > 0 => "Quote",
             None => "Standard",
         };
         let style = styles.paragraph_style(parent, attrs.trim(), "");

@@ -382,6 +382,53 @@ fn epigraph_blockquote_uses_the_named_epigraph_styles() {
     assert!(content.contains("Tolstoy"));
 }
 
+/// An *ordinary* blockquote is named too, one step down from an epigraph.
+///
+/// Indentation alone cannot say what a paragraph is — verse, a pressed Tab and a
+/// quotation are indistinguishable by it — so a reader meeting `fo:margin-left` has to
+/// guess, and a manuscript's quotations came back as plain paragraphs for exactly that
+/// reason. The `Quote` name is the document stating the answer, and it is what
+/// `document_ingest::sources::odt::StyleTable::quoted_as` reads back.
+#[test]
+fn a_plain_blockquote_uses_the_named_quote_style() {
+    let bytes = odt_from_djot(
+        "Before.\n\n> I shall not be home before the thaw.\n\nAfter.\n",
+        OdtExportOptions::default(),
+    );
+    let content = content_xml(&bytes);
+    assert!(
+        content.contains("text:style-name=\"Quote\"")
+            || content.contains("style:parent-style-name=\"Quote\""),
+        "no quote-styled paragraph: {content}"
+    );
+    // The style has to be declared as well as referenced, or a reader resolves the name
+    // against its own catalogue — the same failure `named_styles_xml` records for headings.
+    let styles = styles_xml(&bytes);
+    assert!(
+        styles.contains("style:name=\"Quote\""),
+        "the Quote style is referenced but never declared: {styles}"
+    );
+}
+
+/// An epigraph keeps its own style rather than being demoted to a plain quotation.
+///
+/// Both live inside a blockquote, so a `quote_depth > 0` test written before the arm
+/// above it would claim every epigraph as an ordinary quote and lose the distinction the
+/// importer depends on to tell a chapter's opening quotation from one in its prose.
+#[test]
+fn an_epigraph_is_not_also_labelled_an_ordinary_quote() {
+    let bytes = odt_from_djot(RICH_DJOT, OdtExportOptions::default());
+    let content = content_xml(&bytes);
+    let epigraph_para = content
+        .split("<text:p")
+        .find(|p| p.contains("All happy families"))
+        .expect("the epigraph paragraph");
+    assert!(
+        !epigraph_para.contains("\"Quote\""),
+        "the epigraph took the ordinary quote style: {epigraph_para}"
+    );
+}
+
 // --- RTL -----------------------------------------------------------------------
 
 #[test]

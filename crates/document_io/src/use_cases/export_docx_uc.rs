@@ -803,6 +803,21 @@ const INDENT_STEP_TWIPS: i32 = 720;
 const EPIGRAPH_STYLE_ID: &str = "Epigraph";
 const EPIGRAPH_ATTRIBUTION_STYLE_ID: &str = "EpigraphAttribution";
 
+/// The style id an ordinary blockquote's paragraphs carry.
+///
+/// Indentation alone cannot say "this is a quotation" — an indent is a measurement, and every
+/// reader that meets one has to guess whether it means a quote, a verse, or a writer who
+/// pressed Tab. So a quotation is named the same way an epigraph is, and for the same reason:
+/// it is the only thing in the file that still says so after the paragraph has been through an
+/// editor, which is what lets `document_ingest`'s scanners read a blockquote *back* as a
+/// blockquote rather than as italic-looking body text.
+///
+/// `Quote` is also Word's own built-in id for exactly this, so a paragraph carrying it lands on
+/// the style a Word user already has rather than on a private invention of ours. The declaration
+/// below still ships a definition, because `docx-rs` writes no built-in styles at all (same
+/// reason `heading_style` exists).
+const QUOTE_STYLE_ID: &str = "Quote";
+
 /// Hanging indent applied to numbered/bulleted/task paragraphs so the marker
 /// sits in the gutter and the text aligns, in twips.
 const HANGING_TWIPS: i32 = 360;
@@ -1086,6 +1101,15 @@ impl ExportDocxUseCase {
                     .name("Epigraph Attribution")
                     .indent(Some(INDENT_STEP_TWIPS), None, None, None)
                     .align(AlignmentType::Right),
+            )
+            // Not italic, unlike the epigraph above: an epigraph is set apart as quoted
+            // matter opening a chapter, while a quotation inside a scene is the writer's
+            // own running text and takes the manuscript's face. Indent is the whole of
+            // what it adds — the *name* is what this style is for.
+            .add_style(
+                Style::new(QUOTE_STYLE_ID, StyleType::Paragraph)
+                    .name("Quote")
+                    .indent(Some(INDENT_STEP_TWIPS), None, None, None),
             );
         // …and the heading styles the heading paragraphs below reference by id. docx-rs
         // ships no built-in styles at all, so without this every `Heading1` in the file is
@@ -1517,12 +1541,20 @@ impl ExportDocxUseCase {
             // is the right-aligned one, which is the convention the editor writes and
             // every other writer renders — so nothing extra has to be recorded to tell
             // a quotation's last line from its source line.
+            //
+            // An ordinary blockquote is named too, one step down: `quote_depth` is the
+            // nesting level, so any paragraph inside a quotation gets `Quote` whatever its
+            // depth. The direct indent `apply_body_style` just applied stays on the
+            // paragraph and wins over the style's own, which is what keeps a *nested*
+            // quote visibly deeper than the one containing it.
             if let Some(SemanticRole::Epigraph) = semantic {
                 paragraph = paragraph.style(if block.fmt_alignment == Some(Alignment::Right) {
                     EPIGRAPH_ATTRIBUTION_STYLE_ID
                 } else {
                     EPIGRAPH_STYLE_ID
                 });
+            } else if quote_depth > 0 {
+                paragraph = paragraph.style(QUOTE_STYLE_ID);
             }
         }
 

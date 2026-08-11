@@ -525,6 +525,75 @@ fn nested_blockquote_indents_deeper() {
     );
 }
 
+/// The indent says how far in; the **style name** says what it is.
+///
+/// An indent is a measurement and cannot be read back as a claim — verse, a pressed Tab
+/// and a quotation all look the same to it — which is why a manuscript's quotations came
+/// home from `.docx` as plain paragraphs. `Quote` is Word's own built-in id for this, so a
+/// paragraph carrying it lands on the style a Word user already has, and it is what
+/// `document_ingest::sources::docx::StyleTable::quoted_as` matches.
+#[test]
+fn blockquote_paragraph_carries_the_named_quote_style() {
+    let docx = docx_from_djot("> a quoted line");
+    let p = para_containing(&docx, "a quoted line");
+    assert_eq!(
+        p.property.style.as_ref().map(|s| s.val.as_str()),
+        Some("Quote"),
+        "an indented paragraph with no name cannot be read back as a quotation"
+    );
+}
+
+/// Every level of a nested quotation is named, and the direct indent still wins over the
+/// style's own — so a nested quote stays visibly deeper than the one containing it.
+#[test]
+fn a_nested_blockquote_is_named_at_every_level_and_keeps_its_deeper_indent() {
+    let docx = docx_from_djot("> outer quote\n>\n> > inner quote");
+    for (text, indent) in [("outer quote", 720), ("inner quote", 1440)] {
+        let p = para_containing(&docx, text);
+        assert_eq!(
+            p.property.style.as_ref().map(|s| s.val.as_str()),
+            Some("Quote"),
+            "{text} is inside a quotation and must say so"
+        );
+        assert_eq!(left_indent(p), Some(indent), "{text} kept its own indent");
+    }
+}
+
+/// The style is declared, not merely referenced.
+///
+/// `docx-rs` ships no built-in styles at all, so a `w:pStyle` naming one this file never
+/// defines is a dangling reference the reader resolves from its own catalogue — the same
+/// failure `heading_style`'s own doc records for a book title that "asked to be a title
+/// and arrived as whatever Word had lying around".
+#[test]
+fn the_quote_style_is_declared_in_the_stylesheet() {
+    let bytes = docx_bytes_from_djot("> a quoted line");
+    let styles = read_zip_entry(&bytes, "word/styles.xml");
+    assert!(
+        styles.contains(r#"w:styleId="Quote""#),
+        "the Quote style is referenced but never declared: {styles}"
+    );
+}
+
+/// An epigraph keeps its own named style rather than being demoted to a plain quotation.
+///
+/// An epigraph lives inside a blockquote too, so a `quote_depth > 0` arm placed before the
+/// epigraph one would claim every epigraph as an ordinary quote — and the importer would
+/// lose the distinction between a chapter's opening quotation and one in its prose, which
+/// is the whole difference between an `EpigraphText` and a paragraph of the manuscript.
+#[test]
+fn an_epigraph_keeps_its_own_style_rather_than_the_ordinary_quote_one() {
+    let docx = docx_from_djot(
+        "> {semantic_role=epigraph}\n> All happy families are alike.\n",
+    );
+    let p = para_containing(&docx, "All happy families are alike.");
+    assert_eq!(
+        p.property.style.as_ref().map(|s| s.val.as_str()),
+        Some("Epigraph"),
+        "an epigraph must not be flattened into the ordinary quote style"
+    );
+}
+
 // --- headings & plain ------------------------------------------------------
 
 #[test]

@@ -403,7 +403,8 @@ impl OdtStyleSheet {
 /// `export_docx_uc::heading_style`'s doc comment: a heading's *level* comes from
 /// `text:outline-level`, read back independently of style name, but what it *looks like* still
 /// has to be said somewhere or it opens as plain body text), `Epigraph`/`EpigraphAttribution`
-/// (mirrors the DOCX writer's identical pair), `Rule` (the horizontal-rule/scene-break style —
+/// (mirrors the DOCX writer's identical pair), `Quote` (an ordinary blockquote's paragraphs),
+/// `Rule` (the horizontal-rule/scene-break style —
 /// see `export_odt_uc`'s module doc for why this exists and what it must look like for
 /// `document_ingest::sources::odt::StyleTable::is_rule` to recognise it), and `Code_Block`
 /// (monospace + shaded, mirrors `export_docx_uc::CODE_BLOCK_FILL`). `Header` is added only when
@@ -482,6 +483,12 @@ pub(crate) fn named_styles_xml(
 
     // Epigraph / EpigraphAttribution: mirrors `export_docx_uc`'s pair — italic quote body, its
     // right-aligned attribution line, both indented one step in from the body margin.
+    //
+    // `Quote` joins them for an *ordinary* blockquote, mirroring `export_docx_uc::QUOTE_STYLE_ID`
+    // and carrying the same argument: an indent is a measurement and cannot say what it means,
+    // so a quotation is named rather than merely inset — which is what lets
+    // `document_ingest::sources::odt::StyleTable::is_quote` read one back as a quotation. Not
+    // italic, unlike the epigraph: a quotation inside a scene is the writer's running text.
     out.push_str(&format!(
         "<style:style style:name=\"Epigraph\" style:family=\"paragraph\" \
          style:parent-style-name=\"Standard\" style:class=\"text\">\
@@ -490,7 +497,10 @@ pub(crate) fn named_styles_xml(
          <style:style style:name=\"EpigraphAttribution\" style:family=\"paragraph\" \
          style:parent-style-name=\"Standard\" style:class=\"text\">\
          <style:paragraph-properties fo:margin-left=\"{indent}\" fo:text-align=\"right\"/>\
-         </style:style>",
+         </style:style>\
+         <style:style style:name=\"Quote\" style:family=\"paragraph\" \
+         style:parent-style-name=\"Standard\" style:class=\"text\">\
+         <style:paragraph-properties fo:margin-left=\"{indent}\"/></style:style>",
         indent = fmt_pt(INDENT_STEP_PT)
     ));
 
