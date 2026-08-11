@@ -102,7 +102,17 @@ fn execute_set_block_format(
         // Block overlaps the range if its text interval [block_start, block_end)
         // intersects [range_start, range_end].  Empty blocks (text_length == 0)
         // are included when their position falls inside the range.
-        let overlaps = if block_char_length(block, &store) > 0 {
+        //
+        // A COLLAPSED cursor is its own case: it selects no text at all, so it
+        // formats the one block it sits in, end inclusive. Running it through
+        // the half-open test above made a caret at a paragraph's end match
+        // NOTHING — `block_end > range_start` is false when the two are equal,
+        // and the next block starts a character later — so applying a heading
+        // or an alignment there silently did nothing at all. End-inclusive also
+        // subsumes the empty-block case, where start and end coincide.
+        let overlaps = if range_start == range_end {
+            block_start <= range_start && range_start <= block_end
+        } else if block_char_length(block, &store) > 0 {
             block_start <= range_end && block_end > range_start
         } else {
             block_start >= range_start && block_start <= range_end

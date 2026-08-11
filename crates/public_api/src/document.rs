@@ -976,14 +976,9 @@ impl TextDocument {
     /// the caret-band highlight lit the *next* paragraph the moment the caret reached the end of
     /// one.
     pub fn block_at_caret(&self, position: usize) -> Result<BlockInfo> {
-        let info = self.block_at(position)?;
-        // The only way `block_at` reports a block starting after the position asked for is the
-        // separator rule having stepped forward over it. A separator is exactly one character,
-        // so the caret belongs to whatever block owns `position - 1`.
-        if position < info.start && position > 0 {
-            return self.block_at(position - 1);
-        }
-        Ok(info)
+        let inner = self.inner.lock();
+        let info = crate::inner::block_at_caret_dto(&inner.ctx, position)?;
+        Ok(BlockInfo::from(&info))
     }
 
     /// The sentence containing `position`, as absolute char offsets `(start, end)` — the
@@ -1034,12 +1029,13 @@ impl TextDocument {
     }
 
     /// Get the block format at a position.
+    ///
+    /// `position` is read with **caret** semantics ([`block_at_caret`](Self::block_at_caret)):
+    /// at the end of a paragraph this reports that paragraph's format, not the next one's.
+    /// Formatting queries are asked about a cursor, never about a character index.
     pub fn block_format_at(&self, position: usize) -> Result<BlockFormat> {
         let inner = self.inner.lock();
-        let dto = frontend::document_inspection::GetBlockAtPositionDto {
-            position: to_i64(position),
-        };
-        let block_info = document_inspection_commands::get_block_at_position(&inner.ctx, &dto)?;
+        let block_info = crate::inner::block_at_caret_dto(&inner.ctx, position)?;
         let block_id = block_info.block_id;
         let block_id = block_id as u64;
         let block_dto = frontend::commands::block_commands::get_block(&inner.ctx, &block_id)?

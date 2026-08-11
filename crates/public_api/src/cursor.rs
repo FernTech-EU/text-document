@@ -2456,13 +2456,15 @@ impl TextCursor {
     }
 
     /// Get the block format of the block containing the cursor.
+    ///
+    /// Resolved with caret semantics, as "containing the cursor" says: a cursor at the end of
+    /// a paragraph is still in it. Reading the character-index answer instead reported the
+    /// NEXT paragraph's format there — which is what the editor's format panel showed for the
+    /// whole time the caret sat at the end of the line being typed.
     pub fn block_format(&self) -> Result<BlockFormat> {
         let pos = self.position();
         let inner = self.doc.lock();
-        let dto = frontend::document_inspection::GetBlockAtPositionDto {
-            position: to_i64(pos),
-        };
-        let block_info = document_inspection_commands::get_block_at_position(&inner.ctx, &dto)?;
+        let block_info = crate::inner::block_at_caret_dto(&inner.ctx, pos)?;
         let block_id = block_info.block_id as u64;
         let block = frontend::commands::block_commands::get_block(&inner.ctx, &block_id)?
             .ok_or_else(|| DocumentError::NotFound("block not found".into()))?;

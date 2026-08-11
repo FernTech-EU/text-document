@@ -486,6 +486,36 @@ pub(crate) fn refresh_block_positions(
     }
 }
 
+/// The block a **caret** at `position` sits in.
+///
+/// `get_block_at_position` reads its argument as a character index, so the inter-block
+/// separator belongs to the block that follows it. That is right for walking text and is
+/// pinned by its own tests — but a caret on that same offset has not left the paragraph it
+/// just finished typing, and every cursor-driven query wants the other answer.
+///
+/// The correction is exact rather than heuristic: the separator rule is the only way the
+/// command can report a block starting *after* the position asked for, and a separator is
+/// exactly one character wide, so the caret belongs to whatever owns `position - 1`.
+///
+/// Lives here so the document-level query, the cursor's own, and anything else needing
+/// caret semantics share one rule instead of three copies that can drift.
+pub(crate) fn block_at_caret_dto(
+    ctx: &AppContext,
+    position: usize,
+) -> Result<frontend::document_inspection::BlockInfoDto> {
+    let at = |p: usize| {
+        frontend::commands::document_inspection_commands::get_block_at_position(
+            ctx,
+            &frontend::document_inspection::GetBlockAtPositionDto { position: p as i64 },
+        )
+    };
+    let info = at(position)?;
+    if position > 0 && (info.block_start as usize) > position {
+        return Ok(at(position - 1)?);
+    }
+    Ok(info)
+}
+
 /// Like [`refresh_block_positions`] but for a single DTO.
 pub(crate) fn refresh_block_position(
     dto: &mut frontend::block::dtos::BlockDto,
