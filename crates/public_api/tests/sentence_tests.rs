@@ -66,6 +66,73 @@ fn every_caret_position_in_a_document_resolves_or_declines_cleanly() {
     }
 }
 
+/// A caret at the very end of a paragraph is still *in* that paragraph.
+///
+/// It sits on the character index of the inter-block separator, which `block_at` deliberately
+/// assigns to the following block — right for a character query, wrong for a cursor. Resolving
+/// the sentence through that rule reported the first sentence of the NEXT paragraph, so the
+/// caret-band highlight jumped a paragraph ahead the moment you finished typing one.
+#[test]
+fn a_caret_at_the_end_of_a_paragraph_stays_in_that_paragraph() {
+    let doc = new_doc("First para.\nSecond para.");
+    let end_of_first = "First para.".chars().count();
+
+    assert_eq!(
+        slice(&doc, doc.sentence_at(end_of_first, Some("en")).unwrap()),
+        "First para.",
+        "the caret has not left the first paragraph yet"
+    );
+    // One further along is the start of the second block, and does belong to it.
+    assert_eq!(
+        slice(&doc, doc.sentence_at(end_of_first + 1, Some("en")).unwrap()),
+        "Second para."
+    );
+}
+
+/// The same boundary, for the block query a paragraph-scoped caret band asks.
+#[test]
+fn block_at_caret_keeps_an_end_of_paragraph_caret_in_its_own_block() {
+    let doc = new_doc("First para.\nSecond para.");
+    let end_of_first = "First para.".chars().count();
+
+    let caret = doc.block_at_caret(end_of_first).expect("a block");
+    assert_eq!((caret.start, caret.length), (0, end_of_first));
+
+    // `block_at` keeps its character-index contract: that index IS the separator, and the
+    // separator belongs to the block after it. The two answers differ here on purpose.
+    let index = doc.block_at(end_of_first).expect("a block");
+    assert_eq!(index.block_number, 1);
+    assert_ne!(caret.block_number, index.block_number);
+
+    // Everywhere else the two agree.
+    for pos in 0..=doc.character_count() {
+        if pos == end_of_first {
+            continue;
+        }
+        assert_eq!(
+            doc.block_at_caret(pos).unwrap().block_number,
+            doc.block_at(pos).unwrap().block_number,
+            "the two must differ only at a paragraph end (pos {pos})"
+        );
+    }
+}
+
+/// A blank paragraph between two others is its own block, and a caret in it must not be
+/// dragged back into the paragraph above by the boundary correction.
+#[test]
+fn block_at_caret_still_finds_an_empty_block() {
+    let doc = new_doc("Text.\n\nMore.");
+    let blank = "Text.\n".chars().count();
+
+    let info = doc.block_at_caret(blank).expect("a block");
+    assert_eq!(info.length, 0, "the blank block itself");
+    assert_eq!(info.start, blank);
+    assert_eq!(doc.sentence_at(blank, Some("en")), None);
+
+    // And the position just before it is the end of "Text." — the first block.
+    assert_eq!(doc.block_at_caret(blank - 1).unwrap().block_number, 0);
+}
+
 #[test]
 fn an_empty_block_has_no_sentence() {
     let doc = new_doc("Text.\n\nMore text.");

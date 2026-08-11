@@ -890,7 +890,11 @@ impl TextDocument {
     /// belongs to the preceding element at a boundary" convention
     /// used throughout text-document.
     pub fn find_element_at_position(&self, position: usize) -> Option<(u64, usize, usize)> {
-        let block_info = self.block_at(position).ok()?;
+        // Caret semantics, per the boundary convention documented just above: with the
+        // character-index `block_at`, a position at the end of a paragraph resolved to the
+        // *next* block and the `checked_sub` below then failed, so the last element of every
+        // paragraph was unreachable.
+        let block_info = self.block_at_caret(position).ok()?;
         let block_start = block_info.start;
         let offset_in_block = position.checked_sub(block_start)?;
         let block = crate::text_block::TextBlock {
@@ -945,6 +949,11 @@ impl TextDocument {
     }
 
     /// Get info about the block at a position. O(log n).
+    ///
+    /// `position` is read as a **character index**, so the inter-block separator belongs to
+    /// the block that *follows* it: in `"abc\ndef"`, position 3 is the newline and reports the
+    /// second block. For a **caret** offset — where 3 means "after the c", the last place the
+    /// caret can sit in the first paragraph — use [`block_at_caret`](Self::block_at_caret).
     pub fn block_at(&self, position: usize) -> Result<BlockInfo> {
         let inner = self.inner.lock();
         let dto = frontend::document_inspection::GetBlockAtPositionDto {
@@ -952,6 +961,29 @@ impl TextDocument {
         };
         let result = document_inspection_commands::get_block_at_position(&inner.ctx, &dto)?;
         Ok(BlockInfo::from(&result))
+    }
+
+    /// The block a **caret** at `position` sits in. O(log n).
+    ///
+    /// Differs from [`block_at`](Self::block_at) at exactly one place: the end of a paragraph.
+    /// A character index and a caret offset disagree there — the character at that index is the
+    /// separator, which belongs to the next block, but a caret there is still in the paragraph
+    /// it just finished typing. `block_at` answers the first question (and callers that walk
+    /// text depend on it — moving the caret across a separator, reading the character under an
+    /// offset); this answers the second.
+    ///
+    /// Ask this one whenever the position came from a cursor. Asking `block_at` instead is why
+    /// the caret-band highlight lit the *next* paragraph the moment the caret reached the end of
+    /// one.
+    pub fn block_at_caret(&self, position: usize) -> Result<BlockInfo> {
+        let info = self.block_at(position)?;
+        // The only way `block_at` reports a block starting after the position asked for is the
+        // separator rule having stepped forward over it. A separator is exactly one character,
+        // so the caret belongs to whatever block owns `position - 1`.
+        if position < info.start && position > 0 {
+            return self.block_at(position - 1);
+        }
+        Ok(info)
     }
 
     /// The sentence containing `position`, as absolute char offsets `(start, end)` — the
@@ -969,20 +1001,20 @@ impl TextDocument {
     /// is trimmed off the end, so the range covers the sentence and not the gap after it.
     ///
     /// The trailing edge is inclusive of the caret: a `position` at the very end of the block
-    /// resolves to the last sentence rather than to nothing.
+    /// resolves to the last sentence of *that* block rather than to the first sentence of the
+    /// next one. `position` is a caret offset, so the block is resolved with
+    /// [`block_at_caret`](Self::block_at_caret) and not with the character-index
+    /// [`block_at`](Self::block_at).
     pub fn sentence_at(
         &self,
         position: usize,
         content_locale: Option<&str>,
     ) -> Option<(usize, usize)> {
+        // Resolved before the lock: `block_at_caret` takes it itself.
+        let block = self.block_at_caret(position).ok()?;
         let inner = self.inner.lock();
-        let block_dto = frontend::document_inspection::GetBlockAtPositionDto {
-            position: to_i64(position),
-        };
-        let block =
-            document_inspection_commands::get_block_at_position(&inner.ctx, &block_dto).ok()?;
-        let block_start = to_usize(block.block_start);
-        let block_length = to_usize(block.block_length);
+        let block_start = block.start;
+        let block_length = block.length;
         if block_length == 0 {
             return None;
         }
