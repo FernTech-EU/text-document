@@ -15,7 +15,7 @@ use frontend::commands::{
 use unicode_segmentation::UnicodeSegmentation;
 
 use crate::convert::{to_i64, to_usize};
-use crate::events::DocumentEvent;
+use crate::events::{DocumentEvent, InsertionOrigin};
 use crate::flow::{CellRange, FlowElement, FrameRef, SelectionKind, TableCellRef};
 use crate::fragment::DocumentFragment;
 use crate::inner::{CursorData, QueuedEvents, TextDocumentInner};
@@ -109,6 +109,36 @@ impl TextCursor {
         blocks_affected: usize,
         flow_may_change: bool,
     ) -> QueuedEvents {
+        self.finish_edit_from(
+            inner,
+            edit_pos,
+            removed,
+            new_pos,
+            blocks_affected,
+            flow_may_change,
+            InsertionOrigin::Unspecified,
+        )
+    }
+
+    /// As [`finish_edit_ext`](Self::finish_edit_ext), and additionally reports
+    /// which channel the text arrived through.
+    ///
+    /// ⚠ **The one place an origin is turned into an event.** Every insertion
+    /// method reaches this, so the origin travels through one path rather than
+    /// through each method's own idea of what it did — which is what keeps
+    /// `TextInserted` and `ContentsChanged` describing the same edit instead of
+    /// two edits that happen to coincide.
+    #[allow(clippy::too_many_arguments)]
+    fn finish_edit_from(
+        &self,
+        inner: &mut TextDocumentInner,
+        edit_pos: usize,
+        removed: usize,
+        new_pos: usize,
+        blocks_affected: usize,
+        flow_may_change: bool,
+        origin: InsertionOrigin,
+    ) -> QueuedEvents {
         // Defensive: a use case can return new_position < edit_pos when
         // invoked through a stale or out-of-range cursor (e.g. after an
         // undo restores a state where the previously-saved cursor position
@@ -131,6 +161,16 @@ impl TextCursor {
             chars_added: added,
             blocks_affected,
         });
+        // Only when something was actually inserted. An edit that only deletes
+        // has no origin to report, and emitting one with `chars_inserted: 0`
+        // would put a channel's name on text that never arrived.
+        if added > 0 {
+            inner.queue_event(DocumentEvent::TextInserted {
+                position: edit_pos,
+                chars_inserted: added,
+                origin,
+            });
+        }
         inner.check_block_count_changed();
         if flow_may_change {
             inner.check_flow_changed();
@@ -514,7 +554,18 @@ impl TextCursor {
     // ── Text editing ─────────────────────────────────────────
 
     /// Insert plain text at the cursor. Replaces selection if any.
+    ///
+    /// Reports [`InsertionOrigin::Unspecified`] — the caller did not say. Use
+    /// [`insert_text_with_origin`](Self::insert_text_with_origin) to say.
     pub fn insert_text(&self, text: &str) -> Result<()> {
+        self.insert_text_with_origin(text, InsertionOrigin::Unspecified)
+    }
+
+    /// Insert plain text at the cursor, saying which channel it came through.
+    ///
+    /// The origin reaches consumers as [`DocumentEvent::TextInserted`]. It is a
+    /// fact about the channel and never about who was at the other end of it.
+    pub fn insert_text_with_origin(&self, text: &str, origin: InsertionOrigin) -> Result<()> {
         let (pos, anchor) = self.read_cursor();
 
         // Try direct insert first (handles same-block selection and no-selection cases)
@@ -568,13 +619,14 @@ impl TextCursor {
 
             let edit_pos = pos.min(anchor);
             let removed = pos.max(anchor) - edit_pos;
-            self.finish_edit_ext(
+            self.finish_edit_from(
                 &mut inner,
                 edit_pos,
                 removed,
                 to_usize(result.new_position),
                 to_usize(result.blocks_affected),
                 false,
+                origin,
             )
         };
         crate::inner::dispatch_queued_events(queued);
@@ -669,7 +721,19 @@ impl TextCursor {
     }
 
     /// Insert text with a specific character format. Replaces selection if any.
+    /// Reports [`InsertionOrigin::Unspecified`] — the caller did not say.
     pub fn insert_formatted_text(&self, text: &str, format: &TextFormat) -> Result<()> {
+        self.insert_formatted_text_with_origin(text, format, InsertionOrigin::Unspecified)
+    }
+
+    /// As [`insert_formatted_text`](Self::insert_formatted_text), saying which
+    /// channel the text came through.
+    pub fn insert_formatted_text_with_origin(
+        &self,
+        text: &str,
+        format: &TextFormat,
+        origin: InsertionOrigin,
+    ) -> Result<()> {
         let (pos, anchor) = self.read_cursor();
 
         let make_dto = |p: usize, a: usize| frontend::document_editing::InsertFormattedTextDto {
@@ -721,13 +785,14 @@ impl TextCursor {
 
             let edit_pos = pos.min(anchor);
             let removed = pos.max(anchor) - edit_pos;
-            self.finish_edit_ext(
+            self.finish_edit_from(
                 &mut inner,
                 edit_pos,
                 removed,
                 to_usize(result.new_position),
                 1,
                 false,
+                origin,
             )
         };
         crate::inner::dispatch_queued_events(queued);
@@ -785,6 +850,13 @@ impl TextCursor {
     }
 
     /// Insert an HTML fragment at the cursor position. Replaces selection if any.
+    /// As [`insert_html`](Self::insert_html), saying which channel the text came
+    /// through.
+    pub fn insert_html_with_origin(&self, html: &str, origin: InsertionOrigin) -> Result<()> {
+        let frag = DocumentFragment::from_html(html);
+        self.insert_fragment_with_origin(&frag, origin)
+    }
+
     pub fn insert_html(&self, html: &str) -> Result<()> {
         // Delegate to insert_fragment so table structure is preserved.
         let frag = DocumentFragment::from_html(html);
@@ -792,12 +864,30 @@ impl TextCursor {
     }
 
     /// Insert a Markdown fragment at the cursor position. Replaces selection if any.
+    /// As [`insert_markdown`](Self::insert_markdown), saying which channel the text came
+    /// through.
+    pub fn insert_markdown_with_origin(
+        &self,
+        markdown: &str,
+        origin: InsertionOrigin,
+    ) -> Result<()> {
+        let frag = DocumentFragment::from_markdown(markdown);
+        self.insert_fragment_with_origin(&frag, origin)
+    }
+
     pub fn insert_markdown(&self, markdown: &str) -> Result<()> {
         let frag = DocumentFragment::from_markdown(markdown);
         self.insert_fragment(&frag)
     }
 
     /// Insert a djot fragment at the cursor position. Replaces selection if any.
+    /// As [`insert_djot`](Self::insert_djot), saying which channel the text came
+    /// through.
+    pub fn insert_djot_with_origin(&self, djot: &str, origin: InsertionOrigin) -> Result<()> {
+        let frag = DocumentFragment::from_djot(djot);
+        self.insert_fragment_with_origin(&frag, origin)
+    }
+
     pub fn insert_djot(&self, djot: &str) -> Result<()> {
         let frag = DocumentFragment::from_djot(djot);
         self.insert_fragment(&frag)
@@ -820,7 +910,19 @@ impl TextCursor {
     }
 
     /// Insert a document fragment at the cursor. Replaces selection if any.
+    /// Reports [`InsertionOrigin::Unspecified`] — the caller did not say.
     pub fn insert_fragment(&self, fragment: &DocumentFragment) -> Result<()> {
+        self.insert_fragment_with_origin(fragment, InsertionOrigin::Unspecified)
+    }
+
+    /// As [`insert_fragment`](Self::insert_fragment), saying which channel the
+    /// text came through. This is the path a paste, a drop and an import all
+    /// take, so it is the one that most needs to be able to say so.
+    pub fn insert_fragment_with_origin(
+        &self,
+        fragment: &DocumentFragment,
+        origin: InsertionOrigin,
+    ) -> Result<()> {
         let (pos, anchor) = self.read_cursor();
         let queued = {
             let mut inner = self.doc.lock();
@@ -857,12 +959,14 @@ impl TextCursor {
             }
 
             let edit_pos = pos.min(anchor);
-            self.finish_edit(
+            self.finish_edit_from(
                 &mut inner,
                 edit_pos,
                 removed,
                 to_usize(result.new_position),
                 to_usize(result.blocks_added),
+                true,
+                origin,
             )
         };
         crate::inner::dispatch_queued_events(queued);

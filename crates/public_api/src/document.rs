@@ -2239,6 +2239,24 @@ pub(crate) fn emit_content_change_events(inner: &mut TextDocumentInner, before: 
             chars_added,
             blocks_affected,
         });
+        // **`Replayed`, hard-coded, and it cannot double-count.** Undo and redo
+        // never re-enter the insertion API — they snapshot and diff, which is
+        // why this function exists — so text restored by them is reported once,
+        // under an origin that says it came back rather than arrived.
+        //
+        // ⚠ Measured as the document's **total** gain, not from `chars_added`.
+        // That figure is the size of the restored region, which is non-zero for
+        // an undo that removes text: reporting it would put `Replayed` on a
+        // count of characters nothing brought back. A test caught exactly that.
+        let before_len: i64 = before.iter().map(|b| b.text_length.max(0)).sum();
+        let after_len: i64 = after.iter().map(|a| a.text_length.max(0)).sum();
+        if after_len > before_len {
+            inner.queue_event(DocumentEvent::TextInserted {
+                position,
+                chars_inserted: (after_len - before_len) as usize,
+                origin: crate::InsertionOrigin::Replayed,
+            });
+        }
     }
 
     // Emit FormatChanged for blocks where only formatting changed (not content).

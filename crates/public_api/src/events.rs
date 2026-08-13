@@ -12,6 +12,91 @@ use crate::inner::{CallbackEntry, TextDocumentInner};
 ///
 /// These events carry enough information for a UI to do incremental updates —
 /// repaint only the affected region, not the entire document.
+/// Which channel some text arrived through.
+///
+/// A **fact about how the characters reached the document**, and nothing more.
+/// It says who typed, pasted or dictated nothing at all: an application can only
+/// report the channel it was called through, and the inference from a channel to
+/// an author is not one any of this can make.
+///
+/// ## Why the default is `Unspecified` and not `Programmatic`
+///
+/// Every insertion method has a plain form and a `_with_origin` sibling. The
+/// plain form reports [`Unspecified`](Self::Unspecified), which means *the
+/// caller did not say* — deliberately **not** [`Programmatic`](Self::Programmatic),
+/// which would assert that the application inserted the text itself. Those are
+/// different claims, and a consumer counting them apart is entitled to know
+/// which one it has.
+///
+/// The same distinction as an absent field versus a zero: an unspecified origin
+/// is missing information, and a wrong one is a wrong fact.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum InsertionOrigin {
+    /// The caller did not say. The default for every plain insertion method.
+    #[default]
+    Unspecified,
+    /// Entered a key at a time.
+    Typed,
+    /// Committed by an input method — the multi-keystroke path that produces
+    /// one character. Kept apart from [`Typed`](Self::Typed) because a consumer
+    /// counting keystrokes and one counting characters disagree here, and both
+    /// are right.
+    Composed,
+    /// Pasted from a clipboard.
+    Pasted,
+    /// Dropped in from elsewhere.
+    Dropped,
+    /// Brought in by a document import.
+    Imported,
+    /// Re-applied by undo or redo.
+    ///
+    /// Hard-coded at those two paths, which never re-enter the insertion API —
+    /// they snapshot and diff instead — so a replayed edit can never be counted
+    /// twice under its original origin.
+    Replayed,
+    /// Inserted by the application: a template, an expansion, a substitution.
+    Programmatic,
+    /// Arrived through an accessibility channel: dictation, a braille display.
+    ///
+    /// **Never folded into [`Typed`](Self::Typed).** Some people write this way,
+    /// and a record that erased the distinction would be reporting them as
+    /// something they are not.
+    Assistive,
+}
+
+impl InsertionOrigin {
+    /// A stable lower-case token, for anything that has to write one down.
+    ///
+    /// Spelled out rather than derived from the variant name, so renaming a
+    /// variant cannot silently change what a consumer persisted.
+    pub fn token(self) -> &'static str {
+        match self {
+            InsertionOrigin::Unspecified => "unspecified",
+            InsertionOrigin::Typed => "typed",
+            InsertionOrigin::Composed => "composed",
+            InsertionOrigin::Pasted => "pasted",
+            InsertionOrigin::Dropped => "dropped",
+            InsertionOrigin::Imported => "imported",
+            InsertionOrigin::Replayed => "replayed",
+            InsertionOrigin::Programmatic => "programmatic",
+            InsertionOrigin::Assistive => "assistive",
+        }
+    }
+
+    /// Every variant, for a consumer building a table over them.
+    pub const ALL: [InsertionOrigin; 9] = [
+        InsertionOrigin::Unspecified,
+        InsertionOrigin::Typed,
+        InsertionOrigin::Composed,
+        InsertionOrigin::Pasted,
+        InsertionOrigin::Dropped,
+        InsertionOrigin::Imported,
+        InsertionOrigin::Replayed,
+        InsertionOrigin::Programmatic,
+        InsertionOrigin::Assistive,
+    ];
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum DocumentEvent {
     /// Text content changed at a specific region.
@@ -51,6 +136,34 @@ pub enum DocumentEvent {
         chars_removed: usize,
         chars_added: usize,
         blocks_affected: usize,
+    },
+
+    /// Text arrived, and this is where it came from.
+    ///
+    /// Emitted **alongside** [`ContentsChanged`](Self::ContentsChanged), never
+    /// instead of it, and only when an insertion actually added characters.
+    ///
+    /// ## Why this is not a field on `ContentsChanged`
+    ///
+    /// Because `ContentsChanged` carries the wrong number for the question.
+    /// Its `chars_added` is a **net delta for the affected region**: replacing a
+    /// twelve-character selection with a four-character paste reports both a
+    /// removal and an addition, and neither figure is "how much text this paste
+    /// brought in". Attaching an origin to a net delta would produce an
+    /// attribution that looks precise and is not.
+    ///
+    /// `chars_inserted` here is the other number: **what this insertion
+    /// introduced**, which is the one a consumer attributing text to a channel
+    /// actually wants.
+    ///
+    /// Keeping it a separate event is also what makes it additive — every
+    /// existing consumer of `ContentsChanged` is untouched, and one that does
+    /// not care about origins never has to mention this.
+    TextInserted {
+        position: usize,
+        /// How many characters this insertion introduced. Never a net delta.
+        chars_inserted: usize,
+        origin: InsertionOrigin,
     },
 
     /// Formatting changed without text content change.
