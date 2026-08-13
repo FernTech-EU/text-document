@@ -1621,7 +1621,7 @@ impl TextDocument {
             inner.invalidate_text_cache();
             result?;
             inner.rehighlight_all();
-            emit_undo_redo_change_events(&mut inner, &before);
+            emit_content_change_events(&mut inner, &before);
             inner.check_block_count_changed();
             inner.check_flow_changed();
             let can_undo = undo_redo_commands::can_undo(&inner.ctx, Some(inner.stack_id));
@@ -1642,7 +1642,7 @@ impl TextDocument {
             inner.invalidate_text_cache();
             result?;
             inner.rehighlight_all();
-            emit_undo_redo_change_events(&mut inner, &before);
+            emit_content_change_events(&mut inner, &before);
             inner.check_block_count_changed();
             inner.check_flow_changed();
             let can_undo = undo_redo_commands::can_undo(&inner.ctx, Some(inner.stack_id));
@@ -2058,8 +2058,12 @@ impl Default for TextDocument {
 
 // ── Undo/redo change detection helpers ─────────────────────────
 
-/// Lightweight block state for before/after comparison during undo/redo.
-struct UndoBlockState {
+/// Lightweight block state for before/after comparison.
+///
+/// Named for undo/redo because that is where it started; it is now also how a
+/// structural table edit works out what it did to the text. See
+/// [`emit_content_change_events`].
+pub(crate) struct UndoBlockState {
     id: u64,
     position: i64,
     text_length: i64,
@@ -2068,7 +2072,10 @@ struct UndoBlockState {
 }
 
 /// Capture the state of all blocks, sorted by document_position.
-fn capture_block_state(inner: &TextDocumentInner) -> Vec<UndoBlockState> {
+///
+/// Reads through the store rather than the plain-text cache, so a caller does
+/// not have to have invalidated anything first.
+pub(crate) fn capture_block_state(inner: &TextDocumentInner) -> Vec<UndoBlockState> {
     let mut all_blocks =
         frontend::commands::block_commands::get_all_block(&inner.ctx).unwrap_or_default();
     let store = inner.ctx.db_context.get_store();
@@ -2133,9 +2140,24 @@ fn compute_text_edit(before: &str, after: &str) -> (usize, usize, usize) {
     (prefix_len, removed, added)
 }
 
-/// Compare block state before and after undo/redo and emit
-/// ContentsChanged / FormatChanged events for affected regions.
-fn emit_undo_redo_change_events(inner: &mut TextDocumentInner, before: &[UndoBlockState]) {
+/// Compare block state before and after an edit and emit
+/// `ContentsChanged` / `FormatChanged` events for the affected regions.
+///
+/// ## Why anything else would be a guess
+///
+/// The delta this computes is a **real text diff**, and consumers rely on that
+/// being true rather than approximate: a comment anchor shifts by
+/// `(position, chars_removed, chars_added)`, so a figure that is merely
+/// plausible moves an anchor to somewhere that was never right — which is
+/// harder to notice than not moving it at all.
+///
+/// That is why the table primitives call this rather than describing their own
+/// edit. A row insert knows how many rows it added; it does not know where in
+/// the document's text that lands, and working it out by hand would be seven
+/// separate opportunities to be subtly wrong.
+///
+/// Used by undo, redo, and every structural table edit.
+pub(crate) fn emit_content_change_events(inner: &mut TextDocumentInner, before: &[UndoBlockState]) {
     let after = capture_block_state(inner);
 
     // Build a map of block id → state for the "before" set.

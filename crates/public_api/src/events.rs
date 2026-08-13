@@ -16,9 +16,36 @@ use crate::inner::{CallbackEntry, TextDocumentInner};
 pub enum DocumentEvent {
     /// Text content changed at a specific region.
     ///
-    /// Emitted by: `insert_text`, `delete_char`, `delete_previous_char`,
+    /// Emitted by every edit that changes what the document contains: the
+    /// text-level ones (`insert_text`, `delete_char`, `delete_previous_char`,
     /// `remove_selected_text`, `insert_formatted_text`, `insert_block`,
-    /// `insert_html`, `insert_markdown`, `insert_fragment`, `insert_image`.
+    /// `insert_html`, `insert_markdown`, `insert_fragment`, `insert_image`), the
+    /// streaming appends, `undo` and `redo`, and every **structural table edit**
+    /// (`insert_table_row`, `insert_table_column`, `remove_table_row`,
+    /// `remove_table_column`, `merge_table_cells`, `split_table_cell`,
+    /// `remove_table`, and the cursor-relative wrappers over them).
+    ///
+    /// ⚠ The list above was wrong in both directions for a long time, and the
+    /// half that mattered was the table edits: they emitted nothing at all, so a
+    /// consumer holding offsets kept them across a row insert and a consumer
+    /// caching on [`TextDocument::content_revision`] never reheated. Nothing
+    /// errored and nothing looked wrong.
+    ///
+    /// ## Two things a consumer should know about the figures
+    ///
+    /// `chars_added` and `chars_removed` are a **net delta for the affected
+    /// region**, not "characters this edit introduced": replacing a selection
+    /// reports both, and a caller wanting to know how much text an edit brought
+    /// in cannot get it from here.
+    ///
+    /// For `undo`, `redo` and the table edits the delta is computed as a diff
+    /// over blocks joined by newlines, which is not the same string
+    /// [`TextDocument::to_plain_text`] renders when the document contains a
+    /// table. Consumers that shift offsets by these figures are consistent with
+    /// each other; a consumer reconciling them against `to_plain_text` is not.
+    ///
+    /// [`TextDocument::content_revision`]: crate::TextDocument::content_revision
+    /// [`TextDocument::to_plain_text`]: crate::TextDocument::to_plain_text
     ContentsChanged {
         position: usize,
         chars_removed: usize,

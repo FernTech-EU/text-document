@@ -1426,6 +1426,13 @@ impl TextCursor {
     pub fn remove_table(&self, table_id: usize) -> Result<()> {
         let queued = {
             let mut inner = self.doc.lock();
+            // ⚠ Snapshotted **before** the command, so the text change it makes
+            // can be reported as a real diff afterwards. Every structural table
+            // edit below does the same: they know how many rows or cells they
+            // touched and not where in the document's text that lands, and
+            // working that out by hand would be seven chances to be subtly
+            // wrong in a figure consumers shift their offsets by.
+            let before = crate::document::capture_block_state(&inner);
             let dto = frontend::document_editing::RemoveTableDto {
                 table_id: to_i64(table_id),
             };
@@ -1433,6 +1440,7 @@ impl TextCursor {
             inner.modified = true;
             inner.invalidate_text_cache();
             inner.rehighlight_all();
+            crate::document::emit_content_change_events(&mut inner, &before);
             inner.check_block_count_changed();
             inner.check_flow_changed();
             self.queue_undo_redo_event(&mut inner)
@@ -1445,6 +1453,7 @@ impl TextCursor {
     pub fn insert_table_row(&self, table_id: usize, row_index: usize) -> Result<()> {
         let queued = {
             let mut inner = self.doc.lock();
+            let before = crate::document::capture_block_state(&inner);
             let dto = frontend::document_editing::InsertTableRowDto {
                 table_id: to_i64(table_id),
                 row_index: to_i64(row_index),
@@ -1453,6 +1462,7 @@ impl TextCursor {
             inner.modified = true;
             inner.invalidate_text_cache();
             inner.rehighlight_all();
+            crate::document::emit_content_change_events(&mut inner, &before);
             inner.check_block_count_changed();
             self.queue_undo_redo_event(&mut inner)
         };
@@ -1464,6 +1474,7 @@ impl TextCursor {
     pub fn insert_table_column(&self, table_id: usize, column_index: usize) -> Result<()> {
         let queued = {
             let mut inner = self.doc.lock();
+            let before = crate::document::capture_block_state(&inner);
             let dto = frontend::document_editing::InsertTableColumnDto {
                 table_id: to_i64(table_id),
                 column_index: to_i64(column_index),
@@ -1472,6 +1483,7 @@ impl TextCursor {
             inner.modified = true;
             inner.invalidate_text_cache();
             inner.rehighlight_all();
+            crate::document::emit_content_change_events(&mut inner, &before);
             inner.check_block_count_changed();
             self.queue_undo_redo_event(&mut inner)
         };
@@ -1483,6 +1495,7 @@ impl TextCursor {
     pub fn remove_table_row(&self, table_id: usize, row_index: usize) -> Result<()> {
         let queued = {
             let mut inner = self.doc.lock();
+            let before = crate::document::capture_block_state(&inner);
             let dto = frontend::document_editing::RemoveTableRowDto {
                 table_id: to_i64(table_id),
                 row_index: to_i64(row_index),
@@ -1491,6 +1504,7 @@ impl TextCursor {
             inner.modified = true;
             inner.invalidate_text_cache();
             inner.rehighlight_all();
+            crate::document::emit_content_change_events(&mut inner, &before);
             inner.check_block_count_changed();
             self.queue_undo_redo_event(&mut inner)
         };
@@ -1502,6 +1516,7 @@ impl TextCursor {
     pub fn remove_table_column(&self, table_id: usize, column_index: usize) -> Result<()> {
         let queued = {
             let mut inner = self.doc.lock();
+            let before = crate::document::capture_block_state(&inner);
             let dto = frontend::document_editing::RemoveTableColumnDto {
                 table_id: to_i64(table_id),
                 column_index: to_i64(column_index),
@@ -1510,6 +1525,7 @@ impl TextCursor {
             inner.modified = true;
             inner.invalidate_text_cache();
             inner.rehighlight_all();
+            crate::document::emit_content_change_events(&mut inner, &before);
             inner.check_block_count_changed();
             self.queue_undo_redo_event(&mut inner)
         };
@@ -1528,6 +1544,7 @@ impl TextCursor {
     ) -> Result<()> {
         let queued = {
             let mut inner = self.doc.lock();
+            let before = crate::document::capture_block_state(&inner);
             let dto = frontend::document_editing::MergeTableCellsDto {
                 table_id: to_i64(table_id),
                 start_row: to_i64(start_row),
@@ -1539,6 +1556,7 @@ impl TextCursor {
             inner.modified = true;
             inner.invalidate_text_cache();
             inner.rehighlight_all();
+            crate::document::emit_content_change_events(&mut inner, &before);
             inner.check_block_count_changed();
             self.queue_undo_redo_event(&mut inner)
         };
@@ -1555,6 +1573,7 @@ impl TextCursor {
     ) -> Result<()> {
         let queued = {
             let mut inner = self.doc.lock();
+            let before = crate::document::capture_block_state(&inner);
             let dto = frontend::document_editing::SplitTableCellDto {
                 cell_id: to_i64(cell_id),
                 split_rows: to_i64(split_rows),
@@ -1564,6 +1583,7 @@ impl TextCursor {
             inner.modified = true;
             inner.invalidate_text_cache();
             inner.rehighlight_all();
+            crate::document::emit_content_change_events(&mut inner, &before);
             inner.check_block_count_changed();
             self.queue_undo_redo_event(&mut inner)
         };
@@ -2524,7 +2544,9 @@ impl TextCursor {
     ///
     /// Not expressible through [`merge_char_format`](Self::merge_char_format):
     /// its fields merge, so `anchor_href: None` means "leave the link alone",
-    /// never "take it off". Mirrors [`clear_direction`](Self::clear_direction).
+    /// never "take it off". Which is why the removal is its own verb, and why
+    /// [`TextFormat::clear_link`](crate::TextFormat::clear_link) exists as a
+    /// flag rather than as an absent field.
     ///
     /// Note the selection must be non-empty — a zero-width range formats
     /// nothing, here as everywhere else. Callers editing an existing link
