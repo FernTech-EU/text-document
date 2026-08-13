@@ -340,8 +340,9 @@ impl TextBlock {
     /// [`display_fragments`](Self::display_fragments) — whose `offset` is block-relative,
     /// fine for the layout engine that consumes them one block at a time — whenever a piece
     /// boundary needs comparing against something addressed in the *document's* own space:
-    /// a comment's stored character range, a [`TextDocument::find_all`](crate::TextDocument::
-    /// find_all) match position, another block's [`position()`](Self::position).
+    /// a comment's stored character range, a
+    /// [`TextDocument::find_all`](crate::TextDocument::find_all) match position,
+    /// another block's [`position()`](Self::position).
     ///
     /// Thin wrapper over [`common::format_runs_query::addressable_inline_pieces_for_block`]
     /// — the same accessor a DOCX/ODT export writer reaches for below the public API, so a
