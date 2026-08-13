@@ -106,6 +106,8 @@ fn test_merge_text_format_on_list_blocks() -> Result<()> {
             font_underline: None,
             font_strikeout: None,
             vertical_alignment: None,
+            anchor_href: None,
+            clear_link: false,
         },
     )?;
 
@@ -150,6 +152,8 @@ fn test_merge_text_format_partial_split_preserves_fields() -> Result<()> {
             word_spacing: Some(4),
             underline_style: Some(UnderlineStyle::NoUnderline),
             vertical_alignment: Some(CharVerticalAlignment::Normal),
+            anchor_href: None,
+            clear_link: false,
         },
     )?;
 
@@ -168,6 +172,8 @@ fn test_merge_text_format_partial_split_preserves_fields() -> Result<()> {
             font_underline: None,
             font_strikeout: None,
             vertical_alignment: None,
+            anchor_href: None,
+            clear_link: false,
         },
     )?;
 
@@ -227,6 +233,8 @@ fn test_merge_text_format_undo_redo() -> Result<()> {
             font_underline: None,
             font_strikeout: None,
             vertical_alignment: None,
+            anchor_href: None,
+            clear_link: false,
         },
     )?;
 
@@ -338,6 +346,192 @@ fn test_merge_text_format_preserves_existing_vertical_alignment() -> Result<()> 
             == Some(common::entities::CharVerticalAlignment::SuperScript)
             && e.fmt_font_bold == Some(true)),
         "bolding a superscript run must keep it superscript"
+    );
+    Ok(())
+}
+
+// ── Hyperlinks ──────────────────────────────────────────────────
+//
+// A link is a character format like any other, so it merges by the same rules.
+// What it does NOT share is a way to be removed: every field here means "leave
+// this alone" when `None`, so removal needs `clear_link`.
+
+#[test]
+fn test_merge_text_format_sets_a_link() -> Result<()> {
+    let (db, hub, mut urm) = setup_with_text("Hello")?;
+
+    document_formatting_controller::merge_text_format(
+        &db,
+        &hub,
+        &mut urm,
+        None,
+        &MergeTextFormatDto {
+            position: 0,
+            anchor: 5,
+            anchor_href: Some("https://example.com".into()),
+            ..Default::default()
+        },
+    )?;
+
+    let block_ids = get_block_ids(&db)?;
+    let elements = test_harness::synth_block_elements(&db, block_ids[0])?;
+    let elem = &elements[0];
+
+    assert_eq!(
+        elem.fmt_anchor_href,
+        Some("https://example.com".into()),
+        "the destination must reach the run"
+    );
+    assert_eq!(
+        elem.fmt_is_anchor,
+        Some(true),
+        "is_anchor is derived from the destination, never carried separately"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_merge_text_format_link_preserves_neighbouring_marks() -> Result<()> {
+    let (db, hub, mut urm) = setup_with_text("Hello")?;
+
+    document_formatting_controller::set_text_format(
+        &db,
+        &hub,
+        &mut urm,
+        None,
+        &SetTextFormatDto {
+            position: 0,
+            anchor: 5,
+            font_bold: Some(true),
+            font_italic: Some(true),
+            ..Default::default()
+        },
+    )?;
+
+    document_formatting_controller::merge_text_format(
+        &db,
+        &hub,
+        &mut urm,
+        None,
+        &MergeTextFormatDto {
+            position: 0,
+            anchor: 5,
+            anchor_href: Some("https://example.com".into()),
+            ..Default::default()
+        },
+    )?;
+
+    let block_ids = get_block_ids(&db)?;
+    let elements = test_harness::synth_block_elements(&db, block_ids[0])?;
+    let elem = &elements[0];
+
+    // The whole reason a link is applied as a format rather than by
+    // reinserting the text: the writer's existing marks survive it.
+    assert_eq!(elem.fmt_font_bold, Some(true), "bold must survive linking");
+    assert_eq!(
+        elem.fmt_font_italic,
+        Some(true),
+        "italic must survive linking"
+    );
+    assert_eq!(elem.fmt_anchor_href, Some("https://example.com".into()));
+    Ok(())
+}
+
+#[test]
+fn test_merge_text_format_clear_link_removes_it() -> Result<()> {
+    let (db, hub, mut urm) = setup_with_text("Hello")?;
+
+    document_formatting_controller::merge_text_format(
+        &db,
+        &hub,
+        &mut urm,
+        None,
+        &MergeTextFormatDto {
+            position: 0,
+            anchor: 5,
+            anchor_href: Some("https://example.com".into()),
+            font_bold: Some(true),
+            ..Default::default()
+        },
+    )?;
+
+    document_formatting_controller::merge_text_format(
+        &db,
+        &hub,
+        &mut urm,
+        None,
+        &MergeTextFormatDto {
+            position: 0,
+            anchor: 5,
+            clear_link: true,
+            ..Default::default()
+        },
+    )?;
+
+    let block_ids = get_block_ids(&db)?;
+    let elements = test_harness::synth_block_elements(&db, block_ids[0])?;
+    let elem = &elements[0];
+
+    assert_eq!(elem.fmt_anchor_href, None, "the destination must be gone");
+    assert_eq!(elem.fmt_is_anchor, None, "and so must the anchor flag");
+    assert_eq!(
+        elem.fmt_font_bold,
+        Some(true),
+        "clearing the link must not touch anything else"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_merge_text_format_clear_link_beats_a_destination() -> Result<()> {
+    let (db, hub, mut urm) = setup_with_text("Hello")?;
+
+    // Both given at once. `clear_link` wins, exactly as `clear_direction`
+    // wins over `direction` on the block DTO.
+    document_formatting_controller::merge_text_format(
+        &db,
+        &hub,
+        &mut urm,
+        None,
+        &MergeTextFormatDto {
+            position: 0,
+            anchor: 5,
+            anchor_href: Some("https://example.com".into()),
+            clear_link: true,
+            ..Default::default()
+        },
+    )?;
+
+    let block_ids = get_block_ids(&db)?;
+    let elements = test_harness::synth_block_elements(&db, block_ids[0])?;
+    assert_eq!(elements[0].fmt_anchor_href, None);
+    Ok(())
+}
+
+#[test]
+fn test_merge_text_format_link_undo_restores_the_prior_state() -> Result<()> {
+    let (db, hub, mut urm) = setup_with_text("Hello")?;
+
+    document_formatting_controller::merge_text_format(
+        &db,
+        &hub,
+        &mut urm,
+        Some(0),
+        &MergeTextFormatDto {
+            position: 0,
+            anchor: 5,
+            anchor_href: Some("https://example.com".into()),
+            ..Default::default()
+        },
+    )?;
+
+    urm.undo(Some(0))?;
+
+    let block_ids = get_block_ids(&db)?;
+    let elements = test_harness::synth_block_elements(&db, block_ids[0])?;
+    assert_eq!(
+        elements[0].fmt_anchor_href, None,
+        "undo must take the link back off"
     );
     Ok(())
 }

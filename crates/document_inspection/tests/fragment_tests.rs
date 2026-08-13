@@ -526,6 +526,8 @@ fn test_extract_fragment_multiple_formats() -> Result<()> {
             word_spacing: Some(0),
             underline_style: Some(UnderlineStyle::NoUnderline),
             vertical_alignment: Some(CharVerticalAlignment::Normal),
+            anchor_href: None,
+            clear_link: false,
         },
     )?;
 
@@ -549,6 +551,8 @@ fn test_extract_fragment_multiple_formats() -> Result<()> {
             word_spacing: Some(0),
             underline_style: Some(UnderlineStyle::NoUnderline),
             vertical_alignment: Some(CharVerticalAlignment::Normal),
+            anchor_href: None,
+            clear_link: false,
         },
     )?;
 

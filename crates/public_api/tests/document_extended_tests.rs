@@ -139,15 +139,24 @@ fn set_text_format_full() {
         word_spacing: Some(3),
         underline_style: Some(text_document::UnderlineStyle::WaveUnderline),
         vertical_alignment: Some(text_document::CharVerticalAlignment::SuperScript),
-        anchor_href: None,
+        anchor_href: Some("https://example.com".into()),
         anchor_names: vec![],
         is_anchor: None,
         tooltip: None,
+        clear_link: false,
         foreground_color: None,
         background_color: None,
         underline_color: None,
     };
     c.set_char_format(&fmt).unwrap();
+
+    // The set path carries a link too, not just the merge path every toolbar
+    // takes. Asserted rather than merely exercised: this test pinned
+    // `anchor_href: None` for as long as the field was silently dropped on the
+    // way to the DTO, so it would not have noticed either way.
+    let readback = doc.cursor_at(2).char_format().unwrap();
+    assert_eq!(readback.anchor_href.as_deref(), Some("https://example.com"));
+    assert_eq!(readback.is_anchor, Some(true));
 }
 
 // ── Block format with full fields ───────────────────────────────

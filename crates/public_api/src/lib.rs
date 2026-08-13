@@ -34,6 +34,7 @@ mod flow;
 mod fragment;
 mod highlight;
 mod inner;
+mod link_extent;
 mod operation;
 
 mod streaming;
@@ -109,6 +110,7 @@ pub use flow::{
     FrameSnapshot, ListInfo, PaintHighlightSpan, SelectionKind, TableCellContext, TableCellRef,
     TableFormat, TableSnapshot,
 };
+pub use link_extent::LinkExtent;
 pub use text_block::TextBlock;
 pub use text_frame::TextFrame;
 pub use text_list::TextList;
@@ -188,6 +190,15 @@ pub struct TextFormat {
     pub anchor_names: Vec<String>,
     pub is_anchor: Option<bool>,
     pub tooltip: Option<String>,
+    /// Remove the range's link, rather than pointing it somewhere else.
+    ///
+    /// Every other field here merges — `None` means "leave this alone" — so
+    /// without a flag there is no way to express removal at all. Takes
+    /// precedence over `anchor_href`. Mirrors [`BlockFormat::clear_direction`].
+    ///
+    /// Write-only: reading a format back never sets it, since it describes an
+    /// edit rather than a state.
+    pub clear_link: bool,
     pub foreground_color: Option<Color>,
     pub background_color: Option<Color>,
     pub underline_color: Option<Color>,

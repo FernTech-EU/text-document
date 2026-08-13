@@ -19,6 +19,8 @@ use crate::events::DocumentEvent;
 use crate::flow::{CellRange, FlowElement, FrameRef, SelectionKind, TableCellRef};
 use crate::fragment::DocumentFragment;
 use crate::inner::{CursorData, QueuedEvents, TextDocumentInner};
+use crate::link_extent::LinkExtent;
+use crate::text_block::TextBlock;
 use crate::text_table::TextTable;
 use crate::{BlockFormat, FrameFormat, MoveMode, MoveOperation, SelectionType, TextFormat};
 
@@ -2492,6 +2494,46 @@ impl TextCursor {
         };
         crate::inner::dispatch_queued_events(queued);
         Ok(())
+    }
+
+    /// The hyperlink the cursor sits in, with its full reach.
+    ///
+    /// A link has no identity of its own — it is a stretch of runs agreeing on
+    /// a destination — so this reports the *extent*, coalesced across any runs
+    /// an inner bold or italic split it into. See [`LinkExtent`].
+    ///
+    /// `None` when the cursor is not on a link. Uses the same caret semantics
+    /// as [`block_format`](Self::block_format): a cursor at the end of a link
+    /// is still in it.
+    pub fn link_at_caret(&self) -> Option<LinkExtent> {
+        let pos = self.position();
+        let block_id = {
+            let inner = self.doc.lock();
+            crate::inner::block_at_caret_dto(&inner.ctx, pos)
+                .ok()?
+                .block_id as usize
+        };
+        let block = TextBlock {
+            doc: self.doc.clone(),
+            block_id,
+        };
+        crate::link_extent::link_extent_at(&block, pos)
+    }
+
+    /// Remove the hyperlink from the selection.
+    ///
+    /// Not expressible through [`merge_char_format`](Self::merge_char_format):
+    /// its fields merge, so `anchor_href: None` means "leave the link alone",
+    /// never "take it off". Mirrors [`clear_direction`](Self::clear_direction).
+    ///
+    /// Note the selection must be non-empty — a zero-width range formats
+    /// nothing, here as everywhere else. Callers editing an existing link
+    /// should select its [`LinkExtent`] first.
+    pub fn clear_char_anchor(&self) -> Result<()> {
+        self.merge_char_format(&TextFormat {
+            clear_link: true,
+            ..Default::default()
+        })
     }
 
     /// Merge a character format into the selection.

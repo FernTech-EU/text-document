@@ -267,6 +267,8 @@ fn test_set_text_format_whole_element() -> Result<()> {
             word_spacing: Some(4),
             underline_style: Some(UnderlineStyle::SingleUnderline),
             vertical_alignment: Some(CharVerticalAlignment::Normal),
+            anchor_href: None,
+            clear_link: false,
         },
     )?;
 
@@ -316,6 +318,8 @@ fn test_set_text_format_partial() -> Result<()> {
             word_spacing: Some(0),
             underline_style: Some(UnderlineStyle::NoUnderline),
             vertical_alignment: Some(CharVerticalAlignment::Normal),
+            anchor_href: None,
+            clear_link: false,
         },
     )?;
 
@@ -373,6 +377,8 @@ fn test_merge_text_format_preserves_other_fields() -> Result<()> {
             word_spacing: Some(10),
             underline_style: Some(UnderlineStyle::WaveUnderline),
             vertical_alignment: Some(CharVerticalAlignment::SuperScript),
+            anchor_href: None,
+            clear_link: false,
         },
     )?;
 
@@ -391,6 +397,8 @@ fn test_merge_text_format_preserves_other_fields() -> Result<()> {
             font_underline: Some(true),
             font_strikeout: None,
             vertical_alignment: None,
+            anchor_href: None,
+            clear_link: false,
         },
     )?;
 
@@ -451,6 +459,8 @@ fn test_merge_text_format_undo() -> Result<()> {
             word_spacing: Some(0),
             underline_style: Some(UnderlineStyle::NoUnderline),
             vertical_alignment: Some(CharVerticalAlignment::Normal),
+            anchor_href: None,
+            clear_link: false,
         },
     )?;
 
@@ -469,6 +479,8 @@ fn test_merge_text_format_undo() -> Result<()> {
             font_underline: Some(false),
             font_strikeout: None,
             vertical_alignment: None,
+            anchor_href: None,
+            clear_link: false,
         },
     )?;
 
@@ -522,6 +534,8 @@ fn test_set_text_format_undo() -> Result<()> {
             word_spacing: Some(0),
             underline_style: Some(UnderlineStyle::NoUnderline),
             vertical_alignment: Some(CharVerticalAlignment::Normal),
+            anchor_href: None,
+            clear_link: false,
         },
     )?;
 
@@ -563,6 +577,8 @@ fn test_set_text_format_cross_block() -> Result<()> {
             word_spacing: Some(0),
             underline_style: Some(UnderlineStyle::NoUnderline),
             vertical_alignment: Some(CharVerticalAlignment::Normal),
+            anchor_href: None,
+            clear_link: false,
         },
     )?;
 

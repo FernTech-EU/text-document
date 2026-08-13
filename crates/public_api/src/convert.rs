@@ -256,6 +256,8 @@ impl TextFormat {
                 .vertical_alignment
                 .as_ref()
                 .map(vertical_alignment_to_dto),
+            anchor_href: self.anchor_href.clone(),
+            clear_link: self.clear_link,
         }
     }
 
@@ -276,6 +278,8 @@ impl TextFormat {
                 .vertical_alignment
                 .as_ref()
                 .map(vertical_alignment_to_dto),
+            anchor_href: self.anchor_href.clone(),
+            clear_link: self.clear_link,
         }
     }
 }
@@ -301,6 +305,9 @@ impl From<&frontend::common::format_runs::CharacterFormat> for TextFormat {
             anchor_names: fmt.anchor_names.clone(),
             is_anchor: fmt.is_anchor,
             tooltip: fmt.tooltip.clone(),
+            // Describes an edit, never a state, so reading a format back never
+            // sets it.
+            clear_link: false,
             foreground_color: None,
             background_color: None,
             underline_color: None,

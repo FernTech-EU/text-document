@@ -583,9 +583,7 @@ fn the_quote_style_is_declared_in_the_stylesheet() {
 /// is the whole difference between an `EpigraphText` and a paragraph of the manuscript.
 #[test]
 fn an_epigraph_keeps_its_own_style_rather_than_the_ordinary_quote_one() {
-    let docx = docx_from_djot(
-        "> {semantic_role=epigraph}\n> All happy families are alike.\n",
-    );
+    let docx = docx_from_djot("> {semantic_role=epigraph}\n> All happy families are alike.\n");
     let p = para_containing(&docx, "All happy families are alike.");
     assert_eq!(
         p.property.style.as_ref().map(|s| s.val.as_str()),

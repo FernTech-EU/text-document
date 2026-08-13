@@ -134,7 +134,33 @@ fn merge_dto(base: &CharacterFormat, dto: &SetTextFormatDto) -> CharacterFormat 
     if let Some(ref v) = dto.vertical_alignment {
         out.vertical_alignment = Some(vertical_alignment_to_entity(v));
     }
+    apply_link(&mut out, dto.clear_link, dto.anchor_href.as_deref());
     out
+}
+
+/// Write a hyperlink onto a character format, or take one off.
+///
+/// `is_anchor` is derived rather than carried: every importer sets it to
+/// `Some(true)` exactly when a destination is present, so deriving it here is
+/// the only way the two cannot fall out of step. An empty destination is
+/// treated as "no change", following the same rule `font_family` already
+/// follows in both merge paths.
+///
+/// Shared by [`set_text_format`](super::set_text_format_uc) and
+/// [`merge_text_format`](super::merge_text_format_uc) so the two cannot
+/// disagree about what applying a link means.
+pub(crate) fn apply_link(out: &mut CharacterFormat, clear: bool, href: Option<&str>) {
+    if clear {
+        out.anchor_href = None;
+        out.is_anchor = None;
+        out.anchor_names = Vec::new();
+        out.tooltip = None;
+    } else if let Some(href) = href
+        && !href.is_empty()
+    {
+        out.anchor_href = Some(href.to_string());
+        out.is_anchor = Some(true);
+    }
 }
 
 /// Build the replacement run list covering `[byte_start..byte_end)` of a

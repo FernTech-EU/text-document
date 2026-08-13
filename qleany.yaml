@@ -983,6 +983,22 @@ features:
                 - Bottom
                 - Top
                 - Baseline
+            # Hyperlink destination. `is_anchor` is deliberately absent: every
+            # importer sets it to `Some(true)` exactly when a href is present
+            # and never independently, so the use case derives it rather than
+            # trusting two fields to stay in step. `anchor_names` and `tooltip`
+            # are absent for a blunter reason — neither the Djot writer nor the
+            # reader touches them, so a value written here would not survive a
+            # save and reload.
+            - name: anchor_href
+              type: string
+              optional: true
+            # Remove the run's link. Every other field here *merges* — `None`
+            # means "leave this property alone" — so there is otherwise no way
+            # to express "take the link off again", only "point it elsewhere".
+            # Same shape, and same reason, as `clear_direction` below.
+            - name: clear_link
+              type: boolean
 
       - name: merge_text_format
         undoable: true
@@ -1022,6 +1038,16 @@ features:
                 - SuperScript
                 - SubScript
                 - Middle
+            # The link, and its removal. This is the copy that matters: as with
+            # `vertical_alignment` above, `merge_char_format` is the path every
+            # toolbar takes, so a link the set-DTO alone could carry would be
+            # silently discarded on the way through. See SetTextFormatDto for
+            # why `is_anchor` / `anchor_names` / `tooltip` are not here.
+            - name: anchor_href
+              type: string
+              optional: true
+            - name: clear_link
+              type: boolean
 
       - name: set_block_format
         undoable: true
@@ -1062,6 +1088,9 @@ features:
             - name: non_breakable_lines
               type: boolean
               optional: true
+            - name: page_break_before
+              type: boolean
+              optional: true
             - name: direction
               type: enum
               enum_name: TextDirection
@@ -1069,6 +1098,12 @@ features:
               enum_values:
                 - LeftToRight
                 - RightToLeft
+            # Unset the block's stored direction, handing the paragraph back to
+            # the bidi algorithm's first-strong-character detection. Merge
+            # semantics leave no other way to say "remove the direction I set
+            # earlier". Takes precedence over `direction` when both are given.
+            - name: clear_direction
+              type: boolean
             - name: background_color
               type: string
               optional: true

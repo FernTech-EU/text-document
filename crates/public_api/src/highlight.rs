@@ -719,6 +719,9 @@ fn apply_highlight(base: &TextFormat, hl: &HighlightFormat) -> TextFormat {
         anchor_href: base.anchor_href.clone(),
         anchor_names: base.anchor_names.clone(),
         is_anchor: base.is_anchor,
+        // A highlight paints over a format; it never edits one, and removing a
+        // link is an edit.
+        clear_link: false,
     }
 }
 

@@ -65,6 +65,11 @@ fn merge_dto(base: &CharacterFormat, dto: &MergeTextFormatDto) -> CharacterForma
         out.vertical_alignment =
             Some(crate::use_cases::set_text_format_uc::vertical_alignment_to_entity(v));
     }
+    crate::use_cases::set_text_format_uc::apply_link(
+        &mut out,
+        dto.clear_link,
+        dto.anchor_href.as_deref(),
+    );
     out
 }
 

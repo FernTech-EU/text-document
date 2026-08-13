@@ -335,6 +335,8 @@ fn test_set_text_format_all_fields() -> Result<()> {
             word_spacing: Some(6),
             underline_style: Some(UnderlineStyle::WaveUnderline),
             vertical_alignment: Some(CharVerticalAlignment::SuperScript),
+            anchor_href: None,
+            clear_link: false,
         },
     )?;
 

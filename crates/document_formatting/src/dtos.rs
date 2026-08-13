@@ -18,6 +18,22 @@ pub struct SetTextFormatDto {
     pub word_spacing: Option<i64>,
     pub underline_style: Option<UnderlineStyle>,
     pub vertical_alignment: Option<CharVerticalAlignment>,
+    /// Hyperlink destination for the range.
+    ///
+    /// `is_anchor` is deliberately not a field of its own: every importer sets
+    /// it to `Some(true)` exactly when a destination is present and never
+    /// independently, so the use case derives it here rather than trusting two
+    /// fields to stay in step. `anchor_names` and `tooltip` are absent for a
+    /// blunter reason — neither the Djot writer nor the reader touches them, so
+    /// a value set through here would not survive a save and reload.
+    pub anchor_href: Option<String>,
+    /// Remove the range's link.
+    ///
+    /// Every other field here *merges* — `None` means "leave this property
+    /// alone" — so there is otherwise no way to express "take the link off
+    /// again", only "point it somewhere else". Takes precedence over
+    /// `anchor_href` when both are given.
+    pub clear_link: bool,
 }
 
 #[derive(Serialize, Deserialize, Default, Clone, Debug, PartialEq, Eq)]
@@ -54,6 +70,14 @@ pub struct MergeTextFormatDto {
     pub font_underline: Option<bool>,
     pub font_strikeout: Option<bool>,
     pub vertical_alignment: Option<CharVerticalAlignment>,
+    /// The link. This is the copy that matters: as with `vertical_alignment`,
+    /// `merge_char_format` is the path every toolbar takes, so a destination
+    /// only [`SetTextFormatDto`] could carry would be silently discarded on the
+    /// way through. See that type for why `is_anchor` is derived rather than
+    /// carried.
+    pub anchor_href: Option<String>,
+    /// Remove the range's link. Takes precedence over `anchor_href`.
+    pub clear_link: bool,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct SetBlockFormatDto {
