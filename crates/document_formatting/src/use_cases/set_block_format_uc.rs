@@ -95,6 +95,37 @@ fn execute_set_block_format(
     // Find blocks that overlap the range
     let mut blocks_to_update: Vec<Block> = Vec::new();
     let store = uow.store();
+
+    // A collapsed cursor resolves to exactly ONE block, decided here rather
+    // than by the per-block test below.
+    //
+    // The end-inclusive rule that test uses is deliberate (see its comment: a
+    // caret at a paragraph's end must still format that paragraph), but it is
+    // ambiguous wherever two blocks touch — a paragraph ending at offset N and
+    // a following block starting at N both match a caret at N. Where the next
+    // block is a table cell, "format this cell as a code block" also reformatted
+    // the paragraph above the table.
+    //
+    // The block that *starts* latest at or before the caret wins, which is the
+    // same answer `block_at_caret_dto` gives one layer up: a caret between two
+    // blocks opens the second rather than closing the first, and a caret at a
+    // paragraph's end — where the next block starts a character later — has no
+    // competitor and keeps that paragraph.
+    // Keyed by id, not by position: two blocks in different frames can share a
+    // document position, and a position match would then format both.
+    let caret_block_id = if range_start == range_end {
+        blocks
+            .iter()
+            .filter(|b| {
+                let start = b.document_position;
+                start <= range_start && range_start <= start + block_char_length(b, &store)
+            })
+            .max_by_key(|b| b.document_position)
+            .map(|b| b.id)
+    } else {
+        None
+    };
+
     for block in &blocks {
         let block_start = block.document_position;
         let block_end = block_start + block_char_length(block, &store);
@@ -111,7 +142,8 @@ fn execute_set_block_format(
         // or an alignment there silently did nothing at all. End-inclusive also
         // subsumes the empty-block case, where start and end coincide.
         let overlaps = if range_start == range_end {
-            block_start <= range_start && range_start <= block_end
+            // Resolved above: one block, not every block the caret touches.
+            caret_block_id == Some(block.id)
         } else if block_char_length(block, &store) > 0 {
             block_start <= range_end && block_end > range_start
         } else {

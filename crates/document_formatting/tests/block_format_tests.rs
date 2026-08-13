@@ -225,10 +225,30 @@ fn test_set_block_format_in_table_cell() -> Result<()> {
         Some("#1e1e1e".into())
     );
 
-    // Verify "Before" block is unaffected
+    // Verify "Before" block is unaffected.
+    //
+    // This is the assertion that matters, and it caught a real bug: the
+    // paragraph ends at the exact offset the first cell's block starts, and a
+    // collapsed caret used to match *both* under the end-inclusive rule — so
+    // formatting a cell also reformatted the paragraph above the table.
     let main_block_ids = get_block_ids(&db)?;
     let main_block = block_controller::get(&db, &main_block_ids[0])?.unwrap();
     assert_eq!(main_block.fmt_is_code_block, None);
+
+    // ...and so are the sibling cells. Same bug, one step further: a caret
+    // resolves to exactly one block, so the other three cells must be
+    // untouched however close together their positions sit.
+    for (i, sibling) in cells.iter().enumerate().skip(1) {
+        let frame = sibling.cell_frame.unwrap();
+        let ids = frame_controller::get_relationship(&db, &frame, &FrameRelationshipField::Blocks)?;
+        for id in ids {
+            let b = block_controller::get(&db, &id)?.unwrap();
+            assert_eq!(
+                b.fmt_is_code_block, None,
+                "cell {i} must not have been formatted along with cell 0"
+            );
+        }
+    }
     Ok(())
 }
 
