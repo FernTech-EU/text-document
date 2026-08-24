@@ -1351,3 +1351,109 @@ fn roundtrip_nested_list_three_levels_markdown() {
         "copy/paste roundtrip should preserve correct list order and indents (Markdown)"
     );
 }
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// Clipboard HTML from other applications
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+/// Word, Google Docs and Chrome all publish `text/html` as a whole document
+/// with a `<style>` block in the head. The walker used to recurse into any tag
+/// it did not recognise, on the assumption that an unknown tag is an inline
+/// wrapper — which turned the stylesheet into paragraphs of the pasted text.
+#[test]
+fn a_style_block_is_not_pasted_as_body_text() {
+    let doc = TextDocument::new();
+    doc.set_plain_text("").unwrap();
+    let cursor = doc.cursor();
+    cursor
+        .insert_html(
+            "<html><head><meta charset=\"utf-8\"><style type=\"text/css\">\
+             p.c1 { color: #ff0000; font-weight: 700 }\np.c2 { margin: 0 }\
+             </style></head><body><!--StartFragment--><p class=\"c1\">Hello</p>\
+             <p class=\"c2\">World</p><!--EndFragment--></body></html>",
+        )
+        .unwrap();
+
+    let plain = doc.to_plain_text().unwrap();
+    assert!(
+        plain.contains("Hello") && plain.contains("World"),
+        "the prose must still arrive: {plain:?}"
+    );
+    assert!(
+        !plain.contains("color:") && !plain.contains("font-weight"),
+        "the <style> CSS was pasted as prose: {plain:?}"
+    );
+}
+
+/// `<script>` is the same problem wearing a different tag.
+#[test]
+fn a_script_block_is_not_pasted_as_body_text() {
+    let doc = TextDocument::new();
+    doc.set_plain_text("").unwrap();
+    let cursor = doc.cursor();
+    cursor
+        .insert_html("<div><script>var x = 1; alert('hi');</script><p>kept</p></div>")
+        .unwrap();
+
+    let plain = doc.to_plain_text().unwrap();
+    assert!(plain.contains("kept"), "{plain:?}");
+    assert!(!plain.contains("alert"), "the script leaked: {plain:?}");
+}
+
+/// A `<style>` inside a table cell reaches the document through a third walker.
+#[test]
+fn a_style_block_inside_a_table_cell_is_not_pasted_as_cell_text() {
+    let doc = TextDocument::new();
+    doc.set_plain_text("").unwrap();
+    let cursor = doc.cursor();
+    cursor
+        .insert_html("<table><tr><td><style>td { color: red }</style>cell</td></tr></table>")
+        .unwrap();
+
+    let plain = doc.to_plain_text().unwrap();
+    assert!(plain.contains("cell"), "{plain:?}");
+    assert!(!plain.contains("color: red"), "the style leaked: {plain:?}");
+}
+
+/// Superscript is character formatting like bold, and an exponent that lands on
+/// the baseline is simply the wrong text. Both directions used to drop it: the
+/// walker hard-coded `superscript: false`, and `to_html` emitted no `<sup>`.
+#[test]
+fn superscript_and_subscript_survive_an_html_round_trip() {
+    use text_document::CharVerticalAlignment;
+
+    let doc = TextDocument::new();
+    doc.set_plain_text("").unwrap();
+    let cursor = doc.cursor();
+    cursor
+        .insert_html("<p>x<sup>2</sup> and H<sub>2</sub>O</p>")
+        .unwrap();
+
+    let plain = doc.to_plain_text().unwrap();
+    let exponent = plain.find('2').expect("the exponent");
+    let probe = doc.cursor();
+    probe.set_position(exponent, MoveMode::MoveAnchor);
+    assert_eq!(
+        probe.char_format().unwrap().vertical_alignment,
+        Some(CharVerticalAlignment::SuperScript),
+        "<sup> must import as superscript"
+    );
+
+    let index = plain.rfind('2').expect("the index");
+    assert_ne!(index, exponent, "two distinct digits");
+    let probe = doc.cursor();
+    probe.set_position(index, MoveMode::MoveAnchor);
+    assert_eq!(
+        probe.char_format().unwrap().vertical_alignment,
+        Some(CharVerticalAlignment::SubScript),
+        "<sub> must import as subscript"
+    );
+
+    // And back out again, so a copy into another application keeps them.
+    let all = doc.cursor();
+    all.set_position(0, MoveMode::MoveAnchor);
+    all.move_position(MoveOperation::End, MoveMode::KeepAnchor, 1);
+    let html = all.selection().to_html();
+    assert!(html.contains("<sup>"), "to_html must emit <sup>: {html:?}");
+    assert!(html.contains("<sub>"), "to_html must emit <sub>: {html:?}");
+}

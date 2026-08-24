@@ -1039,10 +1039,36 @@ pub fn parse_html_elements(html: &str) -> Vec<ParsedElement> {
         underline: bool,
         strikeout: bool,
         code: bool,
+        superscript: bool,
+        subscript: bool,
         link_href: Option<String>,
     }
 
     const MAX_RECURSION_DEPTH: usize = 256;
+
+    /// Elements whose text content is machinery, not prose.
+    ///
+    /// `<style>` and `<script>` hold raw text the HTML spec never renders, and
+    /// `<head>` and its metadata children carry none a reader is meant to see.
+    /// Every walker below recurses into unknown tags on the assumption that
+    /// they are inline wrappers, which turns a stylesheet into paragraphs —
+    /// and Word, Google Docs and Chrome all put a `<style>` block in the
+    /// `text/html` flavour they publish to the clipboard, so this is the
+    /// ordinary paste, not an exotic one.
+    fn is_metadata_tag(tag: &str) -> bool {
+        matches!(
+            tag,
+            "head"
+                | "style"
+                | "script"
+                | "title"
+                | "meta"
+                | "link"
+                | "base"
+                | "noscript"
+                | "template"
+        )
+    }
 
     /// Collect inline spans from a `<td>` or `<th>` cell element.
     fn collect_cell_spans(
@@ -1066,8 +1092,8 @@ pub fn parse_html_elements(html: &str) -> Vec<ParsedElement> {
                             underline: state.underline,
                             strikeout: state.strikeout,
                             code: state.code,
-                            superscript: false,
-                            subscript: false,
+                            superscript: state.superscript,
+                            subscript: state.subscript,
                             link_href: state.link_href.clone(),
                             image: None,
                             footnote_ref: None,
@@ -1076,6 +1102,9 @@ pub fn parse_html_elements(html: &str) -> Vec<ParsedElement> {
                 }
                 Node::Element(el) => {
                     let tag = el.name();
+                    if is_metadata_tag(tag) {
+                        continue;
+                    }
                     let mut new_state = state.clone();
                     match tag {
                         "b" | "strong" => new_state.bold = true,
@@ -1083,6 +1112,8 @@ pub fn parse_html_elements(html: &str) -> Vec<ParsedElement> {
                         "u" | "ins" => new_state.underline = true,
                         "s" | "del" | "strike" => new_state.strikeout = true,
                         "code" => new_state.code = true,
+                        "sup" => new_state.superscript = true,
+                        "sub" => new_state.subscript = true,
                         "a" => {
                             if let Some(href) = el.attr("href") {
                                 new_state.link_href = Some(href.to_string());
@@ -1178,6 +1209,9 @@ pub fn parse_html_elements(html: &str) -> Vec<ParsedElement> {
         match node.value() {
             Node::Element(el) => {
                 let tag = el.name();
+                if is_metadata_tag(tag) {
+                    return;
+                }
                 let mut new_state = state.clone();
                 let mut new_list_style = current_list_style.clone();
                 let mut bq_depth = blockquote_depth;
@@ -1208,6 +1242,8 @@ pub fn parse_html_elements(html: &str) -> Vec<ParsedElement> {
                     "u" | "ins" => new_state.underline = true,
                     "s" | "del" | "strike" => new_state.strikeout = true,
                     "code" => new_state.code = true,
+                    "sup" => new_state.superscript = true,
+                    "sub" => new_state.subscript = true,
                     "a" => {
                         if let Some(href) = el.attr("href") {
                             new_state.link_href = Some(href.to_string());
@@ -1413,8 +1449,8 @@ pub fn parse_html_elements(html: &str) -> Vec<ParsedElement> {
                             underline: state.underline,
                             strikeout: state.strikeout,
                             code: state.code,
-                            superscript: false,
-                            subscript: false,
+                            superscript: state.superscript,
+                            subscript: state.subscript,
                             link_href: state.link_href.clone(),
                             image: None,
                             footnote_ref: None,
@@ -1486,8 +1522,8 @@ pub fn parse_html_elements(html: &str) -> Vec<ParsedElement> {
                             underline: state.underline,
                             strikeout: state.strikeout,
                             code: state.code,
-                            superscript: false,
-                            subscript: false,
+                            superscript: state.superscript,
+                            subscript: state.subscript,
                             link_href: state.link_href.clone(),
                             image: None,
                             footnote_ref: None,
@@ -1496,6 +1532,9 @@ pub fn parse_html_elements(html: &str) -> Vec<ParsedElement> {
                 }
                 Node::Element(el) => {
                     let tag = el.name();
+                    if is_metadata_tag(tag) {
+                        continue;
+                    }
                     let mut new_state = state.clone();
 
                     match tag {
@@ -1504,6 +1543,8 @@ pub fn parse_html_elements(html: &str) -> Vec<ParsedElement> {
                         "u" | "ins" => new_state.underline = true,
                         "s" | "del" | "strike" => new_state.strikeout = true,
                         "code" => new_state.code = true,
+                        "sup" => new_state.superscript = true,
+                        "sub" => new_state.subscript = true,
                         "a" => {
                             if let Some(href) = el.attr("href") {
                                 new_state.link_href = Some(href.to_string());

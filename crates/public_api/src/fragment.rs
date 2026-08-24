@@ -1,6 +1,6 @@
 //! DocumentFragment — format-agnostic rich text interchange type.
 
-use crate::{InlineContent, ListStyle};
+use crate::{CharVerticalAlignment, InlineContent, ListStyle};
 use frontend::common::parser_tools::content_parser::{ParsedElement, ParsedSpan};
 use frontend::common::parser_tools::fragment_schema::{
     FragmentBlock, FragmentData, FragmentElement, FragmentTable, FragmentTableCell,
@@ -479,6 +479,11 @@ fn push_inline_html(out: &mut String, elements: &[FragmentElement]) {
         let is_underline = elem.fmt_font_underline.unwrap_or(false);
         let is_strikeout = elem.fmt_font_strikeout.unwrap_or(false);
         let is_anchor = elem.fmt_is_anchor.unwrap_or(false);
+        // Superscript and subscript are character formatting like the rest, and
+        // an exponent or a chemical index that lands on the baseline is simply
+        // the wrong text — so they belong in the clipboard payload alongside
+        // bold and italic rather than being dropped on the way out.
+        let vertical = elem.fmt_vertical_alignment.as_ref();
 
         let mut result = text;
 
@@ -496,6 +501,11 @@ fn push_inline_html(out: &mut String, elements: &[FragmentElement]) {
         }
         if is_strikeout {
             result = format!("<s>{}</s>", result);
+        }
+        match vertical {
+            Some(CharVerticalAlignment::SuperScript) => result = format!("<sup>{result}</sup>"),
+            Some(CharVerticalAlignment::SubScript) => result = format!("<sub>{result}</sub>"),
+            _ => {}
         }
         if is_anchor && let Some(ref href) = elem.fmt_anchor_href {
             result = format!("<a href=\"{}\">{}</a>", escape_html(href), result);
@@ -718,6 +728,18 @@ fn span_to_fragment_element(span: &ParsedSpan) -> FragmentElement {
     } else {
         (None, None)
     };
+    // Raised and lowered text is character formatting like bold and italic, and
+    // dropping it here is what silently flattened an exponent or a chemical
+    // index on the way in: the parsers set the flags, `character_format_from_span`
+    // maps them, and only this conversion — the one every `insert_html` /
+    // `insert_markdown` / `insert_djot` goes through — threw them away.
+    let fmt_vertical_alignment = if span.superscript {
+        Some(CharVerticalAlignment::SuperScript)
+    } else if span.subscript {
+        Some(CharVerticalAlignment::SubScript)
+    } else {
+        None
+    };
 
     FragmentElement {
         content,
@@ -736,7 +758,7 @@ fn span_to_fragment_element(span: &ParsedSpan) -> FragmentElement {
         fmt_is_anchor,
         fmt_tooltip: None,
         fmt_underline_style: None,
-        fmt_vertical_alignment: None,
+        fmt_vertical_alignment,
     }
 }
 
