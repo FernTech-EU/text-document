@@ -96,7 +96,14 @@ proptest = "1"
 # (`text-document` depends on `document_io` as a normal dependency) — Cargo explicitly permits a
 # cycle that exists solely through dev-dependencies, since they play no part in the normal build
 # graph.
-text-document = { workspace = true }
+#
+# Deliberately `path`-only, NOT `{ workspace = true }`: the workspace entry carries a version, and
+# a dev-dependency that names a version is kept in the manifest `cargo publish` uploads. That made
+# this crate unpublishable — packaging it demanded `text-document = "^<current version>"` from the
+# crates.io index, which cannot exist yet, because `text-document` is published *after* the crate
+# it depends on. A version-less dev-dependency is stripped from the published manifest instead, so
+# the cycle stays where Cargo allows it: inside this workspace.
+text-document = { path = "../public_api" }
 
 [features]
 # Embedded Typst PDF export (`typst_compile.rs`/`typst_markup.rs`/`export_pdf_uc.rs`). Off by
