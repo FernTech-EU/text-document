@@ -6,11 +6,20 @@
 //! them — that pinned a core. The index makes both O(ranges-in-block).
 //!
 //! The gates are **ratios** (loaded ÷ zero-range baseline), measured back-to-back in one
-//! process, so machine speed cancels and they are stable on any CI runner. That is exactly the
-//! property that would catch a regression to the old behaviour (whose ratios were ≈3.8× for a
-//! full snapshot and ≈6× for one keystroke): with the index the range work is a rounding error
-//! next to the base snapshot cost, so both ratios sit near 1. Absolute times are printed for
-//! information but never asserted (they would flake on a shared runner).
+//! process, so machine speed largely cancels and they hold on any CI runner. That is the
+//! property that catches a regression to the old behaviour, whose ratios were ≈3.8× for a full
+//! snapshot and ≈6× for one keystroke. Absolute times are printed for information but never
+//! asserted (they would flake on a shared runner).
+//!
+//! A **full** snapshot's ratio does not sit near 1, and cannot: the index removed the
+//! O(blocks × ranges) scan, not the O(ranges) materialization behind it — every range still
+//! becomes a `HighlightSpan` carrying a cloned `HighlightFormat` (120 bytes a span, ≈1.7 MB per
+//! snapshot at the density below) that the zero-range baseline never pays for. What is left is a
+//! constant factor near 1.7×, whose exact value tracks the allocator and the build profile:
+//! macOS is visibly heavier than glibc on tens of thousands of small allocations, in the debug
+//! profile CI tests with. So the gate sits between that constant and the pre-index behaviour,
+//! rather than just above whatever one machine prints. Only the single-block path really is a
+//! rounding error next to its baseline.
 
 use std::time::Instant;
 
@@ -60,13 +69,21 @@ fn one_range_per_word(doc: &TextDocument) -> Vec<RangeHighlight> {
     out
 }
 
-fn time_avg(iters: usize, mut f: impl FnMut()) -> f64 {
+/// The **fastest** of `iters` runs, in milliseconds.
+///
+/// The minimum, not the mean: on a shared runner every sample carries whatever the scheduler did
+/// to it, and an average keeps that noise, while the fastest run estimates the structural cost
+/// these gates are about. Over repeated runs of this file the mean snapshot ratio wandered across
+/// 1.65–1.83× where the min held 1.69–1.71×.
+fn time_min(iters: usize, mut f: impl FnMut()) -> f64 {
     f(); // warm
-    let t = Instant::now();
+    let mut best = f64::INFINITY;
     for _ in 0..iters {
+        let t = Instant::now();
         f();
+        best = best.min(t.elapsed().as_secs_f64() * 1000.0);
     }
-    t.elapsed().as_secs_f64() * 1000.0 / iters as f64
+    best
 }
 
 #[test]
@@ -82,13 +99,13 @@ fn a_full_snapshot_does_not_scale_with_document_range_count() {
 
     // Baseline: no ranges.
     doc.set_session_ranges(session, Vec::new());
-    let base = time_avg(20, || {
+    let base = time_min(20, || {
         std::hint::black_box(doc.snapshot_flow());
     });
 
     // Loaded: one range per word.
     doc.set_session_ranges(session, ranges.clone());
-    let loaded = time_avg(20, || {
+    let loaded = time_min(20, || {
         std::hint::black_box(doc.snapshot_flow());
     });
 
@@ -98,9 +115,10 @@ fn a_full_snapshot_does_not_scale_with_document_range_count() {
         ranges.len()
     );
     assert!(
-        ratio < 2.0,
+        ratio < 2.5,
         "a full snapshot must not scale with the document's range count (was ≈3.8× before the \
-         index); got {ratio:.2}× ({loaded:.2}ms vs {base:.2}ms baseline)"
+         index, and sits near 1.7× with it — see the module header on why not 1×); got \
+         {ratio:.2}× ({loaded:.2}ms vs {base:.2}ms baseline)"
     );
 }
 
@@ -117,12 +135,12 @@ fn one_keystroke_does_not_leak_the_whole_documents_range_count() {
     };
 
     doc.set_session_ranges(session, Vec::new());
-    let base = time_avg(200, || {
+    let base = time_min(200, || {
         std::hint::black_box(doc.snapshot_block_at_position(mid));
     });
 
     doc.set_session_ranges(session, ranges.clone());
-    let loaded = time_avg(200, || {
+    let loaded = time_min(200, || {
         std::hint::black_box(doc.snapshot_block_at_position(mid));
     });
 
@@ -149,11 +167,11 @@ fn building_the_index_at_push_is_cheaper_than_a_snapshot() {
     let ranges = one_range_per_word(&doc);
 
     doc.set_session_ranges(session, ranges.clone());
-    let snapshot = time_avg(20, || {
+    let snapshot = time_min(20, || {
         std::hint::black_box(doc.snapshot_flow());
     });
 
-    let push = time_avg(20, || {
+    let push = time_min(20, || {
         doc.set_session_ranges(session, ranges.clone());
     });
 
