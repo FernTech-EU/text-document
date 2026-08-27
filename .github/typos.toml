@@ -11,6 +11,9 @@ ths = "ths"
 wrold = "wrold"
 # EPUB Open Packaging Format (content.opf)
 opf = "opf"
+# OpenDocument Format
+odf = "odf"
+ODF = "ODF"
 # Arabic letter names (teh marbuta) in Unicode folding tables
 teh = "teh"
 # "mis-" prefix in hyphenated compounds

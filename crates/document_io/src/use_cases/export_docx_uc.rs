@@ -2402,8 +2402,9 @@ fn patch_comment_extras(xml_docx: &mut docx_rs::XMLDocx, spans: &[PreparedSpan])
     Ok(())
 }
 
-/// Skribisto's own extension namespace, used only to carry [`DocumentComment::uid`] on a
-/// `<w:comment>` — see `patch_comment_extras`. Versioned so a future incompatible shape change
+/// Skribisto's own extension namespace, used only to carry
+/// [`common::parser_tools::DocumentComment::uid`] on a `<w:comment>` — see
+/// `patch_comment_extras`. Versioned so a future incompatible shape change
 /// does not get misread as the current one by an older writer or reader sharing this crate.
 const SKRB_NAMESPACE_URI: &str = "urn:ferntech:text-document:comment:1";
 

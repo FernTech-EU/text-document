@@ -1100,9 +1100,10 @@ pub fn merge_runs_and_anchors<'a>(
 /// a caller that reconstructs a document position by summing `InlinePiece` text lengths drifts
 /// the moment a block holds a multi-byte character before the point in question, or an inline
 /// image/footnote reference at all — their `U+FFFC` sentinel is three bytes but one char (see
-/// [`sentinel_len`]). That is the same "offset from one space, string from another" bug class
-/// the public API's `TextDocument::to_addressable_text()` exists to close for whole-document
-/// offsets (see its doc comment), one level down, inside a single block.
+/// `sentinel_len` on [`merge_runs_and_anchors`]). That is the same "offset from one space,
+/// string from another" bug class the public API's `TextDocument::to_addressable_text()`
+/// exists to close for whole-document offsets (see its doc comment), one level down, inside
+/// a single block.
 ///
 /// Built by [`addressable_inline_pieces`] (pure — block-local character space, `base_char_offset`
 /// left at `0`) or [`crate::format_runs_query::addressable_inline_pieces_for_block`]
