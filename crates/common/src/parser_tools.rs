@@ -1,5 +1,6 @@
 pub mod comment_options;
 pub mod content_parser;
+pub mod djot_depth;
 pub mod djot_escape;
 pub mod djot_options;
 pub mod docx_options;

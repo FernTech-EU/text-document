@@ -153,7 +153,12 @@ impl ParsedElement {
 }
 
 /// A parsed block (paragraph, heading, list item, code block)
-#[derive(Debug, Clone)]
+///
+/// `Default` is an unformatted, empty paragraph — the shape a caller wants when
+/// it has prose and no structure to give it. Deriving it also means a field
+/// added later reaches those callers as "absent" rather than as a compile error
+/// they would fix by guessing a value.
+#[derive(Debug, Clone, Default)]
 pub struct ParsedBlock {
     pub spans: Vec<ParsedSpan>,
     pub heading_level: Option<i64>,
@@ -2060,6 +2065,28 @@ fn djot_push_block(
 /// ordered-list start number, table column alignment, and list tight/loose.
 pub fn parse_djot(djot: &str, options: &DjotImportOptions) -> Vec<ParsedElement> {
     use jotdown::{Container as C, Event as E, ListKind, Parser};
+
+    // `jotdown` descends once per nested container with no depth limit, and a
+    // stack overflow **aborts the process** — it cannot be caught by
+    // `catch_unwind`, so there is no recovering from it after the fact and the
+    // only safe move is not to start. Input is not always the author's own: a
+    // project bundle is mailed and shared, and an imported document comes from
+    // whoever sent it.
+    //
+    // Degrade rather than refuse, so the signature stays the same and nothing is
+    // lost: the source comes back as one plain paragraph. Its structure is not
+    // computed, which is the honest answer for a document whose structure cannot
+    // be computed without ending the process — and every character is still
+    // there for the writer to see and repair.
+    if crate::parser_tools::djot_depth::is_too_deep(djot) {
+        return vec![ParsedElement::Block(ParsedBlock {
+            spans: vec![ParsedSpan {
+                text: djot.to_string(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        })];
+    }
 
     let mut elements: Vec<ParsedElement> = Vec::new();
     let mut current_spans: Vec<ParsedSpan> = Vec::new();
