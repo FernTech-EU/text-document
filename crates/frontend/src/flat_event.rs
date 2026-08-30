@@ -107,6 +107,7 @@ pub enum FlatEventKind {
     // Undo/redo
     UndoPerformed,
     RedoPerformed,
+    UndoStackChanged,
     CompositeBegin,
     CompositeEnd,
     CompositeCancelled,
@@ -298,6 +299,7 @@ impl From<Event> for FlatEvent {
             Origin::UndoRedo(ur) => match ur {
                 UndoRedoEvent::Undone => FlatEventKind::UndoPerformed,
                 UndoRedoEvent::Redone => FlatEventKind::RedoPerformed,
+                UndoRedoEvent::StackChanged => FlatEventKind::UndoStackChanged,
                 UndoRedoEvent::BeginComposite => FlatEventKind::CompositeBegin,
                 UndoRedoEvent::EndComposite => FlatEventKind::CompositeEnd,
                 UndoRedoEvent::CancelComposite => FlatEventKind::CompositeCancelled,
@@ -377,6 +379,22 @@ mod tests {
     }
 
     #[test]
+    fn test_stack_changed_converts_to_flat_and_keeps_its_stack_id() {
+        // The stack id travels in `data`, not `ids` — `ids` means *entity* ids.
+        // A subscriber holding one stack per open document has no other way to
+        // tell whose history moved, so losing it here would make the event
+        // useless to exactly the consumer it was added for.
+        let event = Event {
+            origin: Origin::UndoRedo(UndoRedoEvent::StackChanged),
+            ids: vec![],
+            data: Some("7".to_string()),
+        };
+        let flat: FlatEvent = event.into();
+        assert_eq!(flat.kind, FlatEventKind::UndoStackChanged);
+        assert_eq!(flat.data.as_deref(), Some("7"));
+    }
+
+    #[test]
     fn test_is_mutation() {
         assert!(is_mutation(&FlatEventKind::RootCreated));
         assert!(is_mutation(&FlatEventKind::RootUpdated));
@@ -412,6 +430,11 @@ mod tests {
 
         assert!(!is_mutation(&FlatEventKind::Reset));
         assert!(!is_mutation(&FlatEventKind::UndoPerformed));
+        // History growing is not the store changing: the entity events the
+        // command itself published inside its own transaction are what the
+        // generic refresh path reacts to. Counting this one too would repaint
+        // every model a second time for every keystroke.
+        assert!(!is_mutation(&FlatEventKind::UndoStackChanged));
         assert!(!is_mutation(&FlatEventKind::LongOperationStarted));
     }
 }

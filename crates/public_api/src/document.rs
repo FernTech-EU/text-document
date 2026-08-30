@@ -1617,8 +1617,32 @@ impl TextDocument {
         let queued = {
             let mut inner = self.inner.lock();
             let before = capture_block_state(&inner);
+            let stepped = undo_redo_commands::can_undo(&inner.ctx, Some(inner.stack_id));
             let result = undo_redo_commands::undo(&inner.ctx, Some(inner.stack_id));
             inner.invalidate_text_cache();
+            // An undo that actually popped a command changed the buffer, so the
+            // document is dirty again. Nothing else sets `modified` here: every
+            // other setter is an *edit* in `cursor.rs`/`streaming.rs`. Without
+            // this, an embedder that gates its write-back on `is_modified()`
+            // silently discards the undo — the text reverts on screen while the
+            // persisted copy keeps the pre-undo version, and the next reload
+            // brings the stale text back. (Skribisto's `ProseField::flush` did
+            // exactly that.)
+            //
+            // `can_undo` is sampled *before* the call because `undo()` on an
+            // empty stack is a successful no-op, and marking a clean document
+            // dirty for a keystroke that did nothing would be its own bug.
+            //
+            // Set *before* `result?`, and deliberately. A composite entry undoes
+            // its parts in reverse and gives up on the first failure, so a
+            // failed undo can still have reverted some of them — the buffer has
+            // moved, which is why `invalidate_text_cache` above is also
+            // unconditional. Marking a document dirty that turns out not to need
+            // saving costs one redundant write; the other way round loses the
+            // writer's text.
+            if stepped {
+                inner.modified = true;
+            }
             result?;
             inner.rehighlight_all();
             emit_content_change_events(&mut inner, &before);
@@ -1638,8 +1662,17 @@ impl TextDocument {
         let queued = {
             let mut inner = self.inner.lock();
             let before = capture_block_state(&inner);
+            let stepped = undo_redo_commands::can_redo(&inner.ctx, Some(inner.stack_id));
             let result = undo_redo_commands::redo(&inner.ctx, Some(inner.stack_id));
             inner.invalidate_text_cache();
+            // A redo re-applies an edit the writer took back, which is a change
+            // to the buffer like any other: same reasoning as `undo` above, and
+            // the same placement before `result?` for the same reason. Here the
+            // predicate is `can_redo`, sampled before the call because `redo()`
+            // on an empty redo branch is a successful no-op.
+            if stepped {
+                inner.modified = true;
+            }
             result?;
             inner.rehighlight_all();
             emit_content_change_events(&mut inner, &before);
@@ -1652,6 +1685,47 @@ impl TextDocument {
         };
         crate::inner::dispatch_queued_events(queued);
         Ok(())
+    }
+
+    /// Close the current undo entry, so the next edit starts a new one.
+    ///
+    /// Typing is coalesced — contiguous inserts within a couple of seconds
+    /// become one undo step, which is what makes Ctrl+Z take back a word rather
+    /// than a letter. The rule looks only at the *shape* of two edits and cannot
+    /// see that something happened between them: an embedder whose user typed,
+    /// renamed a chapter somewhere else, then typed again gets one entry
+    /// spanning both bursts, and undoing it takes back text entered before an
+    /// event the user remembers as a dividing line.
+    ///
+    /// The embedder is the only one who knows such a line was crossed. This is
+    /// how it says so. Idempotent, and harmless on an empty history.
+    pub fn break_undo_merge(&self) {
+        let inner = self.inner.lock();
+        undo_redo_commands::seal_head(&inner.ctx, Some(inner.stack_id));
+    }
+
+    /// Bound how many undo entries this document keeps, dropping the oldest
+    /// past the limit. `None` — the default — keeps everything.
+    ///
+    /// Typing history is unbounded by construction: every keystroke that does
+    /// not coalesce into the entry below it is another entry, and each holds a
+    /// snapshot of what it changed. Over a day-long drafting session on one
+    /// document that is a ceiling nobody set. An embedder that cares about the
+    /// ceiling needs a way to say so, and this is it — the far end of a long
+    /// history is the part nobody reaches for.
+    ///
+    /// The limit belongs to the document, not to one edit: lowering it trims
+    /// on the next push rather than immediately, so an entry the writer can
+    /// still see in a menu does not vanish under them.
+    pub fn set_undo_limit(&self, limit: Option<usize>) {
+        let inner = self.inner.lock();
+        undo_redo_commands::set_undo_limit(&inner.ctx, limit);
+    }
+
+    /// The current entry limit, if one is set.
+    pub fn undo_limit(&self) -> Option<usize> {
+        let inner = self.inner.lock();
+        undo_redo_commands::undo_limit(&inner.ctx)
     }
 
     /// Returns true if there are operations that can be undone.

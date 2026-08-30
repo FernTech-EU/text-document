@@ -86,3 +86,34 @@ pub fn delete_stack(ctx: &AppContext, stack_id: u64) -> Result<()> {
         .delete_stack(stack_id)
         .context("deleting undo/redo stack")
 }
+
+/// The sequence number the most recent push landed in. Read it straight after
+/// the call that pushed — every later push overwrites it.
+pub fn last_pushed_seq(ctx: &AppContext) -> Option<u64> {
+    let undo_redo_manager = ctx.undo_redo_manager.lock();
+    undo_redo_manager.last_pushed_seq()
+}
+
+/// The sequence number now on top of a stack, if any.
+pub fn head_seq(ctx: &AppContext, stack_id: Option<u64>) -> Option<u64> {
+    let undo_redo_manager = ctx.undo_redo_manager.lock();
+    undo_redo_manager.head_seq(stack_id)
+}
+
+/// Bound how many entries a stack keeps, dropping the oldest past the limit.
+pub fn set_undo_limit(ctx: &AppContext, limit: Option<usize>) {
+    let mut undo_redo_manager = ctx.undo_redo_manager.lock();
+    undo_redo_manager.set_undo_limit(limit);
+}
+
+/// The current entry limit, if one is set.
+pub fn undo_limit(ctx: &AppContext) -> Option<usize> {
+    let undo_redo_manager = ctx.undo_redo_manager.lock();
+    undo_redo_manager.undo_limit()
+}
+
+/// Close the top entry to merging, so the next command starts a new one.
+pub fn seal_head(ctx: &AppContext, stack_id: Option<u64>) {
+    let mut undo_redo_manager = ctx.undo_redo_manager.lock();
+    undo_redo_manager.seal_head(stack_id);
+}

@@ -507,3 +507,164 @@ fn clear_undo_redo_stack() {
     assert!(!doc.can_undo());
     assert!(!doc.can_redo());
 }
+
+// ── undo/redo mark the document modified ────────────────────────
+//
+// The embedder-visible half of undo: a host that gates its write-back on
+// `is_modified()` must be told that undo changed the buffer, or it skips the
+// write and the persisted copy silently keeps the pre-undo text.
+
+#[test]
+fn undo_marks_the_document_modified_again() {
+    let doc = new_doc("Hello");
+    let c = doc.cursor_at(5);
+    c.insert_text(" world").unwrap();
+
+    // Stand in for a host that has just persisted the buffer.
+    doc.set_modified(false);
+    assert!(!doc.is_modified());
+
+    doc.undo().unwrap();
+    assert_eq!(doc.to_plain_text().unwrap(), "Hello");
+    assert!(
+        doc.is_modified(),
+        "an undo that reverted text must leave the document dirty, or the host \
+         skips its write-back and keeps the pre-undo version"
+    );
+}
+
+#[test]
+fn redo_marks_the_document_modified_again() {
+    let doc = new_doc("Hello");
+    let c = doc.cursor_at(5);
+    c.insert_text(" world").unwrap();
+    doc.undo().unwrap();
+
+    doc.set_modified(false);
+    doc.redo().unwrap();
+    assert_eq!(doc.to_plain_text().unwrap(), "Hello world");
+    assert!(
+        doc.is_modified(),
+        "a redo re-applies the edit; that is a change"
+    );
+}
+
+#[test]
+fn undo_on_an_empty_history_leaves_a_clean_document_clean() {
+    // `UndoRedoManager::undo` on an empty stack is a successful no-op, so the
+    // flag must be driven by "did a command actually pop", not by "did the call
+    // return Ok".
+    let doc = new_doc("Hello");
+    doc.set_modified(false);
+    assert!(!doc.can_undo());
+
+    doc.undo().unwrap();
+    assert!(
+        !doc.is_modified(),
+        "a keystroke that did nothing must not mark a clean document dirty"
+    );
+
+    doc.redo().unwrap();
+    assert!(!doc.is_modified());
+}
+
+// ── Breaking the merge chain ────────────────────────────────────
+
+#[test]
+fn break_undo_merge_splits_a_typing_burst_in_two() {
+    let doc = new_doc("");
+    let c = doc.cursor_at(0);
+
+    c.insert_text("before").unwrap();
+    // Without this the two bursts merge — they are adjacent and moments apart,
+    // which is exactly the rule that makes Ctrl+Z take back a word.
+    doc.break_undo_merge();
+    c.insert_text(" after").unwrap();
+    assert_eq!(doc.to_plain_text().unwrap(), "before after");
+
+    doc.undo().unwrap();
+    assert_eq!(
+        doc.to_plain_text().unwrap(),
+        "before",
+        "one undo must take back only the burst after the break"
+    );
+    doc.undo().unwrap();
+    assert_eq!(doc.to_plain_text().unwrap(), "");
+}
+
+#[test]
+fn without_the_break_the_same_two_bursts_are_one_step() {
+    // The control for the test above: this is the behaviour `break_undo_merge`
+    // exists to interrupt, and pinning it keeps the first test honest if the
+    // merge policy ever changes.
+    let doc = new_doc("");
+    let c = doc.cursor_at(0);
+    c.insert_text("before").unwrap();
+    c.insert_text(" after").unwrap();
+
+    doc.undo().unwrap();
+    assert_eq!(doc.to_plain_text().unwrap(), "");
+}
+
+#[test]
+fn break_undo_merge_is_harmless_with_no_history() {
+    let doc = new_doc("Hello");
+    doc.break_undo_merge();
+    assert!(!doc.can_undo());
+}
+
+// ── Bounding the history ────────────────────────────────────────
+//
+// Typing history is unbounded by construction, and one document is where a
+// day-long drafting session accumulates it. The embedder sets the ceiling.
+
+#[test]
+fn the_undo_limit_is_unset_by_default() {
+    let doc = new_doc("Hello");
+    assert_eq!(doc.undo_limit(), None);
+}
+
+#[test]
+fn setting_an_undo_limit_drops_the_oldest_entries() {
+    let doc = new_doc("");
+    doc.set_undo_limit(Some(2));
+    assert_eq!(doc.undo_limit(), Some(2));
+
+    // Three separate steps: without the break these coalesce into one burst,
+    // which is the behaviour `break_undo_merge` exists to interrupt.
+    for word in ["one", "two", "three"] {
+        let c = doc.cursor_at(doc.character_count());
+        c.insert_text(word).unwrap();
+        doc.break_undo_merge();
+    }
+    assert_eq!(doc.to_plain_text().unwrap(), "onetwothree");
+
+    // Two entries survive, so two undos reach back to "one" and no further.
+    doc.undo().unwrap();
+    assert_eq!(doc.to_plain_text().unwrap(), "onetwo");
+    doc.undo().unwrap();
+    assert_eq!(doc.to_plain_text().unwrap(), "one");
+    assert!(
+        !doc.can_undo(),
+        "the oldest entry was dropped to honour the limit, so \"one\" is the \
+         floor — the far end of a long history is the part nobody reaches for"
+    );
+}
+
+#[test]
+fn clearing_the_undo_limit_restores_an_unbounded_history() {
+    let doc = new_doc("");
+    doc.set_undo_limit(Some(1));
+    doc.set_undo_limit(None);
+    assert_eq!(doc.undo_limit(), None);
+
+    for word in ["one", "two", "three"] {
+        let c = doc.cursor_at(doc.character_count());
+        c.insert_text(word).unwrap();
+        doc.break_undo_merge();
+    }
+    doc.undo().unwrap();
+    doc.undo().unwrap();
+    doc.undo().unwrap();
+    assert_eq!(doc.to_plain_text().unwrap(), "");
+}

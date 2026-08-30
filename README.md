@@ -15,7 +15,7 @@ Built on a [ropey](https://github.com/cessen/ropey)-backed text store with a [Ql
 
 - **Rich text model**: Frames, Blocks with character data in a shared `ropey::Rope`, per-block byte-ranged `FormatRun`s, and `ImageAnchor`s (`InlineContent::Text | Image`)
 - **Multi-cursor editing**: Qt-style cursors with automatic position adjustment
-- **Full undo/redo**: Snapshot-based, with composite grouping (`begin_edit_block` / `end_edit_block`)
+- **Full undo/redo**: Snapshot-based, with composite grouping (`begin_edit_block` / `end_edit_block`), word-level coalescing an embedder can interrupt (`break_undo_merge`), an optional depth cap (`set_undo_limit`), and an untracked stack for writes that must not become history
 - **Import/Export**: Plain text, Markdown, HTML, LaTeX, DOCX
 - **Search**: Find, find all, regex, replace (undoable)
 - **Formatting**: Character format (`bold`, `italic`, `underline`, ...), block format (`alignment`, `heading_level`, ...), frame format
@@ -293,6 +293,26 @@ crates/
 ```
 
 Data flow: `TextDocument / TextCursor -> frontend::commands -> controllers -> use cases -> UoW -> RopeStore (rope + structural entities)`
+
+## Stability
+
+The event enums — `common::event::{Origin, AllEvent, EntityEvent, UndoRedoEvent,
+LongOperationEvent, DirectAccessEntity, …}` and `frontend::flat_event::FlatEventKind` — are
+**exhaustive by design and gain variants in minor releases**.
+
+They are not `#[non_exhaustive]`, and that is deliberate rather than an oversight. Most of
+them are generated from the Qleany manifest, one variant per entity, per use case or per
+feature, and `FlatEventKind` is the single place every one of them is mapped: because that
+mapping is an exhaustive `match` in a *different crate*, the compiler refuses to build the
+workspace until a newly added event has been given a kind. Marking the enums
+`#[non_exhaustive]` would force a wildcard arm there and silently retire that guarantee —
+trading a compile-time proof that no event goes unmapped for a semver promise. We keep the
+proof.
+
+The practical consequence for an external consumer: **match these enums with a wildcard arm**,
+and treat a minor version bump as potentially adding variants. Strictly, that makes such a
+release breaking under semver; it is a considered trade, and it is what v1.8.0 and v1.10.0
+already did.
 
 ## License
 

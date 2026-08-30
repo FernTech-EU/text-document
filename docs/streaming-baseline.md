@@ -79,10 +79,11 @@ That turns out to be well-supported rather than a workaround:
 
 - **`None` does not mean "no undo".** `add_command_to_stack(cmd, None)` resolves
   `stack_id.unwrap_or(0)` and pushes to stack 0 (erroring if it does not exist) — it does not
-  skip. The codebase's actual no-undo idiom is *perform, then `clear_stack`* (`set_plain_text`,
-  `document.rs:166`). Per-line that would either grow the undo stack without bound or destroy the
-  user's real history, so streaming ops need a dedicated throwaway stack, cleared per batch: one
-  allocation per line, negligible against 15.9 ms.
+  skip. The no-undo idiom is `UNTRACKED_STACK_ID`: passed as the stack id, the command is
+  dropped at the door rather than stored, so there is nothing to clear afterwards and no
+  window in which a half-written history exists. (It replaced *perform, then `clear_stack`*,
+  which is what `set_plain_text` used to do — that shape either grows the undo stack without
+  bound or destroys the user's real history, depending on which stack you clear.)
 - **`Frame.child_order` is a `Vec<i64>`**, so appending clones it — an O(N) memcpy (~50–80 µs at
   100 k). Small against 15.9 ms, but genuinely not O(1). Removing it would mean changing a core
   entity that the whole engine and its proptests depend on; out of scope by decision.
