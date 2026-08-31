@@ -944,6 +944,11 @@ struct BlockStyles {
     page_break_before: Option<bool>,
     direction: Option<TextDirection>,
     background_color: Option<String>,
+    /// `white-space` asks for the source's own spacing to be kept verbatim.
+    /// Separate from `non_breakable_lines` because the two do not coincide:
+    /// `nowrap` forbids wrapping but still collapses runs of spaces, so a
+    /// block carrying it must be normalised like any other.
+    preserve_whitespace: Option<bool>,
 }
 
 /// Parse relevant CSS properties from an inline style string.
@@ -965,6 +970,9 @@ fn parse_block_styles(style: &str) -> BlockStyles {
                 }
                 "white-space" if val == "pre" || val == "nowrap" || val == "pre-wrap" => {
                     result.non_breakable_lines = Some(true);
+                    if val != "nowrap" {
+                        result.preserve_whitespace = Some(true);
+                    }
                 }
                 // CSS3 `break-before` and its CSS2 predecessor `page-break-before` mean
                 // the same thing; both are read because both are written (browsers still
@@ -991,6 +999,106 @@ fn parse_block_styles(style: &str) -> BlockStyles {
         }
     }
     result
+}
+
+/// The five characters HTML calls whitespace.
+///
+/// Deliberately not `char::is_whitespace`, which is `true` for U+00A0: a
+/// no-break space is a character the writer typed — the one French typography
+/// puts before a colon, holding "Attention&nbsp;:" together — and collapsing it
+/// away is a silent edit of the text, not of its layout.
+fn is_html_space(ch: char) -> bool {
+    matches!(ch, ' ' | '\t' | '\n' | '\r' | '\u{0C}')
+}
+
+/// Whether a span run holds anything a reader would see.
+fn spans_carry_content(spans: &[ParsedSpan]) -> bool {
+    spans
+        .iter()
+        .any(|s| !s.text.is_empty() || s.image.is_some() || s.footnote_ref.is_some())
+}
+
+/// Apply the CSS `white-space: normal` rules to one block's inline spans: every
+/// run of HTML whitespace collapses to a single space, and the runs at the
+/// block's two ends disappear entirely.
+///
+/// Per block rather than per text node, because a run crosses span boundaries —
+/// `<b>word</b>\n<i>next</i>` is one collapsible run split over three nodes —
+/// and because only the block knows where its own ends are.
+///
+/// Without this, an exporter's own source formatting reaches the document as
+/// text. LibreOffice writes a newline after every `<p …>` and hard-wraps the
+/// prose inside it at about seventy columns, so pasting a whole book put a
+/// blank line before every paragraph and a break through the middle of every
+/// sentence.
+fn collapse_inline_whitespace(spans: &mut [ParsedSpan]) {
+    fn is_replaced(span: &ParsedSpan) -> bool {
+        span.image.is_some() || span.footnote_ref.is_some()
+    }
+
+    // Collapse within each span first. Nothing non-empty is emptied here, which
+    // is what lets the second pass read `is_empty()` as "this span held no text
+    // to begin with" — the marker a `<br>` leaves behind.
+    for span in spans.iter_mut() {
+        if is_replaced(span) {
+            continue;
+        }
+        let mut out = String::with_capacity(span.text.len());
+        let mut in_run = false;
+        for ch in span.text.chars() {
+            if is_html_space(ch) {
+                if !in_run {
+                    out.push(' ');
+                    in_run = true;
+                }
+            } else {
+                out.push(ch);
+                in_run = false;
+            }
+        }
+        span.text = out;
+    }
+
+    // The block's start counts as "already ended on a space", so a run opening
+    // the block is dropped outright.
+    let mut prev_ends_with_space = true;
+    for span in spans.iter_mut() {
+        if is_replaced(span) {
+            prev_ends_with_space = false;
+            continue;
+        }
+        if span.text.is_empty() {
+            // The empty span a `<br>` leaves. It contributes no text, but it
+            // still ends the collapsible run either side of it — without that,
+            // `x <br> y` closes up into "xy".
+            prev_ends_with_space = false;
+            continue;
+        }
+        if prev_ends_with_space && span.text.starts_with(' ') {
+            span.text.remove(0);
+        }
+        // A span emptied by that drop leaves the run open rather than closing
+        // it: the space it carried belongs to the run its neighbours share.
+        if !span.text.is_empty() {
+            prev_ends_with_space = span.text.ends_with(' ');
+        }
+    }
+
+    // The block's trailing run, in whichever span still holds it. Replaced
+    // content stops the walk: a space before a trailing image is between two
+    // pieces of content, not after the last one.
+    for span in spans.iter_mut().rev() {
+        if is_replaced(span) {
+            break;
+        }
+        if span.text.is_empty() {
+            continue;
+        }
+        if span.text.ends_with(' ') {
+            span.text.pop();
+        }
+        break;
+    }
 }
 
 pub fn parse_html(html: &str) -> Vec<ParsedBlock> {
@@ -1207,6 +1315,7 @@ pub fn parse_html_elements(html: &str) -> Vec<ParsedElement> {
                                     let mut spans = Vec::new();
                                     let state = FmtState::default();
                                     collect_cell_spans(td, &state, &mut spans, 0);
+                                    collapse_inline_whitespace(&mut spans);
                                     if spans.is_empty() {
                                         spans.push(ParsedSpan::default());
                                     }
@@ -1431,7 +1540,21 @@ pub fn parse_html_elements(html: &str) -> Vec<ParsedElement> {
                         0
                     };
 
-                    if !spans.is_empty() || heading_level.is_some() {
+                    if !(is_code_block || css.preserve_whitespace == Some(true)) {
+                        collapse_inline_whitespace(&mut spans);
+                    }
+
+                    // Whitespace between block-level children is layout, not
+                    // content. `<body>` holds a newline after every `</p>` an
+                    // exporter writes, and keeping those as the container's own
+                    // inline run is what closed a pasted book with a paragraph
+                    // of four thousand blank lines. A block that produced no
+                    // children keeps its empty run instead: `<p> </p>` is an
+                    // empty paragraph the writer meant to be there.
+                    let own_run_is_content =
+                        spans_carry_content(&spans) || nested_elements.is_empty();
+
+                    if (!spans.is_empty() && own_run_is_content) || heading_level.is_some() {
                         elements.push(ParsedElement::Block(ParsedBlock {
                             spans,
                             heading_level,
@@ -1686,7 +1809,10 @@ pub fn parse_html_elements(html: &str) -> Vec<ParsedElement> {
         0,
         0,
     );
-    if !root_spans.is_empty() {
+    collapse_inline_whitespace(&mut root_spans);
+    // Only when something survived: the root's direct text children are the
+    // newlines between top-level blocks in every document an exporter writes.
+    if spans_carry_content(&root_spans) {
         elements.push(ParsedElement::Block(ParsedBlock {
             spans: root_spans,
             heading_level: None,
@@ -2984,6 +3110,107 @@ mod tests {
         assert_eq!(blocks[0].line_height, Some(1500));
         assert_eq!(blocks[0].direction, Some(TextDirection::RightToLeft));
         assert_eq!(blocks[0].background_color, Some("#ccc".to_string()));
+    }
+
+    /// The shape every word processor publishes on the clipboard: a newline
+    /// after the opening tag, the prose hard-wrapped inside it, and a newline
+    /// between every pair of blocks. None of it is text.
+    #[test]
+    fn test_parse_html_collapses_exporter_line_wrapping() {
+        let blocks = parse_html(
+            "<body>\n<p style=\"line-height: 200%\">\nfirst line wrapped\nhere</p>\n\
+             <p>\nsecond para</p>\n</body>",
+        );
+        let texts: Vec<String> = blocks
+            .iter()
+            .map(|b| b.spans.iter().map(|s| s.text.as_str()).collect())
+            .collect();
+        assert_eq!(texts, vec!["first line wrapped here", "second para"]);
+    }
+
+    /// The reported bug: pasting a whole LibreOffice book ended in one block
+    /// holding every newline the exporter had written between its paragraphs —
+    /// four thousand blank lines under the last sentence.
+    #[test]
+    fn test_parse_html_drops_whitespace_between_blocks() {
+        let blocks = parse_html("<html>\n<body>\n<p>a</p>\n<p>b</p>\n</body>\n</html>");
+        assert_eq!(blocks.len(), 2, "no block for the whitespace between them");
+        assert!(
+            blocks
+                .iter()
+                .all(|b| b.spans.iter().all(|s| !s.text.contains('\n'))),
+            "no block keeps a literal newline"
+        );
+    }
+
+    /// A run split across inline elements is still one run, and it collapses to
+    /// one space rather than disappearing between them.
+    #[test]
+    fn test_parse_html_collapses_across_span_boundaries() {
+        let blocks = parse_html("<p>  <b>bold</b>\n  <i>italic</i>  </p>");
+        assert_eq!(blocks.len(), 1);
+        let text: String = blocks[0].spans.iter().map(|s| s.text.as_str()).collect();
+        assert_eq!(text, "bold italic");
+    }
+
+    /// U+00A0 is content, not layout — the space holding "Attention&nbsp;:"
+    /// together in French must survive a paste.
+    #[test]
+    fn test_parse_html_keeps_no_break_space() {
+        let blocks = parse_html("<p>\nAttention&nbsp;: ici</p>");
+        let text: String = blocks[0].spans.iter().map(|s| s.text.as_str()).collect();
+        assert_eq!(text, "Attention\u{a0}: ici");
+    }
+
+    /// An empty paragraph is a paragraph. Only the whitespace *between* blocks
+    /// goes; a block the writer opened stays, however little is in it.
+    #[test]
+    fn test_parse_html_keeps_empty_paragraph() {
+        let blocks = parse_html("<body>\n<p>a</p>\n<p> </p>\n<p>b</p>\n</body>");
+        assert_eq!(blocks.len(), 3);
+        let text: String = blocks[1].spans.iter().map(|s| s.text.as_str()).collect();
+        assert_eq!(text, "");
+    }
+
+    /// `<pre>` and `white-space: pre` mean the source's spacing *is* the
+    /// content. `nowrap` does not: it forbids wrapping and collapses runs like
+    /// any other block, which is why it is not in the same test.
+    #[test]
+    fn test_parse_html_preserves_whitespace_in_pre() {
+        // The newline straight after `<pre>` is the one the HTML parser itself
+        // drops, per spec; every newline after that is content.
+        let blocks = parse_html("<pre>\nfn main() {\n    let x = 1;\n}</pre>");
+        let text: String = blocks[0].spans.iter().map(|s| s.text.as_str()).collect();
+        assert_eq!(text, "fn main() {\n    let x = 1;\n}");
+
+        let styled = parse_html("<p style=\"white-space: pre-wrap\">a\n  b</p>");
+        let text: String = styled[0].spans.iter().map(|s| s.text.as_str()).collect();
+        assert_eq!(text, "a\n  b");
+
+        let nowrap = parse_html("<p style=\"white-space: nowrap\">a\n  b</p>");
+        let text: String = nowrap[0].spans.iter().map(|s| s.text.as_str()).collect();
+        assert_eq!(text, "a b");
+    }
+
+    /// Table cells are blocks too, and an exporter indents them just as
+    /// generously as it indents paragraphs.
+    #[test]
+    fn test_parse_html_collapses_table_cell_whitespace() {
+        let elements = parse_html_elements(
+            "<table>\n<tr>\n<td>\n  one\n</td>\n<td>\n  two\n</td>\n</tr>\n</table>",
+        );
+        let table = elements
+            .iter()
+            .find_map(|e| match e {
+                ParsedElement::Table(t) => Some(t),
+                _ => None,
+            })
+            .expect("a table");
+        let cells: Vec<String> = table.rows[0]
+            .iter()
+            .map(|c| c.spans.iter().map(|s| s.text.as_str()).collect())
+            .collect();
+        assert_eq!(cells, vec!["one", "two"]);
     }
 
     #[test]
