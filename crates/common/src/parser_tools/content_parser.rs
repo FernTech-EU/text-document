@@ -997,6 +997,39 @@ pub fn parse_html(html: &str) -> Vec<ParsedBlock> {
     ParsedElement::flatten_to_blocks(parse_html_elements(html))
 }
 
+/// The attribute an HTML producer uses to say "this element *is* a footnote
+/// reference", and the label it names.
+///
+/// A data attribute on an otherwise-ordinary element, rather than a literal
+/// `[^label]` in the text, because the text a producer emits is *escaped* on the
+/// way to Djot — [`escape_djot_inline`](crate::parser_tools::djot_escape::escape_djot_inline)
+/// neutralises `[`, `]` and `^`, so a reference smuggled through as characters
+/// arrives as `\[\^1\]` and is prose rather than a reference. It has to be a
+/// node before it is serialised, which is what this makes it.
+///
+/// [`ParsedSpan::footnote_ref`] is the same field the Markdown/Djot reader
+/// already fills, so everything downstream — the document model, the Djot
+/// writer, numbering — needs no change at all.
+pub const HTML_FOOTNOTE_ATTR: &str = "data-footnote-ref";
+
+/// Build a footnote-reference span from any element carrying
+/// [`HTML_FOOTNOTE_ATTR`].
+fn html_footnote_span(
+    el: &scraper::node::Element,
+    link_href: Option<String>,
+) -> Option<ParsedSpan> {
+    let label = el.attr(HTML_FOOTNOTE_ATTR)?.trim();
+    if label.is_empty() {
+        return None;
+    }
+    Some(ParsedSpan {
+        text: String::new(),
+        link_href,
+        footnote_ref: Some(label.to_string()),
+        ..Default::default()
+    })
+}
+
 /// Build an inline-image span from an `<img>` element, if it has a usable
 /// source.
 ///
@@ -1112,6 +1145,16 @@ pub fn parse_html_elements(html: &str) -> Vec<ParsedElement> {
                     }
                     let mut new_state = state.clone();
                     match tag {
+                        // Checked by attribute rather than by tag name: the
+                        // producer picks the element (a `<sup>` renders sensibly
+                        // in a browser), and only the attribute is a contract.
+                        _ if el.attr(HTML_FOOTNOTE_ATTR).is_some() => {
+                            if let Some(span) = html_footnote_span(el, new_state.link_href.clone())
+                            {
+                                spans.push(span);
+                            }
+                            continue;
+                        }
                         "b" | "strong" => new_state.bold = true,
                         "i" | "em" => new_state.italic = true,
                         "u" | "ins" => new_state.underline = true,
@@ -1543,6 +1586,16 @@ pub fn parse_html_elements(html: &str) -> Vec<ParsedElement> {
                     let mut new_state = state.clone();
 
                     match tag {
+                        // Checked by attribute rather than by tag name: the
+                        // producer picks the element (a `<sup>` renders sensibly
+                        // in a browser), and only the attribute is a contract.
+                        _ if el.attr(HTML_FOOTNOTE_ATTR).is_some() => {
+                            if let Some(span) = html_footnote_span(el, new_state.link_href.clone())
+                            {
+                                spans.push(span);
+                            }
+                            continue;
+                        }
                         "b" | "strong" => new_state.bold = true,
                         "i" | "em" => new_state.italic = true,
                         "u" | "ins" => new_state.underline = true,
@@ -3461,4 +3514,87 @@ pub fn djot_to_plain_text(djot: &str, options: &DjotImportOptions) -> String {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod html_footnote_tests {
+    use super::*;
+
+    /// The reason this exists at all: a producer cannot smuggle a reference
+    /// through as text, because the Djot escaper neutralises `[`, `^` and `]`.
+    /// Pinned here so the escaping rule and this workaround cannot drift apart.
+    #[test]
+    fn a_literal_reference_in_text_would_be_escaped_into_prose() {
+        let blocks = parse_html("<p>The ferry.[^1]</p>");
+        let text: String = blocks[0].spans.iter().map(|s| s.text.as_str()).collect();
+        assert!(
+            text.contains("[^1]"),
+            "the parser keeps it as characters: {text:?}"
+        );
+        assert!(
+            blocks[0].spans.iter().all(|s| s.footnote_ref.is_none()),
+            "text is text — it must not become a reference by accident"
+        );
+    }
+
+    #[test]
+    fn an_attributed_element_becomes_a_real_footnote_reference() {
+        let blocks = parse_html(
+            r#"<p>The ferry was late.<sup data-footnote-ref="3"></sup> She waited.</p>"#,
+        );
+        let refs: Vec<&str> = blocks
+            .iter()
+            .flat_map(|b| b.spans.iter())
+            .filter_map(|s| s.footnote_ref.as_deref())
+            .collect();
+        assert_eq!(refs, vec!["3"]);
+
+        // And it carries no text of its own, so it cannot be counted as words or
+        // matched by a search.
+        let marker = blocks[0]
+            .spans
+            .iter()
+            .find(|s| s.footnote_ref.is_some())
+            .expect("the reference span");
+        assert!(marker.text.is_empty(), "{marker:?}");
+    }
+
+    /// The attribute is the contract, not the tag: a producer may use whatever
+    /// element renders sensibly in a browser.
+    #[test]
+    fn any_element_carrying_the_attribute_works() {
+        for html in [
+            r#"<p>a<sup data-footnote-ref="1"></sup></p>"#,
+            r#"<p>a<span data-footnote-ref="1"></span></p>"#,
+            r##"<p>a<a data-footnote-ref="1" href="#fn1"></a></p>"##,
+        ] {
+            let blocks = parse_html(html);
+            assert_eq!(
+                blocks
+                    .iter()
+                    .flat_map(|b| b.spans.iter())
+                    .filter_map(|s| s.footnote_ref.as_deref())
+                    .collect::<Vec<_>>(),
+                vec!["1"],
+                "failed for {html}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_empty_or_absent_label_is_not_a_reference() {
+        for html in [
+            r#"<p>a<sup data-footnote-ref=""></sup></p>"#,
+            r#"<p>a<sup></sup></p>"#,
+        ] {
+            let blocks = parse_html(html);
+            assert!(
+                blocks
+                    .iter()
+                    .flat_map(|b| b.spans.iter())
+                    .all(|s| s.footnote_ref.is_none()),
+                "failed for {html}"
+            );
+        }
+    }
 }
