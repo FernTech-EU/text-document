@@ -17,7 +17,7 @@ pub mod text_options;
 pub mod word_count;
 
 pub use comment_options::{CommentReply, DocumentComment, DocumentComments};
-pub use content_parser::{TABLE_ANCHOR, djot_to_plain_text};
+pub use content_parser::{HTML_FOOTNOTE_ATTR, TABLE_ANCHOR, djot_to_plain_text};
 pub use djot_escape::{
     djot_round_trip_is_lossy, escape_djot_inline, guard_djot_block_start, needs_djot_escaping,
     plain_text_to_djot,
