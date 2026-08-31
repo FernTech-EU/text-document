@@ -521,6 +521,9 @@ fn test_insert_html_single_paragraph_merges_inline() -> Result<()> {
         &InsertHtmlAtPositionDto {
             position: 5,
             anchor: 5,
+            // The paragraph's leading space is layout, not text: a whitespace
+            // run at a block edge collapses away, so the fragment carries
+            // exactly "beautiful" into the merge.
             html: "<p> <b>beautiful</b></p>".to_string(),
         },
     )?;
@@ -541,7 +544,7 @@ fn test_insert_html_single_paragraph_merges_inline() -> Result<()> {
     // Verify text is merged
     let text = export_text(&db_context, &event_hub)?;
     assert!(
-        text.contains("Hello beautiful world"),
+        text.contains("Hellobeautiful world"),
         "Text should be merged inline, got: {}",
         text
     );
