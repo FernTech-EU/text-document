@@ -75,9 +75,41 @@ impl AppContext {
         }
     }
 
-    /// Signal background event-hub threads to stop. Idempotent — the
-    /// second call is a no-op because the sender has already been
-    /// taken.
+    /// A context that shares another's event hub, shutdown channel and
+    /// long-operation manager, with a **private** store and undo stack.
+    ///
+    /// What may be shared and what may not is decided by undo. Every
+    /// repository's `snapshot`/`restore` takes and puts back the *whole* store
+    /// (see `Transaction::snapshot_store`), so two documents in one store would
+    /// undo and roll each other back. The store and the undo manager therefore
+    /// stay private to each document.
+    ///
+    /// The event hub can be shared, and that is where the cost is: draining one
+    /// costs an OS thread, so a hub per document is a thread per document. A
+    /// stream over a book-length manuscript opens more than a hundred.
+    ///
+    /// Because the hub is shared, so is the shutdown channel: a document that
+    /// stopped the pump on its own way out would stop it for every sibling. The
+    /// owner of the shared context is what decides when the pump ends.
+    pub fn new_sharing(other: &AppContext) -> Self {
+        let db_context = DbContext::new().expect("Failed to create database context");
+        let undo_redo_manager = Arc::new(Mutex::new(UndoRedoManager::new()));
+        {
+            let mut urm = undo_redo_manager.lock();
+            urm.set_event_hub(&other.event_hub);
+        }
+        Self {
+            db_context,
+            event_hub: Arc::clone(&other.event_hub),
+            shutdown_rx: other.shutdown_rx.clone(),
+            shutdown_tx: Arc::clone(&other.shutdown_tx),
+            undo_redo_manager,
+            long_operation_manager: Arc::clone(&other.long_operation_manager),
+        }
+    }
+
+    /// Signal background event-hub threads to stop. Idempotent: the second call
+    /// is a no-op because the sender has already been taken.
     pub fn shutdown(&self) {
         let _ = self.shutdown_tx.lock().take();
     }

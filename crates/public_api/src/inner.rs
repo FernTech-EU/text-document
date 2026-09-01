@@ -128,6 +128,21 @@ pub(crate) struct TextDocumentInner {
     // for the unmasked `snapshot_flow()`; masked snapshots derive their own at the root.
     pub highlight_kind: crate::highlight::HighlighterKind,
 
+    /// The shared backend this document was built in, if any.
+    ///
+    /// `None` for a document built by `TextDocument::new`, which owns its whole
+    /// context and its own pump. `Some` means the hub, the pump and the
+    /// long-operation manager belong to a [`DocumentBackend`](crate::DocumentBackend)
+    /// shared with sibling documents, and this document must not shut any of
+    /// them down on its own way out.
+    pub backend: Option<crate::DocumentBackend>,
+    /// The ids of the long operations this document started.
+    ///
+    /// A shared hub delivers every document's long-operation events to every
+    /// document's subscription, so each one has to recognise its own. Empty for
+    /// a standalone document, which is the only subscriber on its own hub and
+    /// can accept everything it is handed.
+    pub own_operations: std::collections::HashSet<String>,
     // Holds SubscriptionTokens for LongOperation event bridges. Dropping a
     // token unsubscribes the callback, so these must outlive the document.
     pub long_op_subscriptions: Vec<SubscriptionToken>,
@@ -352,7 +367,24 @@ impl TextDocumentInner {
     }
 
     /// Initialize the document: create Root → Document → Frame → Block.
+    /// Initialize a document inside a shared backend: its own store and undo
+    /// stack, the backend's hub, pump and long-operation manager.
+    pub fn initialize_in(backend: &crate::DocumentBackend) -> Result<Self> {
+        let ctx = AppContext::new_sharing(backend.shared_ctx());
+        let mut inner = Self::initialize_with_pump(ctx, false)?;
+        inner.backend = Some(backend.clone());
+        Ok(inner)
+    }
+
     pub fn initialize(ctx: AppContext) -> Result<Self> {
+        Self::initialize_with_pump(ctx, true)
+    }
+
+    /// `own_pump` is false for a document in a shared backend, whose pump is the
+    /// backend's. Starting a second one on the same hub would have two threads
+    /// competing for each event, and flume delivers an event to exactly one
+    /// receiver, so half of them would reach the wrong drain.
+    fn initialize_with_pump(ctx: AppContext, own_pump: bool) -> Result<Self> {
         use frontend::block::dtos::CreateBlockDto;
         use frontend::commands::{
             block_commands, document_commands, frame_commands, root_commands, undo_redo_commands,
@@ -362,7 +394,9 @@ impl TextDocumentInner {
         use frontend::root::dtos::CreateRootDto;
 
         let event_client = EventHubClient::new(&ctx.event_hub);
-        event_client.start(ctx.shutdown_rx.clone());
+        if own_pump {
+            event_client.start(ctx.shutdown_rx.clone());
+        }
 
         let stack_id = undo_redo_commands::create_new_stack(&ctx);
 
@@ -430,13 +464,33 @@ impl TextDocumentInner {
             highlights: HighlightRegistry::default(),
             highlight_kind: crate::highlight::HighlighterKind::None,
             long_op_subscriptions: Vec::new(),
+            backend: None,
+            own_operations: std::collections::HashSet::new(),
         })
+    }
+}
+
+impl TextDocumentInner {
+    /// Whether `op_id` names an operation this document started.
+    ///
+    /// A standalone document is the only subscriber on its own hub, so
+    /// everything it is handed is its own and the recorded set is never
+    /// consulted. Only a document in a shared backend can be offered a sibling's
+    /// event, and only then does the answer matter.
+    pub fn owns_operation(&self, op_id: &str) -> bool {
+        self.backend.is_none() || self.own_operations.contains(op_id)
     }
 }
 
 impl Drop for TextDocumentInner {
     fn drop(&mut self) {
-        self.ctx.shutdown();
+        // Only a document that owns its context may stop its pump. One built in
+        // a shared backend shares that pump with every sibling, and shutting it
+        // down here would stop delivery for all of them the first time any one
+        // document was dropped. The backend's own `Drop` ends it instead.
+        if self.backend.is_none() {
+            self.ctx.shutdown();
+        }
     }
 }
 

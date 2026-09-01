@@ -80,82 +80,120 @@ impl TextDocument {
         Ok(Self { inner })
     }
 
+    /// Create a document inside a shared [`DocumentBackend`].
+    ///
+    /// The document keeps its own store and its own undo stack, because undo
+    /// snapshots and restores a whole store and two documents sharing one would
+    /// roll each other back. What it shares is the event hub, the single thread
+    /// draining it, and the long-operation manager.
+    ///
+    /// Use this wherever a host opens many documents at once. Each
+    /// [`TextDocument::new`] starts an OS thread of its own, so a manuscript
+    /// stream over a book-length project starts one per scene.
+    ///
+    /// The backend must outlive every document built in it: dropping it stops
+    /// the pump. Holding a [`DocumentBackend`] clone beside the documents is
+    /// enough, and it is what the documents themselves do.
+    pub fn new_in(backend: &crate::DocumentBackend) -> Self {
+        Self::try_new_in(backend).expect("failed to initialize document")
+    }
+
+    /// [`new_in`](Self::new_in), returning an error instead of panicking.
+    pub fn try_new_in(backend: &crate::DocumentBackend) -> Result<Self> {
+        let doc_inner = TextDocumentInner::initialize_in(backend)?;
+        let inner = Arc::new(Mutex::new(doc_inner));
+        Self::subscribe_long_operation_events(&inner);
+        Ok(Self { inner })
+    }
+
     /// Subscribe to backend long-operation events and bridge them to DocumentEvent.
     fn subscribe_long_operation_events(inner: &Arc<Mutex<TextDocumentInner>>) {
         use frontend::common::event::{LongOperationEvent as LOE, Origin};
 
         let weak = Arc::downgrade(inner);
         let mut locked = inner.lock();
+        // In a shared backend the subscriptions go on the backend's client,
+        // because that is the one with a thread behind it. The document's own
+        // client exists but was never started: a second drain on one hub would
+        // compete for each event, and flume hands an event to exactly one
+        // receiver, so half of them would reach the wrong document.
+        let client = match &locked.backend {
+            Some(backend) => backend.client().clone(),
+            None => locked.event_client.clone(),
+        };
 
         // Progress
         let w = weak.clone();
-        let progress_tok =
-            locked
-                .event_client
-                .subscribe(Origin::LongOperation(LOE::Progress), move |event| {
-                    if let Some(inner) = w.upgrade() {
-                        let (op_id, percent, message) = parse_progress_data(&event.data);
-                        let mut inner = inner.lock();
-                        inner.queue_event(DocumentEvent::LongOperationProgress {
-                            operation_id: op_id,
-                            percent,
-                            message,
-                        });
-                    }
+        let progress_tok = client.subscribe(Origin::LongOperation(LOE::Progress), move |event| {
+            if let Some(inner) = w.upgrade() {
+                let (op_id, percent, message) = parse_progress_data(&event.data);
+                let mut inner = inner.lock();
+                if !inner.owns_operation(&op_id) {
+                    return;
+                }
+                inner.queue_event(DocumentEvent::LongOperationProgress {
+                    operation_id: op_id,
+                    percent,
+                    message,
                 });
+            }
+        });
 
         // Completed
         let w = weak.clone();
-        let completed_tok =
-            locked
-                .event_client
-                .subscribe(Origin::LongOperation(LOE::Completed), move |event| {
-                    if let Some(inner) = w.upgrade() {
-                        let op_id = parse_id_data(&event.data);
-                        let mut inner = inner.lock();
-                        inner.queue_event(DocumentEvent::DocumentReset);
-                        inner.check_block_count_changed();
-                        inner.reset_cached_child_order();
-                        inner.queue_event(DocumentEvent::LongOperationFinished {
-                            operation_id: op_id,
-                            success: true,
-                            error: None,
-                        });
-                    }
+        let completed_tok = client.subscribe(Origin::LongOperation(LOE::Completed), move |event| {
+            if let Some(inner) = w.upgrade() {
+                let op_id = parse_id_data(&event.data);
+                let mut inner = inner.lock();
+                if !inner.owns_operation(&op_id) {
+                    return;
+                }
+                inner.own_operations.remove(&op_id);
+                inner.queue_event(DocumentEvent::DocumentReset);
+                inner.check_block_count_changed();
+                inner.reset_cached_child_order();
+                inner.queue_event(DocumentEvent::LongOperationFinished {
+                    operation_id: op_id,
+                    success: true,
+                    error: None,
                 });
+            }
+        });
 
         // Cancelled
         let w = weak.clone();
-        let cancelled_tok =
-            locked
-                .event_client
-                .subscribe(Origin::LongOperation(LOE::Cancelled), move |event| {
-                    if let Some(inner) = w.upgrade() {
-                        let op_id = parse_id_data(&event.data);
-                        let mut inner = inner.lock();
-                        inner.queue_event(DocumentEvent::LongOperationFinished {
-                            operation_id: op_id,
-                            success: false,
-                            error: Some("cancelled".into()),
-                        });
-                    }
+        let cancelled_tok = client.subscribe(Origin::LongOperation(LOE::Cancelled), move |event| {
+            if let Some(inner) = w.upgrade() {
+                let op_id = parse_id_data(&event.data);
+                let mut inner = inner.lock();
+                if !inner.owns_operation(&op_id) {
+                    return;
+                }
+                inner.own_operations.remove(&op_id);
+                inner.queue_event(DocumentEvent::LongOperationFinished {
+                    operation_id: op_id,
+                    success: false,
+                    error: Some("cancelled".into()),
                 });
+            }
+        });
 
         // Failed
-        let failed_tok =
-            locked
-                .event_client
-                .subscribe(Origin::LongOperation(LOE::Failed), move |event| {
-                    if let Some(inner) = weak.upgrade() {
-                        let (op_id, error) = parse_failed_data(&event.data);
-                        let mut inner = inner.lock();
-                        inner.queue_event(DocumentEvent::LongOperationFinished {
-                            operation_id: op_id,
-                            success: false,
-                            error: Some(error),
-                        });
-                    }
+        let failed_tok = client.subscribe(Origin::LongOperation(LOE::Failed), move |event| {
+            if let Some(inner) = weak.upgrade() {
+                let (op_id, error) = parse_failed_data(&event.data);
+                let mut inner = inner.lock();
+                if !inner.owns_operation(&op_id) {
+                    return;
+                }
+                inner.own_operations.remove(&op_id);
+                inner.queue_event(DocumentEvent::LongOperationFinished {
+                    operation_id: op_id,
+                    success: false,
+                    error: Some(error),
                 });
+            }
+        });
 
         locked.long_op_subscriptions.extend([
             progress_tok,
@@ -284,6 +322,7 @@ impl TextDocument {
             markdown_text: markdown.into(),
         };
         let op_id = document_io_commands::import_markdown(&inner.ctx, &dto)?;
+        inner.own_operations.insert(op_id.clone());
         Ok(Operation::new(
             op_id,
             &inner.ctx,
@@ -340,6 +379,7 @@ impl TextDocument {
             options,
         };
         let op_id = document_io_commands::import_djot(&inner.ctx, &dto)?;
+        inner.own_operations.insert(op_id.clone());
         Ok(Operation::new(
             op_id,
             &inner.ctx,
@@ -433,6 +473,7 @@ impl TextDocument {
             html_text: html.into(),
         };
         let op_id = document_io_commands::import_html(&inner.ctx, &dto)?;
+        inner.own_operations.insert(op_id.clone());
         Ok(Operation::new(
             op_id,
             &inner.ctx,
@@ -510,12 +551,13 @@ impl TextDocument {
         output_path: &str,
         options: crate::DocxExportOptions,
     ) -> Result<Operation<DocxExportResult>> {
-        let inner = self.inner.lock();
+        let mut inner = self.inner.lock();
         let dto = frontend::document_io::ExportDocxDto {
             output_path: output_path.into(),
             options,
         };
         let op_id = document_io_commands::export_docx(&inner.ctx, &dto)?;
+        inner.own_operations.insert(op_id.clone());
         Ok(Operation::new(
             op_id,
             &inner.ctx,
@@ -549,12 +591,13 @@ impl TextDocument {
         output_path: &str,
         options: crate::EpubExportOptions,
     ) -> Result<Operation<EpubExportResult>> {
-        let inner = self.inner.lock();
+        let mut inner = self.inner.lock();
         let dto = frontend::document_io::ExportEpubDto {
             output_path: output_path.into(),
             options,
         };
         let op_id = document_io_commands::export_epub(&inner.ctx, &dto)?;
+        inner.own_operations.insert(op_id.clone());
         Ok(Operation::new(
             op_id,
             &inner.ctx,
@@ -588,12 +631,13 @@ impl TextDocument {
         output_path: &str,
         options: crate::OdtExportOptions,
     ) -> Result<Operation<OdtExportResult>> {
-        let inner = self.inner.lock();
+        let mut inner = self.inner.lock();
         let dto = frontend::document_io::ExportOdtDto {
             output_path: output_path.into(),
             options,
         };
         let op_id = document_io_commands::export_odt(&inner.ctx, &dto)?;
+        inner.own_operations.insert(op_id.clone());
         Ok(Operation::new(
             op_id,
             &inner.ctx,
@@ -644,6 +688,7 @@ impl TextDocument {
             options,
         };
         let op_id = document_io_commands::export_pdf(&inner.ctx, &dto)?;
+        inner.own_operations.insert(op_id.clone());
         Ok(Operation::new(
             op_id,
             &inner.ctx,

@@ -24,6 +24,7 @@
 //! doc.undo().unwrap();
 //! ```
 
+mod backend;
 mod batch;
 mod convert;
 mod cursor;
@@ -44,6 +45,7 @@ mod text_list;
 mod text_table;
 
 // ── Re-exports from entity DTOs (enums that consumers need) ──────
+pub use backend::DocumentBackend;
 pub use frontend::block::dtos::{Alignment, MarkerType};
 pub use frontend::block::dtos::{CharVerticalAlignment, InlineContent, UnderlineStyle};
 pub use frontend::common::format_runs::ReplaceFormatPolicy;
