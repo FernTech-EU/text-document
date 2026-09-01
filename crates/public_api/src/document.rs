@@ -1975,8 +1975,68 @@ impl TextDocument {
     ///
     /// A view's own find session is a range session it alone admits; that is how two panes
     /// over one document highlight different queries.
+    ///
+    /// **Shared**: every view renders it unless its mask says otherwise. For a layer that
+    /// belongs to one view rather than to the text, see
+    /// [`add_opt_in_range_session`](Self::add_opt_in_range_session).
     pub fn add_range_session(&self) -> crate::highlight::SessionId {
         self.add_range_session_with_priority(0)
+    }
+
+    /// Register an empty range session that **no view renders until it asks for it** by name
+    /// (`HighlightMask::all().with(id)`).
+    ///
+    /// The session lives on the document like any other (a range session has nowhere else to
+    /// live), but it is a fact about one *view*, not about the text, so a second view of the
+    /// same document must be left alone. Reach for this whenever the answer to "should the
+    /// pane next door draw this too?" is no: a reading that marks every mention of one
+    /// character marks it in the reading, not in every editor that happens to hold the same
+    /// scene.
+    ///
+    /// The alternative, [`HighlightMask::only`](crate::highlight::HighlightMask::only) on
+    /// every *other* view, cannot be written: a view would have to name every session it
+    /// does want, including ones it holds no handle on, and would silently drop the next
+    /// layer anyone adds.
+    pub fn add_opt_in_range_session(&self) -> crate::highlight::SessionId {
+        self.add_opt_in_range_session_with_priority(0)
+    }
+
+    /// Every [`OptIn`](crate::highlight::SessionVisibility::OptIn) session on this document,
+    /// in merge order.
+    ///
+    /// Sessions can be added and retired but there was no way to ask what a document carries,
+    /// which is the one question worth asking about a private layer: it is invisible to the
+    /// plain snapshot by design, so "is it there, and is it marking the right characters" has
+    /// no other answer. Shared sessions are deliberately not listed, since every view already
+    /// draws those, so enumerating them answers nothing.
+    ///
+    /// Not a route to a view's mask: a view names the session it *owns*, and one built from
+    /// this list would draw whatever the pane next door happens to have registered, which is
+    /// exactly what [`add_opt_in_range_session`](Self::add_opt_in_range_session) exists to
+    /// prevent.
+    pub fn opt_in_session_ids(&self) -> Vec<crate::highlight::SessionId> {
+        let inner = self.inner.lock();
+        inner
+            .highlights
+            .sessions
+            .iter()
+            .filter(|s| s.visibility == crate::highlight::SessionVisibility::OptIn)
+            .map(|s| s.id)
+            .collect()
+    }
+
+    /// [`add_opt_in_range_session`](Self::add_opt_in_range_session) at an explicit **merge
+    /// priority**. See
+    /// [`add_range_session_with_priority`](Self::add_range_session_with_priority).
+    pub fn add_opt_in_range_session_with_priority(
+        &self,
+        priority: i32,
+    ) -> crate::highlight::SessionId {
+        let mut inner = self.inner.lock();
+        inner
+            .highlights
+            .add_range(priority, crate::highlight::SessionVisibility::OptIn)
+        // No repaint: an empty range session shows nothing until its ranges are set.
     }
 
     /// [`add_range_session`](Self::add_range_session) at an explicit **merge priority**.
@@ -1991,7 +2051,9 @@ impl TextDocument {
     /// after the find session depends on the order the user happened to open things in.
     pub fn add_range_session_with_priority(&self, priority: i32) -> crate::highlight::SessionId {
         let mut inner = self.inner.lock();
-        inner.highlights.add_range(priority)
+        inner
+            .highlights
+            .add_range(priority, crate::highlight::SessionVisibility::Shared)
         // No repaint: an empty range session shows nothing until its ranges are set.
     }
 

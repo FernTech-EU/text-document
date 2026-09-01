@@ -181,6 +181,28 @@ pub struct RangeHighlight {
     pub format: HighlightFormat,
 }
 
+/// Whether a session is shown to every view or only to the ones that ask for it.
+///
+/// The default is [`Shared`](SessionVisibility::Shared), and it is the right default: a
+/// spell-checker's squiggles and a comment's underline are facts about the *text*, so every
+/// view of that text should draw them.
+///
+/// [`OptIn`](SessionVisibility::OptIn) is for a layer that is a fact about **one view**
+/// rather than about the text: a reading that marks every mention of one character, say.
+/// Such a layer still lives on the document (there is nowhere else for a range session to
+/// live), but a mask has to name it before anything renders it, so a second view of the same
+/// document is left alone. Without this the only way to keep a layer out of a sibling view
+/// would be [`HighlightMask::only`], which means naming *every* session the view does want,
+/// including ones it has no handle on, such as the widget's own ambient caret band.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SessionVisibility {
+    /// Rendered by every view whose mask does not exclude it. The default.
+    #[default]
+    Shared,
+    /// Rendered only by a view whose mask names it. See [`HighlightMask::with`].
+    OptIn,
+}
+
 /// Which highlight sessions a particular **view** renders.
 ///
 /// Two panes over one shared document can carry different find queries, so "which highlights
@@ -188,63 +210,89 @@ pub struct RangeHighlight {
 /// only the sessions the mask admits contribute spans, and the effective
 /// `HighlighterKind` is the join over just those.
 ///
-/// The default ([`HighlightMask::all`]) shows every session — the behaviour of the old
-/// `snapshot_flow()`. [`HighlightMask::none`] shows none — the old
+/// The default ([`HighlightMask::all`]) shows every **shared** session, the behaviour of the
+/// old `snapshot_flow()`. [`HighlightMask::none`] shows none, the old
 /// `snapshot_flow_without_highlights()`, and it must stay exactly as cheap, since every
-/// read-only preview pane uses it.
+/// read-only preview pane uses it. An [`OptIn`](SessionVisibility::OptIn) session is shown by
+/// neither until [`with`](HighlightMask::with) names it.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct HighlightMask {
-    /// `None` = admit every session (the default). `Some(set)` = admit only these ids.
+    /// `None` = admit every shared session (the default). `Some(set)` = admit only these ids,
+    /// whatever their visibility, since an explicit list is an explicit choice.
     included: Option<Vec<SessionId>>,
+    /// [`OptIn`](SessionVisibility::OptIn) sessions this view asked for by name. Only
+    /// consulted when [`Self::included`] is `None`; a `Some` list already names everything
+    /// this view renders.
+    opted_in: Vec<SessionId>,
 }
 
 impl HighlightMask {
     /// The all-admitting mask as a `const`, so a snapshot builder can reference "show
-    /// everything" with a `'static` lifetime — no temporary to outlive.
-    pub(crate) const ALL: HighlightMask = HighlightMask { included: None };
+    /// everything shared" with a `'static` lifetime, with no temporary to outlive.
+    pub(crate) const ALL: HighlightMask = HighlightMask {
+        included: None,
+        opted_in: Vec::new(),
+    };
 
-    /// Show every session attached to the document. The default, and the shape of a plain
-    /// `snapshot_flow()`.
+    /// Show every **shared** session attached to the document. The default, and the shape of
+    /// a plain `snapshot_flow()`. An [`OptIn`](SessionVisibility::OptIn) session needs
+    /// [`with`](Self::with) on top.
     pub fn all() -> Self {
-        Self { included: None }
+        Self::ALL
     }
 
     /// Show no highlights at all — as cheap as the old `show_highlights = false`.
     pub fn none() -> Self {
         Self {
             included: Some(Vec::new()),
+            opted_in: Vec::new(),
         }
     }
 
     /// Show only the named sessions (e.g. the shared syntax + spell sessions plus *this*
-    /// view's own find session).
+    /// view's own find session), whatever their visibility: naming a session **is** asking
+    /// for it, so an [`OptIn`](SessionVisibility::OptIn) id listed here is admitted.
     pub fn only(ids: impl IntoIterator<Item = SessionId>) -> Self {
         Self {
             included: Some(ids.into_iter().collect()),
+            opted_in: Vec::new(),
         }
     }
 
-    /// Add a session to a mask that already names some (a no-op on [`HighlightMask::all`],
-    /// which already admits everything).
+    /// Ask for one more session by name.
+    ///
+    /// On a mask that already names a set ([`only`](Self::only) / [`none`](Self::none)) this
+    /// adds to it. On [`all`](Self::all) it admits one
+    /// [`OptIn`](SessionVisibility::OptIn) session **without narrowing anything else**,
+    /// which is the shape a view wants when it owns a private layer and still wants the
+    /// spell squiggles, comment underlines and ambient caret band it holds no handle on.
     pub fn with(mut self, id: SessionId) -> Self {
-        if let Some(ids) = &mut self.included
-            && !ids.contains(&id)
-        {
-            ids.push(id);
+        let bucket = match &mut self.included {
+            Some(ids) => ids,
+            None => &mut self.opted_in,
+        };
+        if !bucket.contains(&id) {
+            bucket.push(id);
         }
         self
     }
 
-    /// Whether this mask admits `id`.
-    pub(crate) fn admits(&self, id: SessionId) -> bool {
+    /// Whether this mask admits a session with this id and this visibility.
+    pub(crate) fn admits(&self, id: SessionId, visibility: SessionVisibility) -> bool {
         match &self.included {
-            None => true,
             Some(ids) => ids.contains(&id),
+            None => match visibility {
+                SessionVisibility::Shared => true,
+                SessionVisibility::OptIn => self.opted_in.contains(&id),
+            },
         }
     }
 
     /// Whether this mask admits nothing — the fast path an empty/no-op preview takes, which
     /// must be exactly as cheap as the old boolean `false`.
+    ///
+    /// `opted_in` is deliberately not consulted: it is only read when `included` is `None`,
+    /// and a `None` mask always admits every shared session, so it is never empty.
     pub(crate) fn is_empty(&self) -> bool {
         matches!(&self.included, Some(ids) if ids.is_empty())
     }
@@ -334,6 +382,9 @@ pub(crate) struct Session {
     pub id: SessionId,
     /// Where this session sits in the merge order — see [`HighlightRegistry::sessions`].
     pub priority: i32,
+    /// Whether every view draws this layer, or only the ones that name it. See
+    /// [`SessionVisibility`].
+    pub visibility: SessionVisibility,
     pub body: SessionBody,
 }
 
@@ -372,13 +423,27 @@ impl HighlightRegistry {
     /// the search finds the first session that outranks `priority` and inserts before it. One
     /// insertion point for both session kinds is what keeps every downstream iteration —
     /// span collection and the kind join alike — priority-ordered for free.
-    fn insert_session(&mut self, id: SessionId, priority: i32, body: SessionBody) {
+    fn insert_session(
+        &mut self,
+        id: SessionId,
+        priority: i32,
+        visibility: SessionVisibility,
+        body: SessionBody,
+    ) {
         let at = self
             .sessions
             .iter()
             .position(|s| s.priority > priority)
             .unwrap_or(self.sessions.len());
-        self.sessions.insert(at, Session { id, priority, body });
+        self.sessions.insert(
+            at,
+            Session {
+                id,
+                priority,
+                visibility,
+                body,
+            },
+        );
     }
 
     /// Register a syntax session (empty cache; the caller rehighlights).
@@ -391,6 +456,7 @@ impl HighlightRegistry {
         self.insert_session(
             id,
             priority,
+            SessionVisibility::Shared,
             SessionBody::Syntax(SyntaxSession {
                 highlighter,
                 blocks: HashMap::new(),
@@ -400,11 +466,12 @@ impl HighlightRegistry {
     }
 
     /// Register an empty range session.
-    pub(crate) fn add_range(&mut self, priority: i32) -> SessionId {
+    pub(crate) fn add_range(&mut self, priority: i32, visibility: SessionVisibility) -> SessionId {
         let id = self.alloc_id();
         self.insert_session(
             id,
             priority,
+            visibility,
             SessionBody::Range(RangeSession {
                 ranges: Vec::new(),
                 block_index: HashMap::new(),
@@ -670,12 +737,30 @@ impl HighlightRegistry {
         }
         let mut kind = HighlighterKind::None;
         for s in &self.sessions {
-            if !mask.admits(s.id) {
+            if !mask.admits(s.id, s.visibility) {
                 continue;
             }
             let k = match &s.body {
                 SessionBody::Syntax(syn) => syntax_session_kind(syn),
                 SessionBody::Range(r) => r.kind, // cached at set_ranges — no rescan
+            };
+            kind = kind.join(k);
+            if kind == HighlighterKind::Metric {
+                break;
+            }
+        }
+        kind
+    }
+
+    /// The join over **every** session, mask and visibility ignored. See
+    /// [`TextDocumentInner::recompute_highlight_kind`](crate::inner::TextDocumentInner), the
+    /// only caller.
+    pub(crate) fn kind_of_every_session(&self) -> HighlighterKind {
+        let mut kind = HighlighterKind::None;
+        for s in &self.sessions {
+            let k = match &s.body {
+                SessionBody::Syntax(syn) => syntax_session_kind(syn),
+                SessionBody::Range(r) => r.kind,
             };
             kind = kind.join(k);
             if kind == HighlighterKind::Metric {
@@ -1168,7 +1253,7 @@ pub(crate) fn merged_spans_for_block(
     let mut out: Vec<HighlightSpan> = Vec::new();
 
     for s in &inner.highlights.sessions {
-        if !mask.admits(s.id) {
+        if !mask.admits(s.id, s.visibility) {
             continue;
         }
         match &s.body {
@@ -1255,10 +1340,18 @@ impl TextDocumentInner {
     }
 
     /// Recompute the cached document-wide [`highlight_kind`](TextDocumentInner::highlight_kind)
-    /// — the effective kind under the all-sessions mask, which is what the unmasked
-    /// `snapshot_flow()` uses. Masked snapshots derive their own kind at the root.
+    /// (the join over **every** session, whatever its visibility). Masked snapshots derive
+    /// their own kind at the root.
+    ///
+    /// Every session and not [`HighlightMask::all`]'s set, because this value does not decide
+    /// what a view *draws*. It decides which event a highlight change is announced with
+    /// (`HighlightPaintChanged` against `FormatChanged`), and `queue_highlight_changed`
+    /// returns early when the kind is `None` on both sides. Leaving
+    /// [`OptIn`](SessionVisibility::OptIn) sessions out would make a document whose only
+    /// layer is one of them announce nothing at all, so the one view that *had* asked for it
+    /// would never hear that its marks moved.
     pub(crate) fn recompute_highlight_kind(&mut self) {
-        self.highlight_kind = self.highlights.effective_kind(&HighlightMask::all());
+        self.highlight_kind = self.highlights.kind_of_every_session();
     }
 
     /// This syntax session's cached block state (−1 if unset / not a syntax session).
@@ -1584,7 +1677,7 @@ mod index_tests {
     #[test]
     fn set_ranges_caches_the_kind_read_back_by_effective_kind() {
         let mut reg = HighlightRegistry::default();
-        let id = reg.add_range(0);
+        let id = reg.add_range(0, SessionVisibility::Shared);
         let positions = [(0u64, 0usize)];
         assert_eq!(
             reg.effective_kind(&HighlightMask::all()),

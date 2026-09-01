@@ -96,7 +96,7 @@ pub use events::{DocumentEvent, InsertionOrigin, Subscription};
 pub use fragment::DocumentFragment;
 pub use highlight::{
     HighlightContext, HighlightFormat, HighlightMask, HighlightSpan, RangeHighlight, SessionId,
-    SyntaxHighlighter,
+    SessionVisibility, SyntaxHighlighter,
 };
 pub use operation::{
     DocxExportResult, EpubExportResult, HtmlImportResult, MarkdownImportResult, OdtExportResult,

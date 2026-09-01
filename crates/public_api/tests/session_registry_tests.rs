@@ -817,3 +817,163 @@ fn priority_does_not_disturb_masking() {
     assert_eq!(only_band[0].background_color, Some(LOW));
     assert!(masked_paint_spans(&doc, &HighlightMask::none()).is_empty());
 }
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// Opt-in sessions: a layer that belongs to one view, not to the text
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+/// **The point of the whole thing.** A range session added opt-in is invisible to a view that
+/// did not ask for it, and `all()` (every ordinary view's mask) is such a view.
+///
+/// The alternative a caller would otherwise be pushed to, `only([...])` on every *other*
+/// view, is unwritable: it means naming every session that view does want, including the
+/// widget's own ambient caret band, whose id the application never sees.
+#[test]
+fn an_opt_in_session_is_invisible_to_a_view_that_did_not_ask() {
+    let doc = new_doc("hello world");
+    let mine = doc.add_opt_in_range_session();
+    doc.set_session_ranges(
+        mine,
+        vec![RangeHighlight {
+            start: 0,
+            length: 5,
+            format: bg(GREEN),
+        }],
+    );
+
+    let neighbour = masked_paint_spans(&doc, &HighlightMask::all());
+    assert!(
+        neighbour.iter().all(|s| s.background_color != Some(GREEN)),
+        "a view on `all()` must not draw an opt-in layer: {neighbour:?}"
+    );
+
+    let owner = masked_paint_spans(&doc, &HighlightMask::all().with(mine));
+    assert!(
+        owner.iter().any(|s| s.background_color == Some(GREEN)),
+        "the view that named it must draw it: {owner:?}"
+    );
+}
+
+/// Naming an opt-in session must **not** narrow anything else away. The owning view still
+/// draws every shared layer on the document. That is the difference between `with` on
+/// `all()` and `only`, and the reason the first exists.
+#[test]
+fn asking_for_an_opt_in_session_keeps_every_shared_one() {
+    let doc = new_doc("hello world");
+    let shared = doc.add_range_session();
+    doc.set_session_ranges(
+        shared,
+        vec![RangeHighlight {
+            start: 6,
+            length: 5,
+            format: bg(BLUE),
+        }],
+    );
+    let mine = doc.add_opt_in_range_session();
+    doc.set_session_ranges(
+        mine,
+        vec![RangeHighlight {
+            start: 0,
+            length: 5,
+            format: bg(GREEN),
+        }],
+    );
+
+    let owner = masked_paint_spans(&doc, &HighlightMask::all().with(mine));
+    assert!(
+        owner.iter().any(|s| s.background_color == Some(GREEN)),
+        "the opt-in layer: {owner:?}"
+    );
+    assert!(
+        owner.iter().any(|s| s.background_color == Some(BLUE)),
+        "and the shared one it must not have replaced: {owner:?}"
+    );
+}
+
+/// An explicit `only([...])` list is an explicit choice: an opt-in id named there is admitted,
+/// with no second `with` call. A mask that silently dropped it would make "show exactly these"
+/// mean something different for two ids that look identical at the call site.
+#[test]
+fn only_admits_an_opt_in_session_it_names() {
+    let doc = new_doc("hello world");
+    let mine = doc.add_opt_in_range_session();
+    doc.set_session_ranges(
+        mine,
+        vec![RangeHighlight {
+            start: 0,
+            length: 5,
+            format: bg(GREEN),
+        }],
+    );
+
+    let named = masked_paint_spans(&doc, &HighlightMask::only([mine]));
+    assert!(
+        named.iter().any(|s| s.background_color == Some(GREEN)),
+        "an id in `only` is asked for: {named:?}"
+    );
+}
+
+/// `none()` still means none, even for a session this view would otherwise have opted into:
+/// the master switch above the mask must stay absolute.
+#[test]
+fn none_still_shows_nothing_after_a_with() {
+    let doc = new_doc("hello world");
+    let mine = doc.add_opt_in_range_session();
+    doc.set_session_ranges(
+        mine,
+        vec![RangeHighlight {
+            start: 0,
+            length: 5,
+            format: bg(GREEN),
+        }],
+    );
+    assert!(masked_paint_spans(&doc, &HighlightMask::none()).is_empty());
+}
+
+/// **The event trap.** A document whose *only* layer is opt-in must still announce that its
+/// marks moved, or the one view that asked for them would never repaint.
+///
+/// `queue_highlight_changed` returns early when the cached document kind is `None` on both
+/// sides of the change, so the cached kind is the join over every session whatever its
+/// visibility. It decides how a change is announced, never what a view draws.
+#[test]
+fn an_opt_in_session_still_announces_that_its_marks_moved() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let doc = new_doc("hello world");
+    let mine = doc.add_opt_in_range_session();
+
+    let paints = Arc::new(AtomicUsize::new(0));
+    let _sub = {
+        let paints = paints.clone();
+        doc.on_change(move |event| {
+            if matches!(
+                event,
+                text_document::DocumentEvent::HighlightPaintChanged { .. }
+            ) {
+                paints.fetch_add(1, Ordering::Relaxed);
+            }
+        })
+    };
+
+    doc.set_session_ranges(
+        mine,
+        vec![RangeHighlight {
+            start: 0,
+            length: 5,
+            format: bg(GREEN),
+        }],
+    );
+    assert_eq!(
+        paints.load(Ordering::Relaxed),
+        1,
+        "pushing ranges onto the document's only (opt-in) layer must still emit a repaint"
+    );
+
+    doc.set_session_ranges(mine, Vec::new());
+    assert_eq!(
+        paints.load(Ordering::Relaxed),
+        2,
+        "and so must taking them away again"
+    );
+}
