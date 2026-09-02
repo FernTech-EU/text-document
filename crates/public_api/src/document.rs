@@ -684,7 +684,7 @@ impl TextDocument {
         output_path: &str,
         options: crate::PdfExportOptions,
     ) -> Result<Operation<PdfExportResult>> {
-        let inner = self.inner.lock();
+        let mut inner = self.inner.lock();
         let dto = frontend::document_io::ExportPdfDto {
             output_path: output_path.into(),
             options,
