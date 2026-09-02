@@ -888,6 +888,21 @@ impl TextDocument {
             .map(|(_, label)| label)
     }
 
+    /// Whether this document was built inside a [`DocumentBackend`], rather than
+    /// standing alone with an event hub and a drain thread of its own.
+    ///
+    /// The question a host asks of its own wiring. Documents it means to keep for
+    /// the life of a project — a comment body, a footnote body, one per row of a
+    /// stream — belong in a shared backend, and one built with
+    /// [`TextDocument::new`] instead is indistinguishable in use while costing an
+    /// OS thread that will never have anything to deliver. Nothing else reports
+    /// that, so nothing else can test for it.
+    ///
+    /// [`DocumentBackend`]: crate::DocumentBackend
+    pub fn shares_a_backend(&self) -> bool {
+        self.inner.lock().backend.is_some()
+    }
+
     /// Get the total character count. One entity read, and no document walk.
     ///
     /// It reads the count the `Document` entity carries, through
