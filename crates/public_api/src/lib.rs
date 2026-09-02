@@ -438,3 +438,19 @@ impl ReplaceOptions {
         self
     }
 }
+
+/// How many documents are alive in this process right now.
+///
+/// A [`TextDocument`] is a handle onto a shared body, so a single surviving clone
+/// keeps that document's rope, block table and store resident. A host that opens a
+/// document per scene and closes a project has no other way to ask whether it
+/// actually let go: the memory shows up under the rope and the block table
+/// whoever is holding them, and an allocation profile names the allocation site
+/// rather than the owner.
+///
+/// Counted on the body, not on the handle, so cloning a `TextDocument` does not
+/// move it. It rises by one for each document successfully created and falls by
+/// one when the last handle to it is dropped.
+pub fn live_document_count() -> usize {
+    inner::LIVE_DOCUMENTS.load(std::sync::atomic::Ordering::Relaxed)
+}

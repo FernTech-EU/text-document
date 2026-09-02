@@ -443,6 +443,11 @@ impl TextDocumentInner {
         // Clear undo stack — initialization shouldn't be undoable
         undo_redo_commands::clear_stack(&ctx, stack_id);
 
+        // Counted here rather than at the top of the function: every `?` above
+        // returns without a body, and a count that included those would drift
+        // upwards on its own and read as a leak.
+        LIVE_DOCUMENTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
         Ok(Self {
             ctx,
             event_client,
@@ -482,8 +487,21 @@ impl TextDocumentInner {
     }
 }
 
+/// How many document bodies are alive in this process right now.
+///
+/// A `TextDocument` is a handle onto an `Arc<Mutex<TextDocumentInner>>`, so one
+/// surviving clone anywhere keeps a document's rope, block table and store alive.
+/// That makes "is anything still holding a document" a question a host cannot
+/// answer from the outside, and it is exactly the question a leak hunt asks: the
+/// bytes show up under the rope and the block table whatever holds them.
+///
+/// Read it through [`crate::live_document_count`].
+pub(crate) static LIVE_DOCUMENTS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
 impl Drop for TextDocumentInner {
     fn drop(&mut self) {
+        LIVE_DOCUMENTS.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
         // Only a document that owns its context may stop its pump. One built in
         // a shared backend shares that pump with every sibling, and shutting it
         // down here would stop delivery for all of them the first time any one
