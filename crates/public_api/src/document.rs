@@ -94,6 +94,8 @@ impl TextDocument {
     /// The backend must outlive every document built in it: dropping it stops
     /// the pump. Holding a [`DocumentBackend`] clone beside the documents is
     /// enough, and it is what the documents themselves do.
+    ///
+    /// [`DocumentBackend`]: crate::DocumentBackend
     pub fn new_in(backend: &crate::DocumentBackend) -> Self {
         Self::try_new_in(backend).expect("failed to initialize document")
     }
@@ -906,7 +908,7 @@ impl TextDocument {
     /// Get the total character count. One entity read, and no document walk.
     ///
     /// It reads the count the `Document` entity carries, through
-    /// [`crate::inner::document_counts`]. It used to go through
+    /// `crate::inner::document_counts`. It used to go through
     /// `get_document_stats`, which returns the same number and then walks every
     /// block materialising its text for the word count in the same DTO — so this
     /// call, which a host may make once per widget per layout pass, cost a

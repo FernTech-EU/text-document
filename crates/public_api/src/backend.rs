@@ -3,7 +3,7 @@
 
 //! A backend several documents can share.
 //!
-//! Every [`TextDocument`](crate::TextDocument) built by [`TextDocument::new`]
+//! Every [`TextDocument`](crate::TextDocument) built by [`TextDocument::new`](crate::TextDocument::new)
 //! owns a whole application context: a store, an undo manager, an event hub, and
 //! an OS thread draining that hub. That is right for one document and wrong for
 //! a hundred. A host that opens a document per scene of a manuscript pays a

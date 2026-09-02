@@ -31,8 +31,8 @@
 //! # Not undoable — and not an oversight
 //!
 //! **Nothing in this module participates in undo/redo.** An appended or evicted
-//! line cannot be brought back with [`TextDocument::undo`], does not appear on
-//! the undo stack, and does not affect [`TextDocument::can_undo`].
+//! line cannot be brought back with [`TextDocument::undo`](crate::TextDocument::undo), does not appear on
+//! the undo stack, and does not affect [`TextDocument::can_undo`](crate::TextDocument::can_undo).
 //!
 //! That is deliberate on both counts. A million streamed lines must not become a
 //! million undo entries — the stack is unbounded, so that is a leak, not a
@@ -394,7 +394,7 @@ impl TextDocument {
 
 /// The document's block count, read straight off the entity.
 ///
-/// [`TextDocument::block_count`] answers the same question via
+/// [`TextDocument::block_count`](crate::TextDocument::block_count) answers the same question via
 /// `get_document_stats`, which also computes a word count by materializing every
 /// block's text — 3.18 ms at 10 000 lines. This is the cached value the entity
 /// already carries, which is what `inner.rs`'s own `check_block_count_changed`
