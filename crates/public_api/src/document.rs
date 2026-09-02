@@ -888,20 +888,26 @@ impl TextDocument {
             .map(|(_, label)| label)
     }
 
-    /// Get the total character count. O(1) — reads cached value.
+    /// Get the total character count. One entity read, and no document walk.
+    ///
+    /// It reads the count the `Document` entity carries, through
+    /// [`crate::inner::document_counts`]. It used to go through
+    /// `get_document_stats`, which returns the same number and then walks every
+    /// block materialising its text for the word count in the same DTO — so this
+    /// call, which a host may make once per widget per layout pass, cost a
+    /// complete scan of the document. `stats()` still pays that walk, and should:
+    /// it is the caller that asked for the word count.
     pub fn character_count(&self) -> usize {
         let inner = self.inner.lock();
-        let dto = document_inspection_commands::get_document_stats(&inner.ctx)
-            .expect("get_document_stats should not fail");
-        to_usize(dto.character_count)
+        crate::inner::document_counts(&inner).map_or(0, |(chars, _)| chars)
     }
 
-    /// Get the number of blocks (paragraphs). O(1) — reads cached value.
+    /// Get the number of blocks (paragraphs). One entity read, and no document
+    /// walk. See [`character_count`](Self::character_count) for what that
+    /// replaced.
     pub fn block_count(&self) -> usize {
         let inner = self.inner.lock();
-        let dto = document_inspection_commands::get_document_stats(&inner.ctx)
-            .expect("get_document_stats should not fail");
-        to_usize(dto.block_count)
+        crate::inner::document_counts(&inner).map_or(0, |(_, blocks)| blocks)
     }
 
     /// Returns true if the document has no text content.

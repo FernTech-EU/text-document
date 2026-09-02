@@ -1,4 +1,4 @@
-use text_document::TextDocument;
+use text_document::{MoveMode, TextDocument};
 
 fn new_doc() -> TextDocument {
     TextDocument::new()
@@ -43,6 +43,29 @@ fn is_empty_after_clear() {
     let doc = new_doc_with_text("Hello");
     doc.clear().unwrap();
     assert!(doc.is_empty());
+}
+
+/// The cheap counts and the expensive ones must agree, on a document with
+/// several blocks and an edit behind it.
+///
+/// `character_count` and `block_count` read the two counts off the `Document`
+/// entity; `stats()` recomputes the same two fields inside `get_document_stats`,
+/// on the far side of a transaction and a walk over every block. They are the
+/// same numbers by construction today, and this is what says so if either side
+/// is ever rewritten: a drift here is a caret clamping to the wrong end of the
+/// document and a host laying out a scene at the wrong height, neither of which
+/// looks like a counting bug from the outside.
+#[test]
+fn the_cheap_counts_agree_with_the_walked_ones() {
+    let doc = new_doc_with_text("One\nTwo\nThree");
+    let cursor = doc.cursor();
+    cursor.set_position(3, MoveMode::MoveAnchor);
+    cursor.insert_text(" more").unwrap();
+
+    let stats = doc.stats();
+    assert_eq!(doc.character_count(), stats.character_count);
+    assert_eq!(doc.block_count(), stats.block_count);
+    assert_eq!(doc.block_count(), 3);
 }
 
 #[test]

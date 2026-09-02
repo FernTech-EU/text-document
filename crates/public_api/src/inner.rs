@@ -509,6 +509,35 @@ pub(crate) fn dispatch_queued_events(queued: QueuedEvents) {
 /// Shift an offset after an edit: offsets before the edit are unchanged,
 /// offsets inside the removed range clamp to the edit point, offsets after
 /// shift by the delta.
+/// The character and block counts the `Document` entity already carries.
+///
+/// **The cheap answer to a question that had only an expensive one.**
+/// `get_document_stats` returns these two straight off the entity
+/// (`get_document_stats_uc.rs` reads `document.character_count` /
+/// `document.block_count`), and then, for the word count and image count in the
+/// same DTO, opens a transaction, fetches every block, materialises each one's
+/// text out of the rope into a fresh `String` and whitespace-splits it. Measured
+/// at 3.18 ms for a ten-thousand-line document in `streaming.rs`'s own baseline.
+///
+/// Every caller that only wanted "how long is this document" was paying that
+/// walk: the caret's end-of-document clamp on every move, insert and delete, and
+/// a host's `character_count()` on every layout measurement. `streaming.rs`
+/// already went around it for the block count alone and recorded why; this is
+/// the same read, shared, so that no caller has to know.
+///
+/// `None` when the document entity cannot be read, so each caller keeps the
+/// fallback it already had rather than being handed a zero that reads as an
+/// empty document.
+pub(crate) fn document_counts(inner: &TextDocumentInner) -> Option<(usize, usize)> {
+    let doc = frontend::commands::document_commands::get_document(&inner.ctx, &inner.document_id)
+        .ok()
+        .flatten()?;
+    Some((
+        usize::try_from(doc.character_count).unwrap_or(0),
+        usize::try_from(doc.block_count).unwrap_or(0),
+    ))
+}
+
 pub(crate) fn adjust_offset(offset: usize, edit_pos: usize, removed: usize, added: usize) -> usize {
     if offset <= edit_pos {
         offset

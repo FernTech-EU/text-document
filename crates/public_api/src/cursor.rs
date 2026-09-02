@@ -26,19 +26,29 @@ use crate::{BlockFormat, FrameFormat, MoveMode, MoveOperation, SelectionType, Te
 
 use crate::document::get_main_frame_id;
 
-/// Compute the maximum valid cursor position from document stats.
+/// The maximum valid cursor position, from the two counts the `Document` entity
+/// already carries.
 ///
 /// Cursor positions include block separators (one between each pair of adjacent
 /// blocks), but `character_count` does not. The max position is therefore
 /// `character_count + (block_count - 1)`.
-fn max_cursor_position(stats: &frontend::document_inspection::DocumentStatsDto) -> usize {
-    let chars = to_usize(stats.character_count);
-    let blocks = to_usize(stats.block_count);
-    if blocks > 1 {
+///
+/// It used to take a `DocumentStatsDto`, which meant every clamp on this path —
+/// and it is reached by every move, every insert and every delete — ran
+/// `get_document_stats`, whose other fields cost a walk over every block of the
+/// document, materialising each one's text out of the rope to whitespace-split a
+/// word count nothing here reads. See [`crate::inner::document_counts`].
+///
+/// `None` only when the document entity cannot be read, so each caller keeps the
+/// fallback position it already chose for that case rather than being handed a
+/// zero that reads as an empty document.
+fn max_cursor_position_of(inner: &TextDocumentInner) -> Option<usize> {
+    let (chars, blocks) = crate::inner::document_counts(inner)?;
+    Some(if blocks > 1 {
         chars + blocks - 1
     } else {
         chars
-    }
+    })
 }
 
 /// A cursor into a [`TextDocument`](crate::TextDocument).
@@ -364,18 +374,7 @@ impl TextCursor {
     pub fn at_end(&self) -> bool {
         let pos = self.position();
         let inner = self.doc.lock();
-        let stats = document_inspection_commands::get_document_stats(&inner.ctx).unwrap_or({
-            frontend::document_inspection::DocumentStatsDto {
-                character_count: 0,
-                word_count: 0,
-                block_count: 0,
-                frame_count: 0,
-                image_count: 0,
-                list_count: 0,
-                table_count: 0,
-            }
-        });
-        pos >= max_cursor_position(&stats)
+        pos >= max_cursor_position_of(&inner).unwrap_or(0)
     }
 
     /// The block number (0-indexed) containing the cursor.
@@ -419,9 +418,7 @@ impl TextCursor {
         // Clamp to max document position (includes block separators)
         let end = {
             let inner = self.doc.lock();
-            document_inspection_commands::get_document_stats(&inner.ctx)
-                .map(|s| max_cursor_position(&s))
-                .unwrap_or(0)
+            max_cursor_position_of(&inner).unwrap_or(0)
         };
         let mut pos = position.min(end);
 
@@ -485,9 +482,7 @@ impl TextCursor {
             SelectionType::Document => {
                 let end = {
                     let inner = self.doc.lock();
-                    document_inspection_commands::get_document_stats(&inner.ctx)
-                        .map(|s| max_cursor_position(&s))
-                        .unwrap_or(0)
+                    max_cursor_position_of(&inner).unwrap_or(0)
                 };
                 let mut d = self.data.lock();
                 d.anchor = 0;
@@ -2255,9 +2250,7 @@ impl TextCursor {
             // No-op at end of document (symmetric with delete_previous_char at start)
             let end = {
                 let inner = self.doc.lock();
-                document_inspection_commands::get_document_stats(&inner.ctx)
-                    .map(|s| max_cursor_position(&s))
-                    .unwrap_or(0)
+                max_cursor_position_of(&inner).unwrap_or(0)
             };
             if pos >= end {
                 return Ok(());
@@ -2806,9 +2799,7 @@ impl TextCursor {
             MoveOperation::Start => 0,
             MoveOperation::End => {
                 let inner = self.doc.lock();
-                document_inspection_commands::get_document_stats(&inner.ctx)
-                    .map(|s| max_cursor_position(&s))
-                    .unwrap_or(pos)
+                max_cursor_position_of(&inner).unwrap_or(pos)
             }
             MoveOperation::NextCharacter | MoveOperation::Right => {
                 let mut cur = pos;
@@ -2889,9 +2880,7 @@ impl TextCursor {
                 if end == pos {
                     // Already at a boundary, skip whitespace
                     let inner = self.doc.lock();
-                    let max_pos = document_inspection_commands::get_document_stats(&inner.ctx)
-                        .map(|s| max_cursor_position(&s))
-                        .unwrap_or(0);
+                    let max_pos = max_cursor_position_of(&inner).unwrap_or(0);
                     let scan_len = max_pos.saturating_sub(pos).min(64);
                     if scan_len == 0 {
                         return pos;
@@ -3048,15 +3037,13 @@ impl TextCursor {
     /// cluster (snap forward). Block separators are always treated as
     /// boundaries.
     ///
-    /// Leaves out-of-range positions (`pos > max_cursor_position`)
+    /// Leaves out-of-range positions (`pos > max_cursor_position_of`)
     /// unchanged — the snap must never silently upgrade an out-of-
     /// range cursor to a valid one, because edit ops rely on the
     /// out-of-range check to stay no-ops.
     fn forward_grapheme_boundary_at_or_after(&self, pos: usize) -> usize {
         let inner = self.doc.lock();
-        let end = document_inspection_commands::get_document_stats(&inner.ctx)
-            .map(|s| max_cursor_position(&s))
-            .unwrap_or(pos);
+        let end = max_cursor_position_of(&inner).unwrap_or(pos);
         if pos >= end {
             return pos;
         }
@@ -3111,9 +3098,7 @@ impl TextCursor {
     /// Returns `pos` unchanged when already at the document end.
     fn next_grapheme_boundary(&self, pos: usize) -> usize {
         let inner = self.doc.lock();
-        let end = document_inspection_commands::get_document_stats(&inner.ctx)
-            .map(|s| max_cursor_position(&s))
-            .unwrap_or(pos);
+        let end = max_cursor_position_of(&inner).unwrap_or(pos);
         if pos >= end {
             return pos;
         }
