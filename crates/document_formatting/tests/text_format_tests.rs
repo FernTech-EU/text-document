@@ -195,7 +195,6 @@ fn test_set_text_format_in_table_cell() -> Result<()> {
     let cell_block_ids =
         frame_controller::get_relationship(&db, &cell_frame_id, &FrameRelationshipField::Blocks)?;
     let cell_block = block_controller::get(&db, &cell_block_ids[0])?.unwrap();
-    let cell_block_pos = cell_block.document_position;
 
     // Write the cell content into the rope directly (the cell is
     // already registered in block_offsets by `insert_table_uc`),
@@ -207,6 +206,15 @@ fn test_set_text_format_in_table_cell() -> Result<()> {
     );
     let update_block: UpdateBlockDto = cell_block.into();
     block_controller::update(&db, &hub, &mut urm, None, &update_block)?;
+
+    // A position the use case is handed is a rope position — the space the editor
+    // addresses. A cell block's stored `document_position` is not one: `insert_table_uc`
+    // numbers cell blocks one apart, whatever their length.
+    let cell_block_now = block_controller::get(&db, &cell_block_ids[0])?.unwrap();
+    let cell_block_pos = common::database::rope_helpers::block_document_position(
+        &cell_block_now.into(),
+        db.get_store(),
+    );
 
     document_formatting_controller::set_text_format(
         &db,

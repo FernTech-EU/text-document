@@ -81,6 +81,46 @@ pub fn block_document_position(block: &Block, store: &Store) -> i64 {
     rope.byte_to_char(byte_start as usize) as i64
 }
 
+/// Bring a batch of `document_position` slots in step with the rope.
+///
+/// `slots` pairs each block's id with the field to overwrite. A block the offset index
+/// holds gets its rope-derived start; one it does not hold keeps what it had. When the rope
+/// is not the document's position space (see [`rope_positions_match_flow`]) nothing is
+/// touched: there the stored field is maintained by the editing use cases and is the truth.
+///
+/// This is the reader's half of the bargain `insert_text_uc` and `delete_text_uc` struck
+/// when they stopped shifting every later block on every keystroke: the stored field drifts
+/// by exactly what was typed (or removed) since the last time something wrote it, so a use
+/// case comparing a caller's position with it compares two different spaces. That is how a
+/// cut at a paragraph's end came to carry the paragraph break and the head of the next
+/// paragraph away while the deletion, which walks the rope, took only the selection — and
+/// how bold, replace and "make a list" landed the same number of characters late.
+pub fn refresh_positions_from_rope<'a>(
+    store: &Store,
+    slots: impl IntoIterator<Item = (EntityId, &'a mut i64)>,
+) {
+    if !rope_positions_match_flow(store) {
+        return;
+    }
+    let offsets = store.block_offsets.read();
+    let rope = store.rope.read();
+    for (block_id, slot) in slots {
+        if let Some((byte_start, _)) = offsets.range_of_block(block_id) {
+            *slot = rope.byte_to_char(byte_start as usize) as i64;
+        }
+    }
+}
+
+/// [`refresh_positions_from_rope`] over block entities — what a use case holds after
+/// `get_block_multi`. Call it before sorting by `document_position` or comparing that field
+/// with a position the caller supplied.
+pub fn refresh_block_positions(blocks: &mut [Block], store: &Store) {
+    refresh_positions_from_rope(
+        store,
+        blocks.iter_mut().map(|b| (b.id, &mut b.document_position)),
+    );
+}
+
 /// Whether the rope's char-position space matches the user-visible
 /// flow positions that `Block.document_position` is computed against.
 ///
@@ -106,7 +146,10 @@ pub fn rope_positions_match_flow(store: &Store) -> bool {
     // flow snapshot derives its block positions from this same rope space,
     // so the two agree by construction.) Only count Block markers; the
     // TableAnchor sentinel entries are not blocks.
-    let indexed_block_count = offsets.entries.iter().filter(|(m, _)| m.is_block()).count();
+    // The index holds exactly two kinds of entry, so the blocks it mirrors are what is
+    // left once the anchors are taken away — an O(1) answer for a check that sits on the
+    // clamp of every caret move, insert and delete.
+    let indexed_block_count = offsets.len() - offsets.table_anchor_count();
     drop(offsets);
     let total_block_count = store.blocks.read().len();
     indexed_block_count == total_block_count

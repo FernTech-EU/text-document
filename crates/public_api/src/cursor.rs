@@ -26,12 +26,18 @@ use crate::{BlockFormat, FrameFormat, MoveMode, MoveOperation, SelectionType, Te
 
 use crate::document::get_main_frame_id;
 
-/// The maximum valid cursor position, from the two counts the `Document` entity
-/// already carries.
+/// The maximum valid cursor position.
 ///
-/// Cursor positions include block separators (one between each pair of adjacent
-/// blocks), but `character_count` does not. The max position is therefore
-/// `character_count + (block_count - 1)`.
+/// Cursor positions are rope positions whenever the rope is the document's position
+/// space (see `rope_helpers::rope_positions_match_flow`), and the rope's length is then
+/// the end. It holds every block separator and, around a table, the anchor sentinel and
+/// the separator after it — two positions the two counts the `Document` entity carries
+/// never see. An end computed from those counts stopped two short of the last characters
+/// after a table: no caret could reach them, and a selection to End left them behind.
+///
+/// Where the rope is not the position space the counts still serve: positions include
+/// block separators (one between each pair of adjacent blocks) but `character_count` does
+/// not, so the max position is `character_count + (block_count - 1)`.
 ///
 /// It used to take a `DocumentStatsDto`, which meant every clamp on this path —
 /// and it is reached by every move, every insert and every delete — ran
@@ -43,6 +49,10 @@ use crate::document::get_main_frame_id;
 /// fallback position it already chose for that case rather than being handed a
 /// zero that reads as an empty document.
 fn max_cursor_position_of(inner: &TextDocumentInner) -> Option<usize> {
+    let store = inner.ctx.db_context.get_store();
+    if common::database::rope_helpers::rope_positions_match_flow(store) {
+        return Some(store.rope.read().len_chars());
+    }
     let (chars, blocks) = crate::inner::document_counts(inner)?;
     Some(if blocks > 1 {
         chars + blocks - 1

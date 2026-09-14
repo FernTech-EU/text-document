@@ -195,7 +195,11 @@ fn test_set_block_format_in_table_cell() -> Result<()> {
     let cell_block_ids =
         frame_controller::get_relationship(&db, &cell_0_frame, &FrameRelationshipField::Blocks)?;
     let cell_block = block_controller::get(&db, &cell_block_ids[0])?.unwrap();
-    let cell_pos = cell_block.document_position;
+    // A position the use case is handed is a rope position — the space the editor
+    // addresses. A cell block's stored `document_position` is not one: `insert_table_uc`
+    // numbers cell blocks one apart, whatever their length.
+    let cell_pos =
+        common::database::rope_helpers::block_document_position(&cell_block.into(), db.get_store());
 
     // Format the cell's block as a code block
     document_formatting_controller::set_block_format(

@@ -90,6 +90,9 @@ fn fetch_blocks_and_build_text(
         .into_iter()
         .flatten()
         .collect();
+    // The stored field lags the rope by whatever was typed since the last deletion, and the
+    // caller's positions are rope positions: read the rope's.
+    common::database::rope_helpers::refresh_block_positions(&mut blocks, &uow.store());
     blocks.sort_by_key(|b| b.document_position);
 
     let full_text = rope_flat_text_if_simple(&uow.store(), frame_ids.len())

@@ -107,9 +107,9 @@ impl BlockOffsetIndex {
     }
 
     /// Number of `OffsetMarker::TableAnchor` entries currently indexed.
-    /// O(1) via a maintained counter. Used to gate flow-position
-    /// derivation: rope-derived positions match `Block.document_position`
-    /// only when this is zero.
+    /// O(1) via a maintained counter. `rope_positions_match_flow` subtracts
+    /// it from `len()` to count the blocks the rope mirrors without walking
+    /// the entries.
     pub fn table_anchor_count(&self) -> usize {
         self.table_anchor_count
     }

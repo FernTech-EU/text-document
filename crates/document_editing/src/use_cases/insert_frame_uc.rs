@@ -61,6 +61,9 @@ fn find_frame_at_position(
         }
         let blocks_opt = uow.get_block_multi(&block_ids)?;
         let mut blocks: Vec<Block> = blocks_opt.into_iter().flatten().collect();
+        // The stored field lags the rope by whatever was typed since the last deletion, and the
+        // caller's positions are rope positions: read the rope's.
+        common::database::rope_helpers::refresh_block_positions(&mut blocks, &store);
         blocks.sort_by_key(|b| b.document_position);
 
         if let (Some(first), Some(last)) = (blocks.first(), blocks.last()) {

@@ -566,25 +566,19 @@ pub(crate) fn adjust_offset(offset: usize, edit_pos: usize, removed: usize, adde
     }
 }
 
-/// Refresh `BlockDto::document_position` in-place using the rope-derived
-/// position from `BlockOffsetIndex`. No-op for documents containing
-/// tables or unmirrored sub-frames — for those, the stored field
-/// (maintained by use-case-side position-refresh loops, plus catch-up
-/// refreshes when tables are inserted) is the authoritative source.
+/// Refresh `BlockDto::document_position` in-place from the rope: the DTO face of
+/// `rope_helpers::refresh_block_positions`, and the same rule — a no-op only for a
+/// document whose blocks are not all mirrored to the rope, where the stored field is
+/// maintained by the editing use cases and is the authoritative source.
 pub(crate) fn refresh_block_positions(
     dtos: &mut [frontend::block::dtos::BlockDto],
     store: &frontend::common::database::Store,
 ) {
-    if !frontend::common::database::rope_helpers::rope_positions_match_flow(store) {
-        return;
-    }
-    let offsets = store.block_offsets.read();
-    let rope = store.rope.read();
-    for dto in dtos.iter_mut() {
-        if let Some((byte_start, _)) = offsets.range_of_block(dto.id) {
-            dto.document_position = rope.byte_to_char(byte_start as usize) as i64;
-        }
-    }
+    frontend::common::database::rope_helpers::refresh_positions_from_rope(
+        store,
+        dtos.iter_mut()
+            .map(|dto| (dto.id, &mut dto.document_position)),
+    );
 }
 
 /// The block a **caret** at `position` sits in.
@@ -622,12 +616,5 @@ pub(crate) fn refresh_block_position(
     dto: &mut frontend::block::dtos::BlockDto,
     store: &frontend::common::database::Store,
 ) {
-    if !frontend::common::database::rope_helpers::rope_positions_match_flow(store) {
-        return;
-    }
-    let offsets = store.block_offsets.read();
-    if let Some((byte_start, _)) = offsets.range_of_block(dto.id) {
-        let rope = store.rope.read();
-        dto.document_position = rope.byte_to_char(byte_start as usize) as i64;
-    }
+    refresh_block_positions(std::slice::from_mut(dto), store);
 }
