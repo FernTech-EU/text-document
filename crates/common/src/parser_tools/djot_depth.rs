@@ -1,4 +1,6 @@
-//! A ceiling on how deeply nested a Djot document may be before it is parsed.
+//! What a Djot document has to stay within before `jotdown` 0.10 is given it: how deeply
+//! it nests, how deep its headings go and how many lines its paragraphs run to. The one
+//! door to the parser, [`parsable`], sees to all three.
 //!
 //! # The failure this prevents
 //!
@@ -75,18 +77,34 @@
 //!
 //! # What callers do with it
 //!
-//! [`parse_djot`](super::content_parser::parse_djot) keeps its signature and
-//! **degrades rather than refusing**. A document this scan finds too deep is first given
-//! shallower indentation ([`flatten_deep_indentation`]) and measured again, by the same
-//! scan. When its depth came from indentation, the way a deeply nested list is written,
-//! it then parses, its lists flattened below a fixed depth with every item and every
-//! word. A document still too deep after that comes back as a single plain paragraph
-//! holding the source verbatim. Nothing is lost either way, since the text is all still
-//! there; structure is dropped only where it cannot be computed without ending the
-//! process.
+//! [`parsable`] is the one door to `jotdown`:
+//! [`parse_djot`](super::content_parser::parse_djot) and the DOCX and ODT writers, which
+//! walk a comment's Djot body with `jotdown` themselves, all go through it. It
+//! **degrades rather than refusing**, a step at a time, each measured again by the same
+//! scan:
 //!
-//! The DOCX and ODT writers walk a comment's Djot body with `jotdown` directly, and do
-//! the same with a body past the ceiling: it is written as its own text.
+//! 1. A heading deeper than [`MAX_HEADING_LEVEL`] gets a backslash before its first `#`,
+//!    which makes its line text (see *Headings* below).
+//! 2. A document still nested too deeply is given shallower indentation
+//!    ([`flatten_deep_indentation`]). When its depth came from indentation, the way a
+//!    deeply nested list is written, it then parses, its lists flattened below a fixed
+//!    depth with every item and every word. A heading the shallower indentation opens
+//!    is escaped as in 1.
+//! 3. A block at the top level of the document holding a paragraph, heading or caption
+//!    longer than [`MAX_LEAF_LINES`] is set down as its lines (see *Long paragraphs*
+//!    below). The rest of the document keeps its structure.
+//! 4. [`Parsable::events`] runs the parser on a stack large enough for the document's
+//!    longest paragraph.
+//!
+//! A document still nested too deeply once flattened is not given a structure.
+//! `parse_djot` shows it as one plain paragraph for each line of its source that holds
+//! text, with that line's text as it is written, and the writers set a comment body down
+//! as its text. One paragraph a line is what keeps the text the same through a save: the
+//! Djot writer escapes whatever each paragraph opens with, so what it saves reads back as
+//! the same paragraphs. Shown as a single paragraph, the source kept its line breaks
+//! through a save, read back as the same document the parser could not take, and each
+//! save escaped its backslashes once more. A block set down as its lines is shown the
+//! same way, one plain paragraph a line, for the same reason.
 //!
 //! # The limit
 //!
@@ -102,10 +120,111 @@
 //!   to the ceiling needs about 600 KiB of that stack. The rest is for the stack the
 //!   caller has already used when it reaches the parse (an editor's event handling, an
 //!   import's use case), which this module cannot see.
+//!
+//! # Headings
+//!
+//! A heading nests nothing, but `jotdown` 0.10 has a limit on it all the same, and one
+//! that ends the process too: it keeps a heading's level (its number of `#`) in 16 bits,
+//! converted with an `unwrap`, so a line of 65,536 `#` and a space panics inside the
+//! parser. A host parsing a project's prose on its interface thread goes down with every
+//! window. The scan reads every heading `jotdown` reads, and [`parsable`] puts a
+//! backslash before the first `#` of any deeper than [`MAX_HEADING_LEVEL`]. `\#` is a
+//! plain `#` in Djot, so the line reads as a line of text written in its place would,
+//! its marks shown as they were written. The rest of the document keeps its structure.
+//! The Djot writer escapes that `#` again when it saves the paragraph, so it reads back
+//! the same.
+//!
+//! Such a line is a paragraph with the lines after it up to a blank line, unless the
+//! block just before it goes on through a line of text. It is then more of that block:
+//! more of a heading, or part of a list item, quotation or note whose last line was not
+//! blank. In one of those, it goes on with the block that one ends with when that block
+//! takes a line of text: a paragraph, a heading, a code block, which shows the backslash
+//! too, or a table's caption, which the importer does not keep. After any other block it
+//! is a paragraph of its own there.
+//!
+//! So escaping a heading can make a line that went on with it open a heading of its
+//! own, once the escaped line has joined the list item, quotation or note before it,
+//! and a line whose indentation flattening cuts can open one where it was more of a
+//! list's paragraph. [`parsable`] escapes headings until it finds none.
+//!
+//! # Long paragraphs
+//!
+//! `jotdown` 0.10 recurses in a second place, the pass that reads a block's text. While
+//! an inline opener waits for its closer (a `_`, a `*`, a `[`, a backtick, a quotation
+//! mark, an attribute set), it reads each further line of the block one call deeper. So
+//! a paragraph, heading or caption of many lines that opens one of those and does not
+//! close it costs the stack a frame a line. Measured on a 2 MiB thread, a debug build
+//! aborts at 730 lines (under 4 KB of text) and a release build at 3,960. It is the
+//! same abort, and no count of containers sees it.
+//!
+//! So the scan also counts the lines of every paragraph, heading and caption, as
+//! `jotdown` reads them. A code block and a link definition cost it nothing, since it
+//! reads them verbatim, and each cell of a table's rows is a block of one line.
+//! [`Parsable::events`] runs the parser on the caller's stack when no block is longer
+//! than 128 lines, which costs less of it than a document nested to the ceiling. A
+//! longer one is parsed on a thread of its own, with a stack sized from its length at
+//! 8 KiB a line, nearly three times what a debug build uses.
+//!
+//! A block longer than [`MAX_LEAF_LINES`] is not parsed: the stack it needs would run to
+//! hundreds of megabytes, and only a document made for that has one. The scan cannot
+//! tell whether an opener waits in it, which takes the parser itself, so this holds
+//! whether one does or not. [`parsable`] sets down as its lines the block at the top
+//! level of the document that holds it (a paragraph, a whole quotation, one list item
+//! with all it holds, a table with its caption): one plain paragraph for each of its
+//! lines, with the line's text as it is written, and a blank line before and after. That
+//! block loses its formatting, a link or note defined in it is no longer defined, and a
+//! list it was an item of is split in two around it. Every other block reads as it did,
+//! since a block at the top level starts on a line that closes every container. The same
+//! is done, on the caller's stack, to every block longer than 128 lines when the thread
+//! they need cannot be started.
+
+use std::borrow::Cow;
+use std::cell::OnceCell;
+use std::ops::Range;
 
 /// The most nested block containers a document may declare before [`is_too_deep`]
 /// reports it.
 pub const MAX_NESTING_DEPTH: usize = 128;
+
+/// The deepest heading, in `#`, a document may open before [`is_too_deep`] reports it
+/// and [`parsable`] escapes it: 65,279.
+///
+/// `jotdown` 0.10 keeps two counts in 16 bits and converts each with an `unwrap`, so
+/// either one past 65,535 panics: a heading's level, and how many blocks are open where
+/// a list starts. Each heading at the top level of a document opens a section inside
+/// every open section of a lower level, so headings of rising levels add up to as many
+/// sections as the deepest level to that second count. The document itself and the
+/// containers [`MAX_NESTING_DEPTH`] allows, each list item with the list around it, add
+/// at most twice that ceiling. A document whose headings stay within this level keeps
+/// both counts within 16 bits.
+///
+/// No other count the block parser keeps grows with the text: an ordered list's number
+/// is at most 19 digits or 13 numerals, and a fence's length is only ever compared.
+pub const MAX_HEADING_LEVEL: usize = u16::MAX as usize - 2 * MAX_NESTING_DEPTH;
+
+/// The most lines one paragraph, heading or caption may run to before [`parsable`] sets
+/// the block at the top level of the document holding it down as its lines: 16,384.
+///
+/// The parser reads each further line of such a block one call deeper while an inline
+/// opener waits to close (see the module note), and [`Parsable::events`] gives it a stack
+/// sized for that. At this length the stack is 130 MiB, reserved rather than used: a debug
+/// build writes about 47 MiB of it, a release build about 9 MiB.
+pub const MAX_LEAF_LINES: usize = 16_384;
+
+/// The most lines a paragraph, heading or caption may run to for [`Parsable::events`] to
+/// read the document on the caller's own stack. Measured through a whole reload in a
+/// debug build, a block this long needs about 390 KiB of stack, where a document nested
+/// to [`MAX_NESTING_DEPTH`] needs about 600 KiB.
+const LEAF_LINES_ON_THE_CALLERS_STACK: usize = 128;
+
+/// The stack [`Parsable::events`] gives the parser for a document with longer blocks,
+/// before what their lines add: the stack a spawned thread gets, on which the tests show
+/// a document nested to the ceiling parses.
+const PARSER_STACK: usize = 2 << 20;
+
+/// The stack [`Parsable::events`] adds for each line of the longest block: nearly three
+/// times the 2.9 KiB a debug build spends on one, and fifteen times a release build's.
+const STACK_PER_LEAF_LINE: usize = 8 << 10;
 
 /// How many columns of indentation [`flatten_deep_indentation`] leaves in a line's
 /// container prefix: four a level (room for markers up to `10.`) for the
@@ -122,27 +241,300 @@ pub fn nesting_depth(text: &str) -> usize {
     deepest(text, usize::MAX)
 }
 
-/// Whether `text` nests deeper than [`MAX_NESTING_DEPTH`], the most `jotdown` is given.
+/// Whether `text` nests deeper than [`MAX_NESTING_DEPTH`], the most `jotdown` is given,
+/// or opens a heading deeper than [`MAX_HEADING_LEVEL`], the deepest it is given: whether
+/// the parser can be handed `text` as it is.
 ///
-/// Stops at the first line past the ceiling.
+/// Stops at the first line past either. It does not measure the length of a paragraph,
+/// which decides the stack the parser needs rather than whether it can have the text:
+/// hand the text to the parser through [`parsable`], which sees to that as well.
 pub fn is_too_deep(text: &str) -> bool {
-    deepest(text, MAX_NESTING_DEPTH) > MAX_NESTING_DEPTH
+    let reach = reach(text, MAX_NESTING_DEPTH, MAX_HEADING_LEVEL, usize::MAX);
+    reach.depth > MAX_NESTING_DEPTH || reach.heading > MAX_HEADING_LEVEL
+}
+
+/// The number of lines in the longest paragraph, heading or caption of `text`, as
+/// `jotdown` 0.10 reads them: how many calls deep it may read that block's text.
+pub fn longest_leaf_lines(text: &str) -> usize {
+    reach(text, usize::MAX, usize::MAX, usize::MAX).longest_leaf
+}
+
+/// `text` made ready for `jotdown` 0.10, or `None` when its structure cannot be computed
+/// without ending the process.
+///
+/// A heading deeper than [`MAX_HEADING_LEVEL`] gets a backslash before its first `#`, a
+/// document nested deeper than [`MAX_NESTING_DEPTH`] is flattened
+/// ([`flatten_deep_indentation`]), and a block at the top level of the document holding a
+/// paragraph, heading or caption longer than [`MAX_LEAF_LINES`] is set down as its lines,
+/// one plain paragraph each, the rest of the document as it was. Each is measured again.
+/// What is still nested too deeply once flattened is `None`. Text within every limit is
+/// borrowed as it is, measured once.
+///
+/// Read what it returns through [`Parsable::events`], which gives the parser the stack
+/// its longest block needs.
+pub fn parsable(text: &str) -> Option<Parsable<'_>> {
+    let mut text = Cow::Borrowed(text);
+    let mut flattened = false;
+    let mut set_down = false;
+    // Each round escapes at least one run of more than MAX_HEADING_LEVEL `#` that no
+    // round escaped before, or flattens, once, or sets long blocks down as their lines,
+    // once. A run once escaped stays text, since flattening only takes out whitespace
+    // and setting down escapes more, and each run takes that many bytes of the text. So
+    // the rounds are at most three more than the runs the text can hold, and they end.
+    // Any round can find headings to escape, not only the first: a line that went on
+    // with a heading escaped before it can open one of its own, and so can a line whose
+    // indentation flattening cut.
+    loop {
+        let reach = reach(&text, MAX_NESTING_DEPTH, usize::MAX, MAX_LEAF_LINES);
+        if !reach.overlong_headings.is_empty() {
+            text = Cow::Owned(escape_at(&text, &reach.overlong_headings)?);
+        } else if reach.depth > MAX_NESTING_DEPTH {
+            if flattened {
+                return None;
+            }
+            text = Cow::Owned(flatten_deep_indentation(&text));
+            flattened = true;
+        } else if !reach.long_blocks.is_empty() {
+            // A block set down holds paragraphs of one line, and nothing around it
+            // changes, so a second round never finds one.
+            if set_down {
+                return None;
+            }
+            text = Cow::Owned(set_down_as_lines(&text, &reach.long_blocks)?);
+            set_down = true;
+        } else {
+            return Some(Parsable {
+                text,
+                longest_leaf: reach.longest_leaf,
+                on_the_callers_stack: OnceCell::new(),
+            });
+        }
+    }
+}
+
+/// Djot text `jotdown` 0.10 can be given, made by [`parsable`], and the length of its
+/// longest paragraph, heading or caption, which decides the stack the parser needs.
+#[derive(Debug)]
+pub struct Parsable<'a> {
+    text: Cow<'a, str>,
+    longest_leaf: usize,
+    /// `text` with every block too long to read on the caller's stack set down as its
+    /// lines: made the first time [`Parsable::events`] cannot start the thread it needs.
+    on_the_callers_stack: OnceCell<Option<String>>,
+}
+
+/// How [`Parsable::events`] runs the parser over all of a text on a thread with a stack
+/// of the given size: the events, `None` if the parser panicked, or why the thread could
+/// not be started.
+type ReadOnAThread = for<'t> fn(&'t str, usize) -> std::io::Result<Option<Vec<jotdown::Event<'t>>>>;
+
+impl Parsable<'_> {
+    /// The text the parser is given: the source, with whatever [`parsable`] changed in it.
+    ///
+    /// When [`events`](Self::events) cannot start the thread a long block needs, the
+    /// parser reads this text with those blocks set down as their lines.
+    pub fn text(&self) -> &str {
+        &self.text
+    }
+
+    /// The events `jotdown` reads from [`text`](Self::text), in order.
+    ///
+    /// When no paragraph, heading or caption is longer than 128 lines, the parser reads
+    /// them as they are asked for, on the caller's stack. Otherwise it reads them all at
+    /// once, on a thread with a stack sized for the longest (see the module note).
+    ///
+    /// If that thread cannot be started (the system refuses it a thread or the memory for
+    /// its stack), every block at the top level holding one of those longer paragraphs,
+    /// headings or captions is set down as its lines, one plain paragraph each, and the
+    /// parser reads the rest as it is written, on the caller's stack. Only those blocks
+    /// lose their formatting, and a host that saves what it shows keeps that loss.
+    ///
+    /// `None` only if the parser panicked on that thread. A caller has nothing left to
+    /// read the text's structure with then, and shows it as its lines.
+    pub fn events(&self) -> Option<DjotEvents<'_>> {
+        self.events_read_by(read_on_a_thread)
+    }
+
+    /// [`events`](Self::events), with `read` running the parser on a thread of its own
+    /// when a block is too long for the caller's stack.
+    fn events_read_by(&self, read: ReadOnAThread) -> Option<DjotEvents<'_>> {
+        let text: &str = &self.text;
+        if self.longest_leaf <= LEAF_LINES_ON_THE_CALLERS_STACK {
+            return Some(DjotEvents::streamed(text));
+        }
+        let stack = PARSER_STACK + self.longest_leaf * STACK_PER_LEAF_LINE;
+        match read(text, stack) {
+            Ok(events) => events.map(|events| DjotEvents(EventSource::Read(events.into_iter()))),
+            Err(error) => {
+                log::warn!(
+                    "no thread with a {stack}-byte stack for a Djot block of {} lines, so every \
+                     block longer than {LEAF_LINES_ON_THE_CALLERS_STACK} lines is read as its \
+                     lines: {error}",
+                    self.longest_leaf
+                );
+                self.on_the_callers_stack
+                    .get_or_init(|| set_down_long_blocks(text, LEAF_LINES_ON_THE_CALLERS_STACK))
+                    .as_deref()
+                    .map(DjotEvents::streamed)
+            }
+        }
+    }
+}
+
+/// Run the parser over all of `text` on a thread of its own with a `stack`-byte stack: its
+/// events, `None` if it panicked, or why the thread could not be started.
+fn read_on_a_thread(text: &str, stack: usize) -> std::io::Result<Option<Vec<jotdown::Event<'_>>>> {
+    std::thread::scope(|scope| {
+        let parser = std::thread::Builder::new()
+            .name("djot parser".to_owned())
+            .stack_size(stack)
+            .spawn_scoped(scope, || jotdown::Parser::new(text).collect::<Vec<_>>())?;
+        Ok(parser.join().ok())
+    })
+}
+
+/// The events of a [`Parsable`] text, from [`Parsable::events`].
+pub struct DjotEvents<'s>(EventSource<'s>);
+
+/// Where [`DjotEvents`] takes its events from.
+enum EventSource<'s> {
+    /// The parser, reading them as they are asked for.
+    Streamed(Box<jotdown::Parser<'s>>),
+    /// The events the parser read in advance, on a stack large enough for them.
+    Read(std::vec::IntoIter<jotdown::Event<'s>>),
+}
+
+impl<'s> DjotEvents<'s> {
+    /// The events of `text`, read by the parser as they are asked for.
+    fn streamed(text: &'s str) -> Self {
+        DjotEvents(EventSource::Streamed(Box::new(jotdown::Parser::new(text))))
+    }
+}
+
+impl<'s> Iterator for DjotEvents<'s> {
+    type Item = jotdown::Event<'s>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match &mut self.0 {
+            EventSource::Streamed(parser) => parser.next(),
+            EventSource::Read(events) => events.next(),
+        }
+    }
+}
+
+/// `text` with a backslash put before the byte at each of `offsets`, which ascend. `None`
+/// if one of them is not at a character's start.
+fn escape_at(text: &str, offsets: &[usize]) -> Option<String> {
+    let mut out = String::with_capacity(text.len() + offsets.len());
+    let mut from = 0;
+    for &offset in offsets {
+        out.push_str(text.get(from..offset)?);
+        out.push('\\');
+        from = offset;
+    }
+    out.push_str(text.get(from..)?);
+    Some(out)
 }
 
 /// The deepest line of `text`, read no further than the first line deeper than `limit`.
 fn deepest(text: &str, limit: usize) -> usize {
-    let mut scan = Scan::default();
+    reach(text, limit, usize::MAX, usize::MAX).depth
+}
+
+/// How far a document reaches: the most containers any line sits in, the deepest
+/// heading any line opens, where each heading deeper than [`MAX_HEADING_LEVEL`] starts,
+/// the most lines any paragraph, heading or caption runs to, and the blocks at the top
+/// level of the document holding one longer than the length [`reach`] was given.
+struct Reach {
+    depth: usize,
+    heading: usize,
+    overlong_headings: Vec<usize>,
+    longest_leaf: usize,
+    /// Each as the bytes it takes. Complete only when the scan read the whole text.
+    long_blocks: Vec<Range<usize>>,
+}
+
+/// How far `text` reaches, read no further than the first line deeper than `depth`
+/// containers or opening a heading deeper than `heading`, and which of its blocks at the
+/// top level hold a paragraph, heading or caption longer than `long_block` lines.
+fn reach(text: &str, depth: usize, heading: usize, long_block: usize) -> Reach {
+    let mut scan = Scan {
+        long_block,
+        ..Scan::default()
+    };
     let mut deepest = 0usize;
+    let mut whole = true;
     // `jotdown` reads lines with their line break, which decides a few of its
     // markers: a lone `-` ending a line opens nothing, a lone `-` ending the text
     // opens a list item.
     for line in text.split_inclusive('\n') {
-        deepest = deepest.max(scan.read(line.as_bytes(), limit));
-        if deepest > limit {
+        scan.line_end += line.len();
+        deepest = deepest.max(scan.read(line.as_bytes(), depth));
+        if deepest > depth || scan.heading > heading {
+            whole = false;
             break;
         }
     }
-    deepest
+    if whole {
+        // The last block ends with the text.
+        scan.begin_block(text.len());
+    }
+    Reach {
+        depth: deepest,
+        heading: scan.heading,
+        overlong_headings: scan.overlong_headings,
+        longest_leaf: scan.longest_leaf,
+        long_blocks: scan.long_blocks,
+    }
+}
+
+/// `text` with each block at the top level of the document that holds a paragraph,
+/// heading or caption longer than `lines` lines set down as its lines
+/// ([`set_down_as_lines`]). `None` only if a block's bounds are not at a character's
+/// start, which a line's never is.
+fn set_down_long_blocks(text: &str, lines: usize) -> Option<String> {
+    set_down_as_lines(
+        text,
+        &reach(text, usize::MAX, usize::MAX, lines).long_blocks,
+    )
+}
+
+/// `text` with each of `blocks` set down as its lines: `blocks` are the bytes of whole
+/// blocks at the top level of the document, in the order they come, and each becomes one
+/// paragraph for each of its lines that holds text. The paragraph holds that line's text
+/// as it is written, its outer whitespace aside, with a backslash in front of every ASCII
+/// punctuation character so that none of it opens anything, and a blank line comes before
+/// and after each, so that none runs into another block. `None` if a bound is not at a
+/// character's start.
+///
+/// The parser then reads each line as a paragraph of one line, whatever it opened before,
+/// and shows exactly the text `parse_djot` shows for each line of a document it cannot
+/// take at all. Every other block reads as it did: a block at the top level starts on a
+/// line that closes every container, and the blank line put in front of it closes nothing
+/// that line did not.
+fn set_down_as_lines(text: &str, blocks: &[Range<usize>]) -> Option<String> {
+    let mut out = String::with_capacity(text.len() + text.len() / 4);
+    let mut from = 0;
+    for block in blocks {
+        out.push_str(text.get(from..block.start)?);
+        out.push('\n');
+        for line in text.get(block.clone())?.lines() {
+            let line = line.trim_matches(|c: char| c.is_ascii_whitespace());
+            if line.is_empty() {
+                continue;
+            }
+            for c in line.chars() {
+                if c.is_ascii_punctuation() {
+                    out.push('\\');
+                }
+                out.push(c);
+            }
+            out.push_str("\n\n");
+        }
+        from = block.end;
+    }
+    out.push_str(text.get(from..)?);
+    Some(out)
 }
 
 /// `text` with the indentation of each line's container prefix cut to at most
@@ -157,10 +549,12 @@ fn deepest(text: &str, limit: usize) -> usize {
 /// it, so a quotation stays a quotation and an item stays an item, and every line keeps
 /// its line break.
 ///
-/// Meant for text [`is_too_deep`] refuses, before giving up on its structure. It reads
-/// each line on its own, so indentation inside a code block is its content and this
-/// cuts it too, and what it returns has to be measured again: the markers it keeps can
-/// still nest past the ceiling. It reads no more than one marker past the ceiling into
+/// Meant for text nested deeper than [`MAX_NESTING_DEPTH`], before giving up on its
+/// structure: [`parsable`] calls it once the headings it found too deep are escaped. It
+/// reads each line on its own, so indentation inside a code block is its content and
+/// this cuts it too, and what it returns has to be measured again: the markers it keeps
+/// can still nest past the ceiling, and a line it cuts out of a list's paragraph can
+/// open a heading, which [`parsable`] then escapes. It reads no more than one marker past the ceiling into
 /// a line, the most the scan opens on one, and leaves the rest of that line as it is.
 pub fn flatten_deep_indentation(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
@@ -657,11 +1051,36 @@ impl Leaf {
 }
 
 /// The containers open at the line being read, outermost first, and the block last
-/// opened inside the innermost of them.
+/// opened inside the innermost of them; and what the scan has seen so far of the
+/// headings and of the lines of the blocks `jotdown` reads as text.
 #[derive(Debug, Default)]
 struct Scan {
     frames: Vec<Frame>,
     leaf: Leaf,
+    /// The deepest heading opened so far.
+    heading: usize,
+    /// Where each heading deeper than [`MAX_HEADING_LEVEL`] starts, as a byte offset in
+    /// the text: its first `#`.
+    overlong_headings: Vec<usize>,
+    /// The byte offset in the text just past the line being read.
+    line_end: usize,
+    /// How many lines `leaf` has run to, when `jotdown` reads it as text: a paragraph, a
+    /// heading, a table's caption, or one of its rows, whose cells are a line each.
+    leaf_lines: usize,
+    /// The most lines any block `jotdown` reads as text has run to so far.
+    longest_leaf: usize,
+    /// Where the block open at the top level of the document starts, as a byte offset in
+    /// the text: the start of the line that opened it, where every container had closed.
+    block_start: usize,
+    /// The most lines a block `jotdown` reads as text has run to in that block.
+    block_longest: usize,
+    /// How many lines a block `jotdown` reads as text may run to before the block at the
+    /// top level holding it goes into `long_blocks`.
+    long_block: usize,
+    /// Each block at the top level holding a block `jotdown` reads as text longer than
+    /// `long_block` lines, as the bytes it takes: from the start of its first line to the
+    /// start of the line that opens the next block at the top level.
+    long_blocks: Vec<Range<usize>>,
 }
 
 impl Scan {
@@ -680,31 +1099,74 @@ impl Scan {
                 // A div's closing fence belongs to it and to nothing inside it.
                 self.frames.truncate(level + 1);
                 self.leaf = Leaf::None;
+                self.leaf_lines = 0;
                 return self.depth();
             }
             view = frame.strip(view);
             level += 1;
         }
+        let in_caption = matches!(self.leaf, Leaf::Table { caption: true, .. });
         if self.leaf.continues(view) {
+            match self.leaf {
+                Leaf::Paragraph | Leaf::Heading(_) => self.leaf_line(),
+                Leaf::Table { caption: true, .. } if in_caption => self.leaf_line(),
+                // Each cell of a row is a block of one line, and so is a caption's first.
+                Leaf::Table { .. } => {
+                    self.leaf_lines = 0;
+                    self.leaf_line();
+                }
+                // Read verbatim, or no block at all.
+                Leaf::None | Leaf::LinkDefinition | Leaf::Code { .. } => {}
+            }
             return self.depth();
         }
         self.open(view, limit)
     }
 
+    /// Count one more line of the block `jotdown` reads as text.
+    fn leaf_line(&mut self) {
+        self.leaf_lines += 1;
+        self.longest_leaf = self.longest_leaf.max(self.leaf_lines);
+        self.block_longest = self.block_longest.max(self.leaf_lines);
+    }
+
+    /// Start a new block at the top level of the document at byte `at`, which ends the
+    /// one before it.
+    fn begin_block(&mut self, at: usize) {
+        if self.block_longest > self.long_block {
+            self.long_blocks.push(self.block_start..at);
+        }
+        self.block_start = at;
+        self.block_longest = 0;
+    }
+
     /// Read `view` as the first line of a new block inside the innermost open
     /// container, opening every container its markers open.
     fn open(&mut self, mut view: &[u8], limit: usize) -> usize {
+        if self.frames.is_empty() {
+            // Every container has closed, so nothing stripped `view`: it is the line.
+            self.begin_block(self.line_end - view.len());
+        }
         self.leaf = Leaf::None;
+        self.leaf_lines = 0;
         while self.frames.len() <= limit {
             let (block, marker_end) = identify(view);
             match block {
                 Block::Blank | Block::Atom => break,
                 Block::Paragraph => {
                     self.leaf = Leaf::Paragraph;
+                    self.leaf_line();
                     break;
                 }
                 Block::Heading(level) => {
+                    self.heading = self.heading.max(level);
+                    if level > MAX_HEADING_LEVEL {
+                        // `view` is the end of the line, and its marks end the marker.
+                        self.overlong_headings
+                            .push(self.line_end - view.len() + marker_end - level);
+                    }
                     self.leaf = Leaf::Heading(level);
+                    self.leaf_line();
                     break;
                 }
                 Block::LinkDefinition => {
@@ -716,6 +1178,7 @@ impl Scan {
                         caption: false,
                         blank: false,
                     };
+                    self.leaf_line();
                     break;
                 }
                 Block::Fence {

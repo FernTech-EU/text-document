@@ -1,9 +1,9 @@
 //! What the editor writes, the depth guard lets through.
 //!
-//! `parse_djot` shows a document it judges too deep as one paragraph of its own Djot
-//! source, and an edit in that paragraph then saves the source back as prose, escapes
-//! and markers included, which corrupts the document for good. So the guard may refuse
-//! nothing the editor itself writes: these tests build documents through the cursor
+//! `parse_djot` shows a document it judges too deep as its own Djot source, a plain
+//! paragraph a line, and a save then keeps that source as prose, markers included, so
+//! the document's structure is lost for good. So the guard may refuse nothing the
+//! editor itself writes: these tests build documents through the cursor
 //! calls an editor's keys and menus make, save them with `to_djot`, and hold the saved
 //! Djot to the guard and to a reload.
 //!
@@ -193,6 +193,116 @@ fn every_container_nested_to_the_ceiling_reloads_on_a_spawned_thread() {
             marker.repeat(MAX_NESTING_DEPTH + 1)
         )));
     }
+}
+
+/// What a document shows once `djot` is loaded into it, a block's text at a time, and
+/// the Djot it saves as, on a spawned thread's stack.
+fn load_and_save(djot: &str) -> (Vec<String>, String) {
+    let djot = djot.to_string();
+    std::thread::Builder::new()
+        .stack_size(SPAWNED_THREAD_STACK)
+        .spawn(move || {
+            let doc = TextDocument::new();
+            doc.set_djot_sync(&djot).expect("load the Djot");
+            let shown = doc.blocks().iter().map(|block| block.text()).collect();
+            (shown, doc.to_djot().expect("save it"))
+        })
+        .expect("spawn the load thread")
+        .join()
+        .expect("the load must not unwind")
+}
+
+/// A heading of 65,536 `#` made the parser panic inside `set_djot_sync`, on the caller's
+/// own thread, which for an editor is its interface thread. It now loads as a paragraph
+/// showing the heading's line, and the rest of the document keeps its structure. Saved
+/// and loaded again, it saves the same.
+#[test]
+fn a_heading_the_parser_cannot_number_loads_as_its_text_and_saves_the_same() {
+    let hashes = "#".repeat(65_536);
+    let djot = format!("Before, _emphasis_.\n\n{hashes} Zeus\n\n- an item\n\nAfter.\n");
+    let (shown, saved) = load_and_save(&djot);
+    assert!(
+        shown
+            == [
+                "Before, emphasis.",
+                &format!("{hashes} Zeus"),
+                "an item",
+                "After."
+            ],
+        "loaded with its structure"
+    );
+    assert!(!is_too_deep(&saved), "saved as a paragraph");
+    let (shown_again, saved_again) = load_and_save(&saved);
+    assert!(shown_again == shown, "loaded again the same");
+    assert!(saved_again == saved, "saved again the same");
+}
+
+/// A document too deep for the parser loads as its lines, one paragraph each, and saves
+/// as those paragraphs, so loading and saving it again gives the same Djot. Loaded as one
+/// paragraph of its source, it saved its line breaks as they were, loaded back as the
+/// same document the parser could not take, and each save escaped its backslashes again.
+#[test]
+fn a_document_the_parser_cannot_take_loads_as_its_lines_and_saves_the_same() {
+    let deep = format!("{}deep", "- ".repeat(700));
+    let djot = format!("Before, _emphasis_.\n\n{deep}\n\nAfter.\n");
+    let (shown, saved) = load_and_save(&djot);
+    assert_eq!(shown, ["Before, _emphasis_.", deep.as_str(), "After."]);
+    assert!(!is_too_deep(&saved), "saved as paragraphs");
+    let (shown_again, saved_again) = load_and_save(&saved);
+    assert_eq!(shown_again, shown);
+    assert_eq!(saved_again, saved);
+}
+
+/// A paragraph of thousands of lines that opens an inline opener and never closes it
+/// aborted the process inside `set_djot_sync`: the parser reads each further line one
+/// call deeper while the opener waits, and a debug build ran out of a spawned thread's
+/// stack at 730 lines. It now loads with every line.
+#[test]
+fn a_long_paragraph_that_keeps_an_opener_waiting_loads_whole() {
+    let lines = 3_000;
+    for opener in ["_", "[", "`", "\"", "{_"] {
+        let (shown, _) = load_and_save(&format!("{opener}{}", "word\n".repeat(lines)));
+        assert_eq!(shown.len(), 1, "{opener:?}: one paragraph");
+        assert_eq!(shown[0].matches("word").count(), lines, "{opener:?}");
+    }
+}
+
+/// A paragraph longer than the parser is given, 16,385 lines, loads as its lines, one
+/// paragraph each, and the blocks around it keep their structure. Saved and loaded again,
+/// it saves the same. It opens an emphasis it never closes, which used to abort the
+/// process.
+#[test]
+fn a_block_too_long_for_the_parser_loads_as_its_lines_alone_and_saves_the_same() {
+    let lines = 16_385;
+    let djot = format!("- an item\n\n_{}\n> quoted\n", "word\n".repeat(lines));
+    let shown = reload_on_a_spawned_thread(&djot);
+    assert_eq!(shown.len(), lines + 2);
+    assert_eq!(shown[0].text, "an item");
+    assert!(
+        shown[0].list_indent.is_some(),
+        "the list item keeps its list"
+    );
+    assert!(
+        shown[1..=lines].iter().enumerate().all(|(line, shown)| {
+            shown.list_indent.is_none()
+                && shown.quotes == 0
+                && shown.text == if line == 0 { "_word" } else { "word" }
+        }),
+        "the long paragraph loads as its lines"
+    );
+    assert_eq!(
+        shown[lines + 1],
+        Shown {
+            text: "quoted".to_string(),
+            list_indent: None,
+            quotes: 1
+        },
+        "the quotation keeps its quote"
+    );
+    let (texts, saved) = load_and_save(&djot);
+    let (texts_again, saved_again) = load_and_save(&saved);
+    assert!(texts_again == texts, "loaded again the same");
+    assert!(saved_again == saved, "saved again the same");
 }
 
 // ── Whatever the editor writes, the guard lets through ─────────────────────────────

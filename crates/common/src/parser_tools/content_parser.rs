@@ -2408,6 +2408,33 @@ fn djot_push_block(
     }));
 }
 
+/// A Djot document whose structure cannot be computed, as its source: one plain
+/// paragraph for each line that holds text, with that line's text as it is written, its
+/// leading and trailing whitespace aside.
+///
+/// A paragraph a line is what keeps the text the same through a save. The Djot writer
+/// escapes whatever a paragraph opens with and whatever in it would read as markup, so
+/// the saved text reads back as these same paragraphs. Shown as one paragraph, the
+/// source kept its line breaks through a save, read back as the same document the parser
+/// could not take, and every save escaped its backslashes once more. Blank lines and a
+/// line's outer whitespace are left out for the same reason: the parser drops both when
+/// it reads the saved paragraphs back.
+fn djot_source_lines(djot: &str) -> Vec<ParsedElement> {
+    djot.lines()
+        .map(|line| line.trim_matches(|c: char| c.is_ascii_whitespace()))
+        .filter(|line| !line.is_empty())
+        .map(|line| {
+            ParsedElement::Block(ParsedBlock {
+                spans: vec![ParsedSpan {
+                    text: line.to_string(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            })
+        })
+        .collect()
+}
+
 /// Parse djot source into the shared [`ParsedElement`] intermediate, mirroring
 /// [`parse_markdown`]. Uses the [`jotdown`] pull parser.
 ///
@@ -2429,40 +2456,36 @@ fn djot_push_block(
 /// Known model limitations (normalised, not preserved on round-trip):
 /// ordered-list start number, table column alignment, and list tight/loose.
 pub fn parse_djot(djot: &str, options: &DjotImportOptions) -> Vec<ParsedElement> {
-    use jotdown::{Container as C, Event as E, ListKind, Parser};
+    use jotdown::{Container as C, Event as E, ListKind};
 
-    // `jotdown` descends once per nested container with no depth limit, and a
-    // stack overflow **aborts the process** — it cannot be caught by
+    // `jotdown` recurses with no limit of its own, once per nested container and
+    // once per line of a paragraph that leaves an inline opener waiting, and a
+    // stack overflow **aborts the process**: it cannot be caught by
     // `catch_unwind`, so there is no recovering from it after the fact and the
-    // only safe move is not to start. Input is not always the author's own: a
-    // project bundle is mailed and shared, and an imported document comes from
-    // whoever sent it.
+    // only safe move is not to start. It also panics on a heading deeper than it
+    // can number, which a caller on an interface thread does not survive either.
+    // Input is not always the author's own: a project bundle is mailed and
+    // shared, and an imported document comes from whoever sent it.
     //
-    // Degrade rather than refuse, so the signature stays the same and nothing is
-    // lost. When the depth comes from indentation, which is how a deeply nested
-    // list is written, the indentation is cut, the text measured again and
-    // parsed: the list comes out flattened below a fixed depth, every item and
-    // word kept (see `flatten_deep_indentation`). This used to hand back a
-    // pasted list nested two hundred levels as one paragraph of markup.
-    // Otherwise the source comes back as one plain paragraph. Its structure is
-    // not computed, which is the honest answer for a document whose structure
-    // cannot be computed without ending the process, and every character is
-    // still there for the writer to see and repair.
-    let flattened;
-    let djot = if crate::parser_tools::djot_depth::is_too_deep(djot) {
-        flattened = crate::parser_tools::djot_depth::flatten_deep_indentation(djot);
-        if crate::parser_tools::djot_depth::is_too_deep(&flattened) {
-            return vec![ParsedElement::Block(ParsedBlock {
-                spans: vec![ParsedSpan {
-                    text: djot.to_string(),
-                    ..Default::default()
-                }],
-                ..Default::default()
-            })];
-        }
-        flattened.as_str()
-    } else {
-        djot
+    // `djot_depth::parsable` is the door that keeps the parser within its limits,
+    // and it degrades rather than refuses, so the signature stays the same and no
+    // word is lost. Such a heading is escaped into text, as it was written. A
+    // document nested too deeply by its indentation, which is how a deeply nested
+    // list is written, is read with the indentation cut: the list comes out
+    // flattened below a fixed depth, every item and word kept. This used to hand
+    // back a pasted list nested two hundred levels as one paragraph of markup. A
+    // long paragraph is parsed on a stack sized for it, and the block holding one
+    // too long for any stack is shown as its lines, the rest of the document as it
+    // was.
+    //
+    // A document still nested too deeply once flattened, or one the parser panicked
+    // on, comes back as its lines, one plain paragraph each (see
+    // `djot_source_lines`). Its structure is not computed, which is the honest
+    // answer for a document whose structure cannot be computed without ending the
+    // process, and its text is still there for the writer to see and repair.
+    let parsable = crate::parser_tools::djot_depth::parsable(djot);
+    let Some(events) = parsable.as_ref().and_then(|parsable| parsable.events()) else {
+        return djot_source_lines(djot);
     };
 
     let mut elements: Vec<ParsedElement> = Vec::new();
@@ -2607,7 +2630,7 @@ pub fn parse_djot(djot: &str, options: &DjotImportOptions) -> Vec<ParsedElement>
         }};
     }
 
-    for event in Parser::new(djot) {
+    for event in events {
         if skip_depth > 0 {
             match event {
                 E::Start(..) => skip_depth += 1,

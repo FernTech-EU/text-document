@@ -454,32 +454,93 @@ fn a_multi_paragraph_body_becomes_real_multiple_text_p_elements() {
     );
 }
 
-/// A comment body nested past what the Djot parser survives is written as its own text
-/// rather than handed to the parser, which has no depth limit: a stack overflow aborts
-/// the process, and every unsaved document with it. It runs on a thread with a spawned
-/// thread's 2 MiB stack, where the 700 list levels of this body abort the parser.
+/// The `content.xml` written for a document holding one comment whose body is `body`,
+/// built on a thread with a spawned thread's 2 MiB stack.
+fn content_xml_for(body: String) -> String {
+    std::thread::Builder::new()
+        .stack_size(2 << 20)
+        .spawn(move || {
+            let (db, ev, _) = setup().expect("setup");
+            import_djot(&db, &ev, "One sentence to comment on.");
+            let range = char_range_of(&db, "One sentence");
+            let mut comments = DocumentComments::new();
+            comments.insert(comment("cmt-deep", "Editor", range, &body));
+            content_xml(&build_odt(&db, comments))
+        })
+        .expect("spawn the export thread")
+        .join()
+        .expect("the export must not unwind")
+}
+
+/// A comment body the Djot parser cannot survive is written as its own text rather than
+/// handed to the parser. Nested past what it follows, the body overflows the stack, which
+/// aborts the process and every unsaved document with it: 700 list levels on one line
+/// abort the parser on a spawned thread's stack.
 #[test]
 fn a_comment_body_too_deep_to_parse_is_exported_as_its_text() {
     let body = format!("{}deep", "- ".repeat(700));
-    let content = {
-        let body = body.clone();
-        std::thread::Builder::new()
-            .stack_size(2 << 20)
-            .spawn(move || {
-                let (db, ev, _) = setup().expect("setup");
-                import_djot(&db, &ev, "One sentence to comment on.");
-                let range = char_range_of(&db, "One sentence");
-                let mut comments = DocumentComments::new();
-                comments.insert(comment("cmt-deep", "Editor", range, &body));
-                content_xml(&build_odt(&db, comments))
-            })
-            .expect("spawn the export thread")
-            .join()
-            .expect("the export must not unwind")
-    };
     assert!(
-        content.contains(&format!("<text:p>{body}</text:p>")),
+        content_xml_for(body.clone()).contains(&format!("<text:p>{body}</text:p>")),
         "the body is written as its text, in one paragraph"
+    );
+}
+
+/// A heading of 65,536 `#` made the parser panic. The body goes through the importer's
+/// door to the parser, which puts a backslash before the first `#`, so it is written as
+/// a paragraph of its text.
+#[test]
+fn a_comment_body_with_a_heading_the_parser_cannot_number_is_exported_as_its_text() {
+    let body = format!("{} Zeus", "#".repeat(65_536));
+    assert!(content_xml_for(body.clone()).contains(&format!("<text:p>{body}</text:p>")));
+}
+
+/// A body of thousands of lines that opens an inline opener and never closes it aborted
+/// the process: the parser reads each further line one call deeper while the opener
+/// waits, and a debug build ran out of a spawned thread's stack at 730 lines. It is
+/// parsed on a stack sized for it now, and every line is written.
+#[test]
+fn a_long_comment_body_that_keeps_an_opener_waiting_is_exported_whole() {
+    let lines = 3_000;
+    let content = content_xml_for(format!("_{}", "quill\n".repeat(lines)));
+    assert_eq!(content.matches("quill").count(), lines);
+}
+
+/// A body with a paragraph longer than the parser is given, 16,385 lines, is written with
+/// that paragraph as its lines and the rest formatted as the importer reads it. That
+/// paragraph opens an emphasis it never closes, which used to abort the process.
+#[test]
+fn a_comment_body_with_a_block_too_long_for_the_parser_keeps_the_rest_formatted() {
+    let lines = 16_385;
+    let content = content_xml_for(format!("Before *strong*.\n\n_{}", "quill\n".repeat(lines)));
+    assert!(
+        content.contains("strong") && !content.contains("*strong*"),
+        "the rest is formatted"
+    );
+    assert_eq!(
+        content.matches("quill").count(),
+        lines,
+        "every line is written"
+    );
+}
+
+/// A body nested past the ceiling by its indentation is written as the importer reads
+/// it, its list flattened with every item, where it used to be written as its Djot
+/// source, a list marker in front of every item.
+#[test]
+fn a_comment_body_nested_by_indentation_is_exported_flattened() {
+    let body: String = (0..300)
+        .map(|level| format!("{}- item {level}\n\n", "  ".repeat(level)))
+        .collect();
+    let content = content_xml_for(body);
+    for level in [0, 150, 299] {
+        assert!(
+            content.contains(&format!("<text:p>item {level}</text:p>")),
+            "item {level}"
+        );
+    }
+    assert!(
+        !content.contains("- item"),
+        "no list marker is written as text"
     );
 }
 

@@ -478,15 +478,18 @@ fn annotation_open_xml(
 /// event at all (both fall through its catch-all `_ => {}` arm), which is a gap that function's
 /// own one-paragraph-per-body constraint mostly hides; this writer has no reason to repeat it.
 fn render_comment_body_odt(djot: &str, styles: &mut OdtStyleSheet) -> String {
-    use jotdown::{Container as C, Event as E, Parser};
+    use jotdown::{Container as C, Event as E};
 
-    // `jotdown` has no depth limit and a stack overflow aborts the process, so a body
-    // nested past what `parse_djot` would parse is never handed to it: it is set down as
-    // the text it is, one paragraph broken at each of its lines, as `parse_djot` degrades
-    // a document.
-    if common::parser_tools::djot_depth::is_too_deep(djot) {
+    // `jotdown` recurses with no limit of its own and a stack overflow aborts the process,
+    // and it panics on a heading deeper than it can number, so the body goes through the
+    // same door as `parse_djot`: escaped, flattened, a block too long for any stack set
+    // down as its lines and the rest parsed on a large enough stack, as `parse_djot`
+    // would parse it. A body that door turns away is set down as the text it
+    // is, one paragraph broken at each of its lines.
+    let parsable = common::parser_tools::djot_depth::parsable(djot);
+    let Some(events) = parsable.as_ref().and_then(|parsable| parsable.events()) else {
         return format!("<text:p>{}</text:p>", odt_render::encode_run_text(djot));
-    }
+    };
 
     let mut paragraphs: Vec<String> = Vec::new();
     let mut current = String::new();
@@ -533,7 +536,7 @@ fn render_comment_body_odt(djot: &str, styles: &mut OdtStyleSheet) -> String {
         };
     }
 
-    for event in Parser::new(djot) {
+    for event in events {
         match event {
             E::Start(C::Paragraph, _) | E::Start(C::Heading { .. }, _) => {}
             E::End(C::Paragraph) | E::End(C::Heading { .. }) => {
