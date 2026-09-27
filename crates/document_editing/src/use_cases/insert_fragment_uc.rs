@@ -8,8 +8,8 @@ use anyhow::{Result, anyhow};
 use common::database::CommandUnitOfWork;
 use common::database::rope_helpers::{
     block_char_length, rope_append_block, rope_delete_in_block, rope_insert_block_at,
-    rope_insert_block_boundary, rope_insert_in_block, rope_insert_table_anchor, rope_split_block,
-    top_level_frame_end_byte,
+    rope_insert_block_boundary, rope_insert_blocks_at, rope_insert_in_block,
+    rope_insert_table_anchor, rope_split_block, rope_split_block_into, top_level_frame_end_byte,
 };
 use common::direct_access::document::document_repository::DocumentRelationshipField;
 use common::direct_access::frame::frame_repository::FrameRelationshipField;
@@ -41,19 +41,23 @@ pub trait InsertFragmentUnitOfWorkFactoryTrait: Send + Sync {
 #[macros::uow_action(entity = "Document", action = "GetRelationship")]
 #[macros::uow_action(entity = "Document", action = "Snapshot")]
 #[macros::uow_action(entity = "Document", action = "Restore")]
+#[macros::uow_action(entity = "Document", action = "SetRelationship")]
 #[macros::uow_action(entity = "Frame", action = "Get")]
 #[macros::uow_action(entity = "Frame", action = "Update")]
 #[macros::uow_action(entity = "Frame", action = "GetRelationship")]
+#[macros::uow_action(entity = "Frame", action = "SetRelationship")]
 #[macros::uow_action(entity = "Block", action = "Get")]
 #[macros::uow_action(entity = "Block", action = "GetMulti")]
 #[macros::uow_action(entity = "Block", action = "Update")]
 #[macros::uow_action(entity = "Block", action = "UpdateMulti")]
 #[macros::uow_action(entity = "Block", action = "UpdateWithRelationships")]
 #[macros::uow_action(entity = "Block", action = "Create")]
+#[macros::uow_action(entity = "Block", action = "CreateOrphan")]
 #[macros::uow_action(entity = "Block", action = "GetRelationship")]
 #[macros::uow_action(entity = "Block", action = "Remove")]
 #[macros::uow_action(entity = "List", action = "Get")]
 #[macros::uow_action(entity = "List", action = "Create")]
+#[macros::uow_action(entity = "List", action = "CreateOrphan")]
 #[macros::uow_action(entity = "Frame", action = "Create")]
 #[macros::uow_action(entity = "Table", action = "Get")]
 #[macros::uow_action(entity = "Table", action = "Create")]
@@ -389,6 +393,46 @@ fn collect_all_blocks_with_frame(
         }
     }
     Ok(())
+}
+
+/// Give `frame_id` the blocks created for it without an owner, in one write,
+/// where creating each one with `create_block(.., frame_id, index)` would have
+/// put it: at `index` when that falls inside the frame's list, at its end
+/// otherwise. Pass `usize::MAX` to append. The blocks form one run either way,
+/// because each block created that way lands right after the one before it.
+///
+/// Creating the blocks with their owner rewrites, re-validates and announces
+/// the frame's whole list once per block, so pasting or restoring a document
+/// of N paragraphs cost N(N+1)/2 of those.
+fn attach_blocks_at(
+    uow: &mut Box<dyn InsertFragmentUnitOfWorkTrait>,
+    frame_id: EntityId,
+    index: usize,
+    block_ids: &[EntityId],
+) -> Result<()> {
+    if block_ids.is_empty() {
+        return Ok(());
+    }
+    let mut blocks = uow.get_frame_relationship(&frame_id, &FrameRelationshipField::Blocks)?;
+    let at = index.min(blocks.len());
+    blocks.splice(at..at, block_ids.iter().copied());
+    uow.set_frame_relationship(&frame_id, &FrameRelationshipField::Blocks, &blocks)
+}
+
+/// Append the lists created without an owner to the document's `lists`, in one
+/// write and in creation order, as creating each one with the document as its
+/// owner would have. See [`attach_blocks_at`].
+fn attach_lists(
+    uow: &mut Box<dyn InsertFragmentUnitOfWorkTrait>,
+    doc_id: EntityId,
+    list_ids: &[EntityId],
+) -> Result<()> {
+    if list_ids.is_empty() {
+        return Ok(());
+    }
+    let mut lists = uow.get_document_relationship(&doc_id, &DocumentRelationshipField::Lists)?;
+    lists.extend_from_slice(list_ids);
+    uow.set_document_relationship(&doc_id, &DocumentRelationshipField::Lists, &lists)
 }
 
 /// Build a mapping from block_id → (cell_frame_id, table_id) for all tables in the document.
@@ -939,6 +983,34 @@ fn build_tail_state(
     }
 }
 
+/// Hand the blocks `insert_mixed_fragment` created since its last flush to
+/// their frame, appended as creating each with `create_block(.., frame_id, -1)`
+/// would have, and to the rope at `next_rope_byte`, which then moves past them,
+/// as inserting each with `rope_insert_block_at` would have. With no rope
+/// position (the head block is not in the rope) the rope is left alone, as
+/// before. Empties `pending`.
+fn flush_pending_blocks(
+    uow: &mut Box<dyn InsertFragmentUnitOfWorkTrait>,
+    frame_id: EntityId,
+    next_rope_byte: &mut Option<u32>,
+    pending: &mut Vec<(EntityId, String)>,
+) -> Result<()> {
+    if pending.is_empty() {
+        return Ok(());
+    }
+    let block_ids: Vec<EntityId> = pending.iter().map(|(id, _)| *id).collect();
+    attach_blocks_at(uow, frame_id, usize::MAX, &block_ids)?;
+    if let Some(byte) = next_rope_byte.as_mut() {
+        let run: Vec<(EntityId, &str)> = pending
+            .iter()
+            .map(|(id, text)| (*id, text.as_str()))
+            .collect();
+        *byte = rope_insert_blocks_at(&uow.store(), *byte, &run);
+    }
+    pending.clear();
+    Ok(())
+}
+
 /// Insert a mixed fragment (both blocks and tables) at the cursor position.
 ///
 /// Handles a paste containing BOTH blocks and tables interleaved (e.g.
@@ -1085,12 +1157,17 @@ fn insert_mixed_fragment(
     let (head_plain, head_inline) =
         build_head_state(&text_before, &left, merge_first, overwrite_head, first_fb);
 
+    // Lists created below, handed to the document in one write at the end
+    // (see `attach_lists`).
+    let mut new_list_ids: Vec<EntityId> = Vec::new();
+
     let mut updated_current = current_block.clone();
     if overwrite_head {
         let fb = first_fb.unwrap();
         let head_list_id = if let Some(ref frag_list) = fb.list {
             let list = frag_list.to_entity();
-            let created_list = uow.create_list(&list, doc_id, -1)?;
+            let created_list = uow.create_orphan_list(&list)?;
+            new_list_ids.push(created_list.id);
             Some(created_list.id)
         } else {
             None
@@ -1178,6 +1255,12 @@ fn insert_mixed_fragment(
         );
     }
 
+    // Blocks created since the last table, not yet in the frame's `blocks`
+    // nor in the rope: both receive the whole run in one write when a table
+    // needs them (its rope placement reads the frame's blocks and the rope)
+    // and after the tail. See `attach_blocks_at` and `rope_insert_blocks_at`.
+    let mut pending: Vec<(EntityId, String)> = Vec::new();
+
     for item in &items {
         match item {
             FragItem::Block(frag_block) => {
@@ -1202,7 +1285,8 @@ fn insert_mixed_fragment(
                         Some(existing_id)
                     } else {
                         let list = frag_list.to_entity();
-                        let created_list = uow.create_list(&list, doc_id, -1)?;
+                        let created_list = uow.create_orphan_list(&list)?;
+                        new_list_ids.push(created_list.id);
                         list_grouper.register(
                             created_list.id,
                             frag_list.style.clone(),
@@ -1242,18 +1326,12 @@ fn insert_mixed_fragment(
                     fmt_language: frag_block.language.clone(),
                 };
 
-                let created_block = uow.create_block(&new_block, frame_id, -1)?;
+                let created_block = uow.create_orphan_block(&new_block)?;
                 write_block_state(uow, created_block.id, inline_runs);
 
-                // ── Rope mirror: middle block ──
-                if let Some(next_rope_byte) = next_rope_byte_opt.as_mut() {
-                    common::database::rope_helpers::rope_insert_block_at(
-                        &store,
-                        *next_rope_byte,
-                        created_block.id,
-                        &frag_block.plain_text,
-                    );
-                    *next_rope_byte += 1 + frag_block.plain_text.len() as u32;
+                // ── Rope mirror: middle block ── (written with the run)
+                pending.push((created_block.id, frag_block.plain_text.clone()));
+                if next_rope_byte_opt.is_some() {
                     last_block_id = created_block.id;
                     last_block_has_content = !frag_block.plain_text.is_empty();
                 }
@@ -1267,6 +1345,7 @@ fn insert_mixed_fragment(
                 if frag_table.rows == 0 || frag_table.columns == 0 || frag_table.cells.is_empty() {
                     continue;
                 }
+                flush_pending_blocks(uow, frame_id, &mut next_rope_byte_opt, &mut pending)?;
 
                 let table = Table {
                     id: 0,
@@ -1591,22 +1670,15 @@ fn insert_mixed_fragment(
             },
         };
 
-        let created_tail = uow.create_block(&tail_block, frame_id, -1)?;
+        let created_tail = uow.create_orphan_block(&tail_block)?;
         // Use the pre-computed char count rather than re-reading from the
         // rope (the rope insert below hasn't happened yet, so a fresh
         // `block_char_length(&created_tail)` would return 0).
         tail_text_len = tail_text_length;
         write_block_state(uow, created_tail.id, tail_inline);
 
-        // ── Rope mirror: tail block ──
-        if let Some(next_rope_byte) = next_rope_byte_opt {
-            common::database::rope_helpers::rope_insert_block_at(
-                &store,
-                next_rope_byte,
-                created_tail.id,
-                &tail_plain,
-            );
-        }
+        // ── Rope mirror: tail block ── (written with the run)
+        pending.push((created_tail.id, tail_plain.clone()));
 
         new_child_order_entries.push(created_tail.id as i64);
         total_blocks_added += 1;
@@ -1614,14 +1686,15 @@ fn insert_mixed_fragment(
     if last_frag.is_some() {
         total_new_chars += last_chars;
     }
+    flush_pending_blocks(uow, frame_id, &mut next_rope_byte_opt, &mut pending)?;
+    attach_lists(uow, doc_id, &new_list_ids)?;
 
     let mut updated_frame = frame.clone();
     let child_order_insert_pos = (block_idx + 1).min(updated_frame.child_order.len());
-    for (i, entry) in new_child_order_entries.iter().enumerate() {
-        updated_frame
-            .child_order
-            .insert(child_order_insert_pos + i, *entry);
-    }
+    updated_frame.child_order.splice(
+        child_order_insert_pos..child_order_insert_pos,
+        new_child_order_entries.iter().copied(),
+    );
     updated_frame.updated_at = now;
     updated_frame.blocks =
         uow.get_frame_relationship(&frame_id, &FrameRelationshipField::Blocks)?;
@@ -1933,6 +2006,9 @@ fn execute_insert_fragment(
                 list_entity.indent as u32,
             );
         }
+        // Lists created below, handed to the document in one write at the end
+        // (see `attach_lists`).
+        let mut new_list_ids: Vec<EntityId> = Vec::new();
 
         let mut updated_current = current_block.clone();
         if overwrite_head {
@@ -1943,7 +2019,8 @@ fn execute_insert_fragment(
                     Some(existing_id)
                 } else {
                     let list = frag_list.to_entity();
-                    let created_list = uow.create_list(&list, doc_id, -1)?;
+                    let created_list = uow.create_orphan_list(&list)?;
+                    new_list_ids.push(created_list.id);
                     list_grouper.register(
                         created_list.id,
                         frag_list.style.clone(),
@@ -2023,7 +2100,8 @@ fn execute_insert_fragment(
                     Some(existing_id)
                 } else {
                     let list = frag_list.to_entity();
-                    let created_list = uow.create_list(&list, doc_id, -1)?;
+                    let created_list = uow.create_orphan_list(&list)?;
+                    new_list_ids.push(created_list.id);
                     list_grouper.register(
                         created_list.id,
                         frag_list.style.clone(),
@@ -2063,8 +2141,8 @@ fn execute_insert_fragment(
                 fmt_language: frag_block.language.clone(),
             };
 
-            let insert_index = (block_idx + 1 + new_block_ids.len()) as i32;
-            let created_block = uow.create_block(&new_block, frame_id, insert_index)?;
+            // The frame receives every new block in one write, below.
+            let created_block = uow.create_orphan_block(&new_block)?;
             write_block_state(uow, created_block.id, inline_runs);
 
             middle_block_payload.push((created_block.id, frag_block.plain_text.clone()));
@@ -2195,24 +2273,24 @@ fn execute_insert_fragment(
                 },
             };
 
-            let tail_insert_index = (block_idx + 1 + new_block_ids.len()) as i32;
-            let created_tail = uow.create_block(&tail_block, frame_id, tail_insert_index)?;
+            let created_tail = uow.create_orphan_block(&tail_block)?;
             tail_text_len = tail_text_length;
             created_tail_id = Some(created_tail.id);
             write_block_state(uow, created_tail.id, tail_inline);
         }
 
+        // The middle blocks, then the tail, right after the current block.
+        let mut inserted_ids = new_block_ids.clone();
+        inserted_ids.extend(created_tail_id);
+        attach_blocks_at(uow, frame_id, block_idx + 1, &inserted_ids)?;
+        attach_lists(uow, doc_id, &new_list_ids)?;
+
         let mut updated_frame = frame.clone();
         let child_order_insert_pos = (block_idx + 1).min(updated_frame.child_order.len());
-        let mut new_child_ids: Vec<i64> = new_block_ids.iter().map(|id| *id as i64).collect();
-        if let Some(tid) = created_tail_id {
-            new_child_ids.push(tid as i64);
-        }
-        for (i, id) in new_child_ids.iter().enumerate() {
-            updated_frame
-                .child_order
-                .insert(child_order_insert_pos + i, *id);
-        }
+        updated_frame.child_order.splice(
+            child_order_insert_pos..child_order_insert_pos,
+            inserted_ids.iter().map(|id| *id as i64),
+        );
         updated_frame.updated_at = now;
         updated_frame.blocks =
             uow.get_frame_relationship(&frame_id, &FrameRelationshipField::Blocks)?;
@@ -2249,28 +2327,17 @@ fn execute_insert_fragment(
                 rope_insert_in_block(&store, current_block.id, byte_offset, head_extra);
             }
 
-            // 2. For each middle block: split off after the previous
-            //    block (which currently has no successor blocks yet
-            //    inside the rope), then fill its content.
-            let mut prev_block_id = current_block.id;
-            let mut prev_block_byte_len = head_plain.len() as u32;
-            for (created_id, frag_plain) in &middle_block_payload {
-                rope_split_block(&store, prev_block_id, prev_block_byte_len, *created_id);
-                if !frag_plain.is_empty() {
-                    rope_insert_in_block(&store, *created_id, 0, frag_plain);
-                }
-                prev_block_id = *created_id;
-                prev_block_byte_len = frag_plain.len() as u32;
-            }
-
-            // 3. If a tail block was created, split off after the
-            //    last block and insert tail_plain.
+            // 2. Each middle block, then the tail if one was created, is
+            //    split off after the block before it and filled with its
+            //    content, all in one rope insert.
+            let mut run: Vec<(EntityId, &str)> = middle_block_payload
+                .iter()
+                .map(|(created_id, frag_plain)| (*created_id, frag_plain.as_str()))
+                .collect();
             if let Some(tail_id) = created_tail_id {
-                rope_split_block(&store, prev_block_id, prev_block_byte_len, tail_id);
-                if !tail_plain.is_empty() {
-                    rope_insert_in_block(&store, tail_id, 0, &tail_plain);
-                }
+                run.push((tail_id, tail_plain.as_str()));
             }
+            rope_split_block_into(&store, current_block.id, head_plain.len() as u32, &run);
             let _ = rope_append_block; // silence unused-import warning for variants used elsewhere
             let _ = rope_insert_block_boundary;
         }

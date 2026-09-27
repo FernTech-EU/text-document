@@ -1,5 +1,7 @@
 //! Read-only block (paragraph) handle.
 
+use std::cell::{Cell, OnceCell};
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use parking_lot::Mutex;
@@ -315,7 +317,12 @@ impl TextBlock {
     /// overlay. Equivalent to the pre-overlay behaviour of `fragments()`.
     pub fn display_fragments(&self) -> Vec<FragmentContent> {
         let inner = self.doc.lock();
-        let fragments = build_raw_fragments(&inner, self.block_id as u64, None);
+        let fragments = build_raw_fragments(
+            &inner,
+            self.block_id as u64,
+            None,
+            &SnapshotLookups::default(),
+        );
         // The fully-merged visual view: every session, regardless of the paint-vs-metric
         // split the optimized path draws on.
         let spans = crate::highlight::merged_spans_for_block(
@@ -433,6 +440,7 @@ impl TextBlock {
 
 /// Find the parent frame of a block by scanning all frames.
 pub(crate) fn find_parent_frame(inner: &TextDocumentInner, block_id: u64) -> Option<EntityId> {
+    whole_document_read();
     let all_frames = frame_commands::get_all_frame(&inner.ctx).ok()?;
     let block_entity_id = block_id as EntityId;
     for frame in &all_frames {
@@ -460,6 +468,7 @@ fn find_table_cell_context(inner: &TextDocumentInner, block_id: u64) -> Option<T
     if document_has_no_tables(inner) {
         return None;
     }
+    whole_document_read();
     let frame_id = find_parent_frame(inner, block_id)?;
 
     let frame_dto = frame_commands::get_frame(&inner.ctx, &frame_id)
@@ -511,6 +520,271 @@ fn find_table_cell_context(inner: &TextDocumentInner, block_id: u64) -> Option<T
     None
 }
 
+/// Whole-document facts a block snapshot reads, each worked out at most once per snapshot
+/// and then shared by every block it covers.
+///
+/// A list item's number, the frame that lists a block, the table cell it sits in, what a
+/// footnote reference prints and the document's default language are facts about the
+/// whole document: finding one for a single block walks every block, frame, table or note
+/// in the store. A flow snapshot used to repeat that walk for every block, so its cost grew
+/// with the square of the text: opening a long document holding a list, a table or
+/// footnotes froze the editor for seconds, and every keystroke that took a new snapshot
+/// paid it again. The answers here are the ones the per-block walks give.
+///
+/// The three facts that differ from block to block (its parent frame, its table cell, its
+/// list number) are indexed only once a second block asks: see [`OnSecondAsk`]. The other
+/// three are one value for the whole document, kept from the first ask.
+///
+/// Lives for one hold of the document lock, like the snapshot it serves.
+#[derive(Default)]
+pub(crate) struct SnapshotLookups {
+    frames: OnSecondAsk<FrameLookup>,
+    cells: OnSecondAsk<CellLookup>,
+    list_item_indices: OnSecondAsk<HashMap<(EntityId, EntityId), usize>>,
+    default_language: OnceCell<Option<String>>,
+    footnote_markers: OnceCell<HashMap<String, String>>,
+    self_footnote_numbers: OnceCell<HashMap<String, usize>>,
+}
+
+/// An index over the whole document, built only once a second question needs it.
+///
+/// The first question is answered by the walk that serves one block, which costs less than
+/// building the index, so a snapshot of a single block (the incremental relayout path, a
+/// code editor's visible rows) costs what it did before. A second question means more are
+/// coming, and the index then answers every one of them for the price of one more walk.
+struct OnSecondAsk<T> {
+    asked: Cell<bool>,
+    index: OnceCell<T>,
+}
+
+impl<T> Default for OnSecondAsk<T> {
+    fn default() -> Self {
+        Self {
+            asked: Cell::new(false),
+            index: OnceCell::new(),
+        }
+    }
+}
+
+impl<T> OnSecondAsk<T> {
+    /// `None` on the first ask, which the caller answers with its one-block walk; the
+    /// index, built with `build` if need be, on every later one.
+    fn get(&self, build: impl FnOnce() -> T) -> Option<&T> {
+        if let Some(index) = self.index.get() {
+            return Some(index);
+        }
+        if !self.asked.replace(true) {
+            return None;
+        }
+        Some(self.index.get_or_init(build))
+    }
+
+    /// The index, built with `build` if need be, whatever was asked before: for a question
+    /// that already had its own first ask.
+    fn force(&self, build: impl FnOnce() -> T) -> &T {
+        self.asked.set(true);
+        self.index.get_or_init(build)
+    }
+}
+
+/// Mark one read of a whole-document fact on the snapshot path: a walk of every block,
+/// frame, table or note, or a copy of a document-wide list. Unit tests count them, which is
+/// how `tests::a_flow_snapshot_reads_each_whole_document_fact_a_fixed_number_of_times`
+/// guards the snapshot's cost in the debug builds CI tests with, where timing it cannot.
+fn whole_document_read() {
+    #[cfg(test)]
+    tests::WHOLE_DOCUMENT_READS.with(|reads| reads.set(reads.get() + 1));
+}
+
+/// Every frame's blocks and table, from one pass over the frames.
+struct FrameLookup {
+    /// The frame [`find_parent_frame`] names for each block: the first frame, in the
+    /// store's order, whose `blocks` list it.
+    parent_of_block: HashMap<EntityId, EntityId>,
+    /// Each frame's `table` field.
+    table_of_frame: HashMap<EntityId, Option<EntityId>>,
+}
+
+impl FrameLookup {
+    fn build(inner: &TextDocumentInner) -> Self {
+        whole_document_read();
+        let all_frames = frame_commands::get_all_frame(&inner.ctx).unwrap_or_default();
+        let mut parent_of_block = HashMap::new();
+        let mut table_of_frame = HashMap::with_capacity(all_frames.len());
+        for frame in &all_frames {
+            for &block_id in &frame.blocks {
+                parent_of_block.entry(block_id).or_insert(frame.id);
+            }
+            table_of_frame.insert(frame.id, frame.table);
+        }
+        Self {
+            parent_of_block,
+            table_of_frame,
+        }
+    }
+}
+
+/// Every table cell's coordinates, from one pass over the tables, keyed the two ways
+/// [`find_table_cell_context`] searches for a cell frame.
+struct CellLookup {
+    tables: HashSet<EntityId>,
+    /// The first cell in `table`'s own list whose frame is `frame`, by `(table, frame)`.
+    in_table: HashMap<(EntityId, EntityId), TableCellContext>,
+    /// The first cell whose frame is `frame`, tables in the store's order, by frame.
+    anywhere: HashMap<EntityId, TableCellContext>,
+}
+
+impl CellLookup {
+    fn build(inner: &TextDocumentInner) -> Self {
+        whole_document_read();
+        let all_tables =
+            frontend::commands::table_commands::get_all_table(&inner.ctx).unwrap_or_default();
+        let mut tables = HashSet::with_capacity(all_tables.len());
+        let mut in_table = HashMap::new();
+        let mut anywhere = HashMap::new();
+        for table_dto in &all_tables {
+            tables.insert(table_dto.id);
+            for &cell_id in &table_dto.cells {
+                let Some(cell_dto) =
+                    frontend::commands::table_cell_commands::get_table_cell(&inner.ctx, &{
+                        cell_id
+                    })
+                    .ok()
+                    .flatten()
+                else {
+                    continue;
+                };
+                let Some(frame_id) = cell_dto.cell_frame else {
+                    continue;
+                };
+                let context = TableCellContext {
+                    table_id: table_dto.id as usize,
+                    row: to_usize(cell_dto.row),
+                    column: to_usize(cell_dto.column),
+                };
+                in_table
+                    .entry((table_dto.id, frame_id))
+                    .or_insert_with(|| context.clone());
+                anywhere.entry(frame_id).or_insert(context);
+            }
+        }
+        Self {
+            tables,
+            in_table,
+            anywhere,
+        }
+    }
+}
+
+impl SnapshotLookups {
+    /// The frame whose `blocks` list `block_id`: [`find_parent_frame`]'s answer.
+    fn parent_frame(&self, inner: &TextDocumentInner, block_id: u64) -> Option<EntityId> {
+        match self.frames.get(|| FrameLookup::build(inner)) {
+            Some(frames) => frames.parent_of_block.get(&block_id).copied(),
+            None => find_parent_frame(inner, block_id),
+        }
+    }
+
+    /// The table cell `block_id` sits in: [`find_table_cell_context`]'s answer.
+    fn table_cell_context(
+        &self,
+        inner: &TextDocumentInner,
+        block_id: u64,
+    ) -> Option<TableCellContext> {
+        if document_has_no_tables(inner) {
+            return None;
+        }
+        let Some(cells) = self.cells.get(|| CellLookup::build(inner)) else {
+            return find_table_cell_context(inner, block_id);
+        };
+        let frames = self.frames.force(|| FrameLookup::build(inner));
+        let frame_id = *frames.parent_of_block.get(&block_id)?;
+        // A frame naming a table is looked for in that table first, and a table it names
+        // that no longer exists ends the search, as in the one-block walk.
+        if let Some(Some(table_id)) = frames.table_of_frame.get(&frame_id) {
+            if !cells.tables.contains(table_id) {
+                return None;
+            }
+            if let Some(context) = cells.in_table.get(&(*table_id, frame_id)) {
+                return Some(context.clone());
+            }
+        }
+        cells.anywhere.get(&frame_id).cloned()
+    }
+
+    /// `block_id`'s 0-based index among `list_id`'s blocks: [`compute_list_item_index`]'s
+    /// answer.
+    fn list_item_index(
+        &self,
+        inner: &TextDocumentInner,
+        list_id: EntityId,
+        block_id: u64,
+    ) -> usize {
+        let build = || {
+            whole_document_read();
+            let mut all_blocks = block_commands::get_all_block(&inner.ctx).unwrap_or_default();
+            let store = inner.ctx.db_context.get_store();
+            crate::inner::refresh_block_positions(&mut all_blocks, store);
+            // Each list's blocks in the order the store gives them, then sorted stably by
+            // position: the order the one-block walk sorts each list into.
+            let mut members: HashMap<EntityId, Vec<(i64, EntityId)>> = HashMap::new();
+            for block in &all_blocks {
+                if let Some(list) = block.list {
+                    members
+                        .entry(list)
+                        .or_default()
+                        .push((block.document_position, block.id));
+                }
+            }
+            let mut indices = HashMap::new();
+            for (list, mut blocks) in members {
+                blocks.sort_by_key(|&(position, _)| position);
+                for (index, (_, id)) in blocks.into_iter().enumerate() {
+                    indices.entry((list, id)).or_insert(index);
+                }
+            }
+            indices
+        };
+        match self.list_item_indices.get(build) {
+            Some(indices) => indices.get(&(list_id, block_id)).copied().unwrap_or(0),
+            None => compute_list_item_index(inner, list_id, block_id),
+        }
+    }
+
+    /// The language a block that sets none inherits: the document's default.
+    fn default_language(&self, inner: &TextDocumentInner) -> Option<String> {
+        self.default_language
+            .get_or_init(|| {
+                whole_document_read();
+                document_commands::get_document(&inner.ctx, &inner.document_id)
+                    .ok()
+                    .flatten()
+                    .and_then(|d| d.default_language)
+            })
+            .clone()
+    }
+
+    /// What the host says each footnote label prints.
+    fn footnote_markers(&self, inner: &TextDocumentInner) -> &HashMap<String, String> {
+        self.footnote_markers.get_or_init(|| {
+            whole_document_read();
+            inner
+                .ctx
+                .db_context
+                .get_store()
+                .footnote_markers
+                .read()
+                .clone()
+        })
+    }
+
+    /// Every footnote label's number in the document's own reading order.
+    fn self_footnote_numbers(&self, inner: &TextDocumentInner) -> &HashMap<String, usize> {
+        self.self_footnote_numbers
+            .get_or_init(|| document_self_footnote_numbers(inner.ctx.db_context.get_store()))
+    }
+}
+
 /// Compute 0-indexed block number by scanning all blocks sorted by document_position.
 fn compute_block_number(inner: &TextDocumentInner, block_id: u64) -> usize {
     let mut all_blocks = block_commands::get_all_block(&inner.ctx).unwrap_or_default();
@@ -533,6 +807,7 @@ pub(crate) fn build_fragments(inner: &TextDocumentInner, block_id: u64) -> Vec<F
             mask: &crate::highlight::HighlightMask::ALL,
             suppress_paint: false,
         },
+        &SnapshotLookups::default(),
     )
 }
 
@@ -546,8 +821,9 @@ pub(crate) fn build_fragments_with_text(
     block_id: u64,
     prefetched_text: Option<&str>,
     hl: crate::highlight::SnapshotHighlights,
+    lookups: &SnapshotLookups,
 ) -> Vec<FragmentContent> {
-    let fragments = build_raw_fragments(inner, block_id, prefetched_text);
+    let fragments = build_raw_fragments(inner, block_id, prefetched_text, lookups);
 
     // Only merge highlights into the shaping input when the effective kind is
     // metric-affecting. Paint-only sessions keep fragments as BASE and carry their spans
@@ -591,6 +867,7 @@ pub(crate) fn build_fragments_with_text(
 fn document_self_footnote_numbers(
     store: &common::database::Store,
 ) -> std::collections::HashMap<String, usize> {
+    whole_document_read();
     let definition_blocks: std::collections::HashSet<common::types::EntityId> = store
         .frames
         .read()
@@ -648,6 +925,7 @@ fn build_raw_fragments(
     inner: &TextDocumentInner,
     block_id: u64,
     prefetched_text: Option<&str>,
+    lookups: &SnapshotLookups,
 ) -> Vec<FragmentContent> {
     let _block_dto = match block_commands::get_block(&inner.ctx, &block_id)
         .ok()
@@ -670,7 +948,7 @@ fn build_raw_fragments(
         }
     };
 
-    let (runs, images, notes, markers) = {
+    let (runs, images, notes) = {
         let store = inner.ctx.db_context.get_store();
         let runs: Vec<FormatRun> = store
             .format_runs
@@ -690,15 +968,7 @@ fn build_raw_fragments(
             .get(&block_id)
             .cloned()
             .unwrap_or_default();
-        // What the host says each label prints. Read once per block rather than
-        // per reference: it is a whole-document fact, and a block with three
-        // notes in it would otherwise take three locks to learn the same thing.
-        let markers = if notes.is_empty() {
-            std::collections::HashMap::new()
-        } else {
-            store.footnote_markers.read().clone()
-        };
-        (runs, images, notes, markers)
+        (runs, images, notes)
     };
 
     // One shared weave of runs + anchors (see
@@ -710,11 +980,6 @@ fn build_raw_fragments(
 
     let mut fragments = Vec::with_capacity(pieces.len());
     let mut char_offset: usize = 0;
-    // Lazily computed — the common case (a host that manages its own
-    // numbering, like Skribisto, always pushes a full marker map before any
-    // document paints) never runs a whole-document scan just to draw one
-    // block.
-    let mut self_numbers: Option<std::collections::HashMap<String, usize>> = None;
 
     for piece in pieces {
         match piece {
@@ -751,15 +1016,24 @@ fn build_raw_fragments(
                     // only for a reference that resolves in neither, the raw
                     // label — visible and traceable rather than a blank
                     // marker, matching `Footnotes::marker`'s own last resort.
-                    marker: markers.get(&note.label).cloned().unwrap_or_else(|| {
-                        self_numbers
-                            .get_or_insert_with(|| {
-                                document_self_footnote_numbers(inner.ctx.db_context.get_store())
-                            })
-                            .get(&note.label)
-                            .map(|n| n.to_string())
-                            .unwrap_or_else(|| note.label.clone())
-                    }),
+                    //
+                    // Both maps are whole-document facts, read once per
+                    // snapshot (see `SnapshotLookups`), and the reading-order
+                    // count only when a reference has no marker: the common
+                    // case (a host that manages its own numbering, like
+                    // Skribisto, always pushes a full marker map before any
+                    // document paints) never runs that scan.
+                    marker: lookups
+                        .footnote_markers(inner)
+                        .get(&note.label)
+                        .cloned()
+                        .unwrap_or_else(|| {
+                            lookups
+                                .self_footnote_numbers(inner)
+                                .get(&note.label)
+                                .map(|n| n.to_string())
+                                .unwrap_or_else(|| note.label.clone())
+                        }),
                     format: TextFormat::from(&note.format),
                     offset: char_offset,
                     element_id: synth_element_id(block_id, note.byte_offset),
@@ -827,6 +1101,7 @@ fn compute_word_starts(text: &str) -> Vec<u8> {
 
 /// Compute 0-based index of a block within its list.
 fn compute_list_item_index(inner: &TextDocumentInner, list_id: EntityId, block_id: u64) -> usize {
+    whole_document_read();
     let mut all_blocks = block_commands::get_all_block(&inner.ctx).unwrap_or_default();
     let store = inner.ctx.db_context.get_store();
     crate::inner::refresh_block_positions(&mut all_blocks, store);
@@ -906,13 +1181,14 @@ fn to_roman_lower(n: usize) -> String {
 fn build_list_info(
     inner: &TextDocumentInner,
     block_dto: &frontend::block::dtos::BlockDto,
+    lookups: &SnapshotLookups,
 ) -> Option<ListInfo> {
     let list_id = block_dto.list?;
     let list_dto = list_commands::get_list(&inner.ctx, &{ list_id })
         .ok()
         .flatten()?;
 
-    let item_index = compute_list_item_index(inner, list_id, block_dto.id);
+    let item_index = lookups.list_item_index(inner, list_id, block_dto.id);
     let marker = format_list_marker(&list_dto, item_index);
 
     Some(ListInfo {
@@ -930,19 +1206,37 @@ pub(crate) fn build_block_snapshot(
     block_id: u64,
     hl: crate::highlight::SnapshotHighlights,
 ) -> Option<BlockSnapshot> {
-    build_block_snapshot_with_position_and_parent(inner, block_id, None, None, hl)
+    build_block_snapshot_with_position_and_parent(
+        inner,
+        block_id,
+        None,
+        None,
+        hl,
+        &SnapshotLookups::default(),
+    )
 }
 
 /// Build a BlockSnapshot, optionally overriding the position with a computed value.
 /// When `computed_position` is Some, it's used instead of `block_dto.document_position`
 /// (which may be stale if position updates are deferred).
+///
+/// `lookups` carries the whole-document facts across the blocks of one snapshot:
+/// [`SnapshotLookups::default`] for a snapshot of this block alone.
 pub(crate) fn build_block_snapshot_with_position(
     inner: &TextDocumentInner,
     block_id: u64,
     computed_position: Option<usize>,
     hl: crate::highlight::SnapshotHighlights,
+    lookups: &SnapshotLookups,
 ) -> Option<BlockSnapshot> {
-    build_block_snapshot_with_position_and_parent(inner, block_id, computed_position, None, hl)
+    build_block_snapshot_with_position_and_parent(
+        inner,
+        block_id,
+        computed_position,
+        None,
+        hl,
+        lookups,
+    )
 }
 
 /// Build a BlockSnapshot with an optional `parent_frame_hint`. When the
@@ -951,12 +1245,17 @@ pub(crate) fn build_block_snapshot_with_position(
 /// call — which would otherwise fetch every Frame in the store on every
 /// invocation. That walk was a major contributor to per-keystroke
 /// editor lag.
+///
+/// `lookups` carries the whole-document facts (list numbers, table cells,
+/// footnote markers, the default language) across the blocks of one
+/// snapshot, so each is worked out once rather than once per block.
 pub(crate) fn build_block_snapshot_with_position_and_parent(
     inner: &TextDocumentInner,
     block_id: u64,
     computed_position: Option<usize>,
     parent_frame_hint: Option<EntityId>,
     hl: crate::highlight::SnapshotHighlights,
+    lookups: &SnapshotLookups,
 ) -> Option<BlockSnapshot> {
     let mut block_dto = block_commands::get_block(&inner.ctx, &block_id)
         .ok()
@@ -969,17 +1268,14 @@ pub(crate) fn build_block_snapshot_with_position_and_parent(
     // so hyphenation has a language for every block. The bridge still
     // falls back to English if this is also unset.
     if block_format.language.is_none() {
-        block_format.language = document_commands::get_document(&inner.ctx, &inner.document_id)
-            .ok()
-            .flatten()
-            .and_then(|d| d.default_language);
+        block_format.language = lookups.default_language(inner);
     }
-    let list_info = build_list_info(inner, &block_dto);
+    let list_info = build_list_info(inner, &block_dto, lookups);
 
     let parent_frame_id = parent_frame_hint
-        .or_else(|| find_parent_frame(inner, block_id))
+        .or_else(|| lookups.parent_frame(inner, block_id))
         .map(|id| id as usize);
-    let table_cell = find_table_cell_context(inner, block_id);
+    let table_cell = lookups.table_cell_context(inner, block_id);
 
     // The flow-snapshot position MUST agree with the space the editing path
     // resolves cursor positions against. When the rope mirrors every block
@@ -1006,7 +1302,7 @@ pub(crate) fn build_block_snapshot_with_position_and_parent(
     let length = to_usize(common::database::rope_helpers::block_char_length(
         &entity, store,
     ));
-    let fragments = build_fragments_with_text(inner, block_id, Some(&text), hl);
+    let fragments = build_fragments_with_text(inner, block_id, Some(&text), hl, lookups);
 
     // Paint-only sessions: emit the merged spans as a separate overlay (fragments stayed base
     // above). Metric / none: empty (highlights merged into fragments, or none). A "without
@@ -1035,10 +1331,12 @@ pub(crate) fn build_block_snapshot_with_position_and_parent(
 }
 
 /// Build BlockSnapshots for all blocks in a frame, sorted by document_position.
+/// `lookups` is shared with the rest of the snapshot this frame belongs to, if any.
 pub(crate) fn build_blocks_snapshot_for_frame(
     inner: &TextDocumentInner,
     frame_id: u64,
     hl: crate::highlight::SnapshotHighlights,
+    lookups: &SnapshotLookups,
 ) -> Vec<BlockSnapshot> {
     let frame_dto = match frame_commands::get_frame(&inner.ctx, &(frame_id as EntityId))
         .ok()
@@ -1063,7 +1361,9 @@ pub(crate) fn build_blocks_snapshot_for_frame(
 
     block_dtos
         .iter()
-        .filter_map(|b| build_block_snapshot(inner, b.id, hl))
+        .filter_map(|b| {
+            build_block_snapshot_with_position_and_parent(inner, b.id, None, None, hl, lookups)
+        })
         .collect()
 }
 
@@ -1072,11 +1372,13 @@ pub(crate) fn build_blocks_snapshot_for_frame(
 /// Returns `(snapshots, running_pos_after_last_block)`.
 /// Positions are computed sequentially from `start_pos` using each block's
 /// `text_length`, matching the logic in `find_block_at_position_sequential`.
+/// `lookups` is shared with the rest of the snapshot this frame belongs to.
 pub(crate) fn build_blocks_snapshot_for_frame_with_positions(
     inner: &TextDocumentInner,
     frame_id: u64,
     start_pos: usize,
     hl: crate::highlight::SnapshotHighlights,
+    lookups: &SnapshotLookups,
 ) -> (Vec<BlockSnapshot>, usize) {
     let frame_dto = match frame_commands::get_frame(&inner.ctx, &(frame_id as EntityId))
         .ok()
@@ -1102,10 +1404,215 @@ pub(crate) fn build_blocks_snapshot_for_frame_with_positions(
     let mut running_pos = start_pos;
     let mut snapshots = Vec::with_capacity(block_dtos.len());
     for b in &block_dtos {
-        if let Some(snap) = build_block_snapshot_with_position(inner, b.id, Some(running_pos), hl) {
+        if let Some(snap) =
+            build_block_snapshot_with_position(inner, b.id, Some(running_pos), hl, lookups)
+        {
             running_pos += snap.length + 1; // +1 for block separator
             snapshots.push(snap);
         }
     }
     (snapshots, running_pos)
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::TextDocument;
+    use crate::flow::FlowElementSnapshot;
+    use std::cell::Cell;
+
+    thread_local! {
+        /// Whole-document reads [`super::whole_document_read`] marked on this thread.
+        pub(super) static WHOLE_DOCUMENT_READS: Cell<usize> = const { Cell::new(0) };
+    }
+
+    /// A text of `paragraphs` paragraphs with every whole-document fact a block snapshot
+    /// reads: footnotes, lists, tables and quotations spread through it.
+    fn novel(paragraphs: usize) -> String {
+        let mut text = String::new();
+        for i in 0..paragraphs {
+            if i % 7 == 3 {
+                text.push_str(&format!("Paragraph {i}, with a note[^n{i}].\n\n"));
+                text.push_str(&format!("[^n{i}]: Note {i}.\n\n"));
+            } else if i % 17 == 5 {
+                text.push_str(&format!("> Quoted paragraph {i}.\n\n"));
+            } else {
+                text.push_str(&format!("Paragraph {i} of the text.\n\n"));
+            }
+            if i % 11 == 4 {
+                text.push_str(&format!("- item {i}\n- item {i}, second\n\n"));
+            }
+            if i % 13 == 6 {
+                text.push_str(&format!("| a{i} | b |\n| c | d |\n\n"));
+            }
+        }
+        text
+    }
+
+    /// Every block snapshot among `elements`, table cells and sub-frames included.
+    fn all_blocks(elements: &[FlowElementSnapshot], out: &mut Vec<crate::flow::BlockSnapshot>) {
+        for element in elements {
+            match element {
+                FlowElementSnapshot::Block(block) => out.push(block.clone()),
+                FlowElementSnapshot::Table(table) => {
+                    for cell in &table.cells {
+                        out.extend(cell.blocks.iter().cloned());
+                    }
+                }
+                FlowElementSnapshot::Frame(frame) => all_blocks(&frame.elements, out),
+            }
+        }
+    }
+
+    /// A flow snapshot works each block's whole-document facts out from indexes it shares
+    /// across its blocks; a snapshot of one block works them out by walking the document.
+    /// The two must give every block the same snapshot: list numbers across several lists,
+    /// cells of tables in and out of quotations, cells holding several paragraphs and a
+    /// list, notes numbered by the document, by the host, or partly by each.
+    #[test]
+    fn a_flow_snapshot_agrees_with_a_snapshot_of_each_block_alone() {
+        let mixed = "# Title\n\nA note[^a] and another[^b].\n\n- one\n- two\n- three\n\n\
+                     Between lists.\n\n1. first\n2. second\n\n> Quoted, with a note[^c].\n>\n\
+                     > - quoted item\n> - quoted item two\n>\n> > nested quote\n\n\
+                     | h1 | h2 |\n|----|----|\n| a | b[^a] |\n| c | d |\n\n\
+                     - again one\n- again two\n\n> | q1 | q2 |\n> | q3 | q4 |\n\n\
+                     Last paragraph[^d].\n\n[^a]: Note a, citing [^b].\n\n[^b]: Note b.\n\n\
+                     [^c]: Note c.\n\n[^d]: Note d.\n";
+        let html = "<p>Before.</p><table><tr><td><p>c1 p1</p><p>c1 p2</p></td><td><ul>\
+                    <li>in cell</li><li>in cell 2</li></ul></td></tr><tr><td>plain</td><td>\
+                    <p>x</p><p>y</p></td></tr></table><ol><li>o1</li><li>o2</li></ol>\
+                    <blockquote><p>q</p><ul><li>qi</li></ul></blockquote><p>After.</p>";
+
+        let from_djot = |text: &str| {
+            let doc = TextDocument::new();
+            doc.set_djot_sync(text).unwrap();
+            doc
+        };
+        let numbered_by_the_document = from_djot(mixed);
+        let partly_by_the_host = from_djot(mixed);
+        partly_by_the_host.set_footnote_markers(
+            [("a", "i"), ("c", "iii")]
+                .into_iter()
+                .map(|(label, marker)| (label.to_string(), marker.to_string()))
+                .collect(),
+        );
+        partly_by_the_host.set_default_language("fr").unwrap();
+        let with_cells_of_paragraphs = TextDocument::new();
+        with_cells_of_paragraphs
+            .set_html(html)
+            .unwrap()
+            .wait()
+            .unwrap();
+        let long = from_djot(&novel(120));
+
+        for (label, doc) in [
+            ("notes numbered by the document", &numbered_by_the_document),
+            ("notes partly numbered by the host", &partly_by_the_host),
+            ("cells holding paragraphs", &with_cells_of_paragraphs),
+            ("a long text", &long),
+        ] {
+            let mut blocks = Vec::new();
+            all_blocks(&doc.snapshot_flow().elements, &mut blocks);
+            assert!(
+                blocks.iter().any(|b| b.table_cell.is_some())
+                    && blocks.iter().any(|b| b.list_info.is_some()),
+                "{label}: the text holds table cells and list items"
+            );
+            for from_flow in blocks {
+                let alone = doc
+                    .block_by_id(from_flow.block_id)
+                    .expect("a block of the flow exists")
+                    .snapshot();
+                assert_eq!(
+                    alone, from_flow,
+                    "{label}: block {} alone and in the flow",
+                    from_flow.block_id
+                );
+            }
+        }
+    }
+
+    /// Whole-document reads one flow snapshot of `doc` makes, and the snapshot.
+    fn reads_for_one_snapshot(doc: &TextDocument) -> (usize, crate::flow::FlowSnapshot) {
+        WHOLE_DOCUMENT_READS.with(|reads| reads.set(0));
+        let flow = doc.snapshot_flow();
+        (WHOLE_DOCUMENT_READS.with(Cell::get), flow)
+    }
+
+    /// A block's list number, its table cell, its footnote numbers and its default language
+    /// are whole-document facts. A flow snapshot used to read each of them again for every
+    /// block that needed it, so opening a long text holding lists, tables or footnotes cost
+    /// time in proportion to the square of its length. It must read each one a fixed number
+    /// of times, however long the text.
+    #[test]
+    fn a_flow_snapshot_reads_each_whole_document_fact_a_fixed_number_of_times() {
+        let mut counts = Vec::new();
+        for paragraphs in [60, 480] {
+            let doc = TextDocument::new();
+            doc.set_djot_sync(&novel(paragraphs)).unwrap();
+            let (numbered_by_the_document, flow) = reads_for_one_snapshot(&doc);
+
+            let blocks: Vec<_> = flow
+                .elements
+                .iter()
+                .filter_map(|element| match element {
+                    FlowElementSnapshot::Block(block) => Some(block),
+                    _ => None,
+                })
+                .collect();
+            assert!(
+                blocks.iter().filter(|b| b.list_info.is_some()).count() > 4,
+                "the text holds list items"
+            );
+            assert!(
+                flow.elements
+                    .iter()
+                    .filter(|e| matches!(e, FlowElementSnapshot::Table(_)))
+                    .count()
+                    > 2,
+                "the text holds tables"
+            );
+            assert!(
+                flow.elements
+                    .iter()
+                    .any(|e| matches!(e, FlowElementSnapshot::Frame(_))),
+                "the text holds quotations"
+            );
+
+            // The host numbering the notes itself, as Skribisto does.
+            let markers = (0..paragraphs)
+                .filter(|i| i % 7 == 3)
+                .enumerate()
+                .map(|(k, i)| (format!("n{i}"), (k + 1).to_string()))
+                .collect();
+            doc.set_footnote_markers(markers);
+            let (numbered_by_the_host, _) = reads_for_one_snapshot(&doc);
+
+            counts.push((paragraphs, numbered_by_the_document, numbered_by_the_host));
+        }
+        let (small, small_self, small_host) = counts[0];
+        let (large, large_self, large_host) = counts[1];
+        println!(
+            "whole-document reads per flow snapshot: {small_self} and {small_host} (notes \
+             numbered by the document, by the host) at {small} paragraphs, {large_self} and \
+             {large_host} at {large}"
+        );
+        assert_eq!(
+            large_self, small_self,
+            "a flow snapshot of {large} paragraphs read whole-document facts {large_self} \
+             times against {small_self} for {small}: one of them is being read again for \
+             each block that needs it"
+        );
+        assert_eq!(
+            large_host, small_host,
+            "with host footnote markers, a flow snapshot of {large} paragraphs read \
+             whole-document facts {large_host} times against {small_host} for {small}"
+        );
+        // Each fact is read at most twice (the one-block walk that answers the first block,
+        // then the index for the rest), plus the walks the direct table-cell search itself
+        // makes the first time.
+        assert!(
+            small_self <= 12 && small_host <= 12,
+            "{small_self} and {small_host} whole-document reads for one snapshot"
+        );
+    }
 }

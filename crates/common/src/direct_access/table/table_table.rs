@@ -247,15 +247,7 @@ impl<'a> TableTable for TableHashMapTable<'a> {
         field: &TableRelationshipField,
         right_ids: &[EntityId],
     ) -> Result<Vec<(EntityId, Vec<EntityId>)>, RepositoryError> {
-        let map = self.store.tables.read();
-        let mut out = Vec::new();
-        for (id, table) in map.iter() {
-            let list = read_field(table, field);
-            if right_ids.iter().any(|rid| list.contains(rid)) {
-                out.push((*id, list));
-            }
-        }
-        Ok(out)
+        Ok(tables_naming_any(self.store, field, right_ids))
     }
 
     fn set_relationship_multi(
@@ -400,16 +392,41 @@ impl<'a> TableTableRO for TableHashMapTableRO<'a> {
         field: &TableRelationshipField,
         right_ids: &[EntityId],
     ) -> Result<Vec<(EntityId, Vec<EntityId>)>, RepositoryError> {
-        let map = self.store.tables.read();
-        let mut out = Vec::new();
-        for (id, table) in map.iter() {
-            let list = read_field(table, field);
-            if right_ids.iter().any(|rid| list.contains(rid)) {
-                out.push((*id, list));
-            }
-        }
-        Ok(out)
+        Ok(tables_naming_any(self.store, field, right_ids))
     }
+}
+
+/// Every table whose `field` names at least one of `right_ids`, with that list.
+///
+/// The ids go into a set first. Asking each table's list about every id in turn
+/// cost tables times ids, and removing the cells of every table a deletion
+/// covers passes all of their ids at once: emptying a text holding many small
+/// tables was quadratic in them.
+fn tables_naming_any(
+    store: &Store,
+    field: &TableRelationshipField,
+    right_ids: &[EntityId],
+) -> Vec<(EntityId, Vec<EntityId>)> {
+    let wanted: std::collections::HashSet<EntityId> = right_ids.iter().copied().collect();
+    let map = store.tables.read();
+    let mut out = Vec::new();
+    for (id, table) in map.iter() {
+        let list = read_field(table, field);
+        if list.iter().any(|named| is_wanted(&wanted, named)) {
+            out.push((*id, list));
+        }
+    }
+    out
+}
+
+/// Whether `id` is one of the ids a lookup asks about: one hash probe, however
+/// many ids were asked about. Unit tests count the probes, which is how
+/// `tests::finding_owners_probes_each_listed_id_once` guards the lookup's cost
+/// in the debug builds CI tests with, where timing it cannot.
+fn is_wanted(wanted: &std::collections::HashSet<EntityId>, id: &EntityId) -> bool {
+    #[cfg(test)]
+    tests::PROBES.with(|probes| probes.set(probes.get() + 1));
+    wanted.contains(id)
 }
 
 fn reorder(current: Vec<EntityId>, ids_to_move: &[EntityId], new_index: i32) -> Vec<EntityId> {
@@ -430,4 +447,107 @@ fn reorder(current: Vec<EntityId>, ids_to_move: &[EntityId], new_index: i32) -> 
         remaining.insert(insert_pos + i, eid);
     }
     remaining
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::entities::TableCell;
+    use std::cell::Cell;
+
+    thread_local! {
+        /// Membership probes [`is_wanted`] made on this thread.
+        pub(super) static PROBES: Cell<usize> = const { Cell::new(0) };
+    }
+
+    const CELLS_PER_TABLE: u64 = 4;
+
+    /// A store of `tables` tables of four cells each, and the id of each table's last cell.
+    fn small_tables(tables: u64) -> (Store, Vec<EntityId>) {
+        let store = Store::new();
+        let mut cell_ids = Vec::new();
+        {
+            let mut table_map = store.tables.write();
+            let mut cell_map = store.table_cells.write();
+            for table_id in 1..=tables {
+                let cells: Vec<EntityId> = (0..CELLS_PER_TABLE)
+                    .map(|k| table_id * CELLS_PER_TABLE + k)
+                    .collect();
+                for &id in &cells {
+                    cell_map.insert(
+                        id,
+                        TableCell {
+                            id,
+                            ..TableCell::default()
+                        },
+                    );
+                }
+                cell_ids.push(cells[cells.len() - 1]);
+                table_map.insert(
+                    table_id,
+                    Table {
+                        id: table_id,
+                        cells,
+                        ..Table::default()
+                    },
+                );
+            }
+        }
+        (store, cell_ids)
+    }
+
+    /// Removing the cells of every table a deletion covers asks which tables own all of
+    /// them at once. Checking each table's list against every id asked about cost tables
+    /// times ids: millions of comparisons here, and quadratic in the tables of a text being
+    /// emptied. The lookup must probe each listed id at most once instead, whatever the
+    /// number of ids asked about. Asking about each table's last cell makes every table's
+    /// scan run to its end, so "at most once" is exactly once here.
+    #[test]
+    fn finding_owners_probes_each_listed_id_once() -> Result<(), RepositoryError> {
+        const TABLES: u64 = 1_000;
+        let listed = (TABLES * CELLS_PER_TABLE) as usize;
+        let (store, cell_ids) = small_tables(TABLES);
+
+        PROBES.with(|probes| probes.set(0));
+        let owners = TableHashMapTable::new(&store)
+            .get_relationships_from_right_ids(&TableRelationshipField::Cells, &cell_ids)?;
+        assert_eq!(owners.len(), TABLES as usize, "every table owns cells");
+        assert_eq!(
+            PROBES.with(Cell::get),
+            listed,
+            "the write lookup probed each of the {listed} listed ids once"
+        );
+
+        PROBES.with(|probes| probes.set(0));
+        let owners = TableHashMapTableRO::new(&store)
+            .get_relationships_from_right_ids(&TableRelationshipField::Cells, &cell_ids)?;
+        assert_eq!(owners.len(), TABLES as usize, "every table owns cells");
+        assert_eq!(
+            PROBES.with(Cell::get),
+            listed,
+            "the read lookup probed each of the {listed} listed ids once"
+        );
+
+        // Asking about a single cell still reads every table's list, stopping at the cell
+        // it names.
+        let asked = TABLES / 2 * CELLS_PER_TABLE + 1;
+        PROBES.with(|probes| probes.set(0));
+        let owners = TableHashMapTable::new(&store)
+            .get_relationships_from_right_ids(&TableRelationshipField::Cells, &[asked])?;
+        let owner = TABLES / 2;
+        assert_eq!(
+            owners,
+            vec![(
+                owner,
+                (0..CELLS_PER_TABLE)
+                    .map(|k| owner * CELLS_PER_TABLE + k)
+                    .collect()
+            )]
+        );
+        assert_eq!(
+            PROBES.with(Cell::get),
+            listed - (CELLS_PER_TABLE as usize - 2)
+        );
+        Ok(())
+    }
 }

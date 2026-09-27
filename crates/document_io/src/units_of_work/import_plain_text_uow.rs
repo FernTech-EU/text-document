@@ -94,9 +94,8 @@ impl CommandUnitOfWork for ImportPlainTextUnitOfWork {
 #[macros::uow_action(entity = "Frame", action = "Get")]
 #[macros::uow_action(entity = "Frame", action = "Create")]
 #[macros::uow_action(entity = "Frame", action = "Update")]
-#[macros::uow_action(entity = "Frame", action = "Remove")]
+#[macros::uow_action(entity = "Frame", action = "RemoveMulti")]
 #[macros::uow_action(entity = "Frame", action = "GetRelationship")]
-#[macros::uow_action(entity = "Block", action = "Create")]
 #[macros::uow_action(entity = "Block", action = "CreateMulti")]
 impl ImportPlainTextUnitOfWorkTrait for ImportPlainTextUnitOfWork {}
 

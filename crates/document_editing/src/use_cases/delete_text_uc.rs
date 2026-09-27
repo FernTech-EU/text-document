@@ -19,6 +19,7 @@ use common::snapshot::EntityTreeSnapshot;
 use common::types::{EntityId, ROOT_ENTITY_ID};
 use common::undo_redo::UndoRedoCommand;
 use std::any::Any;
+use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 
 pub trait DeleteTextUnitOfWorkFactoryTrait: Send + Sync {
@@ -41,14 +42,19 @@ pub trait DeleteTextUnitOfWorkFactoryTrait: Send + Sync {
 #[macros::uow_action(entity = "Block", action = "UpdateMulti")]
 #[macros::uow_action(entity = "Block", action = "Create")]
 #[macros::uow_action(entity = "Block", action = "Remove")]
+#[macros::uow_action(entity = "Block", action = "RemoveMulti")]
 #[macros::uow_action(entity = "Block", action = "GetRelationship")]
 #[macros::uow_action(entity = "Table", action = "Get")]
 #[macros::uow_action(entity = "Table", action = "GetRelationship")]
 #[macros::uow_action(entity = "Table", action = "Remove")]
+#[macros::uow_action(entity = "Table", action = "RemoveMulti")]
 #[macros::uow_action(entity = "TableCell", action = "GetMulti")]
 #[macros::uow_action(entity = "TableCell", action = "Remove")]
+#[macros::uow_action(entity = "TableCell", action = "RemoveMulti")]
 #[macros::uow_action(entity = "Frame", action = "Remove")]
+#[macros::uow_action(entity = "Frame", action = "RemoveMulti")]
 #[macros::uow_action(entity = "List", action = "Remove")]
+#[macros::uow_action(entity = "List", action = "RemoveMulti")]
 pub trait DeleteTextUnitOfWorkTrait: CommandUnitOfWork {}
 
 pub struct DeleteTextUseCase {
@@ -82,9 +88,10 @@ fn read_block_runs_and_images(
     (runs, images)
 }
 
-/// Reset a block to empty state: clears plain_text, text_length,
-/// format_runs and block_images. Also rebuilds the legacy inline_elements
-/// view to one Empty element so downstream legacy readers stay consistent.
+/// Reset a block to empty state: clears its format_runs and block_images
+/// and bumps `updated_at`. Its text leaves the rope separately, through
+/// `rope_clear_blocks`, which empties every cleared block in one walk of the
+/// offset index where clearing them one at a time walked it once per block.
 fn clear_block(
     uow: &mut Box<dyn DeleteTextUnitOfWorkTrait>,
     block: &Block,
@@ -94,7 +101,6 @@ fn clear_block(
     updated.updated_at = now;
     uow.update_block(&updated)?;
     let store = uow.store();
-    common::database::rope_helpers::rope_replace_block_content(&store, block.id, "");
     store.format_runs.write().insert(block.id, Vec::new());
     store.block_images.write().insert(block.id, Vec::new());
     Ok(())
@@ -108,31 +114,46 @@ fn drop_block_runs_and_images(uow: &dyn DeleteTextUnitOfWorkTrait, block_id: Ent
     store.block_images.write().remove(&block_id);
 }
 
-/// Recursive walk of the frame tree rooted at `root_id` to find which
-/// frame's `child_order` contains the positive entry `target`. Used by
-/// the cross-block merge to correctly resolve sub-frame ownership when
-/// the deletion crosses a frame boundary — the cell-only
-/// `block_to_cell_frame` map cannot answer this for blockquote frames.
-fn find_block_owner_frame(
+/// Walk the frame tree rooted at `root_id` once and map every block to the
+/// frame whose `child_order` lists it. Used by the cross-block merge to
+/// correctly resolve sub-frame ownership when the deletion crosses a frame
+/// boundary: the cell-only `block_to_cell_frame` map cannot answer this for
+/// blockquote frames.
+///
+/// Frames are visited depth first in `child_order` order and the first frame
+/// listing a block wins: the answer a search from the root for that one block
+/// gives. The merge used to run that search once per deleted block, a walk
+/// of the document per paragraph.
+///
+/// The walk stops at the first frame it cannot find and hands that error back
+/// beside what it mapped. A block mapped before that point is one the search
+/// finds before meeting the missing frame; for any other block the search
+/// meets the missing frame first and fails, and so must the caller.
+fn block_owner_frames(
     uow: &dyn DeleteTextUnitOfWorkTrait,
     root_id: EntityId,
-    target: EntityId,
-) -> Result<Option<EntityId>> {
-    let f = uow
-        .get_frame(&root_id)?
-        .ok_or_else(|| anyhow!("Frame not found"))?;
-    for &entry in &f.child_order {
-        if entry > 0 && entry as EntityId == target {
-            return Ok(Some(root_id));
-        }
-        if entry < 0 {
-            let sub = (-entry) as EntityId;
-            if let Some(o) = find_block_owner_frame(uow, sub, target)? {
-                return Ok(Some(o));
+) -> (HashMap<EntityId, EntityId>, Option<anyhow::Error>) {
+    fn walk(
+        uow: &dyn DeleteTextUnitOfWorkTrait,
+        frame_id: EntityId,
+        owners: &mut HashMap<EntityId, EntityId>,
+    ) -> Result<()> {
+        let f = uow
+            .get_frame(&frame_id)?
+            .ok_or_else(|| anyhow!("Frame not found"))?;
+        for &entry in &f.child_order {
+            if entry > 0 {
+                owners.entry(entry as EntityId).or_insert(frame_id);
+            }
+            if entry < 0 {
+                walk(uow, (-entry) as EntityId, owners)?;
             }
         }
+        Ok(())
     }
-    Ok(None)
+    let mut owners = HashMap::new();
+    let stopped = walk(uow, root_id, &mut owners).err();
+    (owners, stopped)
 }
 
 /// Recursively prune empty non-table sub-frames under `frame_id` (post-order).
@@ -184,16 +205,18 @@ fn prune_empty_subframes_recursive(
     }
 
     if !sub_frames_to_remove.is_empty() {
-        for &sf_id in &sub_frames_to_remove {
-            uow.remove_frame(&sf_id)?;
-        }
+        // In one call: each single removal rewrites and re-validates the
+        // document's whole frame list, so emptying a document of many
+        // quotations one frame at a time was quadratic in them.
+        uow.remove_frame_multi(&sub_frames_to_remove)?;
+        let removed: HashSet<EntityId> = sub_frames_to_remove.iter().copied().collect();
         let mut updated = uow
             .get_frame(&frame_id)?
             .ok_or_else(|| anyhow!("Frame not found"))?;
         updated.child_order.retain(|entry| {
             if *entry < 0 {
                 let sf_id = (-entry) as EntityId;
-                !sub_frames_to_remove.contains(&sf_id)
+                !removed.contains(&sf_id)
             } else {
                 true
             }
@@ -274,6 +297,14 @@ fn execute_delete(
     let root_frame = uow
         .get_frame(&frame_id)?
         .ok_or_else(|| anyhow!("Root frame not found"))?;
+    // Where each block sits in `blocks`, the first one of an id winning as a
+    // search from the front would find it. Searching per entry instead made
+    // every deletion quadratic in the document's paragraphs, a single
+    // Backspace included.
+    let mut index_of: HashMap<EntityId, usize> = HashMap::with_capacity(blocks.len());
+    for (i, b) in blocks.iter().enumerate() {
+        index_of.entry(b.id).or_insert(i);
+    }
     let mut running: i64 = 0;
     let mut blocks_to_refresh: Vec<Block> = Vec::new();
     for &entry in &root_frame.child_order {
@@ -281,7 +312,8 @@ fn execute_delete(
             continue;
         }
         let id = entry as EntityId;
-        if let Some(b) = blocks.iter_mut().find(|b| b.id == id) {
+        if let Some(&i) = index_of.get(&id) {
+            let b = &mut blocks[i];
             if b.document_position != running {
                 b.document_position = running;
                 blocks_to_refresh.push(b.clone());
@@ -354,6 +386,12 @@ fn execute_delete(
             }
         }
 
+        // Every affected cell's blocks past its first, removed in one call below:
+        // each removal call finds and rewrites the owners of what it removes, a
+        // walk of every frame, so one call per cell cost a walk per cell. The
+        // first blocks, emptied, leave the rope together the same way.
+        let mut extra_block_ids: Vec<EntityId> = Vec::new();
+        let mut cleared_block_ids: Vec<EntityId> = Vec::new();
         for cf_id in &affected_cell_frames {
             let frame = uow
                 .get_frame(cf_id)?
@@ -374,20 +412,42 @@ fn execute_delete(
             total_chars_removed += cell_chars;
 
             clear_block(uow, &cell_blocks[0], now)?;
+            cleared_block_ids.push(cell_blocks[0].id);
 
-            let extra_block_ids: Vec<EntityId> = cell_blocks[1..].iter().map(|b| b.id).collect();
-            for &eid in &extra_block_ids {
-                drop_block_runs_and_images(uow.as_ref(), eid);
-                uow.remove_block(&eid)?;
+            for extra in &cell_blocks[1..] {
+                drop_block_runs_and_images(uow.as_ref(), extra.id);
+                extra_block_ids.push(extra.id);
             }
 
+            // `update_frame` writes `child_order` and keeps the frame's block
+            // list as the store has it, so the removal below trims that list
+            // whether it runs before this or after.
             let mut updated_frame = frame.clone();
             updated_frame.child_order = vec![cell_blocks[0].id as i64];
             updated_frame.updated_at = now;
             uow.update_frame(&updated_frame)?;
         }
+        // Before anything below measures a cell block: the tables loop reads
+        // the emptied blocks' lengths.
+        common::database::rope_helpers::rope_clear_blocks(&store, &cleared_block_ids);
+        if !extra_block_ids.is_empty() {
+            uow.remove_block_multi(&extra_block_ids)?;
+        }
 
+        // What removing the tables the selection covers takes away, gathered
+        // table by table and removed in one call per kind after the loop: each
+        // removal call rewrites the whole list of the owner it removes from
+        // (the document's frames or tables) and walks every owner to find it,
+        // so one call per table cost a walk of the document per table.
         let mut tables_to_remove: Vec<EntityId> = Vec::new();
+        let mut cell_frames_to_remove: Vec<EntityId> = Vec::new();
+        let mut cells_to_remove: Vec<EntityId> = Vec::new();
+        let mut anchors_to_remove: Vec<EntityId> = Vec::new();
+        // Frames the loop has claimed for removal so far, and each table's
+        // anchor candidates: the root frame's sub-frames naming it, in
+        // `child_order` order. Built on the first table removed.
+        let mut claimed_frames: HashSet<EntityId> = HashSet::new();
+        let mut anchor_candidates: Option<HashMap<EntityId, Vec<EntityId>>> = None;
         for &tid in &table_ids {
             let cell_ids = uow.get_table_relationship(&tid, &TableRelationshipField::Cells)?;
             let cells_opt = uow.get_table_cell_multi(&cell_ids)?;
@@ -418,42 +478,67 @@ fn execute_delete(
             if start < table_min_pos || end > table_max_pos {
                 for c in &cells {
                     if let Some(cf_id) = c.cell_frame {
-                        uow.remove_frame(&cf_id)?;
+                        cell_frames_to_remove.push(cf_id);
+                        claimed_frames.insert(cf_id);
                     }
-                    uow.remove_table_cell(&c.id)?;
+                    cells_to_remove.push(c.id);
                 }
 
-                let root_frame = uow
-                    .get_frame(&frame_id)?
-                    .ok_or_else(|| anyhow!("Root frame not found"))?;
-                for &entry in &root_frame.child_order {
-                    if entry < 0 {
-                        let anchor_id = (-entry) as EntityId;
-                        if let Some(anchor) = uow.get_frame(&anchor_id)?
-                            && anchor.table == Some(tid)
-                        {
-                            uow.remove_frame(&anchor_id)?;
-                            break;
+                // The table's anchor: the first of the root frame's sub-frames
+                // naming it that is still there, as a scan of `child_order`
+                // removing each table in turn found it.
+                let candidates = match &mut anchor_candidates {
+                    Some(candidates) => candidates,
+                    None => {
+                        let root_frame = uow
+                            .get_frame(&frame_id)?
+                            .ok_or_else(|| anyhow!("Root frame not found"))?;
+                        let mut by_table: HashMap<EntityId, Vec<EntityId>> = HashMap::new();
+                        for &entry in &root_frame.child_order {
+                            if entry < 0 {
+                                let anchor_id = (-entry) as EntityId;
+                                if let Some(anchor) = uow.get_frame(&anchor_id)?
+                                    && let Some(named) = anchor.table
+                                {
+                                    by_table.entry(named).or_default().push(anchor_id);
+                                }
+                            }
                         }
+                        anchor_candidates.insert(by_table)
                     }
+                };
+                if let Some(&anchor_id) = candidates
+                    .get(&tid)
+                    .and_then(|ids| ids.iter().find(|id| !claimed_frames.contains(id)))
+                {
+                    anchors_to_remove.push(anchor_id);
+                    claimed_frames.insert(anchor_id);
                 }
 
-                uow.remove_table(&tid)?;
                 tables_to_remove.push(tid);
             }
         }
 
         if !tables_to_remove.is_empty() {
+            if !cell_frames_to_remove.is_empty() {
+                uow.remove_frame_multi(&cell_frames_to_remove)?;
+            }
+            uow.remove_table_cell_multi(&cells_to_remove)?;
+            if !anchors_to_remove.is_empty() {
+                uow.remove_frame_multi(&anchors_to_remove)?;
+            }
+            uow.remove_table_multi(&tables_to_remove)?;
+
             let root_frame = uow
                 .get_frame(&frame_id)?
                 .ok_or_else(|| anyhow!("Root frame not found"))?;
             let mut updated_root = root_frame.clone();
+            // Drop every sub-frame entry whose frame is gone: the removed
+            // anchors, and any other entry already dangling, as before.
             updated_root.child_order.retain(|entry| {
                 if *entry < 0 {
                     let anchor_id = (-entry) as EntityId;
-                    !tables_to_remove
-                        .iter()
-                        .any(|_| uow.get_frame(&anchor_id).ok().flatten().is_none())
+                    uow.get_frame(&anchor_id).ok().flatten().is_some()
                 } else {
                     true
                 }
@@ -518,12 +603,16 @@ fn execute_delete(
             } else {
                 total_chars_removed += block_char_length(block, &store);
                 drop_block_runs_and_images(uow.as_ref(), block.id);
-                uow.remove_block(&block.id)?;
                 non_cell_blocks_to_remove.push(block.id);
             }
         }
 
         if !non_cell_blocks_to_remove.is_empty() {
+            // In one call: each single removal rewrites and re-validates the
+            // owning frame's whole block list, so deleting N paragraphs one at
+            // a time cost N(N+1)/2 of those.
+            uow.remove_block_multi(&non_cell_blocks_to_remove)?;
+            let removed: HashSet<EntityId> = non_cell_blocks_to_remove.iter().copied().collect();
             let all_frame_ids =
                 uow.get_document_relationship(&doc_id, &DocumentRelationshipField::Frames)?;
             for &fid in &all_frame_ids {
@@ -532,7 +621,7 @@ fn execute_delete(
                     let mut updated = f.clone();
                     updated
                         .child_order
-                        .retain(|id| !non_cell_blocks_to_remove.contains(&(*id as EntityId)));
+                        .retain(|id| !removed.contains(&(*id as EntityId)));
                     if updated.child_order.len() != old_len {
                         updated.updated_at = now;
                         uow.update_frame(&updated)?;
@@ -569,8 +658,8 @@ fn execute_delete(
                     lists_to_remove.push(lid);
                 }
             }
-            for &lid in &lists_to_remove {
-                uow.remove_list(&lid)?;
+            if !lists_to_remove.is_empty() {
+                uow.remove_list_multi(&lists_to_remove)?;
             }
         }
 
@@ -848,8 +937,11 @@ fn execute_delete(
             // Drop them here so the rope index doesn't carry
             // dangling block ids past delete_text.
             common::database::rope_helpers::rope_remove_block(&uow.store(), *block_id);
-            uow.remove_block(block_id)?;
         }
+        // In one call: each single removal rewrites and re-validates the
+        // owning frame's whole block list, so deleting N paragraphs one at a
+        // time cost N(N+1)/2 of those.
+        uow.remove_block_multi(&blocks_to_remove)?;
 
         // Group removed blocks by their owning frame, then update each
         // affected frame's child_order. Without this, sub-frame (e.g.
@@ -857,15 +949,25 @@ fn execute_delete(
         // the cross-block merge crosses a frame boundary — the cell-only
         // `block_to_cell_frame` map silently falls back to the root.
         let now = chrono::Utc::now();
-        let mut blocks_by_frame: std::collections::HashMap<EntityId, Vec<EntityId>> =
-            std::collections::HashMap::new();
+        let mut blocks_by_frame: HashMap<EntityId, HashSet<EntityId>> = HashMap::new();
+        // Walked once, on the first block that needs it: a search from the
+        // root per block cost a walk of the document per deleted paragraph.
+        let mut owners: Option<(HashMap<EntityId, EntityId>, Option<anyhow::Error>)> = None;
         for &bid in &blocks_to_remove {
             let owning = if let Some(&cf) = block_to_cell_frame.get(&bid) {
                 cf
             } else {
-                find_block_owner_frame(uow.as_ref(), frame_id, bid)?.unwrap_or(frame_id)
+                let (owner_of, stopped) =
+                    owners.get_or_insert_with(|| block_owner_frames(uow.as_ref(), frame_id));
+                match owner_of.get(&bid) {
+                    Some(&owner) => owner,
+                    None => match stopped.take() {
+                        Some(error) => return Err(error),
+                        None => frame_id,
+                    },
+                }
             };
-            blocks_by_frame.entry(owning).or_default().push(bid);
+            blocks_by_frame.entry(owning).or_default().insert(bid);
         }
         for (owning_frame_id, removed_in_frame) in blocks_by_frame {
             let frame = uow

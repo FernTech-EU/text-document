@@ -254,7 +254,7 @@ impl TextDocument {
     /// `document_position`. See `plain_text_order_tests`.
     pub fn to_plain_text(&self) -> Result<String> {
         let mut inner = self.inner.lock();
-        Ok(inner.plain_text()?.to_string())
+        Ok(inner.plain_text()?.into_owned())
     }
 
     /// [`to_plain_text`](Self::to_plain_text) for writing an actual `.txt` file: quoted
@@ -1224,6 +1224,7 @@ impl TextDocument {
                     block_id,
                     Some(running_pos as usize),
                     hl,
+                    &crate::text_block::SnapshotLookups::default(),
                 );
             }
             running_pos = block_end + 1;

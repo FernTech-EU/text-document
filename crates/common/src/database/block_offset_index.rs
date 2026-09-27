@@ -131,6 +131,61 @@ impl BlockOffsetIndex {
         }
     }
 
+    /// Insert consecutive markers starting at `position`, in order. The
+    /// result is exactly what calling [`insert_at`](Self::insert_at) once
+    /// per marker at `position`, `position + 1`, … would leave, but the
+    /// marker index is walked once for the whole run instead of once per
+    /// marker: inserting a run of N markers one at a time costs N walks of
+    /// every marker in the document. The caller keeps the `byte_start`s
+    /// ordered, as for `insert_at`.
+    pub fn insert_run_at(&mut self, position: usize, run: &[(OffsetMarker, u32)]) {
+        if run.is_empty() {
+            return;
+        }
+        Arc::make_mut(&mut self.entries).splice(position..position, run.iter().copied());
+        // Every marker already at or past `position` moves up by the run's length.
+        for (_, p) in self.marker_index.iter_mut() {
+            if *p >= position {
+                *p += run.len();
+            }
+        }
+        for (offset, (marker, _)) in run.iter().enumerate() {
+            self.marker_index.insert(*marker, position + offset);
+            if matches!(marker, OffsetMarker::TableAnchor(_)) {
+                self.table_anchor_count += 1;
+            }
+        }
+    }
+
+    /// Take bytes out after several entries at once: for each
+    /// `(position, bytes)`, every entry past `position` moves back by
+    /// `bytes`, and so does `total_bytes`. The result is exactly what calling
+    /// [`shift_after`](Self::shift_after)`(entries[position].1 + 1, -bytes)`
+    /// once per pair leaves, provided each entry at `position` starts before
+    /// the entry after it, as an entry with content or a boundary after it
+    /// does. The entries are walked once for the whole list instead of once
+    /// per pair. `cuts` is in increasing `position` order.
+    pub fn remove_bytes_after(&mut self, cuts: &[(usize, u32)]) {
+        if cuts.is_empty() {
+            return;
+        }
+        entries_rewritten(self.entries.len());
+        let mut removed: u32 = 0;
+        let mut pending = cuts.iter().peekable();
+        for (position, (_, byte_start)) in Arc::make_mut(&mut self.entries).iter_mut().enumerate() {
+            debug_assert!(*byte_start >= removed, "a cut past an entry's start");
+            *byte_start = byte_start.saturating_sub(removed);
+            while let Some(&&(cut_position, bytes)) = pending.peek() {
+                if cut_position != position {
+                    break;
+                }
+                removed = removed.saturating_add(bytes);
+                pending.next();
+            }
+        }
+        self.total_bytes = self.total_bytes.saturating_sub(removed);
+    }
+
     /// Append a marker at the end (its `byte_start` must be ≥ the last
     /// entry's `byte_start`).
     pub fn push(&mut self, marker: OffsetMarker, byte_start: u32) {
@@ -328,12 +383,24 @@ impl BlockOffsetIndex {
     pub fn shift_after(&mut self, threshold: u32, delta: i32) {
         let start = self.entries.partition_point(|(_, bs)| *bs < threshold);
         if start < self.entries.len() {
+            entries_rewritten(self.entries.len() - start);
             for (_, bs) in Arc::make_mut(&mut self.entries)[start..].iter_mut() {
                 *bs = apply_delta(*bs, delta);
             }
         }
         self.total_bytes = apply_delta(self.total_bytes, delta);
     }
+}
+
+/// Record `count` entries an offset shift rewrote. Unit tests count them, which is
+/// how `rope_helpers`' `tests::clearing_blocks_together_walks_the_index_once`
+/// guards `rope_clear_blocks`' cost in the debug builds CI tests with, where
+/// timing it cannot.
+fn entries_rewritten(count: usize) {
+    #[cfg(test)]
+    tests::ENTRIES_REWRITTEN.with(|rewritten| rewritten.set(rewritten.get() + count));
+    #[cfg(not(test))]
+    let _ = count;
 }
 
 fn apply_delta(value: u32, delta: i32) -> u32 {
@@ -346,5 +413,15 @@ fn apply_delta(value: u32, delta: i32) -> u32 {
         value
             .checked_sub(abs)
             .expect("byte offset would go negative")
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod tests {
+    use std::cell::Cell;
+
+    thread_local! {
+        /// Entries the offset shifts rewrote on this thread (see [`super::entries_rewritten`]).
+        pub(crate) static ENTRIES_REWRITTEN: Cell<usize> = const { Cell::new(0) };
     }
 }

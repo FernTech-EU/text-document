@@ -6,6 +6,9 @@ use common::database::CommandUnitOfWork;
 use common::database::rope_helpers::{
     rope_append_block, rope_append_table_anchor, rope_insert_block_boundary, rope_reset,
 };
+use common::direct_access::document::DocumentRelationshipField;
+use common::direct_access::frame::FrameRelationshipField;
+use common::direct_access::table::TableRelationshipField;
 use common::entities::{Block, Document, Frame, FramePosition, List, Root, Table, TableCell};
 
 use common::long_operation::LongOperation;
@@ -25,21 +28,25 @@ pub trait ImportMarkdownUnitOfWorkFactoryTrait: Send + Sync {
 #[macros::uow_action(entity = "Document", action = "Get", thread_safe = true)]
 #[macros::uow_action(entity = "Document", action = "Update", thread_safe = true)]
 #[macros::uow_action(entity = "Document", action = "GetRelationship", thread_safe = true)]
+#[macros::uow_action(entity = "Document", action = "SetRelationship", thread_safe = true)]
 #[macros::uow_action(entity = "Frame", action = "Get", thread_safe = true)]
-#[macros::uow_action(entity = "Frame", action = "Create", thread_safe = true)]
+#[macros::uow_action(entity = "Frame", action = "CreateOrphan", thread_safe = true)]
 #[macros::uow_action(entity = "Frame", action = "Update", thread_safe = true)]
 #[macros::uow_action(
     entity = "Frame",
     action = "UpdateWithRelationships",
     thread_safe = true
 )]
-#[macros::uow_action(entity = "Frame", action = "Remove", thread_safe = true)]
+#[macros::uow_action(entity = "Frame", action = "RemoveMulti", thread_safe = true)]
 #[macros::uow_action(entity = "Frame", action = "GetRelationship", thread_safe = true)]
+#[macros::uow_action(entity = "Frame", action = "SetRelationship", thread_safe = true)]
 #[macros::uow_action(entity = "Block", action = "Create", thread_safe = true)]
+#[macros::uow_action(entity = "Block", action = "CreateOrphan", thread_safe = true)]
 #[macros::uow_action(entity = "Block", action = "SetRelationship", thread_safe = true)]
-#[macros::uow_action(entity = "List", action = "Create", thread_safe = true)]
-#[macros::uow_action(entity = "Table", action = "Create", thread_safe = true)]
-#[macros::uow_action(entity = "TableCell", action = "Create", thread_safe = true)]
+#[macros::uow_action(entity = "List", action = "CreateOrphan", thread_safe = true)]
+#[macros::uow_action(entity = "Table", action = "CreateOrphan", thread_safe = true)]
+#[macros::uow_action(entity = "Table", action = "SetRelationship", thread_safe = true)]
+#[macros::uow_action(entity = "TableCell", action = "CreateOrphan", thread_safe = true)]
 pub trait ImportMarkdownUnitOfWorkTrait: CommandUnitOfWork + Send + Sync {}
 
 pub struct ImportMarkdownUseCase {
@@ -62,18 +69,78 @@ impl ImportMarkdownUseCase {
 struct FrameState {
     frame_id: EntityId,
     child_order: Vec<i64>,
+    /// The frame's `blocks`, in creation order, written to it once when it
+    /// closes. See [`OrphanedChildren`].
+    blocks: Vec<EntityId>,
+}
+
+/// What the walk creates without an owner, in creation order, until each owner
+/// receives its whole list in one write.
+///
+/// Creating a child *with* its owner appends it to the owner's list, and that
+/// append rewrites the entire list, fetches every entity it names to validate
+/// it, and announces the entire list in an event. One append per paragraph made
+/// loading N paragraphs cost N(N+1)/2 of those: a novel kept in one document
+/// took seconds to open. Ids are handed out in the same order either way, so
+/// the document stored at the end is the same.
+#[derive(Default)]
+struct OrphanedChildren {
+    /// Every frame the import creates: the document's `frames`.
+    frames: Vec<EntityId>,
+    /// The document's new `lists`.
+    lists: Vec<EntityId>,
+    /// The document's new `tables`.
+    tables: Vec<EntityId>,
+}
+
+impl OrphanedChildren {
+    /// Give the document its new frames, lists and tables, one write each, after
+    /// whatever it already holds: its lists and tables outlive a re-import, while
+    /// its frames were all removed first.
+    fn attach(
+        self,
+        uow: &mut Box<dyn ImportMarkdownUnitOfWorkTrait>,
+        doc_id: EntityId,
+    ) -> Result<()> {
+        for (field, children) in [
+            (DocumentRelationshipField::Frames, self.frames),
+            (DocumentRelationshipField::Lists, self.lists),
+            (DocumentRelationshipField::Tables, self.tables),
+        ] {
+            if children.is_empty() {
+                continue;
+            }
+            let mut ids = uow.get_document_relationship(&doc_id, &field)?;
+            ids.extend(children);
+            uow.set_document_relationship(&doc_id, &field, &ids)?;
+        }
+        Ok(())
+    }
+}
+
+/// Give a frame the blocks created for it, in one write.
+fn attach_blocks(
+    uow: &mut Box<dyn ImportMarkdownUnitOfWorkTrait>,
+    frame_id: EntityId,
+    blocks: &[EntityId],
+) -> Result<()> {
+    if blocks.is_empty() {
+        return Ok(());
+    }
+    uow.set_frame_relationship(&frame_id, &FrameRelationshipField::Blocks, blocks)
 }
 
 /// Advance the blockquote frame stack to match `target_depth`, finalising
-/// frames that close (writing back their `child_order`) and creating new
-/// blockquote sub-frames as depth increases. Resets `list_grouper` on every
-/// frame boundary so lists never group across blockquote boundaries.
+/// frames that close (writing back their `blocks` and `child_order`) and
+/// creating new blockquote sub-frames as depth increases. Resets
+/// `list_grouper` on every frame boundary so lists never group across
+/// blockquote boundaries.
 ///
 /// Touches only Frame entities — never the rope — so rope mirroring and
 /// `document_position` bookkeeping in the caller are unaffected.
 fn transition_bq_depth(
     uow: &mut Box<dyn ImportMarkdownUnitOfWorkTrait>,
-    doc_id: EntityId,
+    orphans: &mut OrphanedChildren,
     frame_stack: &mut Vec<FrameState>,
     current_bq_depth: &mut u32,
     target_depth: u32,
@@ -82,6 +149,7 @@ fn transition_bq_depth(
     // Close blockquote frames if depth decreased
     while *current_bq_depth > target_depth && frame_stack.len() > 1 {
         let finished = frame_stack.pop().unwrap();
+        attach_blocks(uow, finished.frame_id, &finished.blocks)?;
         let mut frame_entity = uow
             .get_frame(&finished.frame_id)?
             .ok_or_else(|| anyhow!("Blockquote frame not found"))?;
@@ -100,7 +168,8 @@ fn transition_bq_depth(
             parent_frame: Some(parent_frame_id),
             ..Frame::default()
         };
-        let created_bq = uow.create_frame(&bq_frame, doc_id, -1)?;
+        let created_bq = uow.create_orphan_frame(&bq_frame)?;
+        orphans.frames.push(created_bq.id);
         frame_stack
             .last_mut()
             .unwrap()
@@ -109,6 +178,7 @@ fn transition_bq_depth(
         frame_stack.push(FrameState {
             frame_id: created_bq.id,
             child_order: Vec::new(),
+            blocks: Vec::new(),
         });
         *current_bq_depth += 1;
         list_grouper.reset();
@@ -143,14 +213,10 @@ fn import_parsed_elements(
         .first()
         .ok_or_else(|| anyhow!("Root has no associated Document"))?;
 
-    // Step 2: Remove existing frames
-    let frame_ids = uow.get_document_relationship(
-        &doc_id,
-        &common::direct_access::document::DocumentRelationshipField::Frames,
-    )?;
-    for frame_id in &frame_ids {
-        uow.remove_frame(frame_id)?;
-    }
+    // Step 2: Remove existing frames, in one call: each single removal rescans
+    // every remaining frame, so one at a time is quadratic in the frames replaced.
+    let frame_ids = uow.get_document_relationship(&doc_id, &DocumentRelationshipField::Frames)?;
+    uow.remove_frame_multi(&frame_ids)?;
 
     if cancel_flag.load(Ordering::Relaxed) {
         return Err(anyhow!("Operation was cancelled"));
@@ -162,8 +228,10 @@ fn import_parsed_elements(
     ));
 
     // Step 3: Create root frame
+    let mut orphans = OrphanedChildren::default();
     let new_frame = Frame::default();
-    let created_frame = uow.create_frame(&new_frame, doc_id, -1)?;
+    let created_frame = uow.create_orphan_frame(&new_frame)?;
+    orphans.frames.push(created_frame.id);
 
     // Reset the rope+block_offsets before populating new content
     // (importers replace the entire document). No-op under default
@@ -180,6 +248,7 @@ fn import_parsed_elements(
     let mut frame_stack: Vec<FrameState> = vec![FrameState {
         frame_id: created_frame.id,
         child_order: Vec::new(),
+        blocks: Vec::new(),
     }];
     let mut current_bq_depth: u32 = 0;
     let mut list_grouper = ListGrouper::new();
@@ -206,16 +275,14 @@ fn import_parsed_elements(
             // Mirrors `import_djot_uc`'s handling exactly, since `parse_markdown`
             // produces the same `ParsedElement::FootnoteDefinition` shape.
             ParsedElement::FootnoteDefinition { label, blocks } => {
-                let note_frame = uow.create_frame(
-                    &Frame {
-                        footnote_label: Some(label.clone()),
-                        ..Frame::default()
-                    },
-                    doc_id,
-                    -1,
-                )?;
+                let note_frame = uow.create_orphan_frame(&Frame {
+                    footnote_label: Some(label.clone()),
+                    ..Frame::default()
+                })?;
+                orphans.frames.push(note_frame.id);
 
                 let mut child_order: Vec<i64> = Vec::with_capacity(blocks.len());
+                let mut note_blocks: Vec<EntityId> = Vec::with_capacity(blocks.len());
                 for nb in blocks.iter() {
                     let ParsedInline {
                         plain_text,
@@ -239,8 +306,9 @@ fn import_parsed_elements(
                         fmt_code_language: nb.code_language.clone(),
                         ..Block::default()
                     };
-                    let created = uow.create_block(&block, note_frame.id, -1)?;
+                    let created = uow.create_orphan_block(&block)?;
                     child_order.push(created.id as i64);
+                    note_blocks.push(created.id);
 
                     // Mirrored into the rope like any other block: a definition
                     // is real document content, and `block_content_via_store` is
@@ -276,6 +344,7 @@ fn import_parsed_elements(
                     }
                 }
 
+                attach_blocks(uow, note_frame.id, &note_blocks)?;
                 let mut updated = note_frame.clone();
                 updated.child_order = child_order;
                 uow.update_frame(&updated)?;
@@ -283,7 +352,7 @@ fn import_parsed_elements(
             ParsedElement::Block(parsed_block) => {
                 transition_bq_depth(
                     uow,
-                    doc_id,
+                    &mut orphans,
                     &mut frame_stack,
                     &mut current_bq_depth,
                     parsed_block.blockquote_depth,
@@ -298,8 +367,8 @@ fn import_parsed_elements(
                 } = format_runs_from_spans(&parsed_block.spans, parsed_block.is_code_block);
                 let line_len = plain_text.chars().count() as i64;
 
-                // Create Block in the current (possibly blockquote) frame
-                let current_frame_id = frame_stack.last().unwrap().frame_id;
+                // Create Block for the current (possibly blockquote) frame,
+                // which receives it when it closes.
                 let block = Block {
                     document_position,
                     fmt_heading_level: parsed_block.heading_level,
@@ -312,7 +381,7 @@ fn import_parsed_elements(
                     ..Block::default()
                 };
 
-                let created_block = uow.create_block(&block, current_frame_id, -1)?;
+                let created_block = uow.create_orphan_block(&block)?;
 
                 // Insert an inter-block `\n` into the global rope
                 // before every block after the first.
@@ -362,7 +431,8 @@ fn import_parsed_elements(
                             indent: parsed_block.list_indent as i64,
                             ..List::default()
                         };
-                        let created_list = uow.create_list(&list, doc_id, -1)?;
+                        let created_list = uow.create_orphan_list(&list)?;
+                        orphans.lists.push(created_list.id);
                         list_grouper.register(
                             created_list.id,
                             list_style.clone(),
@@ -380,11 +450,9 @@ fn import_parsed_elements(
                     list_grouper.reset();
                 }
 
-                frame_stack
-                    .last_mut()
-                    .unwrap()
-                    .child_order
-                    .push(created_block.id as i64);
+                let current_frame = frame_stack.last_mut().unwrap();
+                current_frame.child_order.push(created_block.id as i64);
+                current_frame.blocks.push(created_block.id);
                 total_chars += line_len;
                 total_block_count += 1;
 
@@ -400,7 +468,7 @@ fn import_parsed_elements(
                 // lands in the correct frame.
                 transition_bq_depth(
                     uow,
-                    doc_id,
+                    &mut orphans,
                     &mut frame_stack,
                     &mut current_bq_depth,
                     parsed_table.blockquote_depth,
@@ -422,7 +490,8 @@ fn import_parsed_elements(
                     column_widths: vec![],
                     ..Table::default()
                 };
-                let created_table = uow.create_table(&table, doc_id, -1)?;
+                let created_table = uow.create_orphan_table(&table)?;
+                orphans.tables.push(created_table.id);
 
                 // 1b. Mirror the table-anchor sentinel into the global
                 // rope. Appended at the end (the importer processes
@@ -436,12 +505,15 @@ fn import_parsed_elements(
                 let total_cells = num_rows * num_cols;
                 let mut cell_count: i64 = 0;
                 let mut created_cell_frame_ids: Vec<common::types::EntityId> = Vec::new();
+                // The table's `cells`, written to it in one go below.
+                let mut created_cell_ids: Vec<EntityId> = Vec::new();
 
                 for (r, row) in parsed_table.rows.iter().enumerate() {
                     for (c, cell) in row.iter().enumerate() {
                         // Create cell frame
                         let cell_frame = Frame::default();
-                        let created_cell_frame = uow.create_frame(&cell_frame, doc_id, -1)?;
+                        let created_cell_frame = uow.create_orphan_frame(&cell_frame)?;
+                        orphans.frames.push(created_cell_frame.id);
                         created_cell_frame_ids.push(created_cell_frame.id);
 
                         let ParsedInline {
@@ -503,7 +575,8 @@ fn import_parsed_elements(
                             cell_frame: Some(created_cell_frame.id),
                             ..TableCell::default()
                         };
-                        uow.create_table_cell(&table_cell, created_table.id, -1)?;
+                        let created_cell = uow.create_orphan_table_cell(&table_cell)?;
+                        created_cell_ids.push(created_cell.id);
 
                         let text_length = plain_text.chars().count() as i64;
                         total_chars += text_length;
@@ -516,13 +589,20 @@ fn import_parsed_elements(
                     }
                 }
 
+                uow.set_table_relationship(
+                    &created_table.id,
+                    &TableRelationshipField::Cells,
+                    &created_cell_ids,
+                )?;
+
                 // 3. Create anchor frame (links table to the flow)
                 let anchor_frame = Frame {
                     parent_frame: Some(current_frame_id),
                     table: Some(created_table.id),
                     ..Frame::default()
                 };
-                let created_anchor = uow.create_frame(&anchor_frame, doc_id, -1)?;
+                let created_anchor = uow.create_orphan_frame(&anchor_frame)?;
+                orphans.frames.push(created_anchor.id);
 
                 // Backfill each cell frame's `parent_frame` to point at
                 // the anchor frame. Cell frames are created before the
@@ -576,6 +656,7 @@ fn import_parsed_elements(
     // Close any remaining open blockquote frames
     while frame_stack.len() > 1 {
         let finished = frame_stack.pop().unwrap();
+        attach_blocks(uow, finished.frame_id, &finished.blocks)?;
         let mut frame_entity = uow
             .get_frame(&finished.frame_id)?
             .ok_or_else(|| anyhow!("Blockquote frame not found"))?;
@@ -583,13 +664,17 @@ fn import_parsed_elements(
         uow.update_frame(&frame_entity)?;
     }
 
-    // Step 5: Update root frame child_order
+    // Step 5: Update root frame blocks and child_order
     let root_state = frame_stack.pop().unwrap();
+    attach_blocks(uow, root_state.frame_id, &root_state.blocks)?;
     let mut updated_frame = uow
         .get_frame(&root_state.frame_id)?
         .ok_or_else(|| anyhow!("Created frame not found"))?;
     updated_frame.child_order = root_state.child_order;
     uow.update_frame(&updated_frame)?;
+
+    // Every frame, list and table the walk created goes to the document.
+    orphans.attach(uow, doc_id)?;
 
     // Step 6: Update document stats
     let mut updated_doc = uow

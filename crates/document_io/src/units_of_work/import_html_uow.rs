@@ -94,22 +94,26 @@ impl CommandUnitOfWork for ImportHtmlUnitOfWork {
 #[macros::uow_action(entity = "Document", action = "Get", thread_safe = true)]
 #[macros::uow_action(entity = "Document", action = "Update", thread_safe = true)]
 #[macros::uow_action(entity = "Document", action = "GetRelationship", thread_safe = true)]
+#[macros::uow_action(entity = "Document", action = "SetRelationship", thread_safe = true)]
 #[macros::uow_action(entity = "Frame", action = "Get", thread_safe = true)]
-#[macros::uow_action(entity = "Frame", action = "Create", thread_safe = true)]
+#[macros::uow_action(entity = "Frame", action = "CreateOrphan", thread_safe = true)]
 #[macros::uow_action(entity = "Frame", action = "Update", thread_safe = true)]
 #[macros::uow_action(
     entity = "Frame",
     action = "UpdateWithRelationships",
     thread_safe = true
 )]
-#[macros::uow_action(entity = "Frame", action = "Remove", thread_safe = true)]
+#[macros::uow_action(entity = "Frame", action = "RemoveMulti", thread_safe = true)]
 #[macros::uow_action(entity = "Frame", action = "GetRelationship", thread_safe = true)]
+#[macros::uow_action(entity = "Frame", action = "SetRelationship", thread_safe = true)]
 #[macros::uow_action(entity = "Block", action = "Create", thread_safe = true)]
+#[macros::uow_action(entity = "Block", action = "CreateOrphan", thread_safe = true)]
 #[macros::uow_action(entity = "Block", action = "SetRelationship", thread_safe = true)]
-#[macros::uow_action(entity = "List", action = "Create", thread_safe = true)]
+#[macros::uow_action(entity = "List", action = "CreateOrphan", thread_safe = true)]
 #[macros::uow_action(entity = "Resource", action = "Create", thread_safe = true)]
-#[macros::uow_action(entity = "Table", action = "Create", thread_safe = true)]
-#[macros::uow_action(entity = "TableCell", action = "Create", thread_safe = true)]
+#[macros::uow_action(entity = "Table", action = "CreateOrphan", thread_safe = true)]
+#[macros::uow_action(entity = "Table", action = "SetRelationship", thread_safe = true)]
+#[macros::uow_action(entity = "TableCell", action = "CreateOrphan", thread_safe = true)]
 impl ImportHtmlUnitOfWorkTrait for ImportHtmlUnitOfWork {}
 
 pub struct ImportHtmlUnitOfWorkFactory {

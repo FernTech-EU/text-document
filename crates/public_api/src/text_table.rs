@@ -102,6 +102,7 @@ impl TextTable {
                 mask: &crate::highlight::HighlightMask::ALL,
                 suppress_paint: false,
             },
+            &crate::text_block::SnapshotLookups::default(),
         )
         .unwrap_or_else(|| TableSnapshot {
             table_id: self.table_id,
@@ -244,6 +245,7 @@ impl TextTableCell {
                     mask: &crate::highlight::HighlightMask::ALL,
                     suppress_paint: false,
                 },
+                &crate::text_block::SnapshotLookups::default(),
             ),
             None => Vec::new(),
         }

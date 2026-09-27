@@ -358,12 +358,29 @@ impl TextDocumentInner {
     }
 
     /// Get or lazily build the cached plain text.
-    pub fn plain_text(&mut self) -> Result<&str> {
-        if self.plain_text_cache.is_none() {
+    ///
+    /// Read fresh, and not cached, while one of this document's own long
+    /// operations runs. An import writes into the store in place, with no
+    /// isolation from a read, so a read taken meanwhile sees the document partly
+    /// replaced (or, since the importers hand new blocks to their owners at the
+    /// end, briefly empty), and its completion invalidates nothing: a cached copy
+    /// of that read would be returned after the import was done. `set_*` clear
+    /// the cache before starting, so nothing stale can be left once the
+    /// operation's end is handled.
+    pub fn plain_text(&mut self) -> Result<std::borrow::Cow<'_, str>> {
+        if !self.own_operations.is_empty() {
             let dto = frontend::commands::document_io_commands::export_plain_text(&self.ctx)?;
-            self.plain_text_cache = Some(dto.plain_text);
+            return Ok(std::borrow::Cow::Owned(dto.plain_text));
         }
-        Ok(self.plain_text_cache.as_deref().unwrap())
+        let text = match self.plain_text_cache.take() {
+            Some(text) => text,
+            None => {
+                frontend::commands::document_io_commands::export_plain_text(&self.ctx)?.plain_text
+            }
+        };
+        Ok(std::borrow::Cow::Borrowed(
+            self.plain_text_cache.insert(text).as_str(),
+        ))
     }
 
     /// Initialize the document: create Root → Document → Frame → Block.

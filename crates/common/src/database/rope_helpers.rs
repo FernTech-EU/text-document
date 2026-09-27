@@ -553,6 +553,99 @@ pub fn rope_split_block(
     );
 }
 
+/// [`rope_split_block`] on `current_block_id` at `byte_offset_in_block`,
+/// then again at the end of each new block in turn, each new block
+/// filled with its text by [`rope_insert_in_block`]: the rope and index
+/// that loop leaves, built with one rope insert and one index update.
+///
+/// `blocks` pairs each new block's id with its text, in document order.
+/// Whatever followed the split point in `current_block_id` ends up after
+/// the last new block, as it does through the loop. No-op if
+/// `current_block_id` is not in the index.
+///
+/// The loop walks every marker in the index once per new block, so
+/// pasting or restoring a document of N paragraphs through it cost N
+/// walks of N markers.
+pub fn rope_split_block_into(
+    store: &Store,
+    current_block_id: EntityId,
+    byte_offset_in_block: u32,
+    blocks: &[(EntityId, &str)],
+) {
+    let current_marker = OffsetMarker::Block(current_block_id);
+    let (block_start, current_idx) = {
+        let offsets = store.block_offsets.read();
+        let (Some((start, _end)), Some(idx)) = (
+            offsets.range_of(current_marker),
+            offsets.position_of(current_marker),
+        ) else {
+            return;
+        };
+        (start, idx)
+    };
+    rope_insert_block_run(
+        store,
+        block_start + byte_offset_in_block,
+        current_idx + 1,
+        blocks,
+    );
+}
+
+/// [`rope_insert_block_at`] for each of `blocks` in turn, the first at
+/// `byte_pos` and each next one at the byte right after the block before
+/// it: the rope and index that loop leaves, built with one rope insert
+/// and one index update. Returns the byte right after the last block,
+/// where that loop would insert next.
+///
+/// `blocks` pairs each new block's id with its text, in document order.
+pub fn rope_insert_blocks_at(store: &Store, byte_pos: u32, blocks: &[(EntityId, &str)]) -> u32 {
+    // Same placement rule as `rope_insert_block_at`: after every entry at
+    // `byte_pos` itself, before every entry strictly past it.
+    let vec_pos = {
+        let offsets = store.block_offsets.read();
+        offsets
+            .entries
+            .iter()
+            .position(|(_, bs)| *bs > byte_pos)
+            .unwrap_or(offsets.entries.len())
+    };
+    rope_insert_block_run(store, byte_pos, vec_pos, blocks)
+}
+
+/// Insert a run of new blocks at `byte_pos`, each a `\n` boundary
+/// followed by its text, and register them in the offset index at
+/// `vec_pos`, `vec_pos + 1`, …. Every entry strictly past `byte_pos`
+/// shifts by the whole run. Returns the byte right after the run.
+fn rope_insert_block_run(
+    store: &Store,
+    byte_pos: u32,
+    vec_pos: usize,
+    blocks: &[(EntityId, &str)],
+) -> u32 {
+    if blocks.is_empty() {
+        return byte_pos;
+    }
+    let mut inserted = String::with_capacity(blocks.iter().map(|(_, text)| 1 + text.len()).sum());
+    let mut run = Vec::with_capacity(blocks.len());
+    for (block_id, text) in blocks {
+        inserted.push('\n');
+        run.push((
+            OffsetMarker::Block(*block_id),
+            byte_pos + inserted.len() as u32,
+        ));
+        inserted.push_str(text);
+    }
+    {
+        let mut rope = store.rope.write();
+        let char_idx = rope.byte_to_char(byte_pos as usize);
+        rope.insert(char_idx, &inserted);
+    }
+    let mut offsets = store.block_offsets.write();
+    offsets.shift_after(byte_pos + 1, inserted.len() as i32);
+    offsets.insert_run_at(vec_pos, &run);
+    byte_pos + inserted.len() as u32
+}
+
 /// Merge `start_block` and `end_block` by deleting the rope range
 /// `[start_block.start + byte_so .. end_block.start + byte_eo)` — i.e.
 /// the suffix of `start_block`, every block between (and their
@@ -955,6 +1048,77 @@ pub fn rope_replace_block_content(store: &Store, block_id: EntityId, new_text: &
     }
 }
 
+/// [`rope_replace_block_content`] with an empty text for each of
+/// `block_ids` in turn: the rope and index that loop leaves, with one walk
+/// of the index instead of one per block.
+///
+/// Each one-block clear shifts every entry after the block, so emptying the
+/// cells of many tables one block at a time walked the index once per cell.
+/// When the blocks come in index order, as a deletion meets them, each
+/// block's content is exactly what it holds before any of them is cleared:
+/// clearing an earlier block moves this one, the entry after it and the end
+/// of the rope back by the same amount. Out of that order a clear can change
+/// what a later one measures (an emptied last block leaves the boundary
+/// before it looking like content), so the blocks are then cleared one at a
+/// time, as that loop does.
+pub fn rope_clear_blocks(store: &Store, block_ids: &[EntityId]) {
+    // `(index position, byte start, content bytes)` of each block with content.
+    let mut cuts: Vec<(usize, u32, u32)> = Vec::with_capacity(block_ids.len());
+    {
+        let offsets = store.block_offsets.read();
+        let total = offsets.total_bytes();
+        let mut previous: Option<usize> = None;
+        let mut in_index_order = true;
+        for &block_id in block_ids {
+            let marker = OffsetMarker::Block(block_id);
+            let (Some((start, end)), Some(position)) =
+                (offsets.range_of(marker), offsets.position_of(marker))
+            else {
+                // Not in the index: the one-block clear leaves it alone too.
+                continue;
+            };
+            if previous.is_some_and(|before| position <= before) {
+                in_index_order = false;
+                break;
+            }
+            previous = Some(position);
+            // What `rope_replace_block_content` counts as the block's content.
+            let content = if end < total {
+                end - start - 1
+            } else {
+                end - start
+            };
+            if content > 0 {
+                cuts.push((position, start, content));
+            }
+        }
+        if !in_index_order {
+            drop(offsets);
+            for &block_id in block_ids {
+                rope_replace_block_content(store, block_id, "");
+            }
+            return;
+        }
+    }
+    if cuts.is_empty() {
+        return;
+    }
+    {
+        // Last cut first, so the byte offsets of the others still hold.
+        let mut rope = store.rope.write();
+        for &(_, start, content) in cuts.iter().rev() {
+            let char_start = rope.byte_to_char(start as usize);
+            let char_end = rope.byte_to_char((start + content) as usize);
+            rope.remove(char_start..char_end);
+        }
+    }
+    let shifts: Vec<(usize, u32)> = cuts
+        .iter()
+        .map(|&(position, _, content)| (position, content))
+        .collect();
+    store.block_offsets.write().remove_bytes_after(&shifts);
+}
+
 /// Delete bytes `[byte_start_in_block..byte_end_in_block)` from inside
 /// the block identified by `block_id`. Shifts subsequent block offsets
 /// by the deleted byte length. No-op for blocks not in the index.
@@ -1144,4 +1308,69 @@ pub fn replace_in_block(
     let mut updated = block.clone();
     updated.updated_at = chrono::Utc::now();
     Ok(updated)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::database::block_offset_index::tests::ENTRIES_REWRITTEN;
+    use std::cell::Cell;
+
+    /// A store of `blocks` blocks of a few characters each, the way the importers lay a
+    /// document out: separated by a `\n` boundary. Returns the ids of its blocks, in order.
+    fn blocks(blocks: u64) -> (Store, Vec<EntityId>) {
+        let store = Store::new();
+        let ids: Vec<EntityId> = (1..=blocks).collect();
+        for &id in &ids {
+            if id > 1 {
+                rope_insert_block_boundary(&store);
+            }
+            rope_append_block(&store, id, &format!("cell {id}"));
+        }
+        (store, ids)
+    }
+
+    /// Emptying the cells of every table a deletion covers clears a block per cell, and a
+    /// one-block clear rewrites every index entry after the block: clearing a quarter of
+    /// the blocks one at a time rewrites about an eighth of the index squared. Clearing
+    /// them together must rewrite each entry once.
+    #[test]
+    fn clearing_blocks_together_walks_the_index_once() {
+        const BLOCKS: u64 = 1_000;
+        let (one_by_one, ids) = blocks(BLOCKS);
+        let (together, _) = blocks(BLOCKS);
+        let cleared: Vec<EntityId> = ids.iter().copied().step_by(4).collect();
+
+        ENTRIES_REWRITTEN.with(|rewritten| rewritten.set(0));
+        for &id in &cleared {
+            rope_replace_block_content(&one_by_one, id, "");
+        }
+        let block_by_block = ENTRIES_REWRITTEN.with(Cell::get);
+
+        ENTRIES_REWRITTEN.with(|rewritten| rewritten.set(0));
+        rope_clear_blocks(&together, &cleared);
+        let in_one_walk = ENTRIES_REWRITTEN.with(Cell::get);
+
+        assert_eq!(
+            *together.rope.read(),
+            *one_by_one.rope.read(),
+            "the same text is left"
+        );
+        assert_eq!(
+            *together.block_offsets.read(),
+            *one_by_one.block_offsets.read(),
+            "the same index is left"
+        );
+        assert!(
+            block_by_block > 100 * BLOCKS as usize,
+            "clearing block by block rewrote {block_by_block} entries"
+        );
+        assert_eq!(
+            in_one_walk,
+            BLOCKS as usize,
+            "clearing {} blocks together rewrote {in_one_walk} index entries, where one walk \
+             of the {BLOCKS} entries is enough",
+            cleared.len()
+        );
+    }
 }

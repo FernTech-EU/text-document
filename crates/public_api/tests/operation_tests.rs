@@ -174,3 +174,69 @@ fn latex_export_with_preamble() {
     assert!(latex.contains("\\documentclass"));
     assert!(latex.contains("Preamble test"));
 }
+
+// ── Reading while an import runs ─────────────────────────────────
+
+/// An import writes into the store in place, so a read taken while it runs sees the
+/// document partly replaced, or empty. `to_plain_text` used to cache that read, and the
+/// import's completion invalidated nothing, so the half-imported (or empty) text went on
+/// being returned after the import had finished.
+#[test]
+fn plain_text_read_while_an_import_runs_is_not_kept_after_it() {
+    const PARAGRAPHS: usize = 4_000;
+    let lines: Vec<String> = (0..PARAGRAPHS)
+        .map(|i| format!("Paragraph {i} of the imported text."))
+        .collect();
+    let djot: String = lines.iter().map(|line| format!("{line}\n\n")).collect();
+    let html: String = lines.iter().map(|line| format!("<p>{line}</p>")).collect();
+    let expected = {
+        let fresh = TextDocument::new();
+        fresh.set_djot_sync(&djot).unwrap();
+        fresh.to_plain_text().unwrap()
+    };
+
+    type Start = fn(&TextDocument, &str, &str) -> Box<dyn FnOnce() + Send>;
+    let imports: [(&str, Start); 3] = [
+        ("set_djot", |doc, djot, _| {
+            let op = doc.set_djot(djot).unwrap();
+            Box::new(move || {
+                op.wait().unwrap();
+            })
+        }),
+        ("set_markdown", |doc, djot, _| {
+            let op = doc.set_markdown(djot).unwrap();
+            Box::new(move || {
+                op.wait().unwrap();
+            })
+        }),
+        ("set_html", |doc, _, html| {
+            let op = doc.set_html(html).unwrap();
+            Box::new(move || {
+                op.wait().unwrap();
+            })
+        }),
+    ];
+    for (label, start) in imports {
+        let doc = TextDocument::new();
+        doc.set_djot_sync("The text before the import.\n").unwrap();
+        // The text a read sees before the import starts: a cache holding it would be as
+        // stale as one holding a half-imported text.
+        assert!(doc.to_plain_text().unwrap().contains("before the import"));
+
+        let wait = start(&doc, &djot, &html);
+        // Read at once, while the import is writing: thousands of paragraphs take far
+        // longer to import than the few microseconds before this read.
+        let during = doc.to_plain_text().unwrap_or_default();
+        wait();
+
+        assert_ne!(
+            during, expected,
+            "{label}: the read was meant to happen while the import ran"
+        );
+        assert_eq!(
+            doc.to_plain_text().unwrap(),
+            expected,
+            "{label}: the text read after the import is the imported text"
+        );
+    }
+}

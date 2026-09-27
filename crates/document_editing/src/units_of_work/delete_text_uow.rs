@@ -100,14 +100,19 @@ impl CommandUnitOfWork for DeleteTextUnitOfWork {
 #[macros::uow_action(entity = "Block", action = "UpdateMulti")]
 #[macros::uow_action(entity = "Block", action = "Create")]
 #[macros::uow_action(entity = "Block", action = "Remove")]
+#[macros::uow_action(entity = "Block", action = "RemoveMulti")]
 #[macros::uow_action(entity = "Block", action = "GetRelationship")]
 #[macros::uow_action(entity = "Table", action = "Get")]
 #[macros::uow_action(entity = "Table", action = "GetRelationship")]
 #[macros::uow_action(entity = "Table", action = "Remove")]
+#[macros::uow_action(entity = "Table", action = "RemoveMulti")]
 #[macros::uow_action(entity = "TableCell", action = "GetMulti")]
 #[macros::uow_action(entity = "TableCell", action = "Remove")]
+#[macros::uow_action(entity = "TableCell", action = "RemoveMulti")]
 #[macros::uow_action(entity = "Frame", action = "Remove")]
+#[macros::uow_action(entity = "Frame", action = "RemoveMulti")]
 #[macros::uow_action(entity = "List", action = "Remove")]
+#[macros::uow_action(entity = "List", action = "RemoveMulti")]
 impl DeleteTextUnitOfWorkTrait for DeleteTextUnitOfWork {}
 
 pub struct DeleteTextUnitOfWorkFactory {

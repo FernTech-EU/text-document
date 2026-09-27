@@ -282,15 +282,7 @@ impl<'a> FrameTable for FrameHashMapTable<'a> {
         field: &FrameRelationshipField,
         right_ids: &[EntityId],
     ) -> Result<Vec<(EntityId, Vec<EntityId>)>, RepositoryError> {
-        let map = self.store.frames.read();
-        let mut out = Vec::new();
-        for (id, frame) in map.iter() {
-            let list = read_field(frame, field);
-            if right_ids.iter().any(|rid| list.contains(rid)) {
-                out.push((*id, list));
-            }
-        }
-        Ok(out)
+        Ok(frames_naming_any(self.store, field, right_ids))
     }
 
     fn set_relationship_multi(
@@ -435,16 +427,41 @@ impl<'a> FrameTableRO for FrameHashMapTableRO<'a> {
         field: &FrameRelationshipField,
         right_ids: &[EntityId],
     ) -> Result<Vec<(EntityId, Vec<EntityId>)>, RepositoryError> {
-        let map = self.store.frames.read();
-        let mut out = Vec::new();
-        for (id, frame) in map.iter() {
-            let list = read_field(frame, field);
-            if right_ids.iter().any(|rid| list.contains(rid)) {
-                out.push((*id, list));
-            }
-        }
-        Ok(out)
+        Ok(frames_naming_any(self.store, field, right_ids))
     }
+}
+
+/// Every frame whose `field` names at least one of `right_ids`, with that list.
+///
+/// The ids go into a set first. Asking each frame's list about every id in turn
+/// cost frames times ids, and removing a document's frames passes every one of
+/// its block ids at once: replacing a document's content was quadratic in its
+/// footnotes, table cells and quotations, each a frame of a single block.
+fn frames_naming_any(
+    store: &Store,
+    field: &FrameRelationshipField,
+    right_ids: &[EntityId],
+) -> Vec<(EntityId, Vec<EntityId>)> {
+    let wanted: std::collections::HashSet<EntityId> = right_ids.iter().copied().collect();
+    let map = store.frames.read();
+    let mut out = Vec::new();
+    for (id, frame) in map.iter() {
+        let list = read_field(frame, field);
+        if list.iter().any(|named| is_wanted(&wanted, named)) {
+            out.push((*id, list));
+        }
+    }
+    out
+}
+
+/// Whether `id` is one of the ids a lookup asks about: one hash probe, however
+/// many ids were asked about. Unit tests count the probes, which is how
+/// `tests::finding_owners_probes_each_listed_id_once` guards the lookup's cost
+/// in the debug builds CI tests with, where timing it cannot.
+fn is_wanted(wanted: &std::collections::HashSet<EntityId>, id: &EntityId) -> bool {
+    #[cfg(test)]
+    tests::PROBES.with(|probes| probes.set(probes.get() + 1));
+    wanted.contains(id)
 }
 
 fn reorder(current: Vec<EntityId>, ids_to_move: &[EntityId], new_index: i32) -> Vec<EntityId> {
@@ -465,4 +482,83 @@ fn reorder(current: Vec<EntityId>, ids_to_move: &[EntityId], new_index: i32) -> 
         remaining.insert(insert_pos + i, eid);
     }
     remaining
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::entities::Block;
+    use std::cell::Cell;
+
+    thread_local! {
+        /// Membership probes [`is_wanted`] made on this thread.
+        pub(super) static PROBES: Cell<usize> = const { Cell::new(0) };
+    }
+
+    /// A store of `frames` frames owning one block each, and the ids of those blocks.
+    fn one_block_frames(frames: u64) -> (Store, Vec<EntityId>) {
+        let store = Store::new();
+        {
+            let mut frame_map = store.frames.write();
+            let mut block_map = store.blocks.write();
+            for id in 1..=frames {
+                block_map.insert(
+                    id,
+                    Block {
+                        id,
+                        ..Block::default()
+                    },
+                );
+                frame_map.insert(
+                    id,
+                    Frame {
+                        id,
+                        blocks: vec![id],
+                        child_order: vec![id as i64],
+                        ..Frame::default()
+                    },
+                );
+            }
+        }
+        (store, (1..=frames).collect())
+    }
+
+    /// Removing a document's frames asks which frames own every one of its blocks at once.
+    /// Checking each frame's list against every id asked about cost frames times ids: a
+    /// million comparisons here, and quadratic in the footnotes, table cells and quotations
+    /// of a document being replaced. The lookup must probe each listed id once instead,
+    /// whatever the number of ids asked about.
+    #[test]
+    fn finding_owners_probes_each_listed_id_once() -> Result<(), RepositoryError> {
+        const FRAMES: u64 = 1_000;
+        let (store, block_ids) = one_block_frames(FRAMES);
+
+        PROBES.with(|probes| probes.set(0));
+        let owners = FrameHashMapTable::new(&store)
+            .get_relationships_from_right_ids(&FrameRelationshipField::Blocks, &block_ids)?;
+        assert_eq!(owners.len(), FRAMES as usize, "every frame owns a block");
+        assert_eq!(
+            PROBES.with(Cell::get),
+            FRAMES as usize,
+            "the write lookup probed each of the {FRAMES} listed ids once"
+        );
+
+        PROBES.with(|probes| probes.set(0));
+        let owners = FrameHashMapTableRO::new(&store)
+            .get_relationships_from_right_ids(&FrameRelationshipField::Blocks, &block_ids)?;
+        assert_eq!(owners.len(), FRAMES as usize, "every frame owns a block");
+        assert_eq!(
+            PROBES.with(Cell::get),
+            FRAMES as usize,
+            "the read lookup probed each of the {FRAMES} listed ids once"
+        );
+
+        // Asking about a single block still reads every frame's list once, no more.
+        PROBES.with(|probes| probes.set(0));
+        let owners = FrameHashMapTable::new(&store)
+            .get_relationships_from_right_ids(&FrameRelationshipField::Blocks, &[FRAMES / 2])?;
+        assert_eq!(owners, vec![(FRAMES / 2, vec![FRAMES / 2])]);
+        assert_eq!(PROBES.with(Cell::get), FRAMES as usize);
+        Ok(())
+    }
 }

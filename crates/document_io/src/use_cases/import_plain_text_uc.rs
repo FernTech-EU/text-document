@@ -18,9 +18,8 @@ pub trait ImportPlainTextUnitOfWorkFactoryTrait: Send + Sync {
 #[macros::uow_action(entity = "Frame", action = "Get")]
 #[macros::uow_action(entity = "Frame", action = "Create")]
 #[macros::uow_action(entity = "Frame", action = "Update")]
-#[macros::uow_action(entity = "Frame", action = "Remove")]
+#[macros::uow_action(entity = "Frame", action = "RemoveMulti")]
 #[macros::uow_action(entity = "Frame", action = "GetRelationship")]
-#[macros::uow_action(entity = "Block", action = "Create")]
 #[macros::uow_action(entity = "Block", action = "CreateMulti")]
 pub trait ImportPlainTextUnitOfWorkTrait: CommandUnitOfWork {}
 
@@ -53,9 +52,9 @@ impl ImportPlainTextUseCase {
             &doc_id,
             &common::direct_access::document::DocumentRelationshipField::Frames,
         )?;
-        for frame_id in &frame_ids {
-            uow.remove_frame(frame_id)?;
-        }
+        // In one call: each single removal rescans every remaining frame, so
+        // removing them one by one is quadratic in the frames being replaced.
+        uow.remove_frame_multi(&frame_ids)?;
 
         let new_frame = Frame::default();
         let created_frame = uow.create_frame(&new_frame, doc_id, -1)?;
@@ -68,34 +67,40 @@ impl ImportPlainTextUseCase {
         let num_blocks = lines.len() as i64;
         let mut total_chars: i64 = 0;
         let mut document_position: i64 = 0;
-        let mut block_ids: Vec<i64> = Vec::new();
+        let mut blocks: Vec<Block> = Vec::with_capacity(lines.len());
 
         for (i, line) in lines.iter().enumerate() {
             let line_chars = line.chars().count() as i64;
 
-            let block = Block {
+            blocks.push(Block {
                 document_position,
                 ..Block::default()
-            };
+            });
 
-            let created_block = uow.create_block(&block, created_frame.id, -1)?;
+            total_chars += line_chars;
+            document_position += line_chars;
+            if i < lines.len() - 1 {
+                document_position += 1;
+            }
+        }
 
-            // format_runs / block_images stay empty for plain-text import: an
-            // absent or empty run vector means "default format everywhere".
+        // Every block in one call. Creating them one at a time appends each to
+        // the frame's `blocks`, and every append rewrites, re-validates and
+        // re-announces the whole list so far: quadratic in the line count.
+        // Ids are handed out in slice order, as the per-line creation did.
+        let created_blocks = uow.create_block_multi(&blocks, created_frame.id, -1)?;
 
+        // format_runs / block_images stay empty for plain-text import: an
+        // absent or empty run vector means "default format everywhere".
+        let mut block_ids: Vec<i64> = Vec::with_capacity(created_blocks.len());
+        for (i, (created_block, line)) in created_blocks.iter().zip(&lines).enumerate() {
             // Mirror the block's text into the global rope. Insert an
             // inter-block `\n` before every block after the first.
             if i > 0 {
                 rope_insert_block_boundary(&uow.store());
             }
             rope_append_block(&uow.store(), created_block.id, line);
-
             block_ids.push(created_block.id as i64);
-            total_chars += line_chars;
-            document_position += line_chars;
-            if i < lines.len() - 1 {
-                document_position += 1;
-            }
         }
 
         let mut updated_frame = uow

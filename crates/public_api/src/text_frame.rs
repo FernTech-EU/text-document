@@ -12,7 +12,7 @@ use crate::FrameFormat;
 use crate::convert::to_usize;
 use crate::flow::{CellSnapshot, FlowElement, FlowElementSnapshot, FrameSnapshot, TableSnapshot};
 use crate::inner::TextDocumentInner;
-use crate::text_block::TextBlock;
+use crate::text_block::{SnapshotLookups, TextBlock};
 use crate::text_table::TextTable;
 
 /// A read-only handle to a frame in the document.
@@ -237,6 +237,16 @@ pub(crate) fn build_flow_snapshot(
     frame_id: EntityId,
     hl: crate::highlight::SnapshotHighlights,
 ) -> Vec<FlowElementSnapshot> {
+    build_flow_snapshot_with(inner, frame_id, hl, &SnapshotLookups::default())
+}
+
+/// [`build_flow_snapshot`] as part of a larger snapshot, sharing its `lookups`.
+fn build_flow_snapshot_with(
+    inner: &TextDocumentInner,
+    frame_id: EntityId,
+    hl: crate::highlight::SnapshotHighlights,
+    lookups: &SnapshotLookups,
+) -> Vec<FlowElementSnapshot> {
     let frame_dto = match frame_commands::get_frame(&inner.ctx, &frame_id)
         .ok()
         .flatten()
@@ -247,10 +257,10 @@ pub(crate) fn build_flow_snapshot(
 
     if !frame_dto.child_order.is_empty() {
         let (elements, _) =
-            snapshot_from_child_order(inner, &frame_dto.child_order, 0, frame_id, hl);
+            snapshot_from_child_order(inner, &frame_dto.child_order, 0, frame_id, hl, lookups);
         elements
     } else {
-        snapshot_fallback(inner, &frame_dto, hl)
+        snapshot_fallback(inner, &frame_dto, hl, lookups)
     }
 }
 
@@ -265,6 +275,7 @@ fn snapshot_from_child_order(
     start_pos: usize,
     parent_frame_id: EntityId,
     hl: crate::highlight::SnapshotHighlights,
+    lookups: &SnapshotLookups,
 ) -> (Vec<FlowElementSnapshot>, usize) {
     let mut elements = Vec::with_capacity(child_order.len());
     let mut running_pos = start_pos;
@@ -278,6 +289,7 @@ fn snapshot_from_child_order(
                 Some(running_pos),
                 Some(parent_frame_id),
                 hl,
+                lookups,
             ) {
                 running_pos += snap.length + 1; // +1 for block separator
                 elements.push(FlowElementSnapshot::Block(snap));
@@ -289,9 +301,13 @@ fn snapshot_from_child_order(
                 .flatten()
             {
                 if let Some(table_id) = sub_frame.table {
-                    if let Some((snap, new_pos)) =
-                        build_table_snapshot_with_positions(inner, table_id, running_pos, hl)
-                    {
+                    if let Some((snap, new_pos)) = build_table_snapshot_with_positions(
+                        inner,
+                        table_id,
+                        running_pos,
+                        hl,
+                        lookups,
+                    ) {
                         running_pos = new_pos;
                         elements.push(FlowElementSnapshot::Table(snap));
                     }
@@ -302,6 +318,7 @@ fn snapshot_from_child_order(
                         running_pos,
                         sub_frame_id,
                         hl,
+                        lookups,
                     );
                     running_pos = new_pos;
                     elements.push(FlowElementSnapshot::Frame(FrameSnapshot {
@@ -321,6 +338,7 @@ fn snapshot_fallback(
     inner: &TextDocumentInner,
     frame_dto: &frontend::frame::dtos::FrameDto,
     hl: crate::highlight::SnapshotHighlights,
+    lookups: &SnapshotLookups,
 ) -> Vec<FlowElementSnapshot> {
     let cell_frame_ids = build_cell_frame_ids(inner);
 
@@ -339,7 +357,11 @@ fn snapshot_fallback(
 
     let mut elements: Vec<FlowElementSnapshot> = block_dtos
         .iter()
-        .filter_map(|b| crate::text_block::build_block_snapshot(inner, b.id, hl))
+        .filter_map(|b| {
+            crate::text_block::build_block_snapshot_with_position_and_parent(
+                inner, b.id, None, None, hl, lookups,
+            )
+        })
         .map(FlowElementSnapshot::Block)
         .collect();
 
@@ -353,11 +375,11 @@ fn snapshot_fallback(
         }
         if f.parent_frame == Some(frame_dto.id) {
             if let Some(table_id) = f.table {
-                if let Some(snap) = build_table_snapshot(inner, table_id, hl) {
+                if let Some(snap) = build_table_snapshot(inner, table_id, hl, lookups) {
                     elements.push(FlowElementSnapshot::Table(snap));
                 }
             } else {
-                let nested = build_flow_snapshot(inner, f.id as EntityId, hl);
+                let nested = build_flow_snapshot_with(inner, f.id as EntityId, hl, lookups);
                 elements.push(FlowElementSnapshot::Frame(FrameSnapshot {
                     frame_id: f.id as usize,
                     format: frame_dto_to_format(f),
@@ -371,10 +393,12 @@ fn snapshot_fallback(
 }
 
 /// Build a TableSnapshot for the given table ID. Called while lock is held.
+/// `lookups` is shared with the rest of the snapshot this table belongs to, if any.
 pub(crate) fn build_table_snapshot(
     inner: &TextDocumentInner,
     table_id: u64,
     hl: crate::highlight::SnapshotHighlights,
+    lookups: &SnapshotLookups,
 ) -> Option<TableSnapshot> {
     let table_dto = table_commands::get_table(&inner.ctx, &table_id)
         .ok()
@@ -387,7 +411,12 @@ pub(crate) fn build_table_snapshot(
             .flatten()
         {
             let blocks = if let Some(cell_frame_id) = cell_dto.cell_frame {
-                crate::text_block::build_blocks_snapshot_for_frame(inner, cell_frame_id, hl)
+                crate::text_block::build_blocks_snapshot_for_frame(
+                    inner,
+                    cell_frame_id,
+                    hl,
+                    lookups,
+                )
             } else {
                 Vec::new()
             };
@@ -423,6 +452,7 @@ fn build_table_snapshot_with_positions(
     table_id: u64,
     start_pos: usize,
     hl: crate::highlight::SnapshotHighlights,
+    lookups: &SnapshotLookups,
 ) -> Option<(TableSnapshot, usize)> {
     let table_dto = table_commands::get_table(&inner.ctx, &table_id)
         .ok()
@@ -450,6 +480,7 @@ fn build_table_snapshot_with_positions(
                     cell_frame_id,
                     running_pos,
                     hl,
+                    lookups,
                 );
             running_pos = new_pos;
             snaps
