@@ -458,6 +458,48 @@ fn patch_writes_uid_initials_and_resolved_flag() {
     );
 }
 
+// --- a body too deep for the parser -------------------------------------------------------
+
+/// A comment body nested past what the Djot parser survives is written as its own text
+/// rather than handed to the parser, which has no depth limit: a stack overflow aborts
+/// the process, and every unsaved document with it. It runs on a thread with a spawned
+/// thread's 2 MiB stack, where the 700 list levels of this body abort the parser.
+#[test]
+fn a_comment_body_too_deep_to_parse_is_exported_as_its_text() {
+    let body = format!("{}deep", "- ".repeat(700));
+    let comments_xml = {
+        let body = body.clone();
+        std::thread::Builder::new()
+            .stack_size(2 << 20)
+            .spawn(move || {
+                let (db, ev, _) = setup().expect("setup");
+                import_djot(&db, &ev, "One sentence to comment on.");
+                let range = char_range_of(&db, "One sentence");
+                let mut comments = DocumentComments::new();
+                comments.insert(comment("cmt-deep", "Alice Editor", "AE", range, &body));
+                let xml_docx = document_io_controller::build_docx_xml_document(
+                    &db,
+                    &ExportDocxDto {
+                        output_path: "unused.docx".to_string(),
+                        options: DocxExportOptions {
+                            comments,
+                            ..Default::default()
+                        },
+                    },
+                )
+                .expect("build_docx_xml_document");
+                String::from_utf8(xml_docx.comments.clone()).expect("comments.xml is UTF-8")
+            })
+            .expect("spawn the export thread")
+            .join()
+            .expect("the export must not unwind")
+    };
+    assert!(
+        comments_xml.contains(&body),
+        "the body is written as its text: {comments_xml:.300}"
+    );
+}
+
 // --- golden fixture: a real .docx opens in LibreOffice with its comments intact --------
 
 /// `Some(path)` if `soffice` is on `PATH`, else `None` — this test needs a real LibreOffice

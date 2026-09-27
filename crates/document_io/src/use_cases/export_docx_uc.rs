@@ -332,6 +332,13 @@ fn render_comment_body(djot: &str) -> docx_rs::Paragraph {
     use docx_rs::*;
     use jotdown::{Container as C, Event as E, Parser};
 
+    // `jotdown` has no depth limit and a stack overflow aborts the process, so a body
+    // nested past what `parse_djot` would parse is never handed to it: it is set down as
+    // the text it is, line by line, as `parse_djot` degrades a document.
+    if common::parser_tools::djot_depth::is_too_deep(djot) {
+        return append_formatted_text(Paragraph::new(), djot, false, false, false, false);
+    }
+
     let mut paragraph = Paragraph::new();
     let mut bold = false;
     let mut italic = false;

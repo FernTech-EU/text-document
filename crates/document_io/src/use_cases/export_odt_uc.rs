@@ -480,6 +480,14 @@ fn annotation_open_xml(
 fn render_comment_body_odt(djot: &str, styles: &mut OdtStyleSheet) -> String {
     use jotdown::{Container as C, Event as E, Parser};
 
+    // `jotdown` has no depth limit and a stack overflow aborts the process, so a body
+    // nested past what `parse_djot` would parse is never handed to it: it is set down as
+    // the text it is, one paragraph broken at each of its lines, as `parse_djot` degrades
+    // a document.
+    if common::parser_tools::djot_depth::is_too_deep(djot) {
+        return format!("<text:p>{}</text:p>", odt_render::encode_run_text(djot));
+    }
+
     let mut paragraphs: Vec<String> = Vec::new();
     let mut current = String::new();
     let mut bold = false;
