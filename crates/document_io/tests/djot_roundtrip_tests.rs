@@ -164,6 +164,48 @@ fn nested_list() {
     assert_contains(&dj, "    - c");
 }
 
+/// A bullet whose only content is a nested ordered list leaves the model an ordered
+/// item one level down with no item above it, a level Djot cannot write: an indented
+/// first item is read back at the top level. It is written there, so export stays a
+/// fixpoint.
+#[test]
+fn an_item_nested_under_no_item_is_written_at_the_level_it_reloads_at() {
+    assert_eq!(fixpoint("- a. a"), "a. a");
+    assert_eq!(fixpoint("para\n\n- 1. one"), "para\n\n1. one");
+}
+
+/// Two ordered lists the model keeps apart, side by side at one level with one marker,
+/// are one list to the parser, so the second continues the first's numbering.
+#[test]
+fn adjacent_ordered_lists_are_numbered_as_the_one_list_they_reload_as() {
+    assert_eq!(fixpoint("1. 0. A\n\n2. aa"), "1. A\n\n2. aa");
+}
+
+/// The parser resumes a list once a sub-list nested in it closes, so the item after
+/// the sub-list continues the outer numbering; it was written as `1.` again.
+#[test]
+fn an_ordered_list_resumes_its_numbering_after_a_nested_list() {
+    assert_eq!(
+        fixpoint("1. a\n\n   - x\n\n2. b\n\n3. c"),
+        "1. a\n\n  - x\n\n2. b\n\n3. c"
+    );
+    assert_eq!(
+        fixpoint("1. a\n\n   1. x\n\n   2. y\n\n2. b"),
+        "1. a\n\n  1. x\n\n  2. y\n\n2. b"
+    );
+    assert_eq!(
+        fixpoint("1. a\n\n   - x\n\n      1. deep\n\n2. b"),
+        "1. a\n\n  - x\n\n    1. deep\n\n2. b"
+    );
+    // A different kind of list at the same level is a new list, and so is one after a
+    // paragraph.
+    assert_eq!(
+        fixpoint("1. a\n\n   - x\n\n- y\n\n1. z"),
+        "1. a\n\n  - x\n\n- y\n\n1. z"
+    );
+    assert_eq!(fixpoint("1. a\n\npara\n\n1. b"), "1. a\n\npara\n\n1. b");
+}
+
 #[test]
 fn blockquote_depths() {
     assert_contains(&fixpoint("> quoted"), "> quoted");
