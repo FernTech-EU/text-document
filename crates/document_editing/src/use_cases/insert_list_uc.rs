@@ -43,7 +43,8 @@ pub trait InsertListUnitOfWorkTrait: CommandUnitOfWork {}
 pub struct InsertListUseCase {
     uow_factory: Box<dyn InsertListUnitOfWorkFactoryTrait>,
     undo_snapshot: Option<EntityTreeSnapshot>,
-    last_dto: Option<InsertListDto>,
+    /// The document as the execution left it, which redo puts back.
+    redo_snapshot: Option<EntityTreeSnapshot>,
 }
 
 /// Convert from crate's ListStyle to common::entities::ListStyle
@@ -63,7 +64,7 @@ fn convert_list_style(style: &crate::dtos::ListStyle) -> common::entities::ListS
 fn execute_insert_list(
     uow: &mut Box<dyn InsertListUnitOfWorkTrait>,
     dto: &InsertListDto,
-) -> Result<(InsertListResultDto, EntityTreeSnapshot)> {
+) -> Result<(InsertListResultDto, EntityTreeSnapshot, EntityTreeSnapshot)> {
     let position = dto.position;
 
     // Get Root -> Document
@@ -198,6 +199,7 @@ fn execute_insert_list(
             new_position: new_block_position,
         },
         snapshot,
+        uow.snapshot_document(&[doc_id])?,
     ))
 }
 
@@ -206,7 +208,7 @@ impl InsertListUseCase {
         InsertListUseCase {
             uow_factory,
             undo_snapshot: None,
-            last_dto: None,
+            redo_snapshot: None,
         }
     }
 
@@ -214,9 +216,9 @@ impl InsertListUseCase {
         let mut uow = self.uow_factory.create();
         uow.begin_transaction()?;
 
-        let (result, snapshot) = execute_insert_list(&mut uow, dto)?;
+        let (result, snapshot, after) = execute_insert_list(&mut uow, dto)?;
         self.undo_snapshot = Some(snapshot);
-        self.last_dto = Some(dto.clone());
+        self.redo_snapshot = Some(after);
 
         uow.commit()?;
         Ok(result)
@@ -238,17 +240,22 @@ impl UndoRedoCommand for InsertListUseCase {
         Ok(())
     }
 
+    /// Puts back the document as the first execution left it, rather than
+    /// running it again. Run again, it made its list under a new id, and a
+    /// later command of the same edit that names that list failed to redo: an
+    /// editor moving a list item a level in makes a list of it and then sets
+    /// that list's level, and the list the second step named had gone with the
+    /// undo. The ids of the entities this made are kept this way.
     fn redo(&mut self) -> Result<()> {
-        let dto = self
-            .last_dto
+        let snapshot = self
+            .redo_snapshot
             .as_ref()
-            .ok_or_else(|| anyhow!("No DTO available for redo"))?
+            .ok_or_else(|| anyhow!("No snapshot available for redo"))?
             .clone();
 
         let mut uow = self.uow_factory.create();
         uow.begin_transaction()?;
-        let (_, snapshot) = execute_insert_list(&mut uow, &dto)?;
-        self.undo_snapshot = Some(snapshot);
+        uow.restore_document(&snapshot)?;
         uow.commit()?;
         Ok(())
     }

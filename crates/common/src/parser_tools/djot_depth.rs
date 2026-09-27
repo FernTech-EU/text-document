@@ -76,10 +76,14 @@
 //! # What callers do with it
 //!
 //! [`parse_djot`](super::content_parser::parse_djot) keeps its signature and
-//! **degrades rather than refusing**: over-deep input comes back as a single plain
-//! paragraph holding the source verbatim. Nothing is lost, since the text is all still
-//! there; it is simply not given a structure, which is the honest answer for a document
-//! whose structure cannot be computed without ending the process.
+//! **degrades rather than refusing**. A document this scan finds too deep is first given
+//! shallower indentation ([`flatten_deep_indentation`]) and measured again, by the same
+//! scan. When its depth came from indentation, the way a deeply nested list is written,
+//! it then parses, its lists flattened below a fixed depth with every item and every
+//! word. A document still too deep after that comes back as a single plain paragraph
+//! holding the source verbatim. Nothing is lost either way, since the text is all still
+//! there; structure is dropped only where it cannot be computed without ending the
+//! process.
 //!
 //! The DOCX and ODT writers walk a comment's Djot body with `jotdown` directly, and do
 //! the same with a body past the ceiling: it is written as its own text.
@@ -102,6 +106,12 @@
 /// The most nested block containers a document may declare before [`is_too_deep`]
 /// reports it.
 pub const MAX_NESTING_DEPTH: usize = 128;
+
+/// How many columns of indentation [`flatten_deep_indentation`] leaves in a line's
+/// container prefix: four a level (room for markers up to `10.`) for the
+/// [`MAX_LIST_INDENT`](super::list_depth::MAX_LIST_INDENT) levels an insertion keeps
+/// below the top one.
+pub const FLATTENED_INDENT_COLUMNS: usize = 4 * super::list_depth::MAX_LIST_INDENT as usize;
 
 /// The most block containers any line of `text` sits inside, as `jotdown` 0.10 nests
 /// them.
@@ -133,6 +143,56 @@ fn deepest(text: &str, limit: usize) -> usize {
         }
     }
     deepest
+}
+
+/// `text` with the indentation of each line's container prefix cut to at most
+/// [`FLATTENED_INDENT_COLUMNS`] columns in all, and nothing else changed.
+///
+/// A line's container prefix is the run of blockquote, list item and footnote markers
+/// it opens with, each identified as `jotdown` identifies it, and the whitespace before
+/// and between them. Indentation is how Djot nests a list: an item indented past the
+/// item above it goes inside it. Cut at a fixed column, a list nested deeper than that
+/// comes out with its deeper items side by side at the deepest level left, every item
+/// kept, in its order, with its text. Each marker keeps the whitespace byte that ends
+/// it, so a quotation stays a quotation and an item stays an item, and every line keeps
+/// its line break.
+///
+/// Meant for text [`is_too_deep`] refuses, before giving up on its structure. It reads
+/// each line on its own, so indentation inside a code block is its content and this
+/// cuts it too, and what it returns has to be measured again: the markers it keeps can
+/// still nest past the ceiling. It reads no more than one marker past the ceiling into
+/// a line, the most the scan opens on one, and leaves the rest of that line as it is.
+pub fn flatten_deep_indentation(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for line in text.split_inclusive('\n') {
+        let mut columns_left = FLATTENED_INDENT_COLUMNS;
+        let mut markers = 0usize;
+        let mut rest = line;
+        loop {
+            let whitespace = rest.bytes().take_while(|&byte| is_space(byte)).count();
+            // A line break is whitespace too, and has to stay.
+            let indent = rest[..whitespace].find(['\r', '\n']).unwrap_or(whitespace);
+            let keep = indent.min(columns_left);
+            columns_left -= keep;
+            out.push_str(&rest[..keep]);
+            out.push_str(&rest[indent..whitespace]);
+            let content = &rest[whitespace..];
+            let marker = match identify(content.as_bytes()) {
+                (Block::Blockquote | Block::Item { .. }, end) if markers <= MAX_NESTING_DEPTH => {
+                    // The marker, and the whitespace byte that ends it.
+                    end + usize::from(content.as_bytes().get(end).is_some_and(|&b| is_space(b)))
+                }
+                _ => {
+                    out.push_str(content);
+                    break;
+                }
+            };
+            markers += 1;
+            out.push_str(&content[..marker]);
+            rest = &content[marker..];
+        }
+    }
+    out
 }
 
 /// Whitespace as the block parser reads it.

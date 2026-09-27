@@ -1045,6 +1045,14 @@ impl TextCursor {
 
     /// Insert a document fragment at the cursor. Replaces selection if any.
     /// Reports [`InsertionOrigin::Unspecified`] — the caller did not say.
+    ///
+    /// A list the fragment carries goes in with every item, in its order, at
+    /// most 16 levels deep, where an editor's own nesting gestures stop: an
+    /// item nested deeper lands at the 16th level, beside the items there. This
+    /// holds for [`insert_djot`](Self::insert_djot),
+    /// [`insert_html`](Self::insert_html) and
+    /// [`insert_markdown`](Self::insert_markdown) as well, which insert a
+    /// fragment. Loading a document keeps its lists as they are.
     pub fn insert_fragment(&self, fragment: &DocumentFragment) -> Result<()> {
         self.insert_fragment_with_origin(fragment, InsertionOrigin::Unspecified)
     }
@@ -2462,14 +2470,16 @@ impl TextCursor {
 
     /// Returns the list that the block at the cursor position belongs to,
     /// or `None` if the current block is not a list item.
+    ///
+    /// The block is the caret's (see [`TextDocument::block_at_caret`](crate::TextDocument::block_at_caret)):
+    /// at the end of a list item, that item. This and the other list helpers
+    /// acting on the current block used to read the block at the character
+    /// index, the next paragraph there, so moving an item a level in or out
+    /// with the caret at the end of its text moved the item after it.
     pub fn current_list(&self) -> Option<crate::TextList> {
         let pos = self.position();
         let inner = self.doc.lock();
-        let dto = frontend::document_inspection::GetBlockAtPositionDto {
-            position: to_i64(pos),
-        };
-        let block_info =
-            document_inspection_commands::get_block_at_position(&inner.ctx, &dto).ok()?;
+        let block_info = crate::inner::block_at_caret_dto(&inner.ctx, pos).ok()?;
         let block = crate::text_block::TextBlock {
             doc: self.doc.clone(),
             block_id: block_info.block_id as usize,
@@ -2479,6 +2489,12 @@ impl TextCursor {
     }
 
     /// Turn the block(s) in the selection into a list.
+    ///
+    /// The blocks may sit in the main text, a quotation, a table cell or a
+    /// footnote's body. A list runs on inside one frame only, and only as long
+    /// as no quotation or table comes between its items, so a selection
+    /// crossing one makes a list on each side of it. Blocks that leave another
+    /// list for this one take that list away when they were all it held.
     pub fn create_list(&self, style: ListStyle) -> Result<()> {
         let (pos, anchor) = self.read_cursor();
         let queued = {
@@ -2590,14 +2606,12 @@ impl TextCursor {
         Ok(())
     }
 
-    /// Add the block at the cursor position to a list.
+    /// Add the block at the cursor position to a list: the caret's block, as
+    /// [`current_list`](Self::current_list) reads it.
     pub fn add_current_block_to_list(&self, list_id: usize) -> Result<()> {
         let pos = self.position();
         let inner = self.doc.lock();
-        let dto = frontend::document_inspection::GetBlockAtPositionDto {
-            position: to_i64(pos),
-        };
-        let block_info = document_inspection_commands::get_block_at_position(&inner.ctx, &dto)?;
+        let block_info = crate::inner::block_at_caret_dto(&inner.ctx, pos)?;
         drop(inner);
         self.add_block_to_list(block_info.block_id as usize, list_id)
     }
@@ -2628,15 +2642,13 @@ impl TextCursor {
         Ok(())
     }
 
-    /// Remove the block at the cursor position from its list.
+    /// Remove the block at the cursor position from its list: the caret's
+    /// block, as [`current_list`](Self::current_list) reads it.
     /// Returns an error if the current block is not a list item.
     pub fn remove_current_block_from_list(&self) -> Result<()> {
         let pos = self.position();
         let inner = self.doc.lock();
-        let dto = frontend::document_inspection::GetBlockAtPositionDto {
-            position: to_i64(pos),
-        };
-        let block_info = document_inspection_commands::get_block_at_position(&inner.ctx, &dto)?;
+        let block_info = crate::inner::block_at_caret_dto(&inner.ctx, pos)?;
         drop(inner);
         self.remove_block_from_list(block_info.block_id as usize)
     }

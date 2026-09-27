@@ -29,6 +29,23 @@ pub trait ExportMarkdownUnitOfWorkFactoryTrait: Send + Sync {
 #[macros::uow_action(entity = "TableCell", action = "GetMultiRO")]
 pub trait ExportMarkdownUnitOfWorkTrait: QueryUnitOfWork {}
 
+/// One list level open after the block just written: the last item written
+/// at that level. Its index in the stack is its level.
+///
+/// A nested item is written from the column where its parent's text starts,
+/// which is what CommonMark reads as nesting: two spaces under `- a`, three
+/// under `1. a`. A fixed two spaces per level put an ordered sub-list under
+/// the number, where it was read back as a sibling of its parent, one level
+/// up; and an item indented deeper than the item before it, or with none
+/// before it, reached four spaces and came back as a code block.
+struct MdOpenLevel {
+    list_id: EntityId,
+    /// The number written for an ordered item; unused otherwise.
+    counter: i64,
+    /// The column the item's text starts at, where an item nested in it is written.
+    content_column: usize,
+}
+
 pub struct ExportMarkdownUseCase {
     uow_factory: Box<dyn ExportMarkdownUnitOfWorkFactoryTrait>,
     options: MarkdownExportOptions,
@@ -200,8 +217,8 @@ impl ExportMarkdownUseCase {
     ) -> Result<String> {
         let mut result = String::new();
         let mut prev_was_list = false;
-        let mut ordered_list_counter: i64 = 0;
-        let mut current_list_id: Option<EntityId> = None;
+        // The list levels open after the block just written; see `MdOpenLevel`.
+        let mut open_levels: Vec<MdOpenLevel> = Vec::new();
 
         // If child_order is empty, fall back to iterating blocks directly
         let use_child_order = !frame.child_order.is_empty();
@@ -213,13 +230,8 @@ impl ExportMarkdownUseCase {
                     let block_id = entry as EntityId;
                     let block = uow.get_block(&block_id)?;
                     if let Some(ref b) = block {
-                        let (line, is_list_item) = self.render_block_line(
-                            uow,
-                            b,
-                            quote_prefix,
-                            &mut ordered_list_counter,
-                            &mut current_list_id,
-                        )?;
+                        let (line, is_list_item) =
+                            self.render_block_line(uow, b, quote_prefix, &mut open_levels)?;
                         if !result.is_empty() {
                             if is_list_item && prev_was_list {
                                 result.push('\n');
@@ -251,8 +263,7 @@ impl ExportMarkdownUseCase {
                             }
                             result.push_str(&prefixed);
                             prev_was_list = false;
-                            current_list_id = None;
-                            ordered_list_counter = 0;
+                            open_levels.clear();
                             continue;
                         }
 
@@ -272,8 +283,7 @@ impl ExportMarkdownUseCase {
                             result.push_str(&sub_text);
                         }
                         prev_was_list = false;
-                        current_list_id = None;
-                        ordered_list_counter = 0;
+                        open_levels.clear();
                     }
                 }
             }
@@ -296,13 +306,8 @@ impl ExportMarkdownUseCase {
             blocks.sort_by_key(|b| b.document_position);
 
             for block in &blocks {
-                let (line, is_list_item) = self.render_block_line(
-                    uow,
-                    block,
-                    quote_prefix,
-                    &mut ordered_list_counter,
-                    &mut current_list_id,
-                )?;
+                let (line, is_list_item) =
+                    self.render_block_line(uow, block, quote_prefix, &mut open_levels)?;
                 if !result.is_empty() {
                     if is_list_item && prev_was_list {
                         result.push('\n');
@@ -325,8 +330,7 @@ impl ExportMarkdownUseCase {
         uow: &dyn ExportMarkdownUnitOfWorkTrait,
         block: &Block,
         quote_prefix: &str,
-        ordered_list_counter: &mut i64,
-        current_list_id: &mut Option<EntityId>,
+        open_levels: &mut Vec<MdOpenLevel>,
     ) -> Result<(String, bool)> {
         // Check if this is a code block
         if block.fmt_is_code_block == Some(true) {
@@ -365,8 +369,7 @@ impl ExportMarkdownUseCase {
                 lines.join("\n")
             };
 
-            *current_list_id = None;
-            *ordered_list_counter = 0;
+            open_levels.clear();
             return Ok((code_block, false));
         }
 
@@ -396,33 +399,46 @@ impl ExportMarkdownUseCase {
 
         // Build the block line
         let block_line = if let Some(level) = block.fmt_heading_level {
+            open_levels.clear();
             let prefix = "#".repeat(level as usize);
             format!("{}{} {}", quote_prefix, prefix, inline_md)
-        } else if let Some(ref list_entity) = list {
-            let indent_prefix = "  ".repeat(list_entity.indent as usize);
-            match list_entity.style {
+        } else if let (Some(list_entity), Some(list_id)) = (&list, list_ids.first()) {
+            // An item nests at most one level below the item before it, as the
+            // parser reads it, and starts where that item's text starts.
+            let level = (list_entity.indent.max(0) as usize).min(open_levels.len());
+            let column = level
+                .checked_sub(1)
+                .and_then(|parent| open_levels.get(parent))
+                .map_or(0, |parent| parent.content_column);
+            let same_level = open_levels.drain(level..).next();
+            let marker = match list_entity.style {
                 ListStyle::Decimal
                 | ListStyle::LowerAlpha
                 | ListStyle::UpperAlpha
                 | ListStyle::LowerRoman
                 | ListStyle::UpperRoman => {
-                    let this_list_id = list_ids.first().copied();
-                    if this_list_id != *current_list_id {
-                        *ordered_list_counter = 1;
-                        *current_list_id = this_list_id;
-                    } else {
-                        *ordered_list_counter += 1;
-                    }
-                    format!(
-                        "{}{}{}. {}",
-                        quote_prefix, indent_prefix, ordered_list_counter, inline_md
-                    )
+                    let counter = match same_level {
+                        Some(open) if open.list_id == *list_id => open.counter + 1,
+                        _ => 1,
+                    };
+                    (format!("{counter}. "), counter)
                 }
-                _ => format!("{}{}- {}", quote_prefix, indent_prefix, inline_md),
-            }
+                _ => ("- ".to_string(), 0),
+            };
+            open_levels.push(MdOpenLevel {
+                list_id: *list_id,
+                counter: marker.1,
+                content_column: column + marker.0.len(),
+            });
+            format!(
+                "{}{}{}{}",
+                quote_prefix,
+                " ".repeat(column),
+                marker.0,
+                inline_md
+            )
         } else {
-            *current_list_id = None;
-            *ordered_list_counter = 0;
+            open_levels.clear();
             format!("{}{}", quote_prefix, inline_md)
         };
 

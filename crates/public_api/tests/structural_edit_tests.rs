@@ -21,7 +21,8 @@
 //! own selections pasted back, deletions (whole tables among them), Backspace and Delete
 //! anywhere and at block starts, typing, formatted typing and replacement over ranges,
 //! paragraph breaks, images, footnote references, table rows, columns, cells and whole
-//! tables, quotation and list changes, headings, italics, replace-all and undo/redo over
+//! tables, quotation and list changes (list items moved a level in and out as an editor's
+//! Tab does among them), headings, italics, replace-all and undo/redo over
 //! documents holding all of those. Range ends favour the boundaries of blocks, table anchors
 //! and note bodies. It checks the model after every step and, around each edit of a range,
 //! that another cursor past the range still stands before the same text. Its size is bounded
@@ -1102,14 +1103,39 @@ fn random_edit(doc: &TextDocument, rng: &mut Rng, fragments: &[(&str, String)]) 
         }
         23 => {
             let cursor = select(doc, from, to);
-            let _ = match rng.below(3) {
-                0 => cursor.create_list(text_document::ListStyle::Disc),
-                1 => cursor.remove_current_block_from_list(),
-                _ => doc
-                    .cursor_at(from)
-                    .insert_list(text_document::ListStyle::Decimal),
-            };
-            format!("list {from}..{to}")
+            match rng.below(5) {
+                0 => {
+                    let _ = cursor.create_list(text_document::ListStyle::Disc);
+                    format!("list {from}..{to}")
+                }
+                1 => {
+                    let _ = cursor.remove_current_block_from_list();
+                    format!("take the item at {from} out of its list")
+                }
+                2 => {
+                    let _ = doc
+                        .cursor_at(from)
+                        .insert_list(text_document::ListStyle::Decimal);
+                    format!("insert a list item at {from}")
+                }
+                way => {
+                    let deeper = way == 3;
+                    let edit = format!(
+                        "move the item at {from} one level {}",
+                        if deeper { "in" } else { "out" }
+                    );
+                    let was_listed = doc.cursor_at(from).current_list().is_some();
+                    if let Err(error) = nest_list_item(doc, from, deeper) {
+                        panic!("{edit}: {error}");
+                    }
+                    assert_eq!(
+                        doc.cursor_at(from).current_list().is_some(),
+                        was_listed,
+                        "{edit}: the item left its list"
+                    );
+                    edit
+                }
+            }
         }
         24 => {
             let cursor = doc.cursor_at(from);
@@ -1194,6 +1220,34 @@ fn random_edit(doc: &TextDocument, rng: &mut Rng, fragments: &[(&str, String)]) 
             "undo".into()
         }
     }
+}
+
+/// Move the list item at `at` one level in or out, as an editor's Tab and Shift+Tab do: take
+/// it out of its list, then make a list of it at the new level, as one edit. Nothing to do
+/// outside a list, or out of the top level.
+fn nest_list_item(doc: &TextDocument, at: usize, deeper: bool) -> text_document::Result<()> {
+    let cursor = doc.cursor_at(at);
+    let Some(list) = cursor.current_list() else {
+        return Ok(());
+    };
+    let (style, level) = (list.style(), list.indent());
+    let target = match (deeper, level) {
+        (true, _) => level.saturating_add(1),
+        (false, 0) => return Ok(()),
+        (false, _) => level - 1,
+    };
+    cursor.begin_edit_block();
+    let result = cursor
+        .remove_current_block_from_list()
+        .and_then(|()| cursor.create_list(style))
+        .and_then(|()| {
+            cursor.set_current_list_format(&text_document::ListFormat {
+                indent: Some(target),
+                ..Default::default()
+            })
+        });
+    cursor.end_edit_block();
+    result
 }
 
 fn env_count(name: &str, default: u64) -> u64 {
@@ -2500,7 +2554,7 @@ fn inserting_a_list_item_puts_it_after_the_caret_in_its_own_frame() {
     assert_model(&doc, "typing in the list item");
     assert_eq!(
         doc.to_djot().unwrap(),
-        "Alpha beta gamma.\n\n> Quoted line one.\n\n> Quoted two.\n\n> 1. item\n\nOmega end."
+        "Alpha beta gamma.\n\n> Quoted line one.\n>\n> Quoted two.\n>\n> 1. item\n\nOmega end."
     );
 
     let doc = load("Noted[^a].\n\n[^a]: The note.\n\nLast.\n");
@@ -2554,4 +2608,434 @@ fn a_range_from_the_first_cell_on_keeps_the_table_when_a_cell_holds_two_paragrap
         doc.to_addressable_text().unwrap(),
         "Intro.\n\u{FFFC}\nX\n\n\n\nwords."
     );
+}
+
+// ── Lists in quotations, table cells and notes ───────────────────────────────
+
+/// A block as a list shows it: its text, its list's style and level when it is a list item,
+/// and how many quotations hold it.
+type ListedBlock = (String, Option<(text_document::ListStyle, u8)>, usize);
+
+fn listed_blocks(doc: &TextDocument) -> Vec<ListedBlock> {
+    doc.blocks()
+        .iter()
+        .map(|block| {
+            let quoted = doc.cursor_at(block.position()).blockquote_depth_at_cursor();
+            let list = block.list().map(|list| (list.style(), list.indent()));
+            (block.text(), list, quoted)
+        })
+        .collect()
+}
+
+/// The block of `doc` reading `text`, as [`listed_blocks`] shows it.
+#[track_caller]
+fn listed(doc: &TextDocument, text: &str) -> ListedBlock {
+    listed_blocks(doc)
+        .into_iter()
+        .find(|(block, _, _)| block == text)
+        .unwrap_or_else(|| panic!("no block reads {text:?}"))
+}
+
+/// The lists no block is an item of.
+fn lists_without_items(doc: &TextDocument) -> Vec<u64> {
+    let store = doc.rope_store_for_test();
+    let used: HashSet<u64> = store
+        .blocks
+        .read()
+        .values()
+        .filter_map(|block| block.list)
+        .collect();
+    let mut unused: Vec<u64> = store
+        .lists
+        .read()
+        .keys()
+        .copied()
+        .filter(|id| !used.contains(id))
+        .collect();
+    unused.sort_unstable();
+    unused
+}
+
+/// The model holds, and every list has an item.
+#[track_caller]
+fn assert_lists_whole(doc: &TextDocument, after: &str) {
+    assert_model(doc, after);
+    assert_eq!(
+        lists_without_items(doc),
+        Vec::<u64>::new(),
+        "after {after}: lists left without an item"
+    );
+}
+
+/// Move the list item at `at` to `indent` as an editor's Tab and Shift+Tab do: take it out
+/// of its list, then make a list of it at the new level, as one edit.
+#[track_caller]
+fn move_list_item(doc: &TextDocument, at: usize, indent: u8) {
+    let cursor = doc.cursor_at(at);
+    let style = cursor.current_list().expect("a list item").style();
+    cursor.begin_edit_block();
+    cursor.remove_current_block_from_list().unwrap();
+    cursor.create_list(style).unwrap();
+    cursor
+        .set_current_list_format(&text_document::ListFormat {
+            indent: Some(indent),
+            ..Default::default()
+        })
+        .unwrap();
+    cursor.end_edit_block();
+}
+
+fn reload_html(html: &str) -> TextDocument {
+    let doc = TextDocument::new();
+    doc.set_html(html).unwrap().wait().unwrap();
+    doc
+}
+
+fn reload_markdown(markdown: &str) -> TextDocument {
+    let doc = TextDocument::new();
+    doc.set_markdown(markdown).unwrap().wait().unwrap();
+    doc
+}
+
+/// Saved as Djot, HTML and Markdown and read back, each block comes back with its text, its
+/// list and level, and its quotation, and saving the Djot again writes the same text.
+#[track_caller]
+fn assert_lists_round_trip(doc: &TextDocument, after: &str) {
+    let blocks = listed_blocks(doc);
+    let djot = doc.to_djot().unwrap();
+    let back = load(&djot);
+    assert_eq!(listed_blocks(&back), blocks, "after {after}, Djot {djot:?}");
+    assert_eq!(back.to_djot().unwrap(), djot, "after {after}, Djot again");
+    let html = doc.to_html().unwrap();
+    assert_eq!(
+        listed_blocks(&reload_html(&html)),
+        blocks,
+        "after {after}, HTML {html:?}"
+    );
+    let markdown = doc.to_markdown().unwrap();
+    assert_eq!(
+        listed_blocks(&reload_markdown(&markdown)),
+        blocks,
+        "after {after}, Markdown {markdown:?}"
+    );
+}
+
+/// The words of `doc`, in order.
+fn words(doc: &TextDocument) -> String {
+    doc.to_plain_text()
+        .unwrap()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Saved as Djot, HTML and Markdown and read back, `doc` reads the same words in the same
+/// order. A table cell of Djot and Markdown holds one line, and the HTML reader takes each
+/// cell as one paragraph, so a list in a cell comes back as its words.
+#[track_caller]
+fn assert_cell_words_round_trip(doc: &TextDocument, after: &str) {
+    let expected = words(doc);
+    let djot = doc.to_djot().unwrap();
+    assert_eq!(
+        words(&load(&djot)),
+        expected,
+        "after {after}, Djot {djot:?}"
+    );
+    let html = doc.to_html().unwrap();
+    assert_eq!(
+        words(&reload_html(&html)),
+        expected,
+        "after {after}, HTML {html:?}"
+    );
+    let markdown = doc.to_markdown().unwrap();
+    assert_eq!(
+        words(&reload_markdown(&markdown)),
+        expected,
+        "after {after}, Markdown {markdown:?}"
+    );
+}
+
+/// Make a list of the paragraphs "One." and "Two." in `doc`, move "Two." one level in and
+/// back out, then take it out of the list, checking the list, the item's level, that no list
+/// is left without an item, and (through `round_trip`) what an export and a reload keep.
+fn make_move_and_remove_a_list_item(
+    doc: &TextDocument,
+    quoted: usize,
+    round_trip: fn(&TextDocument, &str),
+) {
+    use text_document::ListStyle::Decimal;
+    let (one, two) = (position_of(doc, "One."), position_of(doc, "Two."));
+    select(doc, one, two + 1).create_list(Decimal).unwrap();
+    assert_lists_whole(doc, "making the list");
+    assert_eq!(
+        listed(doc, "One."),
+        ("One.".into(), Some((Decimal, 0)), quoted)
+    );
+    assert_eq!(
+        listed(doc, "Two."),
+        ("Two.".into(), Some((Decimal, 0)), quoted)
+    );
+    assert_eq!(
+        listed(doc, "Three.").1,
+        None,
+        "the paragraph after the selection"
+    );
+    round_trip(doc, "making the list");
+
+    move_list_item(doc, position_of(doc, "Two."), 1);
+    assert_lists_whole(doc, "moving the item one level in");
+    assert_eq!(
+        listed(doc, "One."),
+        ("One.".into(), Some((Decimal, 0)), quoted)
+    );
+    assert_eq!(
+        listed(doc, "Two."),
+        ("Two.".into(), Some((Decimal, 1)), quoted)
+    );
+    round_trip(doc, "moving the item one level in");
+
+    move_list_item(doc, position_of(doc, "Two."), 0);
+    assert_lists_whole(doc, "moving the item back out");
+    assert_eq!(
+        listed(doc, "Two."),
+        ("Two.".into(), Some((Decimal, 0)), quoted)
+    );
+    round_trip(doc, "moving the item back out");
+
+    doc.cursor_at(position_of(doc, "Two."))
+        .remove_current_block_from_list()
+        .unwrap();
+    assert_lists_whole(doc, "taking the item out of the list");
+    assert_eq!(
+        listed(doc, "One."),
+        ("One.".into(), Some((Decimal, 0)), quoted)
+    );
+    assert_eq!(listed(doc, "Two."), ("Two.".into(), None, quoted));
+    round_trip(doc, "taking the item out of the list");
+
+    // Each step is one edit, and undoing them all gives back the paragraphs.
+    for _ in 0..4 {
+        doc.undo().unwrap();
+    }
+    assert_lists_whole(doc, "undoing every step");
+    assert_eq!(listed(doc, "One.").1, None);
+    assert_eq!(listed(doc, "Two.").1, None);
+}
+
+/// Making a list in a quotation found no paragraph: it read the main text's own paragraphs
+/// alone, so it created a list holding nothing and left the paragraph as it was. Moving an
+/// item one level in or out there (take it out of its list, make a list of it at the new
+/// level, which is what an editor's Tab does) then took the item out of its list for good.
+/// And a list that did survive in a quotation lost its levels at the next save: the Djot
+/// writer closed the quotation between two of its blocks, the HTML writer put every item in
+/// one flat list, and the Markdown writer put an ordered sub-list under its parent's number.
+#[test]
+fn a_list_item_in_a_quotation_is_made_moved_and_taken_out() {
+    let doc = load("Alpha.\n\n> One.\n>\n> Two.\n>\n> Three.\n\nOmega.\n");
+    make_move_and_remove_a_list_item(&doc, 1, assert_lists_round_trip);
+}
+
+#[test]
+fn a_list_item_in_a_nested_quotation_is_made_moved_and_taken_out() {
+    let doc = load("Alpha.\n\n> Outer.\n>\n> > One.\n> >\n> > Two.\n> >\n> > Three.\n\nOmega.\n");
+    make_move_and_remove_a_list_item(&doc, 2, assert_lists_round_trip);
+}
+
+/// A table cell as a quotation: the list was never made. The words of the cell also ran
+/// together through HTML, which writes a cell's two paragraphs as `One.<br/>Two.`: the
+/// reader took the line break for nothing.
+#[test]
+fn a_list_item_in_a_table_cell_is_made_moved_and_taken_out() {
+    let doc = load("Alpha.\n\n| One. | x |\n| y | z |\n\nOmega.\n");
+    let cursor = doc.cursor_at(position_of(&doc, "One.") + 4);
+    cursor.insert_block().unwrap();
+    cursor.insert_text("Two.").unwrap();
+    cursor.insert_block().unwrap();
+    cursor.insert_text("Three.").unwrap();
+    assert_model(&doc, "writing three paragraphs in a cell");
+    make_move_and_remove_a_list_item(&doc, 0, assert_cell_words_round_trip);
+    // The cell holds its three paragraphs still, in their order.
+    let cell = doc
+        .cursor_at(position_of(&doc, "One."))
+        .current_table_cell()
+        .expect("the paragraph is in a cell");
+    let texts: Vec<String> = doc
+        .blocks()
+        .iter()
+        .filter(|block| {
+            block
+                .table_cell()
+                .is_some_and(|other| (other.row, other.column) == (cell.row, cell.column))
+        })
+        .map(|block| block.text())
+        .collect();
+    assert_eq!(texts, ["One.", "Two.", "Three."]);
+}
+
+/// A note's body as a quotation, and a list the reader dropped: a list item of a note came
+/// back from a save as a plain paragraph, and one nested in it came back one level up, its
+/// continuation lines indented less than the note's first line. HTML has no notes to read
+/// back, so the note is compared in Djot and Markdown.
+#[test]
+fn a_list_item_in_a_note_is_made_moved_and_taken_out() {
+    fn note_round_trip(doc: &TextDocument, after: &str) {
+        let note = |doc: &TextDocument| -> Vec<ListedBlock> {
+            ["One.", "Two.", "Three."]
+                .into_iter()
+                .map(|text| listed(doc, text))
+                .collect()
+        };
+        let expected = note(doc);
+        let djot = doc.to_djot().unwrap();
+        let back = load(&djot);
+        assert_eq!(note(&back), expected, "after {after}, Djot {djot:?}");
+        assert_eq!(back.to_djot().unwrap(), djot, "after {after}, Djot again");
+        let markdown = doc.to_markdown().unwrap();
+        assert_eq!(
+            note(&reload_markdown(&markdown)),
+            expected,
+            "after {after}, Markdown {markdown:?}"
+        );
+    }
+    let doc = load("Noted[^a].\n\n[^a]: One.\n\n    Two.\n\n    Three.\n\nLast.\n");
+    make_move_and_remove_a_list_item(&doc, 0, note_round_trip);
+}
+
+/// A selection running from the main text through a quotation makes a list in each frame it
+/// crosses: a list runs on inside one frame only, in the model as in every format it is
+/// written to. It used to make one list of the main text's paragraphs across the quotation,
+/// which every format reads back as two, and leave the quotation's paragraph out.
+#[test]
+fn a_list_made_across_a_quotation_is_a_list_in_each_frame() {
+    use text_document::ListStyle::Decimal;
+    let doc = load("One.\n\n> Two.\n\nThree.\n\nAfter.\n");
+    select(&doc, position_of(&doc, "One."), position_of(&doc, "Three."))
+        .create_list(Decimal)
+        .unwrap();
+    assert_lists_whole(&doc, "making the lists");
+    assert_eq!(listed(&doc, "One.").1, Some((Decimal, 0)));
+    assert_eq!(listed(&doc, "Two."), ("Two.".into(), Some((Decimal, 0)), 1));
+    assert_eq!(listed(&doc, "Three.").1, Some((Decimal, 0)));
+    assert_eq!(listed(&doc, "After.").1, None);
+    let list_of = |text: &str| {
+        doc.block_at_position(position_of(&doc, text))
+            .and_then(|block| block.list())
+            .map(|list| list.id())
+    };
+    assert_ne!(list_of("One."), list_of("Three."));
+    assert_ne!(list_of("One."), list_of("Two."));
+    assert_lists_round_trip(&doc, "making the lists");
+}
+
+/// Making a list of the items of another list moves them into it, and the list they all left
+/// goes, as it does when its items leave it one by one. It was left behind without an item.
+#[test]
+fn a_list_whose_items_all_join_a_new_list_is_removed() {
+    use text_document::ListStyle::{Decimal, Disc};
+    let doc = load("Intro.\n\n- One.\n- Two.\n\n> - Three.\n\nEnd.\n");
+    select(&doc, position_of(&doc, "One."), position_of(&doc, "Two."))
+        .create_list(Decimal)
+        .unwrap();
+    assert_lists_whole(&doc, "making a list of a whole list");
+    assert_eq!(listed(&doc, "One.").1, Some((Decimal, 0)));
+    assert_eq!(listed(&doc, "Two.").1, Some((Decimal, 0)));
+    assert_eq!(listed(&doc, "Three.").1, Some((Disc, 0)));
+    doc.undo().unwrap();
+    assert_lists_whole(&doc, "undoing it");
+    assert_eq!(listed(&doc, "One.").1, Some((Disc, 0)));
+}
+
+/// Inserting a list item works in a table cell as it does in a quotation and a note (see
+/// `inserting_a_list_item_puts_it_after_the_caret_in_its_own_frame`).
+#[test]
+fn inserting_a_list_item_in_a_table_cell_keeps_it_in_the_cell() {
+    let doc = load("Alpha.\n\n| One. | x |\n| y | z |\n\nOmega.\n");
+    let cursor = doc.cursor_at(position_of(&doc, "One.") + 4);
+    cursor
+        .insert_list(text_document::ListStyle::Decimal)
+        .unwrap();
+    cursor.insert_text("Item.").unwrap();
+    assert_lists_whole(&doc, "inserting a list item in a cell");
+    assert_eq!(
+        listed(&doc, "Item.").1,
+        Some((text_document::ListStyle::Decimal, 0))
+    );
+    let cell = doc
+        .cursor_at(position_of(&doc, "Item."))
+        .current_table_cell()
+        .expect("the item is in a cell");
+    assert_eq!((cell.row, cell.column), (0, 0));
+    assert_cell_words_round_trip(&doc, "inserting a list item in a cell");
+}
+
+/// Moving an item a level in or out with the caret at the end of its text moves that item. The
+/// list helpers acting on the current block read the block at the character index, which at
+/// the end of a paragraph is the next one: the item after it left its list, and the item at
+/// the caret went into a new list at the level the other one had.
+#[test]
+fn moving_a_list_item_from_the_end_of_its_text_moves_that_item() {
+    use text_document::ListStyle::Decimal;
+    for (source, quoted) in [
+        ("1. zero\n2. first\n3. second\n\nAfter.\n", 0),
+        ("> 1. zero\n>\n> 2. first\n>\n> 3. second\n\nAfter.\n", 1),
+    ] {
+        let doc = load(source);
+        let end = position_of(&doc, "first") + "first".len();
+        assert_eq!(
+            doc.cursor_at(end).current_list().map(|list| list.indent()),
+            Some(0)
+        );
+        nest_list_item(&doc, end, true).unwrap();
+        assert_lists_whole(&doc, "moving the item one level in");
+        assert_eq!(
+            listed(&doc, "zero"),
+            ("zero".into(), Some((Decimal, 0)), quoted)
+        );
+        assert_eq!(
+            listed(&doc, "first"),
+            ("first".into(), Some((Decimal, 1)), quoted)
+        );
+        assert_eq!(
+            listed(&doc, "second"),
+            ("second".into(), Some((Decimal, 0)), quoted)
+        );
+        nest_list_item(&doc, end, false).unwrap();
+        assert_lists_whole(&doc, "moving it back out");
+        assert_eq!(listed(&doc, "first").1, Some((Decimal, 0)));
+        assert_eq!(listed(&doc, "second").1, Some((Decimal, 0)));
+    }
+}
+
+/// Moving a list item a level in, undone and redone, is moved again. The redo ran each step
+/// of the edit again, and making the item's new list again made it under a new id: setting
+/// that list's level, the next step, named the list the undo had taken away, and the redo
+/// failed halfway, the item at the top level.
+#[test]
+fn moving_a_list_item_is_undone_and_redone() {
+    use text_document::ListStyle::Decimal;
+    for (source, quoted) in [
+        ("1. zero\n2. first\n3. second\n", 0),
+        ("> 1. zero\n>\n> 2. first\n>\n> 3. second\n", 1),
+    ] {
+        let doc = load(source);
+        move_list_item(&doc, position_of(&doc, "first"), 1);
+        let moved = listed_blocks(&doc);
+        assert_eq!(
+            listed(&doc, "first"),
+            ("first".into(), Some((Decimal, 1)), quoted)
+        );
+        doc.undo().unwrap();
+        assert_eq!(
+            listed(&doc, "first"),
+            ("first".into(), Some((Decimal, 0)), quoted)
+        );
+        doc.redo().unwrap();
+        assert_eq!(listed_blocks(&doc), moved);
+        assert_lists_whole(&doc, "redoing the move");
+        // And the same again, with the document's history carried on past it.
+        doc.undo().unwrap();
+        doc.redo().unwrap();
+        assert_eq!(listed_blocks(&doc), moved);
+        assert_lists_whole(&doc, "redoing the move a second time");
+    }
 }

@@ -1169,10 +1169,112 @@ fn html_img_span(el: &scraper::node::Element, link_href: Option<String>) -> Opti
     })
 }
 
+/// Whether `node` is a `<ul>` or an `<ol>`.
+fn is_html_list(node: &Node) -> bool {
+    node.as_element()
+        .is_some_and(|el| matches!(el.name(), "ul" | "ol"))
+}
+
+/// Move every list item nested deeper than
+/// [`MAX_LIST_LEVELS`](crate::parser_tools::list_depth::MAX_LIST_LEVELS)
+/// lists into the deepest list kept, right after the item holding it, in
+/// document order: a list nested past that depth comes out flattened to it,
+/// every item kept, in its order.
+///
+/// The reader recurses a few elements deep per list level and stops at
+/// `MAX_RECURSION_DEPTH`, so a list nested past some eighty levels lost every
+/// item below that, pasted or loaded. The editing gestures nest no deeper than
+/// this depth, and an insertion brings any list back to it (see `list_depth`),
+/// so HTML holding more is read at that depth to begin with. The tree is
+/// changed in place, without recursion, before it is read.
+fn flatten_deep_html_lists(tree: &mut ego_tree::Tree<Node>) {
+    use crate::parser_tools::list_depth::MAX_LIST_LEVELS;
+    use ego_tree::iter::Edge;
+
+    // The lists one level past the deepest kept, in document order.
+    let mut too_deep: Vec<ego_tree::NodeId> = Vec::new();
+    let mut depth = 0usize;
+    for edge in tree.root().traverse() {
+        match edge {
+            Edge::Open(node) if is_html_list(node.value()) => {
+                if depth == MAX_LIST_LEVELS {
+                    too_deep.push(node.id());
+                }
+                depth += 1;
+            }
+            Edge::Close(node) if is_html_list(node.value()) => {
+                depth = depth.saturating_sub(1);
+            }
+            _ => {}
+        }
+    }
+
+    for list in too_deep {
+        // The child of the deepest kept list that holds `list` (its `<li>`, or
+        // `list` itself when a list sits right inside another): the items go
+        // after it.
+        let Some(list_ref) = tree.get(list) else {
+            continue;
+        };
+        let mut holder = None;
+        let mut current = list_ref;
+        while let Some(parent) = current.parent() {
+            if is_html_list(parent.value()) {
+                holder = Some(current.id());
+                break;
+            }
+            current = parent;
+        }
+        let Some(holder) = holder else {
+            continue;
+        };
+        let mut after = holder;
+        let items: Vec<ego_tree::NodeId> = list_ref
+            .descendants()
+            .filter(|node| {
+                node.value()
+                    .as_element()
+                    .is_some_and(|el| el.name() == "li")
+            })
+            .map(|node| node.id())
+            .collect();
+        for item in items {
+            // Each node placed here sits in the deepest kept list, so it has a
+            // parent to be placed beside.
+            if tree.get(after).and_then(|node| node.parent()).is_none() {
+                break;
+            }
+            if let Some(mut node) = tree.get_mut(after) {
+                node.insert_id_after(item);
+                after = item;
+            }
+        }
+        // What is left of the list is its items' wrappers, or text standing in
+        // it outside any item. It goes after the items when it holds any text
+        // (it is already beside them when it sits right in the deepest kept
+        // list), and away when it holds none.
+        let holds_text = tree.get(list).is_some_and(|node| {
+            node.descendants()
+                .any(|d| d.value().as_text().is_some_and(|t| !t.trim().is_empty()))
+        });
+        if !holds_text {
+            if let Some(mut node) = tree.get_mut(list) {
+                node.detach();
+            }
+        } else if holder != list
+            && tree.get(after).and_then(|node| node.parent()).is_some()
+            && let Some(mut node) = tree.get_mut(after)
+        {
+            node.insert_id_after(list);
+        }
+    }
+}
+
 pub fn parse_html_elements(html: &str) -> Vec<ParsedElement> {
     use scraper::Html;
 
-    let fragment = Html::parse_fragment(html);
+    let mut fragment = Html::parse_fragment(html);
+    flatten_deep_html_lists(&mut fragment.tree);
     let mut elements: Vec<ParsedElement> = Vec::new();
 
     // Walk the DOM tree starting from the root
@@ -1216,6 +1318,59 @@ pub fn parse_html_elements(html: &str) -> Vec<ParsedElement> {
         )
     }
 
+    /// The text of everything under `node`, for a subtree nested deeper than
+    /// the reader follows ([`MAX_RECURSION_DEPTH`]): read without recursing,
+    /// with a space where a block ends so that words do not run together, and
+    /// without what [`is_metadata_tag`] names.
+    ///
+    /// Past that depth the reader used to stop and keep nothing: text nested
+    /// deeply enough in lists, quotations or plain `<div>`s was dropped from a
+    /// paste without a trace.
+    fn subtree_text(node: ego_tree::NodeRef<Node>) -> String {
+        use ego_tree::iter::Edge;
+        let mut text = String::new();
+        // How many elements deep the walk is inside a metadata element.
+        let mut hidden = 0usize;
+        for edge in node.traverse() {
+            match edge {
+                Edge::Open(open) => match open.value() {
+                    Node::Element(el) => {
+                        if hidden > 0 || is_metadata_tag(el.name()) {
+                            hidden += 1;
+                        } else if !text.is_empty() && !text.ends_with(char::is_whitespace) {
+                            text.push(' ');
+                        }
+                    }
+                    Node::Text(t) if hidden == 0 => text.push_str(t),
+                    _ => {}
+                },
+                Edge::Close(close) => {
+                    if hidden > 0 && close.value().is_element() {
+                        hidden -= 1;
+                    }
+                }
+            }
+        }
+        text
+    }
+
+    /// A span of `text` in `state`'s formatting.
+    fn text_span(text: String, state: &FmtState) -> ParsedSpan {
+        ParsedSpan {
+            text,
+            bold: state.bold,
+            italic: state.italic,
+            underline: state.underline,
+            strikeout: state.strikeout,
+            code: state.code,
+            superscript: state.superscript,
+            subscript: state.subscript,
+            link_href: state.link_href.clone(),
+            image: None,
+            footnote_ref: None,
+        }
+    }
+
     /// Collect inline spans from a `<td>` or `<th>` cell element.
     fn collect_cell_spans(
         node: ego_tree::NodeRef<Node>,
@@ -1224,6 +1379,10 @@ pub fn parse_html_elements(html: &str) -> Vec<ParsedElement> {
         depth: usize,
     ) {
         if depth > MAX_RECURSION_DEPTH {
+            let text = subtree_text(node);
+            if !text.is_empty() {
+                spans.push(text_span(text, state));
+            }
             return;
         }
         for child in node.children() {
@@ -1280,6 +1439,19 @@ pub fn parse_html_elements(html: &str) -> Vec<ParsedElement> {
                                 spans.push(span);
                             }
                             continue;
+                        }
+                        // A cell is read as one paragraph, so a line break, or a
+                        // paragraph or list item of its own, is a space between
+                        // words. Read as nothing, a cell of two paragraphs, which
+                        // the HTML writer puts out as `One<br/>Two`, came back as
+                        // the one word `OneTwo`.
+                        "br" => {
+                            spans.push(text_span(" ".to_string(), state));
+                            continue;
+                        }
+                        "p" | "div" | "li" | "ul" | "ol" | "blockquote" | "pre" | "h1" | "h2"
+                        | "h3" | "h4" | "h5" | "h6" => {
+                            spans.push(text_span(" ".to_string(), state));
                         }
                         _ => {}
                     }
@@ -1361,6 +1533,16 @@ pub fn parse_html_elements(html: &str) -> Vec<ParsedElement> {
         depth: usize,
     ) {
         if depth > MAX_RECURSION_DEPTH {
+            let text = subtree_text(node);
+            if !text.trim().is_empty() {
+                let mut spans = vec![text_span(text, state)];
+                collapse_inline_whitespace(&mut spans);
+                elements.push(ParsedElement::Block(ParsedBlock {
+                    spans,
+                    blockquote_depth,
+                    ..ParsedBlock::default()
+                }));
+            }
             return;
         }
         match node.value() {
@@ -1679,6 +1861,10 @@ pub fn parse_html_elements(html: &str) -> Vec<ParsedElement> {
         depth: usize,
     ) {
         if depth > MAX_RECURSION_DEPTH {
+            let text = subtree_text(node);
+            if !text.is_empty() {
+                spans.push(text_span(text, state));
+            }
             return;
         }
         for child in node.children() {
@@ -2253,19 +2439,31 @@ pub fn parse_djot(djot: &str, options: &DjotImportOptions) -> Vec<ParsedElement>
     // whoever sent it.
     //
     // Degrade rather than refuse, so the signature stays the same and nothing is
-    // lost: the source comes back as one plain paragraph. Its structure is not
-    // computed, which is the honest answer for a document whose structure cannot
-    // be computed without ending the process — and every character is still
-    // there for the writer to see and repair.
-    if crate::parser_tools::djot_depth::is_too_deep(djot) {
-        return vec![ParsedElement::Block(ParsedBlock {
-            spans: vec![ParsedSpan {
-                text: djot.to_string(),
+    // lost. When the depth comes from indentation, which is how a deeply nested
+    // list is written, the indentation is cut, the text measured again and
+    // parsed: the list comes out flattened below a fixed depth, every item and
+    // word kept (see `flatten_deep_indentation`). This used to hand back a
+    // pasted list nested two hundred levels as one paragraph of markup.
+    // Otherwise the source comes back as one plain paragraph. Its structure is
+    // not computed, which is the honest answer for a document whose structure
+    // cannot be computed without ending the process, and every character is
+    // still there for the writer to see and repair.
+    let flattened;
+    let djot = if crate::parser_tools::djot_depth::is_too_deep(djot) {
+        flattened = crate::parser_tools::djot_depth::flatten_deep_indentation(djot);
+        if crate::parser_tools::djot_depth::is_too_deep(&flattened) {
+            return vec![ParsedElement::Block(ParsedBlock {
+                spans: vec![ParsedSpan {
+                    text: djot.to_string(),
+                    ..Default::default()
+                }],
                 ..Default::default()
-            }],
-            ..Default::default()
-        })];
-    }
+            })];
+        }
+        flattened.as_str()
+    } else {
+        djot
+    };
 
     let mut elements: Vec<ParsedElement> = Vec::new();
     let mut current_spans: Vec<ParsedSpan> = Vec::new();
@@ -3822,6 +4020,122 @@ mod html_footnote_tests {
                     .all(|s| s.footnote_ref.is_none()),
                 "failed for {html}"
             );
+        }
+    }
+}
+
+#[cfg(test)]
+mod html_depth_tests {
+    //! HTML nested more deeply than the reader follows, and HTML table cells.
+
+    use super::*;
+
+    /// The text of each block, in order.
+    fn block_texts(blocks: &[ParsedBlock]) -> Vec<String> {
+        blocks
+            .iter()
+            .map(|block| block.spans.iter().map(|span| span.text.as_str()).collect())
+            .collect()
+    }
+
+    /// An HTML list nested past the deepest level an insertion keeps comes in with every
+    /// item, in its order, the deeper ones side by side at that level. The reader stopped
+    /// descending at its recursion limit and dropped every item below it (the eighty-sixth
+    /// level on).
+    #[test]
+    fn a_deep_html_list_keeps_every_item_at_the_deepest_level() {
+        use crate::parser_tools::list_depth::MAX_LIST_INDENT;
+        let depth = 300;
+        let mut html: String = (0..depth).map(|i| format!("<ol><li>item {i}")).collect();
+        html.push_str(&"</li></ol>".repeat(depth));
+        let blocks = parse_html(&html);
+        let items: Vec<(String, u32)> = blocks
+            .iter()
+            .filter(|block| block.list_style.is_some())
+            .map(|block| {
+                let text: String = block.spans.iter().map(|span| span.text.as_str()).collect();
+                (text, block.list_indent)
+            })
+            .collect();
+        let expected: Vec<(String, u32)> = (0..depth)
+            .map(|i| (format!("item {i}"), (i as i64).min(MAX_LIST_INDENT) as u32))
+            .collect();
+        assert_eq!(items, expected);
+    }
+
+    /// Text outside any item of a list nested too deeply stays, after the items.
+    #[test]
+    fn text_in_a_deep_html_list_outside_its_items_is_kept() {
+        let depth = 40;
+        let mut html: String = (0..depth).map(|i| format!("<ul><li>item {i}")).collect();
+        html.push_str("<ul>loose words<li>last</li></ul>");
+        html.push_str(&"</li></ul>".repeat(depth));
+        let texts = block_texts(&parse_html(&html)).join(" ");
+        assert!(texts.contains("loose words"), "{texts:?}");
+        assert!(texts.contains("last"), "{texts:?}");
+        assert!(texts.contains("item 39"), "{texts:?}");
+    }
+
+    /// Past the depth the reader follows, it used to keep nothing: the words at the bottom
+    /// of three hundred nested `<div>`s, or quotations, were dropped from the paste.
+    #[test]
+    fn html_nested_past_the_reader_depth_keeps_its_words() {
+        for (open, close) in [("<div>", "</div>"), ("<blockquote>", "</blockquote>")] {
+            let html = format!(
+                "<p>Top.</p>{}<p>Deep <b>words</b></p><p>here.</p>{}<p>End.</p>",
+                open.repeat(300),
+                close.repeat(300)
+            );
+            let texts = block_texts(&parse_html(&html)).join(" ");
+            let words: Vec<&str> = texts.split_whitespace().collect();
+            assert_eq!(
+                words,
+                ["Top.", "Deep", "words", "here.", "End."],
+                "for {open}"
+            );
+        }
+    }
+
+    /// The same inside a table cell, read as one paragraph.
+    #[test]
+    fn a_table_cell_nested_past_the_reader_depth_keeps_its_words() {
+        let html = format!(
+            "<table><tr><td>{}deep words{}</td></tr></table>",
+            "<span>".repeat(300),
+            "</span>".repeat(300)
+        );
+        let elements = parse_html_elements(&html);
+        let Some(ParsedElement::Table(table)) = elements.first() else {
+            panic!("a table: {elements:?}");
+        };
+        let text: String = table.rows[0][0]
+            .spans
+            .iter()
+            .map(|span| span.text.as_str())
+            .collect();
+        assert_eq!(text, "deep words");
+    }
+
+    /// A cell is one paragraph, so its line breaks and paragraphs are spaces between
+    /// words. The HTML writer puts a cell's two paragraphs out as `One<br/>Two`, and the
+    /// reader read them back as the one word `OneTwo`.
+    #[test]
+    fn line_breaks_and_paragraphs_in_an_html_cell_separate_words() {
+        for cell in [
+            "One<br/>Two",
+            "<p>One</p><p>Two</p>",
+            "<ul><li>One</li><li>Two</li></ul>",
+        ] {
+            let elements = parse_html_elements(&format!("<table><tr><td>{cell}</td></tr></table>"));
+            let Some(ParsedElement::Table(table)) = elements.first() else {
+                panic!("a table: {elements:?}");
+            };
+            let text: String = table.rows[0][0]
+                .spans
+                .iter()
+                .map(|span| span.text.as_str())
+                .collect();
+            assert_eq!(text, "One Two", "for {cell}");
         }
     }
 }

@@ -269,13 +269,41 @@ where
     G: Fn(&EntityId, &FrameRelationshipField) -> Result<Vec<EntityId>>,
     T: Fn(&EntityId) -> Result<Vec<EntityId>>,
 {
+    Ok(collect_blocks_with_owner_recursive(
+        get_frame,
+        get_relationship,
+        get_table_cell_frames,
+        frame_id,
+    )?
+    .into_iter()
+    .map(|(block_id, _)| block_id)
+    .collect())
+}
+
+/// [`collect_block_ids_recursive`], each block with the frame that lists it:
+/// a quotation's frame, a table cell's frame, or `frame_id` itself.
+///
+/// What an edit that shapes blocks by the frame they sit in reads: a list is
+/// written, and read back, inside one frame, so its items have to be told
+/// apart by frame as well as by position.
+pub fn collect_blocks_with_owner_recursive<F, G, T>(
+    get_frame: &F,
+    get_relationship: &G,
+    get_table_cell_frames: &T,
+    frame_id: &EntityId,
+) -> Result<Vec<(EntityId, EntityId)>>
+where
+    F: Fn(&EntityId) -> Result<Option<Frame>>,
+    G: Fn(&EntityId, &FrameRelationshipField) -> Result<Vec<EntityId>>,
+    T: Fn(&EntityId) -> Result<Vec<EntityId>>,
+{
     let frame = get_frame(frame_id)?.ok_or_else(|| anyhow!("Frame not found"))?;
 
     if !frame.child_order.is_empty() {
-        let mut block_ids = Vec::new();
+        let mut blocks = Vec::new();
         for &entry in &frame.child_order {
             if entry > 0 {
-                block_ids.push(entry as EntityId);
+                blocks.push((entry as EntityId, *frame_id));
             } else if entry < 0 {
                 let sub_frame_id = (-entry) as EntityId;
                 let sub_frame =
@@ -284,28 +312,29 @@ where
                     // Table anchor frame: collect blocks from cell frames
                     let cell_frame_ids = get_table_cell_frames(&table_id)?;
                     for cf_id in cell_frame_ids {
-                        let cf_blocks = collect_block_ids_recursive(
+                        blocks.extend(collect_blocks_with_owner_recursive(
                             get_frame,
                             get_relationship,
                             get_table_cell_frames,
                             &cf_id,
-                        )?;
-                        block_ids.extend(cf_blocks);
+                        )?);
                     }
                 } else {
-                    let sub_ids = collect_block_ids_recursive(
+                    blocks.extend(collect_blocks_with_owner_recursive(
                         get_frame,
                         get_relationship,
                         get_table_cell_frames,
                         &sub_frame_id,
-                    )?;
-                    block_ids.extend(sub_ids);
+                    )?);
                 }
             }
         }
-        Ok(block_ids)
+        Ok(blocks)
     } else {
-        get_relationship(frame_id, &FrameRelationshipField::Blocks)
+        Ok(get_relationship(frame_id, &FrameRelationshipField::Blocks)?
+            .into_iter()
+            .map(|block_id| (block_id, *frame_id))
+            .collect())
     }
 }
 

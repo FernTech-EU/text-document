@@ -72,6 +72,27 @@ impl HtmlImagePolicy<'_> {
     }
 }
 
+/// The element a list of `style` is written as.
+fn list_tag(style: &ListStyle) -> &'static str {
+    match style {
+        ListStyle::Decimal
+        | ListStyle::LowerAlpha
+        | ListStyle::UpperAlpha
+        | ListStyle::LowerRoman
+        | ListStyle::UpperRoman => "ol",
+        _ => "ul",
+    }
+}
+
+/// Close the innermost open list: its last item, then the list itself.
+fn close_list_level(html: &mut String, open: &mut Vec<&'static str>) {
+    if let Some(tag) = open.pop() {
+        html.push_str("</li></");
+        html.push_str(tag);
+        html.push('>');
+    }
+}
+
 /// Render a slice of blocks (already fetched, in document order) as HTML,
 /// grouping consecutive list items into `<ul>`/`<ol>` and handling code
 /// blocks, headings, and plain paragraphs. Mirrors the dispatch order used
@@ -114,39 +135,55 @@ pub fn render_blocks_html(
             .list
             .and_then(|list_id| store.lists.read().get(&list_id).cloned());
 
-        if let Some(list_entity) = list {
-            let is_ordered = matches!(
-                list_entity.style,
-                ListStyle::Decimal
-                    | ListStyle::LowerAlpha
-                    | ListStyle::UpperAlpha
-                    | ListStyle::LowerRoman
-                    | ListStyle::UpperRoman
-            );
-            let list_tag = if is_ordered { "ol" } else { "ul" };
-            let mut list_items = Vec::new();
+        if list.is_some() {
+            // The run of list items from here, nested by level: an item one
+            // level deeper than the item before it opens a list inside that
+            // item's `<li>`, which stays open until an item at its level or
+            // above comes. An item nests at most one level below the item
+            // before it, as a reader of the markup sees it.
+            //
+            // Every item of the run used to go into one flat list, tagged by
+            // the first item's style: a nested item came back from the HTML at
+            // the top level, and a bulleted list after a numbered one came back
+            // numbered.
+            let mut html = String::new();
+            let mut open: Vec<&'static str> = Vec::new();
 
             while i < blocks.len() {
                 let b = &blocks[i];
-                let b_is_listed = b
+                let Some(list_entity) = b
                     .list
-                    .is_some_and(|list_id| store.lists.read().contains_key(&list_id));
-
-                if b_is_listed {
-                    let inline_html = render_inline_html(store, b, images, notes);
-                    list_items.push(format!("<li>{}</li>", inline_html));
-                    i += 1;
-                } else {
+                    .and_then(|list_id| store.lists.read().get(&list_id).cloned())
+                else {
                     break;
+                };
+                let tag = list_tag(&list_entity.style);
+                let level = (list_entity.indent.max(0) as usize).min(open.len());
+                while open.len() > level + 1 {
+                    close_list_level(&mut html, &mut open);
                 }
+                if open.len() == level + 1 {
+                    if open[level] == tag {
+                        html.push_str("</li>");
+                    } else {
+                        close_list_level(&mut html, &mut open);
+                    }
+                }
+                if open.len() == level {
+                    html.push('<');
+                    html.push_str(tag);
+                    html.push('>');
+                    open.push(tag);
+                }
+                html.push_str("<li>");
+                html.push_str(&render_inline_html(store, b, images, notes));
+                i += 1;
+            }
+            while !open.is_empty() {
+                close_list_level(&mut html, &mut open);
             }
 
-            parts.push(format!(
-                "<{}>{}</{}>",
-                list_tag,
-                list_items.join(""),
-                list_tag
-            ));
+            parts.push(html);
         } else {
             // --- Normal block (paragraph / heading) ---
             let inline_html = render_inline_html(store, block, images, notes);

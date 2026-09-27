@@ -701,7 +701,10 @@ fn execute_insert_djot(
         &dto.djot,
         &common::parser_tools::DjotImportOptions::default(),
     );
-    let parsed_blocks = content_parser::ParsedElement::flatten_to_blocks(parsed_elements);
+    let mut parsed_blocks = content_parser::ParsedElement::flatten_to_blocks(parsed_elements);
+    // An inserted list keeps its items and their order, at most as deep as the
+    // editing gestures nest one (see `list_depth`).
+    common::parser_tools::list_depth::clamp_parsed_list_indents(&mut parsed_blocks);
     let (new_position, blocks_added, snapshot) =
         execute_content_insert(uow, dto.position, dto.anchor, &parsed_blocks)?;
     Ok((

@@ -7,7 +7,7 @@ use anyhow::{Ok, Result};
 use common::database::CommandUnitOfWork;
 use common::database::{db_context::DbContext, transactions::Transaction};
 #[allow(unused_imports)]
-use common::entities::{Block, Document, Frame, List, Root};
+use common::entities::{Block, Document, Frame, List, Root, Table, TableCell};
 use common::event::{AllEvent, DirectAccessEntity, Event, EventBuffer, EventHub, Origin};
 #[allow(unused_imports)]
 use common::types;
@@ -99,7 +99,10 @@ impl CommandUnitOfWork for CreateListUnitOfWork {
 #[macros::uow_action(entity = "Block", action = "Update")]
 #[macros::uow_action(entity = "Block", action = "UpdateMulti")]
 #[macros::uow_action(entity = "Block", action = "SetRelationship")]
+#[macros::uow_action(entity = "Table", action = "GetRelationship")]
+#[macros::uow_action(entity = "TableCell", action = "GetMulti")]
 #[macros::uow_action(entity = "List", action = "Create")]
+#[macros::uow_action(entity = "List", action = "Remove")]
 impl CreateListUnitOfWorkTrait for CreateListUnitOfWork {}
 
 pub struct CreateListUnitOfWorkFactory {

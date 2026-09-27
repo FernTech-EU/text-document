@@ -13,7 +13,7 @@ use common::entities::{Block, Document, Frame, FramePosition, List, Root, Table,
 
 use common::long_operation::LongOperation;
 use common::parser_tools::content_parser::{
-    ParsedElement, ParsedInline, format_runs_from_spans, parse_djot,
+    ParsedBlock, ParsedElement, ParsedInline, format_runs_from_spans, parse_djot,
 };
 use common::parser_tools::list_grouper::ListGrouper;
 use common::types::{EntityId, ROOT_ENTITY_ID};
@@ -183,6 +183,58 @@ fn transition_bq_depth(
     Ok(())
 }
 
+/// Put `block_id` in the list `parsed` is an item of: the list `list_grouper`
+/// holds open at its level when the item continues it, a new one otherwise. A
+/// block that is no list item ends every open list.
+///
+/// Djot preserves the ordered-list delimiter (`.`/`)`/`( )`) as
+/// `List.prefix`/`suffix`, so grouping must distinguish lists that differ only
+/// by delimiter.
+fn assign_list(
+    uow: &mut Box<dyn ImportDjotUnitOfWorkTrait>,
+    orphans: &mut OrphanedChildren,
+    list_grouper: &mut ListGrouper,
+    parsed: &ParsedBlock,
+    block_id: EntityId,
+) -> Result<()> {
+    let Some(list_style) = &parsed.list_style else {
+        list_grouper.reset();
+        return Ok(());
+    };
+    let list_id = match list_grouper.try_reuse_delim(
+        list_style,
+        parsed.list_indent,
+        &parsed.list_prefix,
+        &parsed.list_suffix,
+    ) {
+        Some(existing_id) => existing_id,
+        None => {
+            let list = List {
+                style: list_style.clone(),
+                indent: parsed.list_indent as i64,
+                prefix: parsed.list_prefix.clone(),
+                suffix: parsed.list_suffix.clone(),
+                ..List::default()
+            };
+            let created_list = uow.create_orphan_list(&list)?;
+            orphans.lists.push(created_list.id);
+            list_grouper.register_delim(
+                created_list.id,
+                list_style.clone(),
+                parsed.list_indent,
+                parsed.list_prefix.clone(),
+                parsed.list_suffix.clone(),
+            );
+            created_list.id
+        }
+    };
+    uow.set_block_relationship(
+        &block_id,
+        &common::direct_access::block::BlockRelationshipField::List,
+        &[list_id],
+    )
+}
+
 fn import_parsed_elements(
     uow: &mut Box<dyn ImportDjotUnitOfWorkTrait>,
     parsed_elements: &[ParsedElement],
@@ -277,6 +329,9 @@ fn import_parsed_elements(
 
                 let mut child_order: Vec<i64> = Vec::with_capacity(blocks.len());
                 let mut note_blocks: Vec<EntityId> = Vec::with_capacity(blocks.len());
+                // A note's lists are its own: they neither continue a list of the
+                // prose nor go on in the prose after it.
+                let mut note_lists = ListGrouper::new();
                 for nb in blocks.iter() {
                     let ParsedInline {
                         plain_text,
@@ -303,6 +358,10 @@ fn import_parsed_elements(
                     let created = uow.create_orphan_block(&block)?;
                     child_order.push(created.id as i64);
                     note_blocks.push(created.id);
+                    // A list item of the note stays one: this used to drop the
+                    // list, so a list written in a note came back from a save as
+                    // plain paragraphs.
+                    assign_list(uow, &mut orphans, &mut note_lists, nb, created.id)?;
 
                     // Mirrored into the rope like any other block: a definition
                     // is real document content, and `block_content_via_store` is
@@ -441,45 +500,13 @@ fn import_parsed_elements(
                     // U+FFFC sentinel from `format_runs_from_spans`.
                 }
 
-                // Handle list items. Djot preserves the ordered-list delimiter
-                // (`.`/`)`/`( )`) as `List.prefix`/`suffix`, so grouping must
-                // distinguish lists that differ only by delimiter.
-                if let Some(ref list_style) = parsed_block.list_style {
-                    let list_id = if let Some(existing_id) = list_grouper.try_reuse_delim(
-                        list_style,
-                        parsed_block.list_indent,
-                        &parsed_block.list_prefix,
-                        &parsed_block.list_suffix,
-                    ) {
-                        existing_id
-                    } else {
-                        let list = List {
-                            style: list_style.clone(),
-                            indent: parsed_block.list_indent as i64,
-                            prefix: parsed_block.list_prefix.clone(),
-                            suffix: parsed_block.list_suffix.clone(),
-                            ..List::default()
-                        };
-                        let created_list = uow.create_orphan_list(&list)?;
-                        orphans.lists.push(created_list.id);
-                        list_grouper.register_delim(
-                            created_list.id,
-                            list_style.clone(),
-                            parsed_block.list_indent,
-                            parsed_block.list_prefix.clone(),
-                            parsed_block.list_suffix.clone(),
-                        );
-                        created_list.id
-                    };
-
-                    uow.set_block_relationship(
-                        &created_block.id,
-                        &common::direct_access::block::BlockRelationshipField::List,
-                        &[list_id],
-                    )?;
-                } else {
-                    list_grouper.reset();
-                }
+                assign_list(
+                    uow,
+                    &mut orphans,
+                    &mut list_grouper,
+                    parsed_block,
+                    created_block.id,
+                )?;
 
                 let current_frame = frame_stack.last_mut().unwrap();
                 current_frame.child_order.push(created_block.id as i64);

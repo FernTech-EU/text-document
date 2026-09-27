@@ -702,3 +702,90 @@ fn test_insert_html_two_blocks_no_middle() -> Result<()> {
 
     Ok(())
 }
+
+// ─── List depth ──────────────────────────────────────────────────────
+
+/// A list nested deeper than the editing gestures nest one goes in at the deepest level,
+/// every item kept, whichever syntax it is inserted in (see
+/// `common::parser_tools::list_depth`). It kept its whole depth.
+#[test]
+fn a_deeply_nested_list_is_inserted_at_the_deepest_level() -> Result<()> {
+    use document_editing::InsertDjotAtPositionDto;
+    use test_harness::{block_text_dto, get_all_block_ids, list_controller};
+
+    let depth = 40;
+    let djot: String = (0..depth)
+        .map(|i| format!("{}- item{i}\n\n", "  ".repeat(i)))
+        .collect();
+    let markdown: String = (0..depth)
+        .map(|i| format!("{}- item{i}\n", "  ".repeat(i)))
+        .collect();
+    let mut html: String = (0..depth).map(|i| format!("<ul><li>item{i}")).collect();
+    html.push_str(&"</li></ul>".repeat(depth));
+
+    for syntax in ["djot", "markdown", "html"] {
+        let (db, hub, mut urm) = setup_with_text("")?;
+        match syntax {
+            "djot" => {
+                document_editing_controller::insert_djot_at_position(
+                    &db,
+                    &hub,
+                    &mut urm,
+                    None,
+                    &InsertDjotAtPositionDto {
+                        position: 0,
+                        anchor: 0,
+                        djot: djot.clone(),
+                    },
+                )?;
+            }
+            "markdown" => {
+                document_editing_controller::insert_markdown_at_position(
+                    &db,
+                    &hub,
+                    &mut urm,
+                    None,
+                    &InsertMarkdownAtPositionDto {
+                        position: 0,
+                        anchor: 0,
+                        markdown: markdown.clone(),
+                    },
+                )?;
+            }
+            _ => {
+                document_editing_controller::insert_html_at_position(
+                    &db,
+                    &hub,
+                    &mut urm,
+                    None,
+                    &InsertHtmlAtPositionDto {
+                        position: 0,
+                        anchor: 0,
+                        html: html.clone(),
+                    },
+                )?;
+            }
+        }
+        let mut items: Vec<(String, i64)> = Vec::new();
+        for id in get_all_block_ids(&db)? {
+            let Some(block) = block_controller::get(&db, &id)? else {
+                continue;
+            };
+            if let Some(list_id) = block.list
+                && let Some(list) = list_controller::get(&db, &list_id)?
+            {
+                items.push((block_text_dto(&db, &block), list.indent));
+            }
+        }
+        items.sort_by_key(|(text, _)| {
+            text.trim_start_matches("item")
+                .parse::<usize>()
+                .unwrap_or(usize::MAX)
+        });
+        let expected: Vec<(String, i64)> = (0..depth)
+            .map(|i| (format!("item{i}"), (i as i64).min(15)))
+            .collect();
+        assert_eq!(items, expected, "inserting {syntax}");
+    }
+    Ok(())
+}

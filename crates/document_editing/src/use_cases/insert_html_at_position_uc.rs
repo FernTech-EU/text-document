@@ -1002,7 +1002,10 @@ fn execute_insert_html(
     uow: &mut Box<dyn InsertHtmlAtPositionUnitOfWorkTrait>,
     dto: &InsertHtmlAtPositionDto,
 ) -> Result<(InsertHtmlAtPositionResultDto, EntityTreeSnapshot)> {
-    let parsed_blocks = content_parser::parse_html(&dto.html);
+    let mut parsed_blocks = content_parser::parse_html(&dto.html);
+    // An inserted list keeps its items and their order, at most as deep as the
+    // editing gestures nest one (see `list_depth`).
+    common::parser_tools::list_depth::clamp_parsed_list_indents(&mut parsed_blocks);
     let (new_position, blocks_added, snapshot) =
         execute_content_insert(uow, dto.position, dto.anchor, &parsed_blocks)?;
     Ok((

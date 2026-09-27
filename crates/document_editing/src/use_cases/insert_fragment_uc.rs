@@ -28,6 +28,7 @@ use common::parser_tools::TABLE_ANCHOR;
 use common::parser_tools::fragment_schema::{
     FragmentBlock, FragmentData, FragmentTable, FragmentTableCell,
 };
+use common::parser_tools::list_depth::clamp_fragment_list_indents;
 use common::parser_tools::list_grouper::ListGrouper;
 use common::snapshot::EntityTreeSnapshot;
 use common::types::{EntityId, ROOT_ENTITY_ID};
@@ -1864,6 +1865,9 @@ fn execute_insert_fragment(
 
     let mut fragment_data: FragmentData = serde_json::from_str(&dto.fragment_data)
         .map_err(|e| anyhow!("Invalid fragment_data JSON: {}", e))?;
+    // A pasted list keeps its items and their order, at most as deep as the
+    // editing gestures nest one (see `list_depth`).
+    clamp_fragment_list_indents(&mut fragment_data);
 
     if fragment_data.blocks.is_empty() && fragment_data.tables.is_empty() {
         return Err(anyhow!("Fragment contains no blocks or tables"));

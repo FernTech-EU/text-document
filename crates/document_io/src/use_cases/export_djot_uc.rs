@@ -147,18 +147,36 @@ impl ExportDjotUseCase {
                     // Continuation lines are indented, which is how djot marks a
                     // multi-block note body as belonging to the definition
                     // rather than ending it.
+                    //
+                    // A line that is itself indented (a nested list item) is
+                    // indented as far as the first line's text starts, past
+                    // `[^label]: `, before its own indentation. The parser takes
+                    // up to the marker's width off every continuation line, so
+                    // with four spaces the item's own indentation was taken
+                    // too, and a list nested in a note was read back one level
+                    // up. The other lines keep the four spaces: the wider
+                    // indentation counts towards the nesting a reader checks
+                    // (`djot_depth`), and a line starting at its own left edge
+                    // has none to lose.
                     if let Some(ref label) = f.footnote_label {
+                        let marker = format!("[^{label}]: ");
+                        let past_marker = " ".repeat(marker.len());
                         let mut lines = frame_text.lines();
                         let mut out = String::new();
                         if let Some(first) = lines.next() {
-                            out.push_str(&format!("[^{label}]: {first}"));
+                            out.push_str(&marker);
+                            out.push_str(first);
                         }
                         for line in lines {
                             out.push('\n');
                             if line.is_empty() {
                                 continue;
                             }
-                            out.push_str("    ");
+                            if line.starts_with(' ') {
+                                out.push_str(&past_marker);
+                            } else {
+                                out.push_str("    ");
+                            }
                             out.push_str(line);
                         }
                         output_parts.push(out);
@@ -207,6 +225,9 @@ impl ExportDjotUseCase {
         // resulting lists "loose", but the model does not distinguish
         // tight/loose, and the blank line is exactly what lets an indented
         // sub-list nest rather than fold into the parent item's paragraph.
+        // Inside a quotation the blank line carries the quotation's markers
+        // (see `block_separator`).
+        let separator = block_separator(quote_prefix);
 
         // If child_order is empty, fall back to iterating blocks directly
         let use_child_order = !frame.child_order.is_empty();
@@ -227,7 +248,7 @@ impl ExportDjotUseCase {
                             options,
                         )?;
                         if !result.is_empty() {
-                            result.push_str("\n\n");
+                            result.push_str(&separator);
                         }
                         result.push_str(&line);
                     }
@@ -248,7 +269,7 @@ impl ExportDjotUseCase {
                                 table_md
                             };
                             if !result.is_empty() {
-                                result.push_str("\n\n");
+                                result.push_str(&separator);
                             }
                             result.push_str(&prefixed);
                             open_levels.clear();
@@ -271,7 +292,7 @@ impl ExportDjotUseCase {
                         )?;
                         if !sub_text.is_empty() {
                             if !result.is_empty() {
-                                result.push_str("\n\n");
+                                result.push_str(&separator);
                             }
                             result.push_str(&sub_text);
                         }
@@ -307,7 +328,7 @@ impl ExportDjotUseCase {
                     options,
                 )?;
                 if !result.is_empty() {
-                    result.push_str("\n\n");
+                    result.push_str(&separator);
                 }
                 result.push_str(&line);
             }
@@ -833,6 +854,23 @@ impl ExportDjotUseCase {
         );
 
         self.render_inline_segments(&elements)
+    }
+}
+
+/// What goes between two blocks of one frame: a blank line, carrying the
+/// quotation's markers inside a quotation (`>` or `> >`, without the space
+/// after the last one).
+///
+/// A blank line without them ends the quotation, and the next block opens
+/// another one. Paragraphs came back from that the same, since the importer
+/// places each block by how deeply it is quoted, but a nested list item came
+/// back at the top level: the item it was nested in had been left in the
+/// quotation before.
+fn block_separator(quote_prefix: &str) -> String {
+    if quote_prefix.is_empty() {
+        "\n\n".to_string()
+    } else {
+        format!("\n{}\n", quote_prefix.trim_end())
     }
 }
 

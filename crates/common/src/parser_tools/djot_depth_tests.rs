@@ -163,20 +163,42 @@ fn past_the_parsers_limit() -> Vec<(&'static str, String)> {
     ]
 }
 
+/// The parse `parse_djot` gives `djot`, written out, to compare two parses by.
+fn parsed(djot: &str) -> String {
+    format!("{:?}", parse_on_a_spawned_thread(djot.to_string()))
+}
+
 /// Every shape in [`past_the_parsers_limit`] is refused, and the real parser comes
-/// back from it on a spawned thread's stack with the source verbatim.
+/// back from it on a spawned thread's stack. A shape nested by indentation comes back
+/// parsed with its indentation cut, the others as their source, verbatim.
 ///
 /// Before the scan followed `jotdown`, only the first shape was refused. Every other
 /// one was handed to the parser and aborted the test binary here.
 #[test]
-fn every_hostile_shape_is_refused_and_comes_back_verbatim() {
+fn every_hostile_shape_is_refused_and_comes_back_whole() {
     for (shape, text) in past_the_parsers_limit() {
         assert!(is_too_deep(&text), "{shape} must be refused");
-        let elements = parse_on_a_spawned_thread(text.clone());
-        assert!(
-            is_raw(&elements, &text),
-            "{shape}: degrading may not lose prose"
+        let flattened = flatten_deep_indentation(&text);
+        let rescued = !is_too_deep(&flattened);
+        assert_eq!(
+            rescued,
+            shape.contains("stepping in"),
+            "{shape}: only indentation is cut, so only a staircase comes back parsed"
         );
+        let elements = parse_on_a_spawned_thread(text.clone());
+        if rescued {
+            assert!(!is_raw(&elements, &text), "{shape}: shown as raw source");
+            assert_eq!(
+                format!("{elements:?}"),
+                parsed(&flattened),
+                "{shape}: parsed as flattened"
+            );
+        } else {
+            assert!(
+                is_raw(&elements, &text),
+                "{shape}: degrading may not lose prose"
+            );
+        }
     }
 }
 
@@ -335,6 +357,30 @@ fn sibling_divs_do_not_accumulate() {
     assert_eq!(nesting_depth(&"::: note\nbody\n:::\n".repeat(500)), 1);
 }
 
+/// A div fence with a class never closes the div it stands in: it opens one inside it.
+#[test]
+fn stacked_div_openings_nest() {
+    let stacked = |levels: usize| "::: a\n".repeat(levels);
+    assert_eq!(nesting_depth(&stacked(10)), 10);
+    assert_eq!(jotdown_depth(&stacked(10)), 10, "the measure itself");
+    assert!(!is_too_deep(&stacked(MAX_NESTING_DEPTH)));
+    assert!(is_too_deep(&stacked(MAX_NESTING_DEPTH + 1)));
+    let hostile = stacked(500);
+    assert!(is_raw(
+        &parse_on_a_spawned_thread(hostile.clone()),
+        &hostile
+    ));
+}
+
+/// A document under the ceiling parses as its structure, not as its source.
+#[test]
+fn prose_below_the_ceiling_still_gets_its_structure() {
+    let text = "> > > a quoted quote\n\nand a paragraph\n";
+    let elements = parse_on_a_spawned_thread(text.to_string());
+    assert_eq!(elements.len(), 2, "{elements:#?}");
+    assert!(!is_raw(&elements, text));
+}
+
 /// Djot lets an outer div use a longer fence so another can nest inside it. A `::::`
 /// line carrying no class closes rather than opens.
 #[test]
@@ -400,6 +446,12 @@ fn text_that_only_looks_like_a_marker_is_not_counted() {
         format!("{}\n", "-\t".repeat(300)),
         // A `>` is a blockquote only before whitespace: a run of them is a word.
         format!("{}deep\n", ">".repeat(4_000)),
+        // Prose that starts like a marker, once.
+        "Mr. Smith arrived.\n".to_string(),
+        "e.g. this\n".to_string(),
+        "-dash\n".to_string(),
+        "1.5 litres\n".to_string(),
+        "[link]: https://example.org\n".to_string(),
     ] {
         assert_eq!(nesting_depth(&text), 0, "{text:.40}");
         assert_eq!(jotdown_depth(&text), 0, "the measure itself: {text:.40}");
@@ -429,6 +481,97 @@ fn the_real_parser_survives_input_that_used_to_abort_the_process() {
     let hostile = one_line("> ", 4_000);
     let elements = parse_djot(&hostile, &DjotImportOptions::default());
     assert!(is_raw(&elements, &hostile));
+}
+
+// ── A document nested by indentation is read flattened ──────────────────────────────
+
+/// The text of each block of `elements`, in order.
+fn block_texts(elements: Vec<ParsedElement>) -> Vec<(String, u32, bool)> {
+    ParsedElement::flatten_to_blocks(elements)
+        .into_iter()
+        .map(|block| {
+            let text = block.spans.iter().map(|s| s.text.as_str()).collect();
+            (text, block.list_indent, block.list_style.is_some())
+        })
+        .collect()
+}
+
+/// A list nested too deeply for the parser is read with its indentation cut: every item
+/// comes back as an item, in its order, the deeper ones side by side. It used to come
+/// back as one paragraph of markup.
+#[test]
+fn a_list_nested_too_deeply_is_read_flattened_with_every_item() {
+    let depth = 300;
+    let text: String = (0..depth)
+        .map(|level| format!("{}- item {level}\n\n", "  ".repeat(level)))
+        .collect();
+    assert!(is_too_deep(&text));
+    let flattened = flatten_deep_indentation(&text);
+    assert!(!is_too_deep(&flattened));
+    let deepest = (FLATTENED_INDENT_COLUMNS / 2) as u32;
+    let expected: Vec<(String, u32, bool)> = (0..depth)
+        .map(|level| (format!("item {level}"), (level as u32).min(deepest), true))
+        .collect();
+    assert_eq!(block_texts(parse_on_a_spawned_thread(text)), expected);
+}
+
+/// Two shapes the parser cannot follow on a spawned thread's stack: markers on one line,
+/// which no indentation deepens and which therefore come back as their source, and a
+/// list indented a thousand levels deep in a quotation, which comes back flattened with
+/// every item, still in the quotation.
+#[test]
+fn markers_on_one_line_come_back_raw_and_a_quoted_deep_list_flattened() {
+    let one_line = one_line("- ", 4_000);
+    let elements = parse_on_a_spawned_thread(one_line.clone());
+    assert!(is_raw(&elements, &one_line));
+
+    let quoted: String = (0..1_000)
+        .map(|level| format!("> {}- item {level}\n>\n", "  ".repeat(level)))
+        .collect();
+    assert!(is_too_deep(&quoted));
+    let items = ParsedElement::flatten_to_blocks(parse_on_a_spawned_thread(quoted));
+    assert_eq!(items.len(), 1_000, "every item comes back");
+    assert!(items.iter().all(|block| block.list_style.is_some()));
+    assert!(items.iter().all(|block| block.blockquote_depth == 1));
+}
+
+/// Only the indentation of a line's container prefix changes: markers keep the
+/// whitespace byte after them, line breaks stay, and the text after the prefix is
+/// untouched, however far it is spaced.
+#[test]
+fn flattening_cuts_only_the_prefix_indentation() {
+    let deep = " ".repeat(200);
+    let wide = " ".repeat(FLATTENED_INDENT_COLUMNS);
+    let text = format!(
+        "{deep}- x  y\r\n> {deep}- z\n>\n{deep}plain   text\nshallow\n  - kept\n\
+         {deep}Mr.{deep}Smith\n{deep}-\t{deep}tab\n"
+    );
+    assert_eq!(
+        flatten_deep_indentation(&text),
+        format!(
+            "{wide}- x  y\r\n> {wide}- z\n>\n{wide}plain   text\nshallow\n  - kept\n\
+             {wide}Mr.{deep}Smith\n{wide}-\t{deep}tab\n"
+        )
+    );
+    let shallow = "- a\n\n  - b\n\n> > quoted\n";
+    assert_eq!(flatten_deep_indentation(shallow), shallow);
+}
+
+/// Flattening reads no more than one marker past the ceiling into a line, the most the
+/// scan opens on one: a line of more markers stays too deep whatever its indentation,
+/// and reading further would cost it the whole line again for each marker.
+#[test]
+fn flattening_reads_a_line_no_further_than_the_scan_does() {
+    let within = "-   ".repeat(MAX_NESTING_DEPTH + 1);
+    let beyond = "-   ".repeat(1_000);
+    let text = format!("{within}{beyond}x\n");
+    let cut: String = (0..=MAX_NESTING_DEPTH)
+        .map(|marker| {
+            let kept = FLATTENED_INDENT_COLUMNS.saturating_sub(2 * marker).min(2);
+            format!("- {}", " ".repeat(kept))
+        })
+        .collect();
+    assert_eq!(flatten_deep_indentation(&text), format!("{cut}{beyond}x\n"));
 }
 
 // ── The count is the nesting jotdown builds ─────────────────────────────────────────
@@ -528,9 +671,6 @@ fn generated_line() -> impl Strategy<Value = String> {
 
 /// A list stepping in `step` columns a level, each item followed by `between`.
 fn staircase() -> impl Strategy<Value = String> {
-    let marker = prop::sample::select(vec![
-        "- ", "1. ", "(iv) ", "- [ ] ", "[^a]: ", ": ", "> - ", "- > ", "> ", "::: c\n",
-    ]);
     let between = prop::sample::select(vec![
         "\n",
         "\n\n",
@@ -545,7 +685,18 @@ fn staircase() -> impl Strategy<Value = String> {
         "\n| a |\n\n",
         "\r\n\r\n",
     ]);
-    (marker, between, 0usize..7, 1usize..60).prop_map(|(marker, between, step, levels)| {
+    staircase_of(1..60, between)
+}
+
+/// A staircase of `levels` levels, its items separated by one of `between`.
+fn staircase_of(
+    levels: std::ops::Range<usize>,
+    between: impl Strategy<Value = &'static str>,
+) -> impl Strategy<Value = String> {
+    let marker = prop::sample::select(vec![
+        "- ", "1. ", "(iv) ", "- [ ] ", "[^a]: ", ": ", "> - ", "- > ", "> ", "::: c\n",
+    ]);
+    (marker, between, 0usize..7, levels).prop_map(|(marker, between, step, levels)| {
         (0..levels)
             .map(|level| format!("{}{marker}level {level}", " ".repeat(step * level)))
             .collect::<Vec<_>>()
@@ -601,10 +752,11 @@ proptest! {
         prop_assert_eq!(nesting_depth(&text), jotdown_depth(&text), "{:?}", text);
     }
 
-    /// Whatever the guard lets through parses from a spawned thread's stack, and what it
-    /// refuses comes back as its source, verbatim. The assertion for the first is the
-    /// parse coming back at all: a guard that let a document past the parser's limit
-    /// through would abort the test binary here.
+    /// Whatever the guard lets through parses from a spawned thread's stack. What it
+    /// refuses parses flattened when cutting its indentation brings it under the ceiling,
+    /// and comes back as its source, verbatim, when it does not. The assertion for the
+    /// first is the parse coming back at all: a guard that let a document past the
+    /// parser's limit through would abort the test binary here.
     #[test]
     fn whatever_the_guard_accepts_parses_from_a_spawned_thread(
         starts in prop::collection::vec(line_start(), 1..4),
@@ -612,9 +764,106 @@ proptest! {
         end in line_end(),
     ) {
         let text = format!("{}{end}\n", starts.concat().repeat(times));
-        let elements = parse_on_a_spawned_thread(text.clone());
-        if is_too_deep(&text) {
-            prop_assert!(is_raw(&elements, &text), "{:?}", text);
+        assert_degrades_whole(&text)?;
+    }
+}
+
+/// `text` parses from a spawned thread's stack; refused, it parses as its flattening
+/// does when that is under the ceiling, and comes back as its source otherwise.
+fn assert_degrades_whole(text: &str) -> Result<(), TestCaseError> {
+    let elements = parse_on_a_spawned_thread(text.to_string());
+    if is_too_deep(text) {
+        let flattened = flatten_deep_indentation(text);
+        if is_too_deep(&flattened) {
+            prop_assert!(is_raw(&elements, text), "{:?}", text);
+        } else {
+            prop_assert_eq!(format!("{elements:?}"), parsed(&flattened), "{:?}", text);
         }
+    }
+    Ok(())
+}
+
+/// A document of generated lines, fenced blocks and staircases, some nested past the
+/// ceiling, with a blank line between any two of them and between the items of a
+/// staircase.
+///
+/// So no paragraph runs longer than a few lines, as none the editor writes does. What
+/// this is for is nesting. A paragraph of several hundred lines that leaves an inline
+/// opener (a `_`, a `[`, a quotation mark) open is a limit of the parser this module does
+/// not measure: `jotdown` 0.10 recurses once a line while it waits for the opener to
+/// close, and aborts a spawned thread's stack past about 700 lines in a debug build.
+fn deep_document() -> impl Strategy<Value = String> {
+    let between = || {
+        prop::sample::select(vec![
+            "\n\n",
+            "\nlazy\n\n",
+            "\n\n  more\n\n",
+            "\n\n```\n",
+            "\n| a |\n\n",
+            "\r\n\r\n",
+        ])
+    };
+    let group = prop_oneof![
+        3 => generated_line(),
+        1 => staircase_of(1..60, between()),
+        2 => staircase_of(MAX_NESTING_DEPTH..3 * MAX_NESTING_DEPTH, between()),
+        1 => fenced_block(),
+    ];
+    (prop::collection::vec(group, 1..8), any::<bool>()).prop_map(|(groups, closed)| {
+        let mut text = groups.join("\n\n");
+        if closed {
+            text.push('\n');
+        }
+        text
+    })
+}
+
+/// `flattened` is `line` with some of its ASCII whitespace taken out, and nothing else:
+/// the bytes it keeps are in `line`, in order, and every other byte of `line` is
+/// whitespace.
+fn only_whitespace_removed(line: &str, flattened: &str) -> bool {
+    let mut kept = flattened.bytes().peekable();
+    for byte in line.bytes() {
+        if kept.peek() == Some(&byte) {
+            kept.next();
+        } else if !byte.is_ascii_whitespace() {
+            return false;
+        }
+    }
+    kept.next().is_none()
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig { cases: 256, ..ProptestConfig::default() })]
+
+    /// Flattening takes out whitespace and nothing else, keeps every line and its line
+    /// break, and changes nothing more when run again.
+    #[test]
+    fn flattening_only_takes_out_whitespace(text in deep_document()) {
+        let flattened = flatten_deep_indentation(&text);
+        let lines: Vec<&str> = text.split_inclusive('\n').collect();
+        let flat_lines: Vec<&str> = flattened.split_inclusive('\n').collect();
+        prop_assert_eq!(lines.len(), flat_lines.len());
+        for (line, flat) in lines.iter().zip(&flat_lines) {
+            prop_assert!(only_whitespace_removed(line, flat), "{:?} -> {:?}", line, flat);
+            prop_assert_eq!(line.ends_with('\n'), flat.ends_with('\n'));
+            prop_assert_eq!(line.ends_with("\r\n"), flat.ends_with("\r\n"));
+        }
+        prop_assert_eq!(flatten_deep_indentation(&flattened), flattened);
+    }
+
+    /// The flattened text is measured again before it is parsed, by the same count, which
+    /// is as exact on it as on any other text.
+    #[test]
+    fn the_count_is_the_nesting_jotdown_builds_once_flattened(text in deep_document()) {
+        let flattened = flatten_deep_indentation(&text);
+        prop_assert_eq!(nesting_depth(&flattened), jotdown_depth(&flattened), "{:?}", flattened);
+    }
+
+    /// A document nested past the ceiling comes back from a spawned thread's stack,
+    /// flattened or as its source.
+    #[test]
+    fn a_deep_document_comes_back_whole(text in deep_document()) {
+        assert_degrades_whole(&text)?;
     }
 }
