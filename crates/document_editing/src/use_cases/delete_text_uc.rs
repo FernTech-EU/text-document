@@ -1,19 +1,24 @@
 use super::editing_helpers::{
-    collect_block_ids_recursive, find_block_at_position, is_word_boundary_punct,
+    Swept, collect_block_ids_recursive, find_block_at_position, impl_nested_content_reader,
+    is_word_boundary_punct, position_roots,
 };
 use crate::DeleteTextDto;
 use crate::DeleteTextResultDto;
 use anyhow::{Result, anyhow};
 use common::database::CommandUnitOfWork;
-use common::database::rope_helpers::{block_char_length, block_content_via_store};
+use common::database::block_offset_index::OffsetMarker;
+use common::database::rope_helpers::{
+    block_char_length, block_content_via_store, range_covers_table_anchor, refresh_block_positions,
+    rope_remove_markers, snap_off_table_anchor, table_anchor_position,
+};
 use common::direct_access::document::document_repository::DocumentRelationshipField;
 use common::direct_access::frame::frame_repository::FrameRelationshipField;
 use common::direct_access::root::root_repository::RootRelationshipField;
 use common::direct_access::table::TableRelationshipField;
 use common::entities::{Block, Document, Frame, Root, Table, TableCell};
 use common::format_runs::{
-    FormatRun, ImageAnchor, debug_assert_well_formed, logical_offset_to_byte,
-    shift_images_for_delete, shift_runs_for_delete,
+    FootnoteRefAnchor, FormatRun, ImageAnchor, debug_assert_well_formed, logical_offset_to_byte,
+    shift_footnote_refs_for_delete, shift_images_for_delete, shift_runs_for_delete,
 };
 use common::snapshot::EntityTreeSnapshot;
 use common::types::{EntityId, ROOT_ENTITY_ID};
@@ -57,6 +62,33 @@ pub trait DeleteTextUnitOfWorkFactoryTrait: Send + Sync {
 #[macros::uow_action(entity = "List", action = "RemoveMulti")]
 pub trait DeleteTextUnitOfWorkTrait: CommandUnitOfWork {}
 
+impl_nested_content_reader!(dyn DeleteTextUnitOfWorkTrait);
+
+/// The refusal of a deletion that would remove nothing: its range, once off a
+/// table's anchor, is empty, or it only meets the blocks at its ends
+/// (Backspace or Delete next to a table, between two table cells, or at the
+/// edge of a footnote's body, none of which joins anything). It carries where
+/// the caret goes.
+///
+/// A use case the controller runs without an error goes on the undo stack, so
+/// a deletion that succeeded at doing nothing gave the Edit menu an Undo that
+/// changed nothing, and the writer had to undo twice to reach their last real
+/// edit. Callers that delete on behalf of a keystroke treat this error as an
+/// edit that removed nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NothingToDelete {
+    /// Where the caret goes.
+    pub new_position: i64,
+}
+
+impl std::fmt::Display for NothingToDelete {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "nothing to delete (caret to {})", self.new_position)
+    }
+}
+
+impl std::error::Error for NothingToDelete {}
+
 pub struct DeleteTextUseCase {
     uow_factory: Box<dyn DeleteTextUnitOfWorkFactoryTrait>,
     undo_snapshot: Option<EntityTreeSnapshot>,
@@ -88,10 +120,56 @@ fn read_block_runs_and_images(
     (runs, images)
 }
 
-/// Reset a block to empty state: clears its format_runs and block_images
-/// and bumps `updated_at`. Its text leaves the rope separately, through
-/// `rope_clear_blocks`, which empties every cleared block in one walk of the
-/// offset index where clearing them one at a time walked it once per block.
+/// Read a block's footnote references.
+fn read_block_footnote_refs(
+    uow: &dyn DeleteTextUnitOfWorkTrait,
+    block_id: EntityId,
+) -> Vec<FootnoteRefAnchor> {
+    uow.store()
+        .block_footnote_refs
+        .read()
+        .get(&block_id)
+        .cloned()
+        .unwrap_or_default()
+}
+
+/// Store `notes` as `block_id`'s footnote references, leaving no entry for a
+/// block that holds none.
+fn write_block_footnote_refs(
+    uow: &dyn DeleteTextUnitOfWorkTrait,
+    block_id: EntityId,
+    notes: Vec<FootnoteRefAnchor>,
+) {
+    let store = uow.store();
+    let mut notes_map = store.block_footnote_refs.write();
+    if notes.is_empty() {
+        notes_map.remove(&block_id);
+    } else {
+        notes_map.insert(block_id, notes);
+    }
+}
+
+/// Delete `[byte_start..byte_end)` from a block's footnote references: the
+/// ones inside go with the text, the ones after move back.
+fn delete_block_footnote_refs(
+    uow: &dyn DeleteTextUnitOfWorkTrait,
+    block_id: EntityId,
+    byte_start: u32,
+    byte_end: u32,
+) {
+    let mut notes = read_block_footnote_refs(uow, block_id);
+    if notes.is_empty() {
+        return;
+    }
+    shift_footnote_refs_for_delete(&mut notes, byte_start, byte_end);
+    write_block_footnote_refs(uow, block_id, notes);
+}
+
+/// Reset a block to empty state: clears its format_runs, block_images and
+/// footnote references and bumps `updated_at`. Its text leaves the rope
+/// separately, through `rope_clear_blocks`, which empties every cleared block
+/// in one walk of the offset index where clearing them one at a time walked it
+/// once per block.
 fn clear_block(
     uow: &mut Box<dyn DeleteTextUnitOfWorkTrait>,
     block: &Block,
@@ -103,18 +181,44 @@ fn clear_block(
     let store = uow.store();
     store.format_runs.write().insert(block.id, Vec::new());
     store.block_images.write().insert(block.id, Vec::new());
+    store.block_footnote_refs.write().remove(&block.id);
     Ok(())
 }
 
-/// Drop the per-block run/image/inline_elements tables for a block that's
-/// about to be removed entirely. Idempotent.
+/// Drop the per-block run/image/footnote tables for a block that's about to
+/// be removed entirely. Idempotent.
 fn drop_block_runs_and_images(uow: &dyn DeleteTextUnitOfWorkTrait, block_id: EntityId) {
     let store = uow.store();
     store.format_runs.write().remove(&block_id);
     store.block_images.write().remove(&block_id);
+    store.block_footnote_refs.write().remove(&block_id);
 }
 
-/// Walk the frame tree rooted at `root_id` once and map every block to the
+/// Remove every footnote definition frame the deletion emptied. A definition
+/// is top-level, so the sub-frame prune under the main frame never sees it,
+/// and one left without blocks is a note with no body that every writer
+/// still visits.
+fn prune_empty_definition_frames(
+    uow: &mut Box<dyn DeleteTextUnitOfWorkTrait>,
+    definition_frames: &[EntityId],
+) -> Result<()> {
+    let mut empty: Vec<EntityId> = Vec::new();
+    for frame_id in definition_frames {
+        let Some(frame) = uow.get_frame(frame_id)? else {
+            continue;
+        };
+        let blocks = uow.get_frame_relationship(frame_id, &FrameRelationshipField::Blocks)?;
+        if blocks.is_empty() && !frame.child_order.iter().any(|entry| *entry < 0) {
+            empty.push(*frame_id);
+        }
+    }
+    if !empty.is_empty() {
+        uow.remove_frame_multi(&empty)?;
+    }
+    Ok(())
+}
+
+/// Walk the frame trees rooted at `root_ids` once and map every block to the
 /// frame whose `child_order` lists it. Used by the cross-block merge to
 /// correctly resolve sub-frame ownership when the deletion crosses a frame
 /// boundary: the cell-only `block_to_cell_frame` map cannot answer this for
@@ -131,7 +235,7 @@ fn drop_block_runs_and_images(uow: &dyn DeleteTextUnitOfWorkTrait, block_id: Ent
 /// meets the missing frame first and fails, and so must the caller.
 fn block_owner_frames(
     uow: &dyn DeleteTextUnitOfWorkTrait,
-    root_id: EntityId,
+    root_ids: &[EntityId],
 ) -> (HashMap<EntityId, EntityId>, Option<anyhow::Error>) {
     fn walk(
         uow: &dyn DeleteTextUnitOfWorkTrait,
@@ -152,7 +256,9 @@ fn block_owner_frames(
         Ok(())
     }
     let mut owners = HashMap::new();
-    let stopped = walk(uow, root_id, &mut owners).err();
+    let stopped = root_ids
+        .iter()
+        .find_map(|root_id| walk(uow, *root_id, &mut owners).err());
     (owners, stopped)
 }
 
@@ -250,10 +356,12 @@ fn execute_delete(
         ));
     }
 
-    let start = std::cmp::min(dto.position, dto.anchor);
-    let end = std::cmp::max(dto.position, dto.anchor);
-
     let store = uow.store();
+
+    // A range endpoint on a table's anchor stands for the table, not for a
+    // block: a start moves into the table, an end back before it.
+    let start = snap_off_table_anchor(&store, std::cmp::min(dto.position, dto.anchor), true);
+    let end = snap_off_table_anchor(&store, std::cmp::max(dto.position, dto.anchor), false);
 
     let root = uow
         .get_root(&ROOT_ENTITY_ID)?
@@ -269,6 +377,13 @@ fn execute_delete(
 
     let snapshot = uow.snapshot_document(&[doc_id])?;
 
+    if start >= end {
+        return Err(NothingToDelete {
+            new_position: std::cmp::min(dto.position, dto.anchor),
+        }
+        .into());
+    }
+
     let frame_ids = uow.get_document_relationship(&doc_id, &DocumentRelationshipField::Frames)?;
     let frame_id = *frame_ids
         .first()
@@ -281,53 +396,46 @@ fn execute_delete(
         cells.sort_by(|a, b| a.row.cmp(&b.row).then(a.column.cmp(&b.column)));
         Ok(cells.into_iter().filter_map(|c| c.cell_frame).collect())
     };
-    let all_block_ids = collect_block_ids_recursive(
-        &|id| uow.get_frame(id),
-        &|id, field| uow.get_frame_relationship(id, field),
-        &get_table_cell_frames,
-        &frame_id,
-    )?;
+    // The main flow's blocks and every footnote definition's: the rope holds
+    // a definition where it was written, so a range across one covers its
+    // blocks. Left out of this list, a merge took their text out of the rope
+    // and left the blocks behind, and every read of them then sliced text
+    // that was gone.
+    let roots = position_roots(&|id| uow.get_frame(id), &frame_ids)?;
+    let definition_frames: Vec<EntityId> = roots.iter().skip(1).copied().collect();
+    let mut all_block_ids: Vec<EntityId> = Vec::new();
+    // Which of those trees each block belongs to: the main text, or one
+    // footnote's body.
+    let mut root_of_block: HashMap<EntityId, EntityId> = HashMap::new();
+    for root in &roots {
+        let root_blocks = collect_block_ids_recursive(
+            &|id| uow.get_frame(id),
+            &|id, field| uow.get_frame_relationship(id, field),
+            &get_table_cell_frames,
+            root,
+        )?;
+        root_of_block.extend(root_blocks.iter().map(|block_id| (*block_id, *root)));
+        all_block_ids.extend(root_blocks);
+    }
 
     let blocks_opt = uow.get_block_multi(&all_block_ids)?;
     let mut blocks: Vec<Block> = blocks_opt.into_iter().flatten().collect();
 
-    // Refresh stored block positions from child_order + text_length, since
-    // insert_text's fast path leaves them stale. Cell-frame blocks remain
-    // in their cell-local position space.
-    let root_frame = uow
-        .get_frame(&frame_id)?
-        .ok_or_else(|| anyhow!("Root frame not found"))?;
-    // Where each block sits in `blocks`, the first one of an id winning as a
-    // search from the front would find it. Searching per entry instead made
-    // every deletion quadratic in the document's paragraphs, a single
-    // Backspace included.
-    let mut index_of: HashMap<EntityId, usize> = HashMap::with_capacity(blocks.len());
-    for (i, b) in blocks.iter().enumerate() {
-        index_of.entry(b.id).or_insert(i);
-    }
-    let mut running: i64 = 0;
-    let mut blocks_to_refresh: Vec<Block> = Vec::new();
-    for &entry in &root_frame.child_order {
-        if entry <= 0 {
-            continue;
-        }
-        let id = entry as EntityId;
-        if let Some(&i) = index_of.get(&id) {
-            let b = &mut blocks[i];
-            if b.document_position != running {
-                b.document_position = running;
-                blocks_to_refresh.push(b.clone());
-            }
-            running += block_char_length(b, &store) + 1;
-        }
-    }
-    if !blocks_to_refresh.is_empty() {
-        uow.update_block_multi(&blocks_to_refresh)?;
-    }
+    // Order the blocks by where they start. The stored `document_position`
+    // lags the rope by whatever was typed since something last wrote it, so
+    // it is read from the rope, as every use case reading positions does (see
+    // `refresh_block_positions`). This used to recount it from the main
+    // frame's own blocks alone, which left every blockquote, table cell and
+    // footnote body out of the count: the blocks after a quotation were
+    // written back at the wrong positions, sorted out of order, and a range
+    // across them resolved its end before its start.
+    refresh_block_positions(&mut blocks, &store);
     blocks.sort_by_key(|b| b.document_position);
 
     let (start_block, start_block_idx, start_offset) =
         find_block_at_position(&blocks, start, &uow.store())?;
+    let (end_block, end_block_idx, end_offset) =
+        find_block_at_position(&blocks, end, &uow.store())?;
 
     // ── Cell selection safety: detect cross-cell deletion ──────────
     let table_ids = uow.get_document_relationship(&doc_id, &DocumentRelationshipField::Tables)?;
@@ -347,13 +455,53 @@ fn execute_delete(
         }
     }
 
-    let is_cross_cell = {
+    // Whether the range takes some of a block: it overlaps the block's text,
+    // or the block is empty and the range runs across it, from before it to
+    // past it. A range that only meets a block at one of its ends takes
+    // nothing of it, and a cell the range takes something of is emptied whole
+    // below. Counting a block the range only meets lost text: Backspace at
+    // the start of the paragraph after a table cleared the table's last cell;
+    // Backspace at the start of a cell cleared the cell before when that one
+    // ended with an empty paragraph, and cleared its own cell, other
+    // paragraphs and all, when its first paragraph was empty.
+    let takes_text_of = |block: &Block| {
+        let block_start = block.document_position;
+        let block_end = block_start + block_char_length(block, &store);
+        if block_start == block_end {
+            start < block_start && block_start < end
+        } else {
+            block_start < end && block_end > start
+        }
+    };
+    // Where the caller's range starts, before any snap off a table's anchor:
+    // a range starting on the anchor holds the table's start.
+    let requested_start = std::cmp::min(dto.position, dto.anchor);
+    // A range whose ends lie in different cells, or one in a cell and one
+    // outside the table, cannot be closed by joining its two blocks: the
+    // join would pull a paragraph into a cell or a cell out of its table.
+    let ends_in_different_cells =
+        block_to_cell_frame.get(&start_block.id) != block_to_cell_frame.get(&end_block.id);
+    // Nor can one whose ends lie in different trees: the main text and a
+    // footnote's body, or two bodies. The rope holds a body between the
+    // paragraphs around it, where no view shows it, so Backspace at the start
+    // of the paragraph after a body joined that paragraph to the hidden note,
+    // and Delete at the end of the paragraph before one pulled the note into
+    // the prose and left its reference without a body. Such a range takes
+    // what it covers of each block and joins nothing, as a range across cells
+    // does; at the boundary itself it takes nothing.
+    let ends_in_different_roots =
+        root_of_block.get(&start_block.id) != root_of_block.get(&end_block.id);
+    // Nor one that covers the start of a table, whatever its ends: from the
+    // end of the paragraph before a table of one cell to the start of the
+    // paragraph after it, the range takes text from that one cell only, and
+    // joining its two ends removed the cell's blocks and left the table
+    // itself behind, an anchor in the frames with nothing in the rope.
+    let covers_a_table = range_covers_table_anchor(&store, start, end);
+    let is_cross_cell = ends_in_different_cells || ends_in_different_roots || covers_a_table || {
         let mut first_cell: Option<Option<EntityId>> = None;
         let mut cross = false;
         for block in &blocks {
-            if block.document_position + block_char_length(block, &store) < start
-                || block.document_position > end
-            {
+            if !takes_text_of(block) {
                 continue;
             }
             let cell = block_to_cell_frame.get(&block.id).copied();
@@ -372,13 +520,70 @@ fn execute_delete(
     if is_cross_cell {
         let now = chrono::Utc::now();
         let mut total_chars_removed: i64 = 0;
+        // Where each block starts, read from the rope above: a cell's blocks
+        // fetched again below carry the stored field, which lags it.
+        let position_of: HashMap<EntityId, i64> =
+            blocks.iter().map(|b| (b.id, b.document_position)).collect();
+        // Where each block ends, before anything below empties it.
+        let end_of: HashMap<EntityId, i64> = blocks
+            .iter()
+            .map(|b| (b.id, b.document_position + block_char_length(b, &store)))
+            .collect();
+        let starts_at = |b: &Block| {
+            position_of
+                .get(&b.id)
+                .copied()
+                .unwrap_or(b.document_position)
+        };
+        // Where each table starts (its anchor) and where the text of its last
+        // cell ends, read before anything below changes the document. The
+        // cells are emptied and their other paragraphs removed before the
+        // tables are looked at: read afterwards, the removed paragraphs no
+        // longer counted towards the table's end, and the rope, which still
+        // held them, was no longer the position space, so the anchor had no
+        // position and the table was taken to start at its first cell. A
+        // range starting at the first cell, which only empties the table,
+        // then removed it.
+        let mut table_extents: Vec<(EntityId, i64, i64)> = Vec::new();
+        for &tid in &table_ids {
+            let cell_ids = uow.get_table_relationship(&tid, &TableRelationshipField::Cells)?;
+            let cells_opt = uow.get_table_cell_multi(&cell_ids)?;
+            let mut table_min_pos = i64::MAX;
+            let mut table_max_pos = i64::MIN;
+            for cell in cells_opt.into_iter().flatten() {
+                if let Some(cf_id) = cell.cell_frame {
+                    let blk_ids =
+                        uow.get_frame_relationship(&cf_id, &FrameRelationshipField::Blocks)?;
+                    let blk_opts = uow.get_block_multi(&blk_ids)?;
+                    for b in blk_opts.into_iter().flatten() {
+                        let b_start = starts_at(&b);
+                        table_min_pos = table_min_pos.min(b_start);
+                        table_max_pos =
+                            table_max_pos.max(end_of.get(&b.id).copied().unwrap_or(b_start));
+                    }
+                }
+            }
+            if table_min_pos > table_max_pos {
+                continue;
+            }
+            // Where the table starts: its anchor. Where the rope is not the
+            // position space the anchor takes no position, and the table
+            // starts right before its first cell.
+            let table_start = table_anchor_position(&store, tid).unwrap_or(table_min_pos - 1);
+            table_extents.push((tid, table_start, table_max_pos));
+        }
+        // Everything the entity removals below take out of the document
+        // leaves the rope in one pass at the end (see `rope_remove_markers`).
+        // The removals only ever touched the entities, so the text of every
+        // paragraph, table and extra cell block a deletion swept up stayed in
+        // the rope, under index entries naming blocks that were gone.
+        let mut leaving_rope: Vec<OffsetMarker> = Vec::new();
 
         let mut affected_set: std::collections::HashSet<EntityId> =
             std::collections::HashSet::new();
         let mut affected_cell_frames: Vec<EntityId> = Vec::new();
         for block in &blocks {
-            if block.document_position + block_char_length(block, &store) >= start
-                && block.document_position <= end
+            if takes_text_of(block)
                 && let Some(&cf_id) = block_to_cell_frame.get(&block.id)
                 && affected_set.insert(cf_id)
             {
@@ -392,6 +597,9 @@ fn execute_delete(
         // first blocks, emptied, leave the rope together the same way.
         let mut extra_block_ids: Vec<EntityId> = Vec::new();
         let mut cleared_block_ids: Vec<EntityId> = Vec::new();
+        // What is nested in the cleared cells and in the removed tables,
+        // removed after the tables loop.
+        let mut swept = Swept::default();
         for cf_id in &affected_cell_frames {
             let frame = uow
                 .get_frame(cf_id)?
@@ -399,7 +607,7 @@ fn execute_delete(
             let blk_ids = uow.get_frame_relationship(cf_id, &FrameRelationshipField::Blocks)?;
             let blk_opts = uow.get_block_multi(&blk_ids)?;
             let mut cell_blocks: Vec<Block> = blk_opts.into_iter().flatten().collect();
-            cell_blocks.sort_by_key(|b| b.document_position);
+            cell_blocks.sort_by_key(starts_at);
 
             if cell_blocks.is_empty() {
                 continue;
@@ -417,7 +625,11 @@ fn execute_delete(
             for extra in &cell_blocks[1..] {
                 drop_block_runs_and_images(uow.as_ref(), extra.id);
                 extra_block_ids.push(extra.id);
+                leaving_rope.push(OffsetMarker::Block(extra.id));
             }
+            // The cell keeps only its first block, so whatever is nested in
+            // it goes too.
+            swept.sweep_frame(&*uow, *cf_id, false)?;
 
             // `update_frame` writes `child_order` and keeps the frame's block
             // list as the store has it, so the removal below trims that list
@@ -439,112 +651,81 @@ fn execute_delete(
         // removal call rewrites the whole list of the owner it removes from
         // (the document's frames or tables) and walks every owner to find it,
         // so one call per table cost a walk of the document per table.
-        let mut tables_to_remove: Vec<EntityId> = Vec::new();
-        let mut cell_frames_to_remove: Vec<EntityId> = Vec::new();
-        let mut cells_to_remove: Vec<EntityId> = Vec::new();
-        let mut anchors_to_remove: Vec<EntityId> = Vec::new();
-        // Frames the loop has claimed for removal so far, and each table's
-        // anchor candidates: the root frame's sub-frames naming it, in
-        // `child_order` order. Built on the first table removed.
-        let mut claimed_frames: HashSet<EntityId> = HashSet::new();
-        let mut anchor_candidates: Option<HashMap<EntityId, Vec<EntityId>>> = None;
-        for &tid in &table_ids {
-            let cell_ids = uow.get_table_relationship(&tid, &TableRelationshipField::Cells)?;
-            let cells_opt = uow.get_table_cell_multi(&cell_ids)?;
-            let cells: Vec<TableCell> = cells_opt.into_iter().flatten().collect();
-
-            let all_affected = cells
-                .iter()
-                .all(|c| c.cell_frame.is_some_and(|cf| affected_set.contains(&cf)));
-            if !all_affected || cells.is_empty() {
-                continue;
-            }
-
-            let mut table_min_pos = i64::MAX;
-            let mut table_max_pos = i64::MIN;
-            for c in &cells {
-                if let Some(cf_id) = c.cell_frame {
-                    let blk_ids =
-                        uow.get_frame_relationship(&cf_id, &FrameRelationshipField::Blocks)?;
-                    let blk_opts = uow.get_block_multi(&blk_ids)?;
-                    for b in blk_opts.into_iter().flatten() {
-                        table_min_pos = table_min_pos.min(b.document_position);
-                        table_max_pos =
-                            table_max_pos.max(b.document_position + block_char_length(&b, &store));
-                    }
-                }
-            }
-
-            if start < table_min_pos || end > table_max_pos {
-                for c in &cells {
-                    if let Some(cf_id) = c.cell_frame {
-                        cell_frames_to_remove.push(cf_id);
-                        claimed_frames.insert(cf_id);
-                    }
-                    cells_to_remove.push(c.id);
-                }
-
-                // The table's anchor: the first of the root frame's sub-frames
-                // naming it that is still there, as a scan of `child_order`
-                // removing each table in turn found it.
-                let candidates = match &mut anchor_candidates {
-                    Some(candidates) => candidates,
-                    None => {
-                        let root_frame = uow
-                            .get_frame(&frame_id)?
-                            .ok_or_else(|| anyhow!("Root frame not found"))?;
-                        let mut by_table: HashMap<EntityId, Vec<EntityId>> = HashMap::new();
-                        for &entry in &root_frame.child_order {
-                            if entry < 0 {
-                                let anchor_id = (-entry) as EntityId;
-                                if let Some(anchor) = uow.get_frame(&anchor_id)?
-                                    && let Some(named) = anchor.table
-                                {
-                                    by_table.entry(named).or_default().push(anchor_id);
-                                }
-                            }
-                        }
-                        anchor_candidates.insert(by_table)
-                    }
-                };
-                if let Some(&anchor_id) = candidates
-                    .get(&tid)
-                    .and_then(|ids| ids.iter().find(|id| !claimed_frames.contains(id)))
-                {
-                    anchors_to_remove.push(anchor_id);
-                    claimed_frames.insert(anchor_id);
-                }
-
-                tables_to_remove.push(tid);
+        //
+        // Each table's anchor frame, by the table it names: wherever it sits,
+        // in the main frame, a quotation, a cell or a footnote. Looking in the
+        // main frame's `child_order` alone left the anchor of a table pasted
+        // anywhere else in place, naming a table that was gone.
+        let mut anchor_frames: HashMap<EntityId, Vec<EntityId>> = HashMap::new();
+        for fid in &frame_ids {
+            if let Some(anchor) = uow.get_frame(fid)?
+                && let Some(named) = anchor.table
+            {
+                anchor_frames.entry(named).or_default().push(*fid);
             }
         }
-
-        if !tables_to_remove.is_empty() {
-            if !cell_frames_to_remove.is_empty() {
-                uow.remove_frame_multi(&cell_frames_to_remove)?;
+        for &(tid, table_start, table_max_pos) in &table_extents {
+            if swept.table_set.contains(&tid) {
+                // Nested in a cell the deletion cleared: already going.
+                continue;
             }
-            uow.remove_table_cell_multi(&cells_to_remove)?;
-            if !anchors_to_remove.is_empty() {
-                uow.remove_frame_multi(&anchors_to_remove)?;
+            // The table goes when the range holds all of it, from its start
+            // to the end of its last cell; a range over its cells alone
+            // empties them. Whether every cell was touched used to decide it,
+            // which held only while an empty cell at the range's end counted as
+            // touched, and counting it lost the text of the cells beside it.
+            if requested_start <= table_start && end >= table_max_pos {
+                swept.sweep_table(&*uow, tid)?;
             }
-            uow.remove_table_multi(&tables_to_remove)?;
-
-            let root_frame = uow
-                .get_frame(&frame_id)?
-                .ok_or_else(|| anyhow!("Root frame not found"))?;
-            let mut updated_root = root_frame.clone();
-            // Drop every sub-frame entry whose frame is gone: the removed
-            // anchors, and any other entry already dangling, as before.
-            updated_root.child_order.retain(|entry| {
-                if *entry < 0 {
-                    let anchor_id = (-entry) as EntityId;
-                    uow.get_frame(&anchor_id).ok().flatten().is_some()
-                } else {
-                    true
+        }
+        // Every anchor frame of a table going away, nested ones included.
+        let mut removed_anchor_parents: HashSet<EntityId> = HashSet::new();
+        for tid in &swept.tables {
+            for anchor_id in anchor_frames.get(tid).into_iter().flatten() {
+                if let Some(parent) = uow.get_frame(anchor_id)?.and_then(|a| a.parent_frame) {
+                    removed_anchor_parents.insert(parent);
                 }
-            });
-            updated_root.updated_at = now;
-            uow.update_frame(&updated_root)?;
+                swept.frames.push(*anchor_id);
+            }
+        }
+        swept.frames.sort_unstable();
+        swept.frames.dedup();
+        leaving_rope.extend(swept.markers.iter().copied());
+
+        if !swept.frames.is_empty() || !swept.tables.is_empty() {
+            // The frames first: their blocks go with them.
+            if !swept.frames.is_empty() {
+                uow.remove_frame_multi(&swept.frames)?;
+            }
+            if !swept.cells.is_empty() {
+                uow.remove_table_cell_multi(&swept.cells)?;
+            }
+            if !swept.tables.is_empty() {
+                uow.remove_table_multi(&swept.tables)?;
+            }
+
+            // Drop every sub-frame entry whose frame is gone from each frame
+            // that held a removed anchor: the removed anchors, and any other
+            // entry already dangling there, as before.
+            removed_anchor_parents.insert(frame_id);
+            for parent_id in &removed_anchor_parents {
+                let Some(parent) = uow.get_frame(parent_id)? else {
+                    continue;
+                };
+                let mut updated_parent = parent.clone();
+                updated_parent.child_order.retain(|entry| {
+                    if *entry < 0 {
+                        let anchor_id = (-entry) as EntityId;
+                        uow.get_frame(&anchor_id).ok().flatten().is_some()
+                    } else {
+                        true
+                    }
+                });
+                if updated_parent.child_order != parent.child_order {
+                    updated_parent.updated_at = now;
+                    uow.update_frame(&updated_parent)?;
+                }
+            }
         }
 
         // ── Handle non-cell blocks in the selection range ──────────
@@ -604,8 +785,10 @@ fn execute_delete(
                 total_chars_removed += block_char_length(block, &store);
                 drop_block_runs_and_images(uow.as_ref(), block.id);
                 non_cell_blocks_to_remove.push(block.id);
+                leaving_rope.push(OffsetMarker::Block(block.id));
             }
         }
+        rope_remove_markers(&store, &leaving_rope);
 
         if !non_cell_blocks_to_remove.is_empty() {
             // In one call: each single removal rewrites and re-validates the
@@ -635,6 +818,7 @@ fn execute_delete(
         // The previous root-only walk left nested blockquotes (depth >= 2)
         // orphaned in the entity store when their content was deleted.
         prune_empty_subframes_recursive(uow, frame_id, now)?;
+        prune_empty_definition_frames(uow, &definition_frames)?;
 
         {
             let list_ids =
@@ -694,15 +878,11 @@ fn execute_delete(
             uf.updated_at = now;
             uow.update_frame(&uf)?;
 
-            // Cross-block delete can leave stale rope-offset entries (e.g.
-            // table-cell blocks that were cascade-removed via frame
-            // deletion never went through `rope_remove_block`, and the
-            // table-anchor sentinel can survive too). Now that every
-            // entity-store block is gone, drop everything in the rope and
-            // re-register a single empty block matching the entity we just
-            // created. No-op under default backend.
-            common::database::rope_helpers::rope_reset(&uow.store());
-            common::database::rope_helpers::rope_append_empty_block(&uow.store(), created.id);
+            // The main flow is empty, but a footnote's body may still be in
+            // the rope: the new block goes in front of whatever is left there.
+            // Resetting the rope here, as this used to, threw a surviving
+            // note's text away and left its blocks with no text at all.
+            common::database::rope_helpers::rope_insert_empty_block_first(&uow.store(), created.id);
         }
 
         let actual_block_count = {
@@ -724,9 +904,36 @@ fn execute_delete(
         updated_doc.updated_at = now;
         uow.update_document(&updated_doc)?;
 
+        // A cell the range starts in is emptied whole, so the caret goes to
+        // where that cell starts: `start` itself may no longer exist once the
+        // cell's text before it is gone. When the range took the cell's table
+        // away, which it only does from the table's anchor or before it, the
+        // caret goes where the range starts: the cell is gone with the table.
+        let new_position = match block_to_cell_frame.get(&start_block.id) {
+            Some(cell_frame) if swept.frames.contains(cell_frame) => requested_start.min(start),
+            Some(cell_frame) if affected_set.contains(cell_frame) => blocks
+                .iter()
+                .filter(|b| block_to_cell_frame.get(&b.id) == Some(cell_frame))
+                .map(|b| b.document_position)
+                .min()
+                .map_or(start, |cell_start| cell_start.min(start)),
+            _ => start,
+        };
+        // A range that only meets the blocks at its ends, between two cells
+        // or at the edge of a table or of a footnote's body, took nothing.
+        // Whatever the path above wrote along the way is rolled back with the
+        // transaction when the error returns.
+        let took_nothing = affected_cell_frames.is_empty()
+            && swept.markers.is_empty()
+            && swept.frames.is_empty()
+            && non_cell_blocks_to_remove.is_empty()
+            && total_chars_removed == 0;
+        if took_nothing {
+            return Err(NothingToDelete { new_position }.into());
+        }
         return Ok((
             DeleteTextResultDto {
-                new_position: start,
+                new_position,
                 deleted_text: String::new(),
             },
             snapshot,
@@ -734,8 +941,16 @@ fn execute_delete(
     }
     // ── End cell selection safety ──────────────────────────────────
 
-    let (end_block, end_block_idx, end_offset) =
-        find_block_at_position(&blocks, end, &uow.store())?;
+    if end_block_idx < start_block_idx
+        || (end_block_idx == start_block_idx && end_offset < start_offset)
+    {
+        // The blocks above are in rope order, so this means the two ends of
+        // the range resolved against different position spaces. Refuse the
+        // edit rather than merge blocks it never covered.
+        return Err(anyhow!(
+            "Delete range {start}..{end} resolves its end before its start"
+        ));
+    }
     let delete_len = end - start;
 
     if start_block_idx == end_block_idx {
@@ -763,6 +978,7 @@ fn execute_delete(
             let images = images_map.entry(start_block.id).or_default();
             shift_images_for_delete(images, byte_so, byte_eo) as i64
         };
+        delete_block_footnote_refs(uow.as_ref(), start_block.id, byte_so, byte_eo);
 
         // Same-block delete: splice the deleted bytes out of the rope.
         // The cross-block merge path below handles the boundary-newline
@@ -893,6 +1109,26 @@ fn execute_delete(
             }
         }
 
+        // And the merged footnote references, by the same rule. They were
+        // left as they were: the start block kept references past the cut,
+        // pointing into text that was gone, and the end block's references
+        // were dropped with it while their sentinels moved into the merged
+        // text as bare characters.
+        let mut merged_notes: Vec<FootnoteRefAnchor> =
+            read_block_footnote_refs(uow.as_ref(), start_block.id)
+                .into_iter()
+                .filter(|note| note.byte_offset < byte_so)
+                .collect();
+        merged_notes.extend(
+            read_block_footnote_refs(uow.as_ref(), end_block.id)
+                .into_iter()
+                .filter(|note| note.byte_offset >= byte_eo)
+                .map(|note| FootnoteRefAnchor {
+                    byte_offset: note.byte_offset - byte_eo + byte_so,
+                    ..note
+                }),
+        );
+
         // Write merged state to start_block.
         let mut updated_start = start_block.clone();
         updated_start.updated_at = now;
@@ -906,6 +1142,7 @@ fn execute_delete(
             .block_images
             .write()
             .insert(start_block.id, merged_images);
+        write_block_footnote_refs(uow.as_ref(), start_block.id, merged_notes);
 
         // Cross-block merge: delete the rope range from
         // `start_block + byte_so` through `end_block + byte_eo`,
@@ -929,13 +1166,13 @@ fn execute_delete(
         for block_id in &blocks_to_remove {
             drop_block_runs_and_images(uow.as_ref(), *block_id);
             // `rope_merge_block_range` only drains entries in the
-            // rope-adjacent slice [start_idx+1..=end_idx]. Blocks
-            // whose rope position is outside that slice (notably
-            // table cells, which live at top_level_frame_end_byte
-            // for their parent frame, far from the main-flow
-            // selection) stay in `block_offsets` with stale entries.
-            // Drop them here so the rope index doesn't carry
-            // dangling block ids past delete_text.
+            // rope-adjacent slice [start_idx+1..=end_idx]. A block the
+            // frames place between the two ends but the rope holds
+            // elsewhere would stay in `block_offsets` with a stale
+            // entry; the layouts the editing use cases build keep the
+            // rope in flow order, so this is a guard, not a path taken.
+            // Drop them here so the rope index doesn't carry dangling
+            // block ids past delete_text.
             common::database::rope_helpers::rope_remove_block(&uow.store(), *block_id);
         }
         // In one call: each single removal rewrites and re-validates the
@@ -958,7 +1195,7 @@ fn execute_delete(
                 cf
             } else {
                 let (owner_of, stopped) =
-                    owners.get_or_insert_with(|| block_owner_frames(uow.as_ref(), frame_id));
+                    owners.get_or_insert_with(|| block_owner_frames(uow.as_ref(), &roots));
                 match owner_of.get(&bid) {
                     Some(&owner) => owner,
                     None => match stopped.take() {
@@ -987,6 +1224,7 @@ fn execute_delete(
         // its blocks in one sweep). Prune empty non-table frames at every
         // depth so the entity store never carries orphans.
         prune_empty_subframes_recursive(uow, frame_id, now)?;
+        prune_empty_definition_frames(uow, &definition_frames)?;
 
         // Use the pre-mutation texts captured at line 653 — by now the
         // rope merge has run and `block_char_length(start_block)` reflects
@@ -1073,6 +1311,7 @@ fn delete_char_range_in_block(
         let images = images_map.entry(block.id).or_default();
         shift_images_for_delete(images, byte_start, byte_end) as i64
     };
+    delete_block_footnote_refs(uow.as_ref(), block.id, byte_start, byte_end);
 
     // Mirror the delete into the global rope.
     common::database::rope_helpers::rope_delete_in_block(&store, block.id, byte_start, byte_end);

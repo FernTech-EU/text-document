@@ -374,7 +374,12 @@ fn test_get_text_at_position_spans_into_table_cell() -> Result<()> {
         },
     )?;
 
-    // Type "ab" into cell(0,0) at its starting position (3).
+    // Positions are the rope's, the space every cursor position is in: the
+    // table's anchor and the boundary after it take two of them.
+    //   "Hi"        : 0..2
+    //   anchor      : 3
+    //   cell(0,0)   : 5
+    // Type "ab" into cell(0,0) at its starting position (5).
     document_editing_controller::insert_text(
         &db_context,
         &event_hub,
@@ -382,38 +387,30 @@ fn test_get_text_at_position_spans_into_table_cell() -> Result<()> {
         None,
         &InsertTextDto {
             format_policy: Default::default(),
-            position: 3,
-            anchor: 3,
+            position: 5,
+            anchor: 5,
             text: "ab".to_string(),
         },
     )?;
 
-    // Now cell(0,0) has text_length=2 → later blocks shift by 2.
-    // Running positions:
-    //   "Hi"        : 0..2
-    //   cell(0,0) ab: 3..5
-    //   cell(0,1)   : 6..6
-    //   cell(1,0)   : 7..7
-    //   cell(1,1)   : 8..8
-
-    // Read "i" + separator + "ab" crossing into the table's first cell —
-    // exercises the cell traversal in collect_block_ids.
+    // Read "i" + separator + the table's anchor + "ab", crossing into the
+    // table's first cell.
     let result = document_inspection_controller::get_text_at_position(
         &db_context,
         &event_hub,
         &GetTextAtPositionDto {
             position: 1,
-            length: 4,
+            length: 6,
         },
     )?;
-    assert_eq!(result.text, "i\nab");
+    assert_eq!(result.text, "i\n\u{FFFC}\nab");
 
     // Also verify typed text is readable purely within the cell.
     let in_cell = document_inspection_controller::get_text_at_position(
         &db_context,
         &event_hub,
         &GetTextAtPositionDto {
-            position: 3,
+            position: 5,
             length: 2,
         },
     )?;

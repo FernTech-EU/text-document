@@ -217,9 +217,11 @@ fn clearing_blocks_empties_each_and_keeps_its_boundaries() {
     }
 }
 
-/// Out of index order, one clear can change what a later one measures: once the last
-/// block is empty, the boundary before it counts as the content of the block before. The
-/// batch must then replay the clears one at a time rather than measure them all first.
+/// Out of index order the batch replays the clears one at a time rather than measure them
+/// all first, and leaves what that loop leaves. Emptying the last block first must not
+/// change what the block before it holds: the boundary between them stays, one byte each
+/// side of it. It used to go with the first block, measured as content once the last block
+/// was empty, and left the two blocks at one offset.
 #[test]
 fn clearing_blocks_out_of_index_order_replays_them_one_at_a_time() {
     let layout = vec![Some("ab".to_string()), Some("cd".to_string())];
@@ -233,8 +235,8 @@ fn clearing_blocks_out_of_index_order_replays_them_one_at_a_time() {
     assert_eq!(state(&together), state(&one_by_one));
     assert_eq!(
         together.rope.read().to_string(),
-        "",
-        "the boundary went with the first block, as it does one clear at a time"
+        "\n",
+        "the boundary between the two emptied blocks stays"
     );
 }
 

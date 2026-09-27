@@ -1,15 +1,19 @@
+use super::editing_helpers::{
+    NestedContentReader, Swept, collect_block_ids_recursive, impl_nested_content_reader,
+};
 use crate::RemoveTableDto;
 use anyhow::{Result, anyhow};
 use common::database::CommandUnitOfWork;
+use common::database::rope_helpers::{rope_insert_empty_block_first, rope_remove_markers};
 use common::direct_access::document::document_repository::DocumentRelationshipField;
 use common::direct_access::frame::frame_repository::FrameRelationshipField;
 use common::direct_access::root::root_repository::RootRelationshipField;
-use common::direct_access::table::table_repository::TableRelationshipField;
 use common::entities::{Block, Document, Frame, Root, Table, TableCell};
 use common::snapshot::EntityTreeSnapshot;
 use common::types::{EntityId, ROOT_ENTITY_ID};
 use common::undo_redo::UndoRedoCommand;
 use std::any::Any;
+use std::collections::HashSet;
 
 pub trait RemoveTableUnitOfWorkFactoryTrait: Send + Sync {
     fn create(&self) -> Box<dyn RemoveTableUnitOfWorkTrait>;
@@ -26,14 +30,19 @@ pub trait RemoveTableUnitOfWorkFactoryTrait: Send + Sync {
 #[macros::uow_action(entity = "Frame", action = "GetMulti")]
 #[macros::uow_action(entity = "Frame", action = "Update")]
 #[macros::uow_action(entity = "Frame", action = "Remove")]
+#[macros::uow_action(entity = "Frame", action = "RemoveMulti")]
 #[macros::uow_action(entity = "Frame", action = "GetRelationship")]
 #[macros::uow_action(entity = "Block", action = "GetMulti")]
 #[macros::uow_action(entity = "Block", action = "UpdateMulti")]
+#[macros::uow_action(entity = "Block", action = "Create")]
 #[macros::uow_action(entity = "Table", action = "Get")]
 #[macros::uow_action(entity = "Table", action = "Remove")]
+#[macros::uow_action(entity = "Table", action = "RemoveMulti")]
 #[macros::uow_action(entity = "Table", action = "GetRelationship")]
 #[macros::uow_action(entity = "TableCell", action = "GetMulti")]
 pub trait RemoveTableUnitOfWorkTrait: CommandUnitOfWork {}
+
+impl_nested_content_reader!(dyn RemoveTableUnitOfWorkTrait);
 
 pub struct RemoveTableUseCase {
     uow_factory: Box<dyn RemoveTableUnitOfWorkFactoryTrait>,
@@ -69,90 +78,117 @@ fn execute_remove_table(
     let snapshot = uow.snapshot_document(&[doc_id])?;
 
     let now = chrono::Utc::now();
+    let store = uow.store();
 
-    // Get the table's cells to find cell frames
-    let cell_ids = uow.get_table_relationship(&table_id, &TableRelationshipField::Cells)?;
-    let cells_opt = uow.get_table_cell_multi(&cell_ids)?;
-    let cells: Vec<TableCell> = cells_opt.into_iter().flatten().collect();
+    // The table with everything it holds: its cells and their frames, what a
+    // cell nests (a quotation, another table), and the rope entry of each
+    // block and table among them. Removing the cells' frames alone left what
+    // was nested in them behind: frames nothing reached, tables with no
+    // anchor in any flow, and their text in the rope.
+    let mut swept = Swept::default();
+    swept.sweep_table(&*uow, table_id)?;
+    let removed_block_ids: Vec<EntityId> = swept
+        .markers
+        .iter()
+        .filter_map(|marker| marker.as_block())
+        .collect();
 
-    // Collect cell frame IDs
-    let cell_frame_ids: Vec<EntityId> = cells.iter().filter_map(|c| c.cell_frame).collect();
+    // Where the table's blocks started, for the stored positions of the
+    // blocks after it (see below).
+    let removed_blocks: Vec<Block> = uow
+        .get_block_multi(&removed_block_ids)?
+        .into_iter()
+        .flatten()
+        .collect();
+    let min_cell_position = removed_blocks.iter().map(|b| b.document_position).min();
+    let total_cell_blocks = removed_blocks.len() as i64;
 
-    // Count how many cell blocks exist (for position shifting), and
-    // remember each cell-block id so we can detach them from the
-    // global rope before the entity cascade below.
-    let mut total_cell_blocks: i64 = 0;
-    let mut min_cell_position: Option<i64> = None;
-    let mut cell_block_ids: Vec<EntityId> = Vec::new();
-    for fid in &cell_frame_ids {
-        let block_ids = uow.get_frame_relationship(fid, &FrameRelationshipField::Blocks)?;
-        if !block_ids.is_empty() {
-            let blocks_opt = uow.get_block_multi(&block_ids)?;
-            for block in blocks_opt.into_iter().flatten() {
-                total_cell_blocks += 1;
-                cell_block_ids.push(block.id);
-                match min_cell_position {
-                    None => min_cell_position = Some(block.document_position),
-                    Some(min) if block.document_position < min => {
-                        min_cell_position = Some(block.document_position);
-                    }
-                    _ => {}
-                }
-            }
-        }
-    }
-
-    // Mirror cell-block removal into the global rope. Cells live at
-    // the end of the rope (plan §1.6 simplified); remove them BEFORE
-    // the entity cascade since rope_remove_block looks each up by id.
-    // No-op under default backend.
-    for cell_block_id in &cell_block_ids {
-        common::database::rope_helpers::rope_remove_block(&uow.store(), *cell_block_id);
-    }
-
-    // Find the anchor frame (frame with table == Some(table_id))
+    // The anchor frame of each table going away, wherever it sits: in the
+    // main frame, a quotation, a table cell or a footnote's body.
     let frame_ids = uow.get_document_relationship(&doc_id, &DocumentRelationshipField::Frames)?;
-    let mut anchor_frame_id: Option<EntityId> = None;
-    for fid in &frame_ids {
-        let frame = match uow.get_frame(fid)? {
-            Some(f) => f,
-            None => continue,
+    let frames: Vec<Frame> = uow
+        .get_frame_multi(&frame_ids)?
+        .into_iter()
+        .flatten()
+        .collect();
+    for frame in &frames {
+        if frame
+            .table
+            .is_some_and(|named| swept.table_set.contains(&named))
+        {
+            swept.frames.push(frame.id);
+        }
+    }
+    swept.frames.sort_unstable();
+    swept.frames.dedup();
+    let removed_frames: HashSet<EntityId> = swept.frames.iter().copied().collect();
+
+    // Out of the rope in one pass: every block and anchor gathered above,
+    // each with one boundary. This used to remove the cells' blocks one at a
+    // time and then the anchor, whose removal shifted every entry from the
+    // start of what it cut: an empty paragraph right before the table starts
+    // there, so it moved back into the paragraph before it and the next save
+    // split that paragraph and lost a letter. A table that was the whole
+    // document had four bytes cut from a rope of three, and panicked.
+    rope_remove_markers(&store, &swept.markers);
+
+    // Every frame listing a removed frame drops it from its order.
+    let is_removed_entry =
+        |entry: &i64| *entry < 0 && removed_frames.contains(&((-*entry) as EntityId));
+    for frame in &frames {
+        if removed_frames.contains(&frame.id) || !frame.child_order.iter().any(is_removed_entry) {
+            continue;
+        }
+        let mut updated = frame.clone();
+        updated.child_order.retain(|entry| !is_removed_entry(entry));
+        updated.updated_at = now;
+        uow.update_frame(&updated)?;
+    }
+
+    // The frames first, their blocks going with them, then the tables, their
+    // cells going with them. One call each: every removal rewrites the whole
+    // list it removes from.
+    if !swept.frames.is_empty() {
+        uow.remove_frame_multi(&swept.frames)?;
+    }
+    uow.remove_table_multi(&swept.tables)?;
+
+    // A table that was all of the main text leaves it without a paragraph,
+    // where no caret can stand: it gets an empty one, as a deletion of all
+    // the text does.
+    let main_frame_id = *frame_ids
+        .first()
+        .ok_or_else(|| anyhow!("Document has no frames"))?;
+    let get_table_cell_frames = |id: &EntityId| -> Result<Vec<EntityId>> {
+        let mut cells = uow.ncr_table_cells(id)?;
+        cells.sort_by_key(|cell| (cell.row, cell.column));
+        Ok(cells
+            .into_iter()
+            .filter_map(|cell| cell.cell_frame)
+            .collect())
+    };
+    let main_blocks = collect_block_ids_recursive(
+        &|id| uow.get_frame(id),
+        &|id, field| uow.get_frame_relationship(id, field),
+        &get_table_cell_frames,
+        &main_frame_id,
+    )?;
+    let mut created_blocks: i64 = 0;
+    if main_blocks.is_empty() {
+        let empty_block = Block {
+            document_position: 0,
+            ..Block::default()
         };
-        if frame.table == Some(table_id) {
-            anchor_frame_id = Some(frame.id);
-            break;
-        }
+        let created = uow.create_block(&empty_block, main_frame_id, -1)?;
+        let mut main_frame = uow
+            .get_frame(&main_frame_id)?
+            .ok_or_else(|| anyhow!("Frame not found"))?;
+        main_frame.child_order.push(created.id as i64);
+        main_frame.updated_at = now;
+        uow.update_frame(&main_frame)?;
+        rope_insert_empty_block_first(&store, created.id);
+        created_blocks = 1;
     }
-
-    // Remove cell frames (cascade removes their blocks and elements)
-    for fid in &cell_frame_ids {
-        uow.remove_frame(fid)?;
-    }
-
-    // Remove anchor frame
-    if let Some(anchor_id) = anchor_frame_id {
-        // First, remove the anchor from its parent frame's child_order
-        let frames_opt = uow.get_frame_multi(&frame_ids)?;
-        for frame in frames_opt.iter().flatten() {
-            let neg_anchor = -(anchor_id as i64);
-            if frame.child_order.contains(&neg_anchor) {
-                let mut updated = frame.clone();
-                updated.child_order.retain(|&x| x != neg_anchor);
-                updated.updated_at = now;
-                uow.update_frame(&updated)?;
-                break;
-            }
-        }
-        uow.remove_frame(&anchor_id)?;
-    }
-
-    // Mirror to rope: remove the TableAnchor sentinel BEFORE removing
-    // the table entity (the helper looks the anchor up by table_id).
-    // No-op under default backend.
-    common::database::rope_helpers::rope_remove_table_anchor(&uow.store(), table_id);
-
-    // Remove the table (cascade removes TableCells)
-    uow.remove_table(&table_id)?;
 
     // Shift document_position for blocks after the removed table
     if let Some(table_start_pos) = min_cell_position {
@@ -181,7 +217,7 @@ fn execute_remove_table(
 
     // Update Document stats
     let mut updated_doc = document.clone();
-    updated_doc.block_count -= total_cell_blocks;
+    updated_doc.block_count = (updated_doc.block_count - total_cell_blocks + created_blocks).max(0);
     updated_doc.updated_at = now;
     uow.update_document(&updated_doc)?;
 

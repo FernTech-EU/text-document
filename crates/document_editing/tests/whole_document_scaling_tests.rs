@@ -91,30 +91,45 @@ enum Pasted {
     Lists,
     /// `units` paragraphs with a two-by-two table halfway: the mixed path.
     ProseWithATable,
+    /// `units` paragraphs with a two-by-two table after every tenth: the mixed path, with
+    /// a table for every few pages of a restored text.
+    ProseWithManyTables,
+    /// `units / 10` two-by-two tables and nothing else: the table-only path.
+    OnlyTables,
 }
 
 fn fragment(pasted: Pasted, units: usize) -> String {
     let mut blocks: Vec<Value> = Vec::new();
-    for i in 0..units {
+    let paragraphs = if let Pasted::OnlyTables = pasted {
+        0
+    } else {
+        units
+    };
+    for i in 0..paragraphs {
         blocks.push(fragment_block(&paragraph(i), None));
         if let Pasted::Lists = pasted {
             let list = json!({"style": "Disc", "indent": 1, "prefix": "", "suffix": ""});
             blocks.push(fragment_block(&format!("Item {i}"), Some(list)));
         }
     }
-    let mut tables: Vec<Value> = Vec::new();
-    if let Pasted::ProseWithATable = pasted {
-        let cell = |row: usize, column: usize| {
-            json!({
-                "row": row, "column": column, "row_span": 1, "column_span": 1,
-                "blocks": [fragment_block(&format!("cell {row} {column}"), None)]
-            })
-        };
-        tables.push(json!({
-            "rows": 2, "columns": 2, "block_insert_index": units / 2,
+    let cell = |row: usize, column: usize| {
+        json!({
+            "row": row, "column": column, "row_span": 1, "column_span": 1,
+            "blocks": [fragment_block(&format!("cell {row} {column}"), None)]
+        })
+    };
+    let table = |block_insert_index: usize| {
+        json!({
+            "rows": 2, "columns": 2, "block_insert_index": block_insert_index,
             "cells": [cell(0, 0), cell(0, 1), cell(1, 0), cell(1, 1)]
-        }));
-    }
+        })
+    };
+    let tables: Vec<Value> = match pasted {
+        Pasted::ProseWithATable => vec![table(units / 2)],
+        Pasted::ProseWithManyTables => (1..units / 10).map(|tenth| table(tenth * 10)).collect(),
+        Pasted::OnlyTables => (0..units / 10).map(|_| table(0)).collect(),
+        Pasted::Paragraphs | Pasted::Lists => Vec::new(),
+    };
     json!({"blocks": blocks, "tables": tables}).to_string()
 }
 
@@ -254,8 +269,13 @@ fn work_of(edit: Edit, units: usize) -> Result<usize> {
                     fragment_data: fragment(pasted, units),
                 },
             )?;
+            let expected = match pasted {
+                // Four cell blocks a table.
+                Pasted::OnlyTables => 4 * (units / 10),
+                _ => units,
+            };
             assert!(
-                block_count(&db) >= blocks_before + units,
+                block_count(&db) >= blocks_before + expected,
                 "{edit:?}: the pasted blocks are in the document"
             );
         }
@@ -341,6 +361,19 @@ fn pasting_a_whole_document_writes_owner_lists_in_linear_work() -> Result<()> {
         Edit::PasteIntoAShortDocument(Pasted::Lists),
         Edit::PasteIntoAShortDocument(Pasted::ProseWithATable),
         Edit::PasteHalfway,
+    ])
+}
+
+/// Every table a paste creates, and the anchor frame and the cell frames each table needs,
+/// used to be created with the document as its owner, each creation rewriting the
+/// document's whole table or frame list: restoring or pasting a text holding a small table
+/// every few pages was quadratic in its tables (8,000 paragraphs with 727 tables took 5.6 s
+/// to restore and 9.3 s to paste).
+#[test]
+fn pasting_many_small_tables_writes_owner_lists_in_linear_work() -> Result<()> {
+    assert_linear(&[
+        Edit::PasteIntoAShortDocument(Pasted::ProseWithManyTables),
+        Edit::PasteIntoAShortDocument(Pasted::OnlyTables),
     ])
 }
 

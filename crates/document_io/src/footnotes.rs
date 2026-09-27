@@ -48,7 +48,8 @@ pub struct Footnotes {
     numbers: HashMap<String, usize>,
     /// Label → the frame holding that note's body.
     definitions: HashMap<String, EntityId>,
-    /// Every definition frame, for the outer walk to skip.
+    /// Every definition frame, and every frame inside one (a quotation's, a
+    /// table's anchor and cells), for the outer walk to skip.
     definition_frames: HashSet<EntityId>,
     /// What the host says each label prints, when it has an opinion.
     overrides: HashMap<String, String>,
@@ -72,23 +73,51 @@ impl Footnotes {
         let mut definition_frames: HashSet<EntityId> = HashSet::new();
         let mut definition_blocks: HashSet<EntityId> = HashSet::new();
 
+        let tables = store.tables.read();
+        let cells = store.table_cells.read();
         for frame in frames.values() {
             let Some(label) = &frame.footnote_label else {
                 continue;
             };
-            definition_frames.insert(frame.id);
             // Last one wins, deterministically: a duplicate label is malformed
             // input, and silently keeping the first would depend on hash order.
             definitions.insert(label.clone(), frame.id);
-            for child in &frame.child_order {
-                if *child > 0 {
-                    definition_blocks.insert(*child as EntityId);
+            // The note's own frame and every frame inside it: a quotation's,
+            // and a table's anchor and cell frames. A cell frame has no parent,
+            // so a writer walking every frame met the cells of a table pasted
+            // into a note as prose of their own, in the middle of the text.
+            let mut pending = vec![frame.id];
+            while let Some(frame_id) = pending.pop() {
+                if !definition_frames.insert(frame_id) {
+                    continue;
+                }
+                let Some(inner) = frames.get(&frame_id) else {
+                    continue;
+                };
+                for child in &inner.child_order {
+                    if *child > 0 {
+                        definition_blocks.insert(*child as EntityId);
+                    } else if *child < 0 {
+                        pending.push((-*child) as EntityId);
+                    }
+                }
+                if let Some(table) = inner.table.and_then(|id| tables.get(&id)) {
+                    pending.extend(
+                        table
+                            .cells
+                            .iter()
+                            .filter_map(|cell| cells.get(cell).and_then(|c| c.cell_frame)),
+                    );
                 }
             }
         }
+        drop(cells);
+        drop(tables);
         drop(frames);
 
-        // Blocks in reading order, definitions left out.
+        // Blocks in reading order, definitions left out. Where a block starts is
+        // read from the rope: the stored field lags it by whatever was typed since
+        // something last wrote it, and numbering by it numbered notes out of order.
         let mut ordered: Vec<(i64, EntityId)> = store
             .blocks
             .read()
@@ -96,6 +125,10 @@ impl Footnotes {
             .filter(|b| !definition_blocks.contains(&b.id))
             .map(|b| (b.document_position, b.id))
             .collect();
+        common::database::rope_helpers::refresh_positions_from_rope(
+            store,
+            ordered.iter_mut().map(|(position, id)| (*id, position)),
+        );
         ordered.sort_unstable();
 
         let refs = store.block_footnote_refs.read();

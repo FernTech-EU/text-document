@@ -215,13 +215,16 @@ impl ExportLatexUseCase {
             &common::direct_access::frame::FrameRelationshipField::Blocks,
         )?;
 
-        // Build a map of block ID -> Block for quick lookup
-        let blocks_opt = uow.get_block_multi(&block_ids)?;
-        let block_map: HashMap<EntityId, Block> = blocks_opt
+        // Build a map of block ID -> Block for quick lookup, each block's
+        // position read from the rope: the stored field lags it by whatever
+        // was typed since something last wrote it.
+        let mut fetched: Vec<Block> = uow
+            .get_block_multi(&block_ids)?
             .into_iter()
             .flatten()
-            .map(|b| (b.id, b))
             .collect();
+        common::database::rope_helpers::refresh_block_positions(&mut fetched, &uow.store());
+        let block_map: HashMap<EntityId, Block> = fetched.into_iter().map(|b| (b.id, b)).collect();
 
         let mut parts: Vec<String> = Vec::new();
 

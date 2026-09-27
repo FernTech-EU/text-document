@@ -1,9 +1,14 @@
 use anyhow::{Result, anyhow};
 use common::database::Store;
-use common::database::rope_helpers::{block_char_length, find_block_at_char_position};
+use common::database::block_offset_index::OffsetMarker;
+use common::database::rope_helpers::{
+    block_char_length, find_block_at_char_position, rope_positions_match_flow,
+    snap_off_table_anchor,
+};
 use common::direct_access::frame::frame_repository::FrameRelationshipField;
-use common::entities::{Block, Frame};
+use common::entities::{Block, Frame, TableCell};
 use common::types::EntityId;
+use std::collections::HashSet;
 
 /// Trait for UoW operations needed to create a cell frame. All
 /// table-related UoW traits satisfy this via the
@@ -162,11 +167,15 @@ pub fn is_word_boundary_punct(c: char) -> bool {
 ///
 /// Returns `(block, index_in_list, offset_within_block)`.
 /// If `position` is beyond all blocks, falls back to the end of the last block.
+/// A position inside the document that no block of `blocks` holds is an error
+/// when the rope is the document's position space.
 pub fn find_block_at_position(
     blocks: &[Block],
     position: i64,
     store: &Store,
 ) -> Result<(Block, usize, i64)> {
+    // A table's anchor belongs to no block: stand in the table's first cell.
+    let position = snap_off_table_anchor(store, position, true);
     // Fast/authoritative path: when the rope index mirrors every block,
     // it — not `Block.document_position` — is the source of truth for
     // positions. Delete paths deliberately skip refreshing the stored
@@ -195,12 +204,48 @@ pub fn find_block_at_position(
             return Ok((block.clone(), i, offset));
         }
     }
+    // A position inside a document whose rope is its position space belongs
+    // to some entry of the rope. Reaching here means it is on no block of
+    // `blocks` (an anchor the snap could not leave, or a block the caller did
+    // not list): choosing the last block instead edited the end of the
+    // document, far from the caret.
+    if rope_positions_match_flow(store) && position < store.rope.read().len_chars() as i64 {
+        return Err(anyhow!("Position {position} is on no block"));
+    }
     // If position is beyond all blocks, use the last block
     if let Some(block) = blocks.last() {
         let offset = block_char_length(block, store);
         return Ok((block.clone(), blocks.len() - 1, offset));
     }
     Err(anyhow!("No blocks found in document"))
+}
+
+/// The frames a document position can fall in, the main frame first: the
+/// main frame (with everything nested in it) and every footnote definition.
+///
+/// A definition is a detached frame, in no frame's `child_order`, but the
+/// importers mirror its blocks into the rope where it was written, between
+/// the paragraphs around it, so a caret can stand in one and a range can run
+/// across one. A use case resolving positions against the main frame's
+/// blocks alone found no block there and fell back to another one: a
+/// deletion took the note's text out of the rope and left its blocks behind,
+/// and a replacement resolved the two ends of one range to one block with
+/// the end before the start.
+pub fn position_roots<F>(get_frame: &F, frame_ids: &[EntityId]) -> Result<Vec<EntityId>>
+where
+    F: Fn(&EntityId) -> Result<Option<Frame>>,
+{
+    let mut roots = Vec::new();
+    for (i, frame_id) in frame_ids.iter().enumerate() {
+        if i == 0 {
+            roots.push(*frame_id);
+        } else if let Some(frame) = get_frame(frame_id)?
+            && frame.footnote_label.is_some()
+        {
+            roots.push(*frame_id);
+        }
+    }
+    Ok(roots)
 }
 
 /// Collect all block IDs in document order by traversing child_order recursively.
@@ -261,5 +306,130 @@ where
         Ok(block_ids)
     } else {
         get_relationship(frame_id, &FrameRelationshipField::Blocks)
+    }
+}
+
+/// What a use case reads to find everything nested in a frame or a table:
+/// frames, a frame's blocks, and a table's cells. The table use cases'
+/// unit-of-work traits satisfy it via the `impl_nested_content_reader!`
+/// macro.
+pub trait NestedContentReader {
+    fn ncr_get_frame(&self, id: &EntityId) -> Result<Option<Frame>>;
+    fn ncr_frame_blocks(&self, id: &EntityId) -> Result<Vec<EntityId>>;
+    fn ncr_table_cells(&self, id: &EntityId) -> Result<Vec<TableCell>>;
+}
+
+/// Implement `NestedContentReader` for a `Box<dyn UowTrait>` whose trait can
+/// get frames, their relationships, a table's relationships and cells.
+macro_rules! impl_nested_content_reader {
+    ($trait_type:ty) => {
+        impl $crate::use_cases::editing_helpers::NestedContentReader for Box<$trait_type> {
+            fn ncr_get_frame(
+                &self,
+                id: &common::types::EntityId,
+            ) -> anyhow::Result<Option<common::entities::Frame>> {
+                (**self).get_frame(id)
+            }
+            fn ncr_frame_blocks(
+                &self,
+                id: &common::types::EntityId,
+            ) -> anyhow::Result<Vec<common::types::EntityId>> {
+                (**self).get_frame_relationship(
+                    id,
+                    &common::direct_access::frame::frame_repository::FrameRelationshipField::Blocks,
+                )
+            }
+            fn ncr_table_cells(
+                &self,
+                id: &common::types::EntityId,
+            ) -> anyhow::Result<Vec<common::entities::TableCell>> {
+                let cell_ids = (**self).get_table_relationship(
+                    id,
+                    &common::direct_access::table::TableRelationshipField::Cells,
+                )?;
+                Ok((**self)
+                    .get_table_cell_multi(&cell_ids)?
+                    .into_iter()
+                    .flatten()
+                    .collect())
+            }
+        }
+    };
+}
+
+pub(crate) use impl_nested_content_reader;
+
+/// What removing a table, or emptying a table cell, takes out of the document
+/// beyond the blocks the caller handles itself: the frames, tables and cells
+/// nested in it, and every rope entry they hold (blocks and table anchors).
+///
+/// A paste into a table cell can nest what it carries in the cell's frame.
+/// Removing a table by removing its cells' frames, or clearing a cell by
+/// resetting its frame to its first block, left what was nested there behind:
+/// frames nothing reached, tables with no anchor in any flow, and their text
+/// still in the rope.
+#[derive(Default)]
+pub struct Swept {
+    pub frames: Vec<EntityId>,
+    pub tables: Vec<EntityId>,
+    /// `tables`, for membership.
+    pub table_set: HashSet<EntityId>,
+    pub cells: Vec<EntityId>,
+    pub markers: Vec<OffsetMarker>,
+}
+
+impl Swept {
+    /// Gather everything nested in `frame_id`: each sub-frame (a quotation's,
+    /// or a table's anchor) with its blocks, and each nested table with its
+    /// cells, their frames and whatever those hold in turn. The frame's own
+    /// blocks are gathered too when `with_own_blocks` is set.
+    pub fn sweep_frame(
+        &mut self,
+        reader: &dyn NestedContentReader,
+        frame_id: EntityId,
+        with_own_blocks: bool,
+    ) -> Result<()> {
+        let Some(frame) = reader.ncr_get_frame(&frame_id)? else {
+            return Ok(());
+        };
+        if with_own_blocks {
+            for block_id in reader.ncr_frame_blocks(&frame_id)? {
+                self.markers.push(OffsetMarker::Block(block_id));
+            }
+        }
+        for entry in &frame.child_order {
+            if *entry >= 0 {
+                continue;
+            }
+            let sub_id = (-*entry) as EntityId;
+            self.frames.push(sub_id);
+            match reader.ncr_get_frame(&sub_id)?.and_then(|sub| sub.table) {
+                Some(table_id) => self.sweep_table(reader, table_id)?,
+                None => self.sweep_frame(reader, sub_id, true)?,
+            }
+        }
+        Ok(())
+    }
+
+    /// Gather a table: its anchor's rope entry, its cells, their frames and
+    /// everything in them. The anchor frame is the caller's to find.
+    pub fn sweep_table(
+        &mut self,
+        reader: &dyn NestedContentReader,
+        table_id: EntityId,
+    ) -> Result<()> {
+        if !self.table_set.insert(table_id) {
+            return Ok(());
+        }
+        self.tables.push(table_id);
+        self.markers.push(OffsetMarker::TableAnchor(table_id));
+        for cell in reader.ncr_table_cells(&table_id)? {
+            self.cells.push(cell.id);
+            if let Some(cell_frame) = cell.cell_frame {
+                self.frames.push(cell_frame);
+                self.sweep_frame(reader, cell_frame, true)?;
+            }
+        }
+        Ok(())
     }
 }

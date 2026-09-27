@@ -3,7 +3,9 @@ use crate::ExportPlainTextDto;
 use anyhow::{Result, anyhow};
 use common::database::QueryUnitOfWork;
 use common::database::Store;
-use common::database::rope_helpers::{block_content_via_store, rope_flat_text_if_simple};
+use common::database::rope_helpers::{
+    block_content_via_store, refresh_block_positions, rope_flat_text_if_simple,
+};
 use common::entities::{Block, Document, Frame, Root};
 use common::format_runs::InlineContent;
 use common::format_runs_query::inline_segments_for_block;
@@ -298,6 +300,10 @@ impl ExportPlainTextUseCase {
             .into_iter()
             .flatten()
             .collect();
+        // The stored field lags the rope by whatever was typed since something
+        // last wrote it; sorting by it put a paragraph created by a later edit
+        // ahead of the ones it followed.
+        refresh_block_positions(&mut blocks, &store);
         blocks.sort_by_key(|b| b.document_position);
 
         let plain_text = blocks
@@ -347,6 +353,7 @@ impl ExportPlainTextUseCase {
                 )?;
                 let blocks_opt = uow.get_block_multi(&block_ids)?;
                 let mut blocks: Vec<Block> = blocks_opt.into_iter().flatten().collect();
+                refresh_block_positions(&mut blocks, &store);
                 blocks.sort_by_key(|b| b.document_position);
                 let body = blocks
                     .iter()

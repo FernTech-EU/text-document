@@ -1304,3 +1304,42 @@ fn test_delete_all_complex_document_leaves_nothing() -> Result<()> {
 
     Ok(())
 }
+
+/// A deletion from a table's anchor to past the table takes the table away, and its caret
+/// goes where the deletion started. It went to where the table's first cell had started, two
+/// characters past that: the range's start moves off the anchor into the first cell, and
+/// that cell went with the table.
+#[test]
+fn deleting_a_table_from_its_anchor_leaves_the_caret_where_the_deletion_started() -> Result<()> {
+    let (db, hub, mut urm) = setup_with_text("Before.\nAfter.")?;
+    document_editing_controller::insert_table(
+        &db,
+        &hub,
+        &mut urm,
+        None,
+        &InsertTableDto {
+            position: 7,
+            anchor: 7,
+            rows: 1,
+            columns: 2,
+        },
+    )?;
+    let rope = || db.get_store().rope.read().to_string();
+    // "Before." 0..7, the anchor at 8, the two empty cells at 10 and 11, "After." from 12.
+    assert_eq!(rope(), "Before.\n\u{FFFC}\n\n\nAfter.");
+
+    let result = document_editing_controller::delete_text(
+        &db,
+        &hub,
+        &mut urm,
+        None,
+        &DeleteTextDto {
+            position: 8,
+            anchor: 14,
+        },
+    )?;
+    assert_eq!(rope(), "Before.\nter.");
+    assert_eq!(get_table_ids(&db)?.len(), 0);
+    assert_eq!(result.new_position, 8);
+    Ok(())
+}

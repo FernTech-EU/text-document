@@ -186,6 +186,41 @@ impl BlockOffsetIndex {
         self.total_bytes = self.total_bytes.saturating_sub(removed);
     }
 
+    /// Drop the entries `dropped` flags (one flag per entry, by position) and
+    /// take the byte ranges `cuts` out of the text they index: every kept
+    /// entry moves back by the bytes cut in front of it, and `total_bytes`
+    /// by all of them. `cuts` is disjoint and in increasing order, and no cut
+    /// straddles a kept entry's first byte: each ends at or before it, or
+    /// starts at or after it. A cut starting exactly there is cut after the
+    /// entry, which keeps its offset: that is how the trailing entries of the
+    /// rope go when the entry before them is empty. One walk of the entries,
+    /// however many are dropped: removing them one at a time walked the index
+    /// once each.
+    pub fn remove_entries(&mut self, dropped: &[bool], cuts: &[(u32, u32)]) {
+        debug_assert_eq!(dropped.len(), self.entries.len());
+        entries_rewritten(self.entries.len());
+        let mut kept: Vec<(OffsetMarker, u32)> = Vec::with_capacity(self.entries.len());
+        let mut pending = cuts.iter().peekable();
+        let mut removed: u32 = 0;
+        for (position, &(marker, byte_start)) in self.entries.iter().enumerate() {
+            while let Some(&&(cut_start, cut_end)) = pending.peek() {
+                if cut_end > byte_start {
+                    break;
+                }
+                debug_assert!(cut_start <= cut_end, "a cut ends before it starts");
+                removed += cut_end - cut_start;
+                pending.next();
+            }
+            if !dropped.get(position).copied().unwrap_or(false) {
+                kept.push((marker, byte_start - removed));
+            }
+        }
+        let cut_total: u32 = cuts.iter().map(|(start, end)| end - start).sum();
+        self.entries = Arc::new(kept);
+        self.total_bytes = self.total_bytes.saturating_sub(cut_total);
+        self.rebuild_marker_index();
+    }
+
     /// Append a marker at the end (its `byte_start` must be ≥ the last
     /// entry's `byte_start`).
     pub fn push(&mut self, marker: OffsetMarker, byte_start: u32) {

@@ -1,4 +1,4 @@
-use super::editing_helpers::{collect_block_ids_recursive, find_block_at_position};
+use super::editing_helpers::{collect_block_ids_recursive, find_block_at_position, position_roots};
 use crate::InsertBlockDto;
 use crate::InsertBlockResultDto;
 use anyhow::{Result, anyhow};
@@ -10,7 +10,8 @@ use common::direct_access::root::root_repository::RootRelationshipField;
 use common::direct_access::table::TableRelationshipField;
 use common::entities::{Block, Document, Frame, Root, TableCell};
 use common::format_runs::{
-    debug_assert_well_formed, logical_offset_to_byte, split_images_at, split_runs_at,
+    debug_assert_well_formed, logical_offset_to_byte, split_footnote_refs_at, split_images_at,
+    split_runs_at,
 };
 
 use common::snapshot::EntityTreeSnapshot;
@@ -80,12 +81,19 @@ fn execute_insert_block(
         cells.sort_by(|a, b| a.row.cmp(&b.row).then(a.column.cmp(&b.column)));
         Ok(cells.into_iter().filter_map(|c| c.cell_frame).collect())
     };
-    let all_block_ids = collect_block_ids_recursive(
-        &|id| uow.get_frame(id),
-        &|id, field| uow.get_frame_relationship(id, field),
-        &get_table_cell_frames,
-        &frame_id,
-    )?;
+    // The main flow's blocks and every footnote definition's: a definition is
+    // in no flow, but the rope holds it and a caret can stand in one, so the
+    // block at the position has to be found among them too.
+    let roots = position_roots(&|id| uow.get_frame(id), &frame_ids)?;
+    let mut all_block_ids: Vec<EntityId> = Vec::new();
+    for root in &roots {
+        all_block_ids.extend(collect_block_ids_recursive(
+            &|id| uow.get_frame(id),
+            &|id, field| uow.get_frame_relationship(id, field),
+            &get_table_cell_frames,
+            root,
+        )?);
+    }
 
     let blocks_opt = uow.get_block_multi(&all_block_ids)?;
     let blocks: Vec<Block> = blocks_opt.into_iter().flatten().collect();
@@ -107,6 +115,12 @@ fn execute_insert_block(
         .get(&current_block.id)
         .cloned()
         .unwrap_or_default();
+    let current_notes = store
+        .block_footnote_refs
+        .read()
+        .get(&current_block.id)
+        .cloned()
+        .unwrap_or_default();
 
     let current_block_text = block_content_via_store(&current_block, &store);
     let byte_split = logical_offset_to_byte(&current_block_text, &current_images, offset);
@@ -115,11 +129,12 @@ fn execute_insert_block(
     let text_after_byte_len = text_after.len();
     let text_before_chars = text_before.chars().count() as i64;
 
-    // Split format_runs and block_images at the byte boundary.
+    // Split format_runs, block_images and footnote references at the byte
+    // boundary. A reference left on the head past the split would point past
+    // the end of its block, which every export slices at.
     let (left_runs, right_runs) = split_runs_at(&current_runs, byte_split);
     let (left_images, right_images) = split_images_at(&current_images, byte_split);
-
-    let left_image_count = left_images.len() as i64;
+    let (left_notes, right_notes) = split_footnote_refs_at(&current_notes, byte_split);
 
     let now = chrono::Utc::now();
 
@@ -136,13 +151,16 @@ fn execute_insert_block(
         .block_images
         .write()
         .insert(current_block.id, left_images);
+    write_footnote_refs(&store, current_block.id, left_notes);
 
     // Create the "after" block. Use `text_before_chars` directly because the
     // rope split mirror (`rope_split_block` below) hasn't run yet — at this
     // point in the function `block_char_length(updated_current)` would still
-    // return the unsplit length (chars in both halves).
-    let new_block_position =
-        current_block.document_position + text_before_chars + left_image_count + 1;
+    // return the unsplit length (chars in both halves). Each image before the
+    // split is one of those characters, its `U+FFFC`: adding the images again
+    // put the caret one position late per image, so the next keystroke after
+    // Enter landed after the first letter of the new paragraph.
+    let new_block_position = current_block.document_position + text_before_chars + 1;
     let new_block = Block {
         id: 0,
         created_at: now,
@@ -185,7 +203,23 @@ fn execute_insert_block(
                 return Ok(Some(*fid));
             } else if entry < 0 {
                 let sub = (-entry) as EntityId;
-                if let Some(owner) = find_owner_frame(uow, &sub, target_block_id)? {
+                // A table's anchor frame lists no blocks of its own: its
+                // cells' frames do. Not looking there found no owner for a
+                // block in a cell, and the paragraph a break split off it was
+                // appended to the main frame, after everything else.
+                let table = uow.get_frame(&sub)?.and_then(|sub_frame| sub_frame.table);
+                if let Some(table_id) = table {
+                    let cell_ids =
+                        uow.get_table_relationship(&table_id, &TableRelationshipField::Cells)?;
+                    for cell in uow.get_table_cell_multi(&cell_ids)?.into_iter().flatten() {
+                        if let Some(cell_frame) = cell.cell_frame
+                            && let Some(owner) =
+                                find_owner_frame(uow, &cell_frame, target_block_id)?
+                        {
+                            return Ok(Some(owner));
+                        }
+                    }
+                } else if let Some(owner) = find_owner_frame(uow, &sub, target_block_id)? {
                     return Ok(Some(owner));
                 }
             }
@@ -196,7 +230,14 @@ fn execute_insert_block(
         }
         Ok(None)
     }
-    let owner_frame_id = find_owner_frame(&**uow, &frame_id, current_block.id)?.unwrap_or(frame_id);
+    let mut owner_frame_id = None;
+    for root in &roots {
+        owner_frame_id = find_owner_frame(&**uow, root, current_block.id)?;
+        if owner_frame_id.is_some() {
+            break;
+        }
+    }
+    let owner_frame_id = owner_frame_id.unwrap_or(frame_id);
 
     let created_block = uow.create_block(&new_block, owner_frame_id, -1)?;
 
@@ -210,6 +251,7 @@ fn execute_insert_block(
         .block_images
         .write()
         .insert(created_block.id, right_images);
+    write_footnote_refs(&store, created_block.id, right_notes);
 
     // Mirror the split into the rope: insert `\n` boundary at the
     // split point, register the new block's start, and shift
@@ -259,6 +301,21 @@ fn execute_insert_block(
         },
         snapshot,
     ))
+}
+
+/// Store `notes` as `block_id`'s footnote references, leaving no entry for a
+/// block that holds none.
+fn write_footnote_refs(
+    store: &common::database::Store,
+    block_id: EntityId,
+    notes: Vec<common::format_runs::FootnoteRefAnchor>,
+) {
+    let mut notes_map = store.block_footnote_refs.write();
+    if notes.is_empty() {
+        notes_map.remove(&block_id);
+    } else {
+        notes_map.insert(block_id, notes);
+    }
 }
 
 impl InsertBlockUseCase {

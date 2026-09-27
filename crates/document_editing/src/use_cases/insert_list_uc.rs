@@ -3,7 +3,10 @@ use crate::InsertListDto;
 use crate::InsertListResultDto;
 use anyhow::{Result, anyhow};
 use common::database::CommandUnitOfWork;
-use common::database::rope_helpers::block_char_length;
+use common::database::block_offset_index::OffsetMarker;
+use common::database::rope_helpers::{
+    block_char_length, refresh_block_positions, rope_insert_run_after,
+};
 use common::direct_access::document::document_repository::DocumentRelationshipField;
 use common::direct_access::frame::frame_repository::FrameRelationshipField;
 use common::direct_access::root::root_repository::RootRelationshipField;
@@ -12,6 +15,7 @@ use common::snapshot::EntityTreeSnapshot;
 use common::types::{EntityId, ROOT_ENTITY_ID};
 use common::undo_redo::UndoRedoCommand;
 use std::any::Any;
+use std::collections::HashMap;
 
 pub trait InsertListUnitOfWorkFactoryTrait: Send + Sync {
     fn create(&self) -> Box<dyn InsertListUnitOfWorkTrait>;
@@ -78,27 +82,37 @@ fn execute_insert_list(
     // Snapshot for undo before mutation
     let snapshot = uow.snapshot_document(&[doc_id])?;
 
-    // Get frames
+    // Every block of the document, whatever frame holds it (the main text, a
+    // quotation, a table cell, a footnote's body), with the frame that holds
+    // it, in the order the rope holds them. This used to read the main
+    // frame's own blocks alone: with the caret in a quotation, a cell or a
+    // note, the new item went after some other paragraph of the main text.
     let frame_ids = uow.get_document_relationship(&doc_id, &DocumentRelationshipField::Frames)?;
-    let frame_id = *frame_ids
-        .first()
-        .ok_or_else(|| anyhow!("Document has no frames"))?;
-
-    let frame = uow
-        .get_frame(&frame_id)?
-        .ok_or_else(|| anyhow!("Frame not found"))?;
-
-    // Get block IDs from frame
-    let block_ids = uow.get_frame_relationship(&frame_id, &FrameRelationshipField::Blocks)?;
-
-    // Get all blocks
+    if frame_ids.is_empty() {
+        return Err(anyhow!("Document has no frames"));
+    }
+    let mut owner_of: HashMap<EntityId, EntityId> = HashMap::new();
+    let mut block_ids: Vec<EntityId> = Vec::new();
+    for frame_id in &frame_ids {
+        for block_id in uow.get_frame_relationship(frame_id, &FrameRelationshipField::Blocks)? {
+            owner_of.entry(block_id).or_insert(*frame_id);
+            block_ids.push(block_id);
+        }
+    }
     let blocks_opt = uow.get_block_multi(&block_ids)?;
     let mut blocks: Vec<Block> = blocks_opt.into_iter().flatten().collect();
+    let store = uow.store();
+    refresh_block_positions(&mut blocks, &store);
     blocks.sort_by_key(|b| b.document_position);
 
     // Find block at position to determine insert index
-    let (_current_block, block_idx, _offset) =
-        find_block_at_position(&blocks, position, &uow.store())?;
+    let (current_block, block_idx, _offset) = find_block_at_position(&blocks, position, &store)?;
+    let frame_id = *owner_of
+        .get(&current_block.id)
+        .ok_or_else(|| anyhow!("Block {} is in no frame", current_block.id))?;
+    let frame = uow
+        .get_frame(&frame_id)?
+        .ok_or_else(|| anyhow!("Frame not found"))?;
 
     let now = chrono::Utc::now();
 
@@ -114,14 +128,10 @@ fn execute_insert_list(
     };
     let created_list = uow.create_list(&list, doc_id, -1)?;
 
-    // Create a new empty block with the list reference
-    let store = uow.store();
-    let new_block_position = if !blocks.is_empty() {
-        let current = &blocks[block_idx];
-        current.document_position + block_char_length(current, &store) + 1
-    } else {
-        0
-    };
+    // Create a new empty block with the list reference, right after the
+    // caret's block in the caret's frame.
+    let new_block_position =
+        current_block.document_position + block_char_length(&current_block, &store) + 1;
 
     let new_block = Block {
         id: 0,
@@ -132,12 +142,20 @@ fn execute_insert_list(
         ..Default::default()
     };
 
-    let insert_index = (block_idx + 1) as i32;
-    let created_block = uow.create_block(&new_block, frame_id, insert_index)?;
+    let frame_blocks = uow.get_frame_relationship(&frame_id, &FrameRelationshipField::Blocks)?;
+    let insert_index = frame_blocks
+        .iter()
+        .position(|id| *id == current_block.id)
+        .map_or(frame_blocks.len(), |i| i + 1);
+    let created_block = uow.create_block(&new_block, frame_id, insert_index as i32)?;
 
     // Update frame's child_order
     let mut updated_frame = frame.clone();
-    let child_order_insert_pos = (block_idx + 1).min(updated_frame.child_order.len());
+    let child_order_insert_pos = updated_frame
+        .child_order
+        .iter()
+        .position(|entry| *entry == current_block.id as i64)
+        .map_or(updated_frame.child_order.len(), |i| i + 1);
     updated_frame
         .child_order
         .insert(child_order_insert_pos, created_block.id as i64);
@@ -145,6 +163,16 @@ fn execute_insert_list(
     updated_frame.blocks =
         uow.get_frame_relationship(&frame_id, &FrameRelationshipField::Blocks)?;
     uow.update_frame(&updated_frame)?;
+
+    // The new block goes into the rope right after the caret's block, as it
+    // follows it in the frame. It used to be left out of the rope: the rope
+    // then stopped being the document's position space, and the next export
+    // sliced a block's text at an offset it did not reach and panicked.
+    rope_insert_run_after(
+        &store,
+        OffsetMarker::Block(current_block.id),
+        &[(OffsetMarker::Block(created_block.id), "")],
+    );
 
     // Update subsequent blocks' document_position (those after the new block)
     let mut blocks_to_update: Vec<Block> = Vec::new();

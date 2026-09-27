@@ -11,7 +11,8 @@ use crate::database::block_offset_index::OffsetMarker;
 use crate::entities::Block;
 use crate::format_runs::{
     FormatRunError, ReplaceFormatPolicy, check_well_formed, logical_offset_to_byte,
-    shift_images_for_delete, shift_images_for_insert, shift_runs_for_replace,
+    shift_footnote_refs_for_delete, shift_footnote_refs_for_insert, shift_images_for_delete,
+    shift_images_for_insert, shift_runs_for_replace,
 };
 use crate::types::EntityId;
 
@@ -404,10 +405,14 @@ pub fn rope_insert_block_at(store: &Store, byte_pos: u32, block_id: EntityId, te
 
 /// Walks up `frame.parent_frame` to find the top-level ancestor of
 /// the given frame, then returns the end byte of that top-level
-/// frame's current rope range — i.e. the byte position where blocks
-/// belonging to that frame's subtree (e.g. table cells per plan §1.6)
-/// should be inserted so they land BEFORE any following top-level
-/// frame's content.
+/// frame's current rope range.
+///
+/// Not where a table's cells belong. They follow the table's anchor, in
+/// reading order (see [`rope_insert_run_after`] and
+/// [`rope_place_new_cell_blocks`]); the end of the enclosing frame is that
+/// place only when the table is the last thing in the frame, and cells put
+/// there after a table followed by text left the rope out of flow order.
+/// No editing use case calls this any more.
 ///
 /// Reads `block_offsets`/`frames`/`tables`/`table_cells` directly, so
 /// the result is fresh even when `Frame.byte_range` has not yet been
@@ -445,6 +450,21 @@ pub fn rope_append_empty_block(store: &Store, block_id: EntityId) -> u32 {
     offsets.push_block(block_id, pos);
     offsets.set_total_bytes(pos);
     pos
+}
+
+/// Register `block_id` as a new empty block in front of every other entry:
+/// at byte 0, followed by a boundary `\n` when anything comes after it.
+/// Every other entry moves one byte on.
+pub fn rope_insert_empty_block_first(store: &Store, block_id: EntityId) {
+    let mut offsets = store.block_offsets.write();
+    if !offsets.is_empty() {
+        {
+            let mut rope = store.rope.write();
+            rope.insert(0, "\n");
+        }
+        offsets.shift_after(0, 1);
+    }
+    offsets.insert_at(0, OffsetMarker::Block(block_id), 0);
 }
 
 /// Append a single `\n` inter-block boundary character to the end of
@@ -583,11 +603,13 @@ pub fn rope_split_block_into(
         };
         (start, idx)
     };
-    rope_insert_block_run(
+    rope_insert_marker_run(
         store,
         block_start + byte_offset_in_block,
         current_idx + 1,
-        blocks,
+        blocks
+            .iter()
+            .map(|(block_id, text)| (OffsetMarker::Block(*block_id), *text)),
     );
 }
 
@@ -609,31 +631,70 @@ pub fn rope_insert_blocks_at(store: &Store, byte_pos: u32, blocks: &[(EntityId, 
             .position(|(_, bs)| *bs > byte_pos)
             .unwrap_or(offsets.entries.len())
     };
-    rope_insert_block_run(store, byte_pos, vec_pos, blocks)
+    rope_insert_marker_run(
+        store,
+        byte_pos,
+        vec_pos,
+        blocks
+            .iter()
+            .map(|(block_id, text)| (OffsetMarker::Block(*block_id), *text)),
+    )
 }
 
-/// Insert a run of new blocks at `byte_pos`, each a `\n` boundary
+/// Insert `run` into the rope right after the content of the entry
+/// `after`, in order: each marker a `\n` boundary followed by its text (a
+/// block's content, or `U+FFFC` for a table's anchor), registered in the
+/// offset index right after `after`. Whatever followed `after` follows the
+/// run. Returns `false`, leaving the rope alone, when `after` is not in the
+/// index.
+///
+/// This is how a paste lays out what it inserts after the block at the
+/// caret: its paragraphs, each table's anchor followed by the table's cells
+/// in reading order, and the tail, in the order the frames list them, with
+/// one rope insert and one index update for the whole paste.
+pub fn rope_insert_run_after(
+    store: &Store,
+    after: OffsetMarker,
+    run: &[(OffsetMarker, &str)],
+) -> bool {
+    let (content_end, position) = {
+        let offsets = store.block_offsets.read();
+        let (Some((start, end, has_successor)), Some(position)) = (
+            offsets.range_with_successor(after),
+            offsets.position_of(after),
+        ) else {
+            return false;
+        };
+        let content_end = if has_successor && end > start {
+            end - 1
+        } else {
+            end
+        };
+        (content_end, position)
+    };
+    rope_insert_marker_run(store, content_end, position + 1, run.iter().copied());
+    true
+}
+
+/// Insert a run of new markers at `byte_pos`, each a `\n` boundary
 /// followed by its text, and register them in the offset index at
 /// `vec_pos`, `vec_pos + 1`, …. Every entry strictly past `byte_pos`
 /// shifts by the whole run. Returns the byte right after the run.
-fn rope_insert_block_run(
+fn rope_insert_marker_run<'a>(
     store: &Store,
     byte_pos: u32,
     vec_pos: usize,
-    blocks: &[(EntityId, &str)],
+    markers: impl IntoIterator<Item = (OffsetMarker, &'a str)>,
 ) -> u32 {
-    if blocks.is_empty() {
-        return byte_pos;
-    }
-    let mut inserted = String::with_capacity(blocks.iter().map(|(_, text)| 1 + text.len()).sum());
-    let mut run = Vec::with_capacity(blocks.len());
-    for (block_id, text) in blocks {
+    let mut inserted = String::new();
+    let mut run = Vec::new();
+    for (marker, text) in markers {
         inserted.push('\n');
-        run.push((
-            OffsetMarker::Block(*block_id),
-            byte_pos + inserted.len() as u32,
-        ));
+        run.push((marker, byte_pos + inserted.len() as u32));
         inserted.push_str(text);
+    }
+    if run.is_empty() {
+        return byte_pos;
     }
     {
         let mut rope = store.rope.write();
@@ -644,6 +705,194 @@ fn rope_insert_block_run(
     offsets.shift_after(byte_pos + 1, inserted.len() as i32);
     offsets.insert_run_at(vec_pos, &run);
     byte_pos + inserted.len() as u32
+}
+
+/// Mirror a table's new, empty cell blocks into the rope where reading order
+/// puts them: each after the block before it in the table's row-major order,
+/// the first cell's after the table's anchor. `new_blocks` are blocks the
+/// table's cells list but the index does not hold yet; the others stay
+/// where they are. Consecutive new blocks go in as one run.
+///
+/// The row, column and cell-split edits used to put their new cells at the
+/// end of the table's enclosing top-level frame, which is where they belong
+/// only when the table is the last thing in it: after any table followed by
+/// text, the new cells sat after that text in the rope, out of flow order,
+/// and every position past the table was wrong.
+pub fn rope_place_new_cell_blocks(store: &Store, table_id: EntityId, new_blocks: &[EntityId]) {
+    if new_blocks.is_empty() {
+        return;
+    }
+    let new: std::collections::HashSet<EntityId> = new_blocks.iter().copied().collect();
+    // Everything the table holds, in reading order: its anchor, then its
+    // cells by row and column, each cell's blocks and whatever is nested in
+    // it in its frame's order.
+    let mut ordered: Vec<OffsetMarker> = Vec::new();
+    {
+        let tables = store.tables.read();
+        let cells = store.table_cells.read();
+        let frames = store.frames.read();
+        table_reading_order(table_id, &tables, &cells, &frames, &mut ordered);
+    }
+    let mut after = OffsetMarker::TableAnchor(table_id);
+    let mut run: Vec<(OffsetMarker, &str)> = Vec::new();
+    for marker in ordered {
+        if matches!(marker, OffsetMarker::Block(id) if new.contains(&id)) {
+            run.push((marker, ""));
+            continue;
+        }
+        if !run.is_empty() {
+            rope_insert_run_after(store, after, &run);
+            run.clear();
+        }
+        after = marker;
+    }
+    if !run.is_empty() {
+        rope_insert_run_after(store, after, &run);
+    }
+}
+
+/// Append `table_id`'s anchor and everything in its cells to `out`, in
+/// reading order.
+fn table_reading_order(
+    table_id: EntityId,
+    tables: &im::HashMap<EntityId, crate::entities::Table>,
+    cells: &im::HashMap<EntityId, crate::entities::TableCell>,
+    frames: &im::HashMap<EntityId, crate::entities::Frame>,
+    out: &mut Vec<OffsetMarker>,
+) {
+    out.push(OffsetMarker::TableAnchor(table_id));
+    let Some(table) = tables.get(&table_id) else {
+        return;
+    };
+    let mut table_cells: Vec<_> = table.cells.iter().filter_map(|id| cells.get(id)).collect();
+    table_cells.sort_by_key(|cell| (cell.row, cell.column));
+    for cell in table_cells {
+        if let Some(frame) = cell.cell_frame {
+            frame_reading_order(frame, tables, cells, frames, out);
+        }
+    }
+}
+
+/// Every block `table_id` holds, nested ones included, in reading order.
+pub fn table_block_ids(store: &Store, table_id: EntityId) -> Vec<EntityId> {
+    let mut ordered: Vec<OffsetMarker> = Vec::new();
+    {
+        let tables = store.tables.read();
+        let cells = store.table_cells.read();
+        let frames = store.frames.read();
+        table_reading_order(table_id, &tables, &cells, &frames, &mut ordered);
+    }
+    ordered
+        .into_iter()
+        .filter_map(OffsetMarker::as_block)
+        .collect()
+}
+
+/// Insert `run` into the rope right after everything `table_id` holds: its
+/// anchor, its cells and whatever is nested in them, in reading order. See
+/// [`rope_insert_run_after`]. Returns `false`, leaving the rope alone, when the
+/// table's last entry is not in the index.
+pub fn rope_insert_run_after_table(
+    store: &Store,
+    table_id: EntityId,
+    run: &[(OffsetMarker, &str)],
+) -> bool {
+    let mut ordered: Vec<OffsetMarker> = Vec::new();
+    {
+        let tables = store.tables.read();
+        let cells = store.table_cells.read();
+        let frames = store.frames.read();
+        table_reading_order(table_id, &tables, &cells, &frames, &mut ordered);
+    }
+    match ordered.last() {
+        Some(last) => rope_insert_run_after(store, *last, run),
+        None => false,
+    }
+}
+
+/// The outermost table whose cells hold the frame `frame_id`, at any depth:
+/// the table, its anchor frame, and the frame whose `child_order` lists that
+/// anchor frame. `None` when `frame_id` is in no table cell.
+///
+/// Read from the tables' cell lists and the frames' `child_order`, never from
+/// `Frame.parent_frame`: a table pasted into the document has cell frames with
+/// no parent, so a walk up the parents took a caret in such a cell for one
+/// outside any table.
+pub fn outermost_table_around(
+    store: &Store,
+    frame_id: EntityId,
+) -> Option<(EntityId, EntityId, EntityId)> {
+    let tables = store.tables.read();
+    let cells = store.table_cells.read();
+    let frames = store.frames.read();
+    let table_of_cell_frame = |frame: EntityId| {
+        let (cell_id, _) = cells
+            .iter()
+            .find(|(_, cell)| cell.cell_frame == Some(frame))?;
+        tables
+            .iter()
+            .find(|(_, table)| table.cells.contains(cell_id))
+            .map(|(table_id, _)| *table_id)
+    };
+    let frame_listing = |frame: EntityId| {
+        let entry = -(frame as i64);
+        frames
+            .iter()
+            .find(|(_, candidate)| candidate.child_order.contains(&entry))
+            .map(|(id, _)| *id)
+    };
+    let mut found = None;
+    let mut current = frame_id;
+    // Each step moves one frame out; a well-formed tree ends at a root in at
+    // most as many steps as there are frames.
+    for _ in 0..=frames.len() {
+        let next = match table_of_cell_frame(current) {
+            Some(table_id) => {
+                let Some((anchor_id, _)) = frames
+                    .iter()
+                    .find(|(_, frame)| frame.table == Some(table_id))
+                else {
+                    break;
+                };
+                let Some(parent) = frame_listing(*anchor_id) else {
+                    break;
+                };
+                found = Some((table_id, *anchor_id, parent));
+                parent
+            }
+            None => match frame_listing(current) {
+                Some(parent) => parent,
+                None => break,
+            },
+        };
+        current = next;
+    }
+    found
+}
+
+/// Append a frame's blocks and everything nested in it to `out`, in the
+/// frame's `child_order`.
+fn frame_reading_order(
+    frame_id: EntityId,
+    tables: &im::HashMap<EntityId, crate::entities::Table>,
+    cells: &im::HashMap<EntityId, crate::entities::TableCell>,
+    frames: &im::HashMap<EntityId, crate::entities::Frame>,
+    out: &mut Vec<OffsetMarker>,
+) {
+    let Some(frame) = frames.get(&frame_id) else {
+        return;
+    };
+    for entry in &frame.child_order {
+        if *entry > 0 {
+            out.push(OffsetMarker::Block(*entry as EntityId));
+        } else if *entry < 0 {
+            let sub_id = (-*entry) as EntityId;
+            match frames.get(&sub_id).and_then(|sub| sub.table) {
+                Some(nested) => table_reading_order(nested, tables, cells, frames, out),
+                None => frame_reading_order(sub_id, tables, cells, frames, out),
+            }
+        }
+    }
 }
 
 /// Merge `start_block` and `end_block` by deleting the rope range
@@ -894,15 +1143,17 @@ pub fn rope_remove_table_anchor(store: &Store, table_id: EntityId) {
         (start, idx, is_last, has_pred)
     };
 
-    // Symmetric to insert_table_anchor. The 4 bytes to remove are:
+    // Symmetric to insert_table_anchor. The bytes to remove are:
     // - if anchor is last: [byte_start - 1 .. byte_start + 3) — the
     //   preceding `\n` + the 3-byte sentinel
+    // - if anchor is the only entry: [byte_start .. byte_start + 3),
+    //   the sentinel alone, with no boundary on either side
     // - otherwise: [byte_start .. byte_start + 4) — the sentinel
     //   + the following `\n`
-    let (remove_start, remove_end) = if anchor_is_last && has_predecessor {
-        (anchor_byte_start - 1, anchor_byte_start + 3)
-    } else {
-        (anchor_byte_start, anchor_byte_start + 4)
+    let (remove_start, remove_end) = match (anchor_is_last, has_predecessor) {
+        (true, true) => (anchor_byte_start - 1, anchor_byte_start + 3),
+        (true, false) => (anchor_byte_start, anchor_byte_start + 3),
+        (false, _) => (anchor_byte_start, anchor_byte_start + 4),
     };
 
     {
@@ -915,7 +1166,241 @@ pub fn rope_remove_table_anchor(store: &Store, table_id: EntityId) {
         let mut offsets = store.block_offsets.write();
         offsets.remove_at(anchor_idx);
     }
-    store.block_offsets.write().shift_after(remove_start, -4);
+    // Shift the entries past the removed range only, as `rope_remove_block`
+    // does. An empty entry right before a last anchor starts where the cut
+    // starts, at the boundary it loses; shifting from there moved it back
+    // into the entry before it, or below zero.
+    store
+        .block_offsets
+        .write()
+        .shift_after(remove_end, -((remove_end - remove_start) as i32));
+}
+
+/// Remove every one of `markers` (blocks and table anchors alike) from the
+/// rope, each with one boundary `\n`, and drop their entries from the index:
+/// the rope and index that [`rope_remove_block`] and
+/// [`rope_remove_table_anchor`] leave, called for each marker, with one walk
+/// of the index for all of them. What is left is the kept entries' contents
+/// joined by boundaries, in their order. Markers not in the index are
+/// skipped.
+///
+/// A deletion that removes entities has to take their text out of the rope
+/// too, or the rope keeps text no block owns: the offset index then names
+/// blocks that are gone, every position after them is off by their length,
+/// and search and the addressable text still find the deleted words.
+pub fn rope_remove_markers(store: &Store, markers: &[OffsetMarker]) {
+    let mut offsets = store.block_offsets.write();
+    let count = offsets.len();
+    let mut dropped = vec![false; count];
+    let mut any = false;
+    for marker in markers {
+        if let Some(position) = offsets.position_of(*marker) {
+            dropped[position] = true;
+            any = true;
+        }
+    }
+    if !any {
+        return;
+    }
+    let total = offsets.total_bytes();
+    // One cut per run of consecutive dropped entries: their contents and the
+    // boundary after each when a kept entry follows the run, or else the
+    // boundary before the run and everything to the end of the rope.
+    let mut cuts: Vec<(u32, u32)> = Vec::new();
+    let mut position = 0;
+    while position < count {
+        if !dropped[position] {
+            position += 1;
+            continue;
+        }
+        let run_start = position;
+        while position < count && dropped[position] {
+            position += 1;
+        }
+        let first_byte = offsets.entries[run_start].1;
+        let cut = if position < count {
+            (first_byte, offsets.entries[position].1)
+        } else if run_start > 0 {
+            (first_byte.saturating_sub(1), total)
+        } else {
+            (0, total)
+        };
+        if cut.1 > cut.0 {
+            cuts.push(cut);
+        }
+    }
+    {
+        // Last cut first, so the byte offsets of the others still hold.
+        let mut rope = store.rope.write();
+        for &(start, end) in cuts.iter().rev() {
+            let char_start = rope.byte_to_char(start as usize);
+            let char_end = rope.byte_to_char(end as usize);
+            rope.remove(char_start..char_end);
+        }
+    }
+    offsets.remove_entries(&dropped, &cuts);
+}
+
+/// What an edit changed between two states of the rope, as positions: the
+/// span of `before` from the first returned position to the second was
+/// replaced by the span of `after` from the first to the third.
+///
+/// `from` is where the edit was asked to go in, and the span starts there or
+/// after it when the text in front of `from` is unchanged: the ends are
+/// matched first, so text that repeats the text in front of it counts as
+/// going in at the earliest place from `from` on, then the starts. An
+/// insertion goes in where it is asked, with two exceptions this finds: a
+/// table pasted into a paragraph goes in after the paragraph, so what of the
+/// paragraph followed the caret stays in front of it; and a table pasted into
+/// a table cell fills the cells from the caret's own, replacing what they held
+/// from the start of the caret's cell, which can lie before `from`. Counting
+/// either as text put in at the caret moved every cursor standing in the rest
+/// of that paragraph, or in those cells, to the wrong place.
+pub fn changed_span(
+    before: &ropey::Rope,
+    after: &ropey::Rope,
+    from: usize,
+) -> (usize, usize, usize) {
+    let (old_len, new_len) = (before.len_chars(), after.len_chars());
+    let shorter = old_len.min(new_len);
+    let from = from.min(shorter);
+    // The common start, as far as `from`.
+    let mut prefix = 0;
+    {
+        let mut old_chars = before.chars();
+        let mut new_chars = after.chars();
+        while prefix < from {
+            match (old_chars.next(), new_chars.next()) {
+                (Some(old), Some(new)) if old == new => prefix += 1,
+                _ => break,
+            }
+        }
+    }
+    // The common end, reaching back no further than the common start.
+    let mut suffix = 0;
+    {
+        let reach = shorter - prefix;
+        let mut old_chars = before.chars_at(old_len);
+        let mut new_chars = after.chars_at(new_len);
+        while suffix < reach {
+            match (old_chars.prev(), new_chars.prev()) {
+                (Some(old), Some(new)) if old == new => suffix += 1,
+                _ => break,
+            }
+        }
+    }
+    let (old_end, new_end) = (old_len - suffix, new_len - suffix);
+    // When nothing in front of `from` changed, the rest of the common start,
+    // from `from` on, up to what the end left.
+    if prefix == from {
+        let mut old_chars = before.chars_at(from);
+        let mut new_chars = after.chars_at(from);
+        while prefix < old_end.min(new_end) {
+            match (old_chars.next(), new_chars.next()) {
+                (Some(old), Some(new)) if old == new => prefix += 1,
+                _ => break,
+            }
+        }
+    }
+    (prefix, old_end, new_end)
+}
+
+/// Where a position belongs when it falls on a table's anchor: the `U+FFFC`
+/// a table occupies in the rope, or the boundary after it. Those two
+/// characters stand for the table as a whole and belong to no block.
+/// `forward`, the position moves to the start of the table's first cell:
+/// where a caret on the table types, and where a range starting on it
+/// starts. Otherwise it moves back to the end of the entry before the table,
+/// where a range ending on it ends. Any other position, and every position of
+/// a document whose rope is not its position space, is returned as is.
+///
+/// Resolved as a block position, the anchor matched no block: the edit fell
+/// back to the document's last block, so text typed or pasted there landed at
+/// the end of the document and a deletion ending there ran to it.
+///
+/// Tables can follow each other with nothing between them in the rope: a table
+/// nested at the start of a cell's frame has its anchor right after the anchor
+/// of the table holding that cell. The walk goes past every anchor of such a
+/// chain, so the result is never an anchor position itself: forward, it is the
+/// first block after the chain (the innermost table's first cell); backward, it
+/// is the end of the entry before the chain, or the document's start when the
+/// chain opens it.
+pub fn snap_off_table_anchor(store: &Store, position: i64, forward: bool) -> i64 {
+    if !rope_positions_match_flow(store) {
+        return position;
+    }
+    let rope = store.rope.read();
+    let clamped = position.clamp(0, rope.len_chars() as i64);
+    let byte = rope.char_to_byte(clamped as usize) as u32;
+    let offsets = store.block_offsets.read();
+    let Some(marker @ OffsetMarker::TableAnchor(_)) = offsets.marker_at_byte(byte) else {
+        return position;
+    };
+    let Some(index) = offsets.position_of(marker) else {
+        return position;
+    };
+    let is_anchor = |i: usize| {
+        offsets
+            .entries
+            .get(i)
+            .is_some_and(|(entry, _)| !entry.is_block())
+    };
+    let target = if forward {
+        let mut next = index + 1;
+        while is_anchor(next) {
+            next += 1;
+        }
+        offsets
+            .entries
+            .get(next)
+            .map_or_else(|| offsets.total_bytes(), |(_, start)| *start)
+    } else {
+        let mut first = index;
+        while first > 0 && is_anchor(first - 1) {
+            first -= 1;
+        }
+        // The boundary in front of the chain's first anchor closes the entry
+        // before it: a caret there stands at that entry's end.
+        offsets
+            .entries
+            .get(first)
+            .map_or(0, |(_, start)| start.saturating_sub(1))
+    };
+    rope.byte_to_char(target as usize) as i64
+}
+
+/// Where `table_id`'s anchor stands in the rope's position space, when the
+/// rope is the document's position space and holds the anchor.
+pub fn table_anchor_position(store: &Store, table_id: EntityId) -> Option<i64> {
+    if !rope_positions_match_flow(store) {
+        return None;
+    }
+    let (byte, _) = store
+        .block_offsets
+        .read()
+        .range_of(OffsetMarker::TableAnchor(table_id))?;
+    Some(store.rope.read().byte_to_char(byte as usize) as i64)
+}
+
+/// Whether a table's anchor lies in the positions `[start, end)`: whether a
+/// range over them covers the start of a table. `false` for a document whose
+/// rope is not its position space.
+pub fn range_covers_table_anchor(store: &Store, start: i64, end: i64) -> bool {
+    if start >= end || !rope_positions_match_flow(store) {
+        return false;
+    }
+    let rope = store.rope.read();
+    let total = rope.len_chars() as i64;
+    let byte_of = |position: i64| rope.char_to_byte(position.clamp(0, total) as usize) as u32;
+    let (from, to) = (byte_of(start), byte_of(end));
+    let offsets = store.block_offsets.read();
+    // The entries are in byte order: only those starting inside the range are
+    // looked at, which for a Backspace or a Delete is one or two.
+    let first = offsets.entries.partition_point(|(_, byte)| *byte < from);
+    offsets.entries[first..]
+        .iter()
+        .take_while(|(_, byte)| *byte < to)
+        .any(|(marker, _)| !marker.is_block())
 }
 
 /// Remove a registered block from the rope: drops its content bytes
@@ -1000,17 +1485,23 @@ pub fn rope_remove_block(store: &Store, block_id: EntityId) {
 pub fn rope_replace_block_content(store: &Store, block_id: EntityId, new_text: &str) {
     let (block_byte_start, content_bytes) = {
         let offsets = store.block_offsets.read();
-        let Some((start, end)) = offsets.range_of_block(block_id) else {
+        let Some((start, end, has_successor)) =
+            offsets.range_with_successor(OffsetMarker::Block(block_id))
+        else {
             return;
         };
-        let total = offsets.total_bytes();
         // `range_of` extends to the next entry's `byte_start` (or to
         // `total_bytes`). If there's a following entry, the byte at
         // `end - 1` is the inter-block boundary `\n` that belongs to
         // the boundary between this block and the next, not to this
         // block's content.
-        let has_trailing_boundary = end < total;
-        let content_bytes = if has_trailing_boundary {
+        //
+        // Whether there is one is the index's to say. Asking whether the
+        // range stops short of the rope's end got it wrong before an empty
+        // last block, which starts at the rope's end: the boundary before it
+        // was taken for content and replaced, and the two blocks were left
+        // at one offset.
+        let content_bytes = if has_successor && end > start {
             end - start - 1
         } else {
             end - start
@@ -1056,24 +1547,22 @@ pub fn rope_replace_block_content(store: &Store, block_id: EntityId, new_text: &
 /// cells of many tables one block at a time walked the index once per cell.
 /// When the blocks come in index order, as a deletion meets them, each
 /// block's content is exactly what it holds before any of them is cleared:
-/// clearing an earlier block moves this one, the entry after it and the end
-/// of the rope back by the same amount. Out of that order a clear can change
-/// what a later one measures (an emptied last block leaves the boundary
-/// before it looking like content), so the blocks are then cleared one at a
-/// time, as that loop does.
+/// clearing an earlier block moves this one and the entry after it back by
+/// the same amount. Out of that order the blocks are cleared one at a time,
+/// as that loop does.
 pub fn rope_clear_blocks(store: &Store, block_ids: &[EntityId]) {
     // `(index position, byte start, content bytes)` of each block with content.
     let mut cuts: Vec<(usize, u32, u32)> = Vec::with_capacity(block_ids.len());
     {
         let offsets = store.block_offsets.read();
-        let total = offsets.total_bytes();
         let mut previous: Option<usize> = None;
         let mut in_index_order = true;
         for &block_id in block_ids {
             let marker = OffsetMarker::Block(block_id);
-            let (Some((start, end)), Some(position)) =
-                (offsets.range_of(marker), offsets.position_of(marker))
-            else {
+            let (Some((start, end, has_successor)), Some(position)) = (
+                offsets.range_with_successor(marker),
+                offsets.position_of(marker),
+            ) else {
                 // Not in the index: the one-block clear leaves it alone too.
                 continue;
             };
@@ -1083,7 +1572,7 @@ pub fn rope_clear_blocks(store: &Store, block_ids: &[EntityId]) {
             }
             previous = Some(position);
             // What `rope_replace_block_content` counts as the block's content.
-            let content = if end < total {
+            let content = if has_successor && end > start {
                 end - start - 1
             } else {
                 end - start
@@ -1243,9 +1732,9 @@ fn walk_frame_bounds(store: &Store, frame_id: EntityId, bounds: &mut Option<(u32
 
 /// Replace `[char_start..char_end)` inside `block` with `replacement`, choosing what the
 /// replacement wears where it overwrites formatted text — see [`ReplaceFormatPolicy`].
-/// Mutates the block's format runs, image anchors, and the global rope consistently in one
-/// step, and returns the updated `Block` (with a bumped `updated_at`) for the caller to
-/// persist via its own unit of work.
+/// Mutates the block's format runs, image anchors, footnote references and the global rope
+/// consistently in one step, and returns the updated `Block` (with a bumped `updated_at`) for
+/// the caller to persist via its own unit of work.
 ///
 /// The single shared implementation of "replace a char range inside one block" — originally
 /// written for the project-wide replace path (`document_search::replace_core::apply_in_block`)
@@ -1280,6 +1769,14 @@ pub fn replace_in_block(
 
     let byte_start = logical_offset_to_byte(&block_text, &images_before, char_start);
     let byte_end = logical_offset_to_byte(&block_text, &images_before, char_end);
+    if byte_end < byte_start {
+        // A range whose end comes before its start names no text to replace;
+        // measuring it overflowed.
+        return Err(FormatRunError::ReversedRange {
+            start: byte_start,
+            end: byte_end,
+        });
+    }
     let new_len = block_text.len() - (byte_end - byte_start) as usize + replacement.len();
 
     let inserted_byte_len = replacement.len() as u32;
@@ -1299,6 +1796,13 @@ pub fn replace_in_block(
         let images = images_map.entry(block.id).or_default();
         shift_images_for_delete(images, byte_start, byte_end);
         shift_images_for_insert(images, byte_start, inserted_byte_len);
+    }
+    {
+        let mut notes_map = store.block_footnote_refs.write();
+        if let Some(notes) = notes_map.get_mut(&block.id) {
+            shift_footnote_refs_for_delete(notes, byte_start, byte_end);
+            shift_footnote_refs_for_insert(notes, byte_start, inserted_byte_len);
+        }
     }
 
     // Mirror the in-block splice into the global rope.
@@ -1372,5 +1876,299 @@ mod tests {
              of the {BLOCKS} entries is enough",
             cleared.len()
         );
+    }
+
+    /// A store holding one block per text, in order, separated by `\n` boundaries.
+    fn blocks_holding(texts: &[&str]) -> Store {
+        let store = Store::new();
+        for (i, text) in texts.iter().enumerate() {
+            if i > 0 {
+                rope_insert_block_boundary(&store);
+            }
+            rope_append_block(&store, i as EntityId + 1, text);
+        }
+        store
+    }
+
+    /// A block followed by an empty last block has a boundary after it, though its range
+    /// runs to the end of the rope: the empty block starts there. Taking a range that ends
+    /// at the rope's end for the last one counted that boundary as the block's content, so
+    /// replacing or clearing the block took the boundary out and left the two blocks at one
+    /// offset, where every later read of either sliced the wrong bytes.
+    #[test]
+    fn emptying_the_block_before_an_empty_last_block_keeps_the_boundary() {
+        for together in [false, true] {
+            let store = blocks_holding(&["text", ""]);
+            if together {
+                rope_clear_blocks(&store, &[1]);
+            } else {
+                rope_replace_block_content(&store, 1, "");
+            }
+            assert_eq!(store.rope.read().to_string(), "\n", "together: {together}");
+            let offsets = store.block_offsets.read();
+            assert_eq!(
+                *offsets.entries,
+                vec![(OffsetMarker::Block(1), 0), (OffsetMarker::Block(2), 1)],
+                "together: {together}"
+            );
+            assert_eq!(offsets.total_bytes(), 1);
+        }
+    }
+
+    /// A table nested at the start of a cell puts its anchor right after the anchor of the
+    /// table holding the cell, and a position on either stands for the tables, not for a
+    /// block. Moving one entry off the anchor landed on the other anchor: forward, a caret
+    /// meant for the first cell stood on the inner table's anchor, and backward, a range end
+    /// meant to stop before the tables stood on the outer anchor's boundary. Resolved as
+    /// block positions, both fell back to the document's last block, where a deletion ran to
+    /// and a paste landed.
+    #[test]
+    fn a_position_on_a_chain_of_anchors_snaps_past_the_whole_chain() {
+        let with_anchors = |texts: &[&str], anchors: &[usize]| {
+            let store = blocks_holding(texts);
+            {
+                let mut offsets = store.block_offsets.write();
+                let mut entries = (*offsets.entries).clone();
+                for (i, entry) in entries.iter_mut().enumerate() {
+                    if anchors.contains(&i) {
+                        entry.0 = OffsetMarker::TableAnchor(100 + i as EntityId);
+                    }
+                }
+                offsets.entries = std::sync::Arc::new(entries);
+                offsets.rebuild_marker_index();
+            }
+            {
+                // The rope is the position space only when it mirrors every block.
+                let mut blocks = store.blocks.write();
+                for id in 1..=texts.len() as EntityId {
+                    if !anchors.contains(&(id as usize - 1)) {
+                        blocks.insert(
+                            id,
+                            Block {
+                                id,
+                                ..Block::default()
+                            },
+                        );
+                    }
+                }
+            }
+            store
+        };
+
+        // "Before." 0..7, its boundary 7, the outer anchor 8 and its boundary 9, the inner
+        // anchor 10 and its boundary 11, then the inner table's cell at 12.
+        let store = with_anchors(
+            &[
+                "Before.", "\u{FFFC}", "\u{FFFC}", "inner", "outer", "After.",
+            ],
+            &[1, 2],
+        );
+        for on_chain in 8..=11 {
+            assert_eq!(
+                snap_off_table_anchor(&store, on_chain, true),
+                12,
+                "from {on_chain}"
+            );
+            assert_eq!(
+                snap_off_table_anchor(&store, on_chain, false),
+                7,
+                "from {on_chain}"
+            );
+        }
+        for off_chain in [0, 6, 7, 12, 17] {
+            assert_eq!(snap_off_table_anchor(&store, off_chain, true), off_chain);
+            assert_eq!(snap_off_table_anchor(&store, off_chain, false), off_chain);
+        }
+
+        // A chain opening the document: back to its start, forward to the first cell.
+        let store = with_anchors(&["\u{FFFC}", "\u{FFFC}", "cell"], &[0, 1]);
+        for on_chain in 0..=3 {
+            assert_eq!(
+                snap_off_table_anchor(&store, on_chain, true),
+                4,
+                "from {on_chain}"
+            );
+            assert_eq!(
+                snap_off_table_anchor(&store, on_chain, false),
+                0,
+                "from {on_chain}"
+            );
+        }
+    }
+
+    /// Whether a range covers a table's anchor, for ranges around, onto and past one.
+    #[test]
+    fn a_range_covers_a_table_when_it_holds_its_anchor() {
+        let store = blocks_holding(&["Before.", "\u{FFFC}", "cell", "After."]);
+        {
+            let mut offsets = store.block_offsets.write();
+            let mut entries = (*offsets.entries).clone();
+            entries[1].0 = OffsetMarker::TableAnchor(40);
+            offsets.entries = std::sync::Arc::new(entries);
+            offsets.rebuild_marker_index();
+        }
+        {
+            let mut blocks = store.blocks.write();
+            for id in [1, 3, 4] {
+                blocks.insert(
+                    id,
+                    Block {
+                        id,
+                        ..Block::default()
+                    },
+                );
+            }
+        }
+        // The anchor is at 8, the cell at 10..14, "After." from 15.
+        for (start, end, covers) in [
+            (0, 8, false),
+            (0, 9, true),
+            (7, 9, true),
+            (8, 9, true),
+            (9, 20, false),
+            (7, 15, true),
+            (14, 15, false),
+            (9, 9, false),
+        ] {
+            assert_eq!(
+                range_covers_table_anchor(&store, start, end),
+                covers,
+                "{start}..{end}"
+            );
+        }
+    }
+
+    /// A rope laid out from `entries`, `None` standing for a table's anchor: the entries'
+    /// contents joined by boundaries. Entry `i` is `Block(i + 1)`, or `TableAnchor(i + 1)`.
+    fn layout_of(entries: &[Option<&str>]) -> (Store, Vec<OffsetMarker>) {
+        let texts: Vec<&str> = entries
+            .iter()
+            .map(|entry| entry.unwrap_or("\u{FFFC}"))
+            .collect();
+        let store = blocks_holding(&texts);
+        let markers: Vec<OffsetMarker> = entries
+            .iter()
+            .enumerate()
+            .map(|(i, entry)| match entry {
+                Some(_) => OffsetMarker::Block(i as EntityId + 1),
+                None => OffsetMarker::TableAnchor(i as EntityId + 1),
+            })
+            .collect();
+        {
+            let mut offsets = store.block_offsets.write();
+            let mut indexed = (*offsets.entries).clone();
+            for (slot, marker) in indexed.iter_mut().zip(&markers) {
+                slot.0 = *marker;
+            }
+            offsets.entries = std::sync::Arc::new(indexed);
+            offsets.rebuild_marker_index();
+        }
+        (store, markers)
+    }
+
+    /// Removing a set of entries leaves the kept entries' contents joined by boundaries, each
+    /// entry indexed where it starts in that text, whether they are removed in one pass or
+    /// one at a time, for every subset of each layout. The layouts hold empty blocks next to
+    /// table anchors: an empty block right before a last anchor starts where the anchor's
+    /// cut starts, which moved it back into the entry before it, or below zero; and a table
+    /// alone had four bytes cut from a rope of three.
+    #[test]
+    fn removing_markers_together_matches_removing_them_one_at_a_time() {
+        let layouts: [&[Option<&str>]; 7] = [
+            &[
+                Some("one"),
+                Some(""),
+                Some("three"),
+                None,
+                Some("five"),
+                Some(""),
+            ],
+            &[Some("Hello"), Some(""), None],
+            &[Some(""), None],
+            &[None],
+            &[None, Some("")],
+            &[Some("x"), None, Some(""), None, Some("")],
+            &[Some(""), None, Some("a"), Some("b"), None],
+        ];
+        for entries in layouts {
+            for subset in 1u32..(1 << entries.len()) {
+                let (_, markers) = layout_of(entries);
+                let chosen: Vec<OffsetMarker> = markers
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, _)| subset & (1 << i) != 0)
+                    .map(|(_, marker)| *marker)
+                    .collect();
+                // What is left: the kept contents joined by boundaries.
+                let mut expected_text = String::new();
+                let mut expected_entries: Vec<(OffsetMarker, u32)> = Vec::new();
+                for (entry, marker) in entries.iter().zip(&markers) {
+                    if chosen.contains(marker) {
+                        continue;
+                    }
+                    if !expected_entries.is_empty() {
+                        expected_text.push('\n');
+                    }
+                    expected_entries.push((*marker, expected_text.len() as u32));
+                    expected_text.push_str(entry.unwrap_or("\u{FFFC}"));
+                }
+
+                let (one_by_one, _) = layout_of(entries);
+                for marker in &chosen {
+                    match marker {
+                        OffsetMarker::Block(id) => rope_remove_block(&one_by_one, *id),
+                        OffsetMarker::TableAnchor(id) => rope_remove_table_anchor(&one_by_one, *id),
+                    }
+                }
+                let (together, _) = layout_of(entries);
+                rope_remove_markers(&together, &chosen);
+                for (how, store) in [("one by one", &one_by_one), ("together", &together)] {
+                    assert_eq!(
+                        store.rope.read().to_string(),
+                        expected_text,
+                        "{how}, removing {chosen:?} from {entries:?}"
+                    );
+                    let offsets = store.block_offsets.read();
+                    assert_eq!(
+                        *offsets.entries, expected_entries,
+                        "{how}, removing {chosen:?} from {entries:?}"
+                    );
+                    assert_eq!(
+                        offsets.total_bytes() as usize,
+                        expected_text.len(),
+                        "{how}, removing {chosen:?} from {entries:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The span an edit changed, from the two ropes around it and where it was asked to go
+    /// in: at the caret, at the earliest place from the caret on when the new text repeats
+    /// the text in front of it, after the rest of the paragraph when the edit put its text
+    /// there, and from before the caret when the edit replaced text there.
+    #[test]
+    fn a_changed_span_is_found_where_the_edit_went() {
+        let span = |before: &str, after: &str, from: usize| {
+            changed_span(
+                &ropey::Rope::from_str(before),
+                &ropey::Rope::from_str(after),
+                from,
+            )
+        };
+        // Typed at the caret.
+        assert_eq!(span("Hello world", "Hello big world", 6), (6, 6, 10));
+        // The same word typed in front of itself: at the caret, not after the old word.
+        assert_eq!(span("X inserted Y", "X insertedinserted Y", 2), (2, 2, 10));
+        // A table pasted at 3 goes in after the paragraph: from its end, a boundary and the
+        // table, in front of the paragraph's own boundary.
+        assert_eq!(
+            span("one two\nthree", "one two\n\u{FFFC}\nx\ny\nthree", 3),
+            (7, 7, 13)
+        );
+        // Cells filled from the start of the caret's cell, which is before the caret.
+        assert_eq!(span("a\nbcd\ne", "a\nx\ny\ne", 4), (2, 5, 5));
+        // Nothing changed: an empty span at the caret.
+        assert_eq!(span("same", "same", 2), (2, 2, 2));
     }
 }

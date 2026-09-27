@@ -1,9 +1,11 @@
-use super::editing_helpers::{collect_block_ids_recursive, find_block_at_position};
+use super::editing_helpers::{collect_block_ids_recursive, find_block_at_position, position_roots};
 use crate::InsertImageDto;
 use crate::InsertImageResultDto;
 use anyhow::{Result, anyhow};
 use common::database::CommandUnitOfWork;
-use common::database::rope_helpers::{block_content_via_store, rope_insert_in_block};
+use common::database::rope_helpers::{
+    block_content_via_store, refresh_block_positions, rope_insert_in_block,
+};
 use common::direct_access::document::document_repository::DocumentRelationshipField;
 use common::direct_access::root::root_repository::RootRelationshipField;
 use common::direct_access::table::TableRelationshipField;
@@ -90,9 +92,9 @@ fn execute_insert_image(
 
     // Get frames
     let frame_ids = uow.get_document_relationship(&doc_id, &DocumentRelationshipField::Frames)?;
-    let frame_id = *frame_ids
-        .first()
-        .ok_or_else(|| anyhow!("Document has no frames"))?;
+    if frame_ids.is_empty() {
+        return Err(anyhow!("Document has no frames"));
+    }
 
     // Blocks in linear order, recursing into sub-frames.
     //
@@ -109,16 +111,23 @@ fn execute_insert_image(
         cells.sort_by(|a, b| a.row.cmp(&b.row).then(a.column.cmp(&b.column)));
         Ok(cells.into_iter().filter_map(|c| c.cell_frame).collect())
     };
-    let block_ids = collect_block_ids_recursive(
-        &|id| uow.get_frame(id),
-        &|id, field| uow.get_frame_relationship(id, field),
-        &get_table_cell_frames,
-        &frame_id,
-    )?;
+    // A footnote's body is in the rope too, between the paragraphs around it,
+    // so a caret can stand there (see `position_roots`).
+    let mut block_ids: Vec<EntityId> = Vec::new();
+    for root in position_roots(&|id| uow.get_frame(id), &frame_ids)? {
+        block_ids.extend(collect_block_ids_recursive(
+            &|id| uow.get_frame(id),
+            &|id, field| uow.get_frame_relationship(id, field),
+            &get_table_cell_frames,
+            &root,
+        )?);
+    }
 
-    // Get all blocks
+    // Get all blocks, in the order the rope holds them: the stored field lags
+    // it by whatever was typed since something last wrote it.
     let blocks_opt = uow.get_block_multi(&block_ids)?;
     let mut blocks: Vec<Block> = blocks_opt.into_iter().flatten().collect();
+    refresh_block_positions(&mut blocks, &uow.store());
     blocks.sort_by_key(|b| b.document_position);
 
     // Find block at position
@@ -188,6 +197,16 @@ fn execute_insert_image(
             shift_runs_for_insert(runs, byte_offset, SENTINEL_BYTES);
         }
     }
+    // Footnote references past the insertion point move with the text too: a
+    // reference occupies a sentinel of its own, and one left in place would now
+    // name the image's sentinel.
+    {
+        let store = uow.store();
+        let mut notes_map = store.block_footnote_refs.write();
+        if let Some(notes) = notes_map.get_mut(&block.id) {
+            common::format_runs::shift_footnote_refs_for_insert(notes, byte_offset, SENTINEL_BYTES);
+        }
+    }
 
     // Mirror to the global rope: insert U+FFFC OBJECT REPLACEMENT
     // CHARACTER at the same byte offset per plan §1.6. The sentinel is
@@ -222,9 +241,11 @@ fn execute_insert_image(
     updated_doc.updated_at = now;
     uow.update_document(&updated_doc)?;
 
+    // After the image, where it went: a caret on a table's anchor puts it in
+    // the table's first cell, past the position asked for.
     Ok((
         InsertImageResultDto {
-            new_position: position + 1,
+            new_position: block.document_position + offset + 1,
             element_id: synth_element_id(block.id, byte_offset) as i64,
         },
         snapshot,

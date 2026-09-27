@@ -120,6 +120,33 @@ fn time_delete_all_with_tables(paragraphs: usize) -> Duration {
     elapsed
 }
 
+/// Select all of a document holding many small tables and insert another such text over
+/// it, as one edit: a version restore of a text with a table every few pages.
+fn time_restore_with_tables(paragraphs: usize) -> Duration {
+    let doc = TextDocument::new();
+    doc.set_djot_sync(&djot_with_tables(paragraphs).replace("Past", "Current"))
+        .unwrap();
+    let past = djot_with_tables(paragraphs);
+    let start = Instant::now();
+    let cursor = doc.cursor();
+    cursor.begin_edit_block();
+    cursor.select(SelectionType::Document);
+    cursor.insert_djot(&past).unwrap();
+    cursor.end_edit_block();
+    start.elapsed()
+}
+
+/// Paste a text holding many small tables into the middle of a two-paragraph document: the
+/// paste's tables are followed by text, where their cells used to go to the end of it.
+fn time_paste_with_tables_mid_document(paragraphs: usize) -> Duration {
+    let doc = TextDocument::new();
+    doc.set_djot_sync("One line.\n\nTwo lines.\n").unwrap();
+    let past = djot_with_tables(paragraphs);
+    let start = Instant::now();
+    doc.cursor_at(4).insert_djot(&past).unwrap();
+    start.elapsed()
+}
+
 /// Load the text `time_delete_all_with_tables` deletes: its linear reference.
 fn time_load_with_tables(paragraphs: usize) -> Duration {
     let doc = TextDocument::new();
@@ -269,5 +296,43 @@ fn deleting_a_long_text_with_many_small_tables_scales_linearly() {
          loading it, for sixteen times the text: the deletion is doing work per table that \
          grows with the document again (removing each table in calls of its own, or looking \
          for the owners of the removed cells table by table)."
+    );
+}
+
+#[test]
+#[cfg_attr(
+    debug_assertions,
+    ignore = "timing guard for long texts, meaningful in release builds only: cargo test --release"
+)]
+fn restoring_or_pasting_a_text_with_many_small_tables_scales_linearly() {
+    // A paste put each table's cells at the end of the frame it landed in, finding that end
+    // by walking the whole frame once per cell, and created every table and every frame
+    // with the document as its owner, rewriting the document's whole table or frame list
+    // each time: restoring 8,000 paragraphs with 727 small tables took 5.6 s, and pasting
+    // them 9.3 s. `whole_document_scaling_tests` counts the list rewrites exactly in every
+    // build; this guard times the whole edit, at 2,000 against 16,000 paragraphs, in release
+    // builds only (`cargo test --release`). Measured on the fix: growth 1.22 for the restore
+    // and 0.98 for the paste; on the code before it, 11.55 and 12.83 (18.7 s and 16.8 s at
+    // 16,000 paragraphs).
+    let restore = growth_over(
+        "restore with tables",
+        time_restore_with_tables,
+        time_load_with_tables,
+        2_000,
+        16_000,
+    );
+    let paste = growth_over(
+        "paste with tables mid document",
+        time_paste_with_tables_mid_document,
+        time_load_with_tables,
+        2_000,
+        16_000,
+    );
+    assert!(
+        restore < 3.0 && paste < 3.0,
+        "restoring (growth {restore:.2}) or pasting (growth {paste:.2}) a text holding many \
+         small tables grew relative to loading it, for eight times the text: a paste is doing \
+         work per table that grows with the document again (walking the frame to place each \
+         table's cells, or creating each table and frame with the document as its owner)."
     );
 }

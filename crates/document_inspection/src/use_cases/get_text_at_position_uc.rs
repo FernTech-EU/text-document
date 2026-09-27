@@ -2,9 +2,10 @@
 use crate::GetTextAtPositionDto;
 use crate::TextAtPositionDto;
 use anyhow::{Result, anyhow};
-use common::database::QueryUnitOfWork;
 use common::database::rope_helpers::block_char_length;
 use common::database::rope_helpers::block_content_via_store;
+use common::database::rope_helpers::{find_block_at_char_position, rope_positions_match_flow};
+use common::database::{QueryUnitOfWork, Store};
 use common::direct_access::document::document_repository::DocumentRelationshipField;
 use common::direct_access::frame::frame_repository::FrameRelationshipField;
 use common::direct_access::root::root_repository::RootRelationshipField;
@@ -57,6 +58,20 @@ impl GetTextAtPositionUseCase {
             });
         }
 
+        // Where the rope is the document's position space, the text at a
+        // position is the rope's text there. The walk below counts each
+        // block and one boundary after it, which leaves out the two
+        // characters a table's anchor takes (and every footnote body): after
+        // a table it read the text further on than asked, so a caret placed
+        // near the end of a paragraph after a table snapped back from where
+        // it was put, and a selection there copied the wrong words.
+        let store = uow.store();
+        if rope_positions_match_flow(&store) {
+            let result = text_from_rope(&store, position, length);
+            uow.end_transaction()?;
+            return result;
+        }
+
         // Get Root(1) -> Document -> root frame -> collect blocks recursively
         let root = uow
             .get_root(&ROOT_ENTITY_ID)?
@@ -79,7 +94,6 @@ impl GetTextAtPositionUseCase {
         // Get all blocks and assign computed positions
         let blocks_opt = uow.get_block_multi(&ordered_block_ids)?;
         let mut blocks: Vec<Block> = blocks_opt.into_iter().flatten().collect();
-        let store = uow.store();
         // Assign on-the-fly positions so they match the true document layout
         let mut running: i64 = 0;
         for block in &mut blocks {
@@ -195,6 +209,58 @@ impl GetTextAtPositionUseCase {
             element_id: first_element_id as i64,
         })
     }
+}
+
+/// [`GetTextAtPositionUseCase::execute`] for a document whose rope is its
+/// position space: `length` characters of the rope from `position`, and the
+/// block and inline element at `position`.
+fn text_from_rope(store: &Store, position: i64, length: i64) -> Result<TextAtPositionDto> {
+    let text = {
+        let rope = store.rope.read();
+        let total = rope.len_chars() as i64;
+        if position < 0 || position > total {
+            return Err(anyhow!("Position {} is out of document range", position));
+        }
+        let end = position.saturating_add(length).min(total);
+        rope.slice(position as usize..end as usize).to_string()
+    };
+    let (block_id, element_id) = match find_block_at_char_position(store, position) {
+        Some((block_id, offset, _)) => (block_id, element_at(store, block_id, offset)),
+        // On a table's anchor: no block, no element.
+        None => (0, 0),
+    };
+    Ok(TextAtPositionDto {
+        text,
+        block_id: block_id as i64,
+        element_id: element_id as i64,
+    })
+}
+
+/// The id of the inline element of `block_id` holding the character at
+/// `offset`, as the walk in [`GetTextAtPositionUseCase::execute`] names it;
+/// 0 at the block's end.
+fn element_at(store: &Store, block_id: EntityId, offset: i64) -> EntityId {
+    let Some(block) = store.blocks.read().get(&block_id).cloned() else {
+        return 0;
+    };
+    let block_text = block_content_via_store(&block, store);
+    let mut chars: i64 = 0;
+    let mut bytes: u32 = 0;
+    for segment in inline_segments_for_block(store, block_id, &block_text) {
+        let (char_len, byte_len) = match &segment.content {
+            InlineContent::Text(s) => (s.chars().count() as i64, s.len() as u32),
+            InlineContent::Image { .. } | InlineContent::FootnoteRef { .. } => {
+                (1, '\u{FFFC}'.len_utf8() as u32)
+            }
+            InlineContent::Empty => (0, 0),
+        };
+        if chars + char_len > offset {
+            return synth_element_id(block_id, bytes);
+        }
+        chars += char_len;
+        bytes += byte_len;
+    }
+    0
 }
 
 /// Collect all block IDs in document order by recursing into sub-frames.

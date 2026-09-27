@@ -1,15 +1,17 @@
 use super::editing_helpers::{
-    CellFrameCreator, collect_block_ids_recursive, create_cell_frame, find_block_at_position,
-    impl_cell_frame_creator,
+    CellFrameCreator, collect_block_ids_recursive, find_block_at_position, impl_cell_frame_creator,
+    position_roots,
 };
 use crate::InsertFragmentDto;
 use crate::InsertFragmentResultDto;
 use anyhow::{Result, anyhow};
 use common::database::CommandUnitOfWork;
+use common::database::block_offset_index::OffsetMarker;
 use common::database::rope_helpers::{
-    block_char_length, rope_append_block, rope_delete_in_block, rope_insert_block_at,
-    rope_insert_block_boundary, rope_insert_blocks_at, rope_insert_in_block,
-    rope_insert_table_anchor, rope_split_block, rope_split_block_into, top_level_frame_end_byte,
+    block_char_length, block_document_position, outermost_table_around, refresh_block_positions,
+    rope_append_block, rope_delete_in_block, rope_insert_block_boundary, rope_insert_in_block,
+    rope_insert_run_after, rope_remove_markers, rope_replace_block_content, rope_split_block,
+    rope_split_block_into,
 };
 use common::direct_access::document::document_repository::DocumentRelationshipField;
 use common::direct_access::frame::frame_repository::FrameRelationshipField;
@@ -22,7 +24,10 @@ use common::format_runs::{
     split_runs_at,
 };
 
-use common::parser_tools::fragment_schema::{FragmentBlock, FragmentData, FragmentTable};
+use common::parser_tools::TABLE_ANCHOR;
+use common::parser_tools::fragment_schema::{
+    FragmentBlock, FragmentData, FragmentTable, FragmentTableCell,
+};
 use common::parser_tools::list_grouper::ListGrouper;
 use common::snapshot::EntityTreeSnapshot;
 use common::types::{EntityId, ROOT_ENTITY_ID};
@@ -59,8 +64,10 @@ pub trait InsertFragmentUnitOfWorkFactoryTrait: Send + Sync {
 #[macros::uow_action(entity = "List", action = "Create")]
 #[macros::uow_action(entity = "List", action = "CreateOrphan")]
 #[macros::uow_action(entity = "Frame", action = "Create")]
+#[macros::uow_action(entity = "Frame", action = "CreateOrphan")]
 #[macros::uow_action(entity = "Table", action = "Get")]
 #[macros::uow_action(entity = "Table", action = "Create")]
+#[macros::uow_action(entity = "Table", action = "CreateOrphan")]
 #[macros::uow_action(entity = "Table", action = "GetRelationship")]
 #[macros::uow_action(entity = "TableCell", action = "GetMulti")]
 #[macros::uow_action(entity = "TableCell", action = "Create")]
@@ -342,14 +349,15 @@ fn write_block_state(
     }
 }
 
-/// Clear all per-block state (format_runs + block_images) for a block
-/// that's about to be repurposed in place. The legacy inline_elements
-/// will be reverse-synced from the new (empty) state by a later
-/// `write_block_state` or `rebuild_block_inline_elements` call.
+/// Clear all per-block state (format_runs, block_images and footnote
+/// references) for a block that's about to be repurposed in place. The
+/// legacy inline_elements will be reverse-synced from the new (empty) state
+/// by a later `write_block_state` or `rebuild_block_inline_elements` call.
 fn clear_block_state(uow: &mut Box<dyn InsertFragmentUnitOfWorkTrait>, block_id: EntityId) {
     let store = uow.store();
     store.format_runs.write().remove(&block_id);
     store.block_images.write().remove(&block_id);
+    store.block_footnote_refs.write().remove(&block_id);
 }
 
 /// Collect all blocks from a frame tree and map each block to its owning frame.
@@ -395,6 +403,77 @@ fn collect_all_blocks_with_frame(
     Ok(())
 }
 
+/// Every block of the document in the order the rope holds them, with the
+/// frame that lists each one.
+///
+/// That is the main flow (blockquotes and table cells included) and the
+/// footnote definitions: a definition is in no flow, but the rope holds its
+/// blocks where it was written and a caret can stand in one, so the block at
+/// a position has to be found among them too.
+///
+/// Positions are read from the rope, as every use case reading them does
+/// (see `refresh_block_positions`): the stored field lags the rope by
+/// whatever was typed since something last wrote it, and sorting by it put
+/// the blocks out of order.
+fn document_blocks_with_frames(
+    uow: &dyn InsertFragmentUnitOfWorkTrait,
+    frame_ids: &[EntityId],
+) -> Result<(Vec<Block>, HashMap<EntityId, EntityId>)> {
+    let get_table_cell_frames = |table_id: &EntityId| -> Result<Vec<EntityId>> {
+        let cell_ids = uow.get_table_relationship(table_id, &TableRelationshipField::Cells)?;
+        let cells = uow.get_table_cell_multi(&cell_ids)?;
+        let mut sorted: Vec<_> = cells.into_iter().flatten().collect();
+        sorted.sort_by(|a, b| a.row.cmp(&b.row).then(a.column.cmp(&b.column)));
+        Ok(sorted.into_iter().filter_map(|c| c.cell_frame).collect())
+    };
+    let roots = position_roots(&|id| uow.get_frame(id), frame_ids)?;
+    let mut block_to_frame: HashMap<EntityId, EntityId> = HashMap::new();
+    let mut all_block_ids: Vec<EntityId> = Vec::new();
+    for root in &roots {
+        collect_all_blocks_with_frame(uow, root, &mut block_to_frame)?;
+        all_block_ids.extend(collect_block_ids_recursive(
+            &|id| uow.get_frame(id),
+            &|id, field| uow.get_frame_relationship(id, field),
+            &get_table_cell_frames,
+            root,
+        )?);
+    }
+    let mut blocks: Vec<Block> = uow
+        .get_block_multi(&all_block_ids)?
+        .into_iter()
+        .flatten()
+        .collect();
+    refresh_block_positions(&mut blocks, &uow.store());
+    blocks.sort_by_key(|b| b.document_position);
+    Ok((blocks, block_to_frame))
+}
+
+/// Where new blocks go after `block_id` in `frame_id`: the index right after
+/// it in the frame's `child_order`, and in its block list. The end of each
+/// when the frame does not list the block.
+///
+/// These used to be the block's index among all of the document's blocks,
+/// which is its index in its own frame only in a document of one frame: in a
+/// blockquote, or after one, the paste landed further down the frame than
+/// the rope put it.
+fn insertion_indices_after(
+    uow: &dyn InsertFragmentUnitOfWorkTrait,
+    frame: &Frame,
+    block_id: EntityId,
+) -> Result<(usize, usize)> {
+    let child_order_index = frame
+        .child_order
+        .iter()
+        .position(|entry| *entry == block_id as i64)
+        .map_or(frame.child_order.len(), |i| i + 1);
+    let frame_blocks = uow.get_frame_relationship(&frame.id, &FrameRelationshipField::Blocks)?;
+    let blocks_index = frame_blocks
+        .iter()
+        .position(|id| *id == block_id)
+        .map_or(frame_blocks.len(), |i| i + 1);
+    Ok((child_order_index, blocks_index))
+}
+
 /// Give `frame_id` the blocks created for it without an owner, in one write,
 /// where creating each one with `create_block(.., frame_id, index)` would have
 /// put it: at `index` when that falls inside the frame's list, at its end
@@ -427,12 +506,75 @@ fn attach_lists(
     doc_id: EntityId,
     list_ids: &[EntityId],
 ) -> Result<()> {
-    if list_ids.is_empty() {
+    attach_to_document(uow, doc_id, &DocumentRelationshipField::Lists, list_ids)
+}
+
+/// Append entities created without an owner to the document's `field` list, in
+/// one write and in creation order, as creating each one with the document as
+/// its owner would have.
+///
+/// Creating a table or a frame with the document as its owner rewrites,
+/// re-validates and announces the document's whole list of them, so a paste
+/// holding many small tables (an anchor frame and a frame per cell each) did
+/// that once per frame and table: restoring or pasting such a text was
+/// quadratic in its tables.
+fn attach_to_document(
+    uow: &mut Box<dyn InsertFragmentUnitOfWorkTrait>,
+    doc_id: EntityId,
+    field: &DocumentRelationshipField,
+    ids: &[EntityId],
+) -> Result<()> {
+    if ids.is_empty() {
         return Ok(());
     }
-    let mut lists = uow.get_document_relationship(&doc_id, &DocumentRelationshipField::Lists)?;
-    lists.extend_from_slice(list_ids);
-    uow.set_document_relationship(&doc_id, &DocumentRelationshipField::Lists, &lists)
+    let mut owned = uow.get_document_relationship(&doc_id, field)?;
+    owned.extend_from_slice(ids);
+    uow.set_document_relationship(&doc_id, field, &owned)
+}
+
+/// A table cell's frame holding one empty block, created without an owner for
+/// [`attach_to_document`], where `create_cell_frame` hands each frame to the
+/// document as it creates it.
+fn create_orphan_cell_frame(
+    uow: &mut Box<dyn InsertFragmentUnitOfWorkTrait>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<(EntityId, Block)> {
+    let created_frame = uow.create_orphan_frame(&Frame::default())?;
+    let block = Block {
+        document_position: 0,
+        ..Block::default()
+    };
+    let created_block = uow.create_block(&block, created_frame.id, -1)?;
+    let mut updated_frame = created_frame.clone();
+    updated_frame.child_order = vec![created_block.id as i64];
+    updated_frame.updated_at = now;
+    uow.update_frame(&updated_frame)?;
+    Ok((created_frame.id, created_block))
+}
+
+/// List every block of a new cell frame in its `child_order`, in order.
+///
+/// `create_orphan_cell_frame` lists the cell's first block; the others are
+/// created with the frame as their owner, which adds them to its block list
+/// only. A pasted cell of several paragraphs then had blocks its
+/// `child_order` left out, and every walk of the frames (the Djot writer's,
+/// the position lookups') missed all but its first paragraph.
+fn order_cell_blocks(
+    uow: &mut Box<dyn InsertFragmentUnitOfWorkTrait>,
+    cell_frame_id: EntityId,
+    cell_blocks: &[(EntityId, String)],
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<()> {
+    if cell_blocks.len() < 2 {
+        return Ok(());
+    }
+    let mut frame = uow
+        .get_frame(&cell_frame_id)?
+        .ok_or_else(|| anyhow!("Cell frame {cell_frame_id} not found"))?;
+    frame.child_order = cell_blocks.iter().map(|(id, _)| *id as i64).collect();
+    frame.updated_at = now;
+    uow.update_frame(&frame)?;
+    Ok(())
 }
 
 /// Build a mapping from block_id → (cell_frame_id, table_id) for all tables in the document.
@@ -458,55 +600,126 @@ fn build_block_to_cell_map(
     Ok(map)
 }
 
+/// Where the caret at `position` stands with respect to the tables: the cell
+/// holding its block, and whether some table encloses the block at all, at
+/// any depth.
+struct CaretInTable {
+    /// The cell frame listing that block and its table, when the block sits
+    /// directly in a cell.
+    cell: Option<(EntityId, EntityId)>,
+    /// Whether the block is inside a table, directly in a cell or deeper.
+    inside_table: bool,
+    /// Whether the block is in a footnote's body, at any depth.
+    in_note: bool,
+}
+
+/// Find where the caret at `position` stands with respect to the document's
+/// tables. `None` for a document without blocks.
+fn caret_in_table(
+    uow: &dyn InsertFragmentUnitOfWorkTrait,
+    doc_id: EntityId,
+    position: i64,
+) -> Result<Option<CaretInTable>> {
+    let frame_ids = uow.get_document_relationship(&doc_id, &DocumentRelationshipField::Frames)?;
+    // Every block the caret can stand in, in rope order: a caret in a
+    // quotation, a cell or a note is found in its own block.
+    let (blocks, block_to_frame) = document_blocks_with_frames(uow, &frame_ids)?;
+    if blocks.is_empty() {
+        return Ok(None);
+    }
+    let (block, _, _) = find_block_at_position(&blocks, position, &uow.store())?;
+    let block_to_cell = build_block_to_cell_map(uow, doc_id)?;
+    let cell = block_to_cell.get(&block.id).copied();
+    let inside_table = cell.is_some()
+        || block_to_frame
+            .get(&block.id)
+            .is_some_and(|frame| outermost_table_around(&uow.store(), *frame).is_some());
+    // The footnote definitions are the position roots after the main frame.
+    let mut in_note = false;
+    for note in position_roots(&|id| uow.get_frame(id), &frame_ids)?
+        .iter()
+        .skip(1)
+    {
+        let mut note_blocks: HashMap<EntityId, EntityId> = HashMap::new();
+        collect_all_blocks_with_frame(uow, note, &mut note_blocks)?;
+        if note_blocks.contains_key(&block.id) {
+            in_note = true;
+            break;
+        }
+    }
+    Ok(Some(CaretInTable {
+        cell,
+        inside_table,
+        in_note,
+    }))
+}
+
+/// A fragment's tables laid out as paragraphs: each table's cells, row by row,
+/// in the place the table held among the fragment's blocks. Empty cells add
+/// nothing.
+///
+/// This is what a paste puts into a table cell. A table cell nesting a table
+/// is more than the saved format can hold: a pipe table's cell is one line of
+/// text, and the Djot writer, which only reads a cell's own paragraphs, left
+/// the nested table out of the save, so the pasted text was visible until the
+/// document was reloaded and then gone.
+fn tables_as_paragraphs(fragment_data: &FragmentData) -> FragmentData {
+    let mut tables: Vec<&FragmentTable> = fragment_data.tables.iter().collect();
+    tables.sort_by_key(|table| table.block_insert_index);
+    let mut blocks: Vec<FragmentBlock> = Vec::new();
+    let mut next = 0;
+    for table in tables {
+        let index = table.block_insert_index.min(fragment_data.blocks.len());
+        while next < index {
+            blocks.push(fragment_data.blocks[next].clone());
+            next += 1;
+        }
+        let mut cells: Vec<_> = table.cells.iter().collect();
+        cells.sort_by_key(|cell| (cell.row, cell.column));
+        for cell in cells {
+            blocks.extend(
+                cell.blocks
+                    .iter()
+                    .filter(|block| !block.plain_text.is_empty() || !block.elements.is_empty())
+                    .cloned(),
+            );
+        }
+    }
+    blocks.extend(
+        fragment_data.blocks[next.min(fragment_data.blocks.len())..]
+            .iter()
+            .cloned(),
+    );
+    FragmentData {
+        blocks,
+        tables: Vec::new(),
+    }
+}
+
 /// Replace cell contents in an existing table with fragment data.
 /// Returns Ok(Some(result)) if replacement was performed, Ok(None) if not applicable.
+///
+/// Each target cell keeps its first block, which takes the pasted cell's first
+/// paragraph; its other blocks go and the pasted cell's other paragraphs follow
+/// the first. Every change reaches the rope as well as the entities: the
+/// replacement used to write the pasted runs over the cell's old text, leave
+/// the removed blocks' text in the rope and create the new blocks outside it,
+/// so the pasted words were lost and the next save sliced a block past its end
+/// and panicked. A target cell holding more than paragraphs (a quotation, a
+/// table) is left alone: the paste then goes in at the caret instead.
 fn try_replace_table_cells(
     uow: &mut Box<dyn InsertFragmentUnitOfWorkTrait>,
     dto: &InsertFragmentDto,
     fragment_data: &FragmentData,
     doc_id: EntityId,
+    caret: &CaretInTable,
 ) -> Result<Option<(InsertFragmentResultDto, EntityTreeSnapshot)>> {
-    if fragment_data.tables.len() != 1 {
+    if fragment_data.tables.len() != 1 || !fragment_data.blocks.is_empty() {
         return Ok(None);
     }
     let frag_table = &fragment_data.tables[0];
-
-    let block_to_cell = build_block_to_cell_map(&**uow, doc_id)?;
-
-    let frame_ids = uow.get_document_relationship(&doc_id, &DocumentRelationshipField::Frames)?;
-    let frame_id = *frame_ids
-        .first()
-        .ok_or_else(|| anyhow!("Document has no frames"))?;
-
-    // Collect every block in the frame tree — including blockquote
-    // sub-frames and table cell frames. Fetching only the root frame's
-    // blocks here would miss a cursor sitting in a quoted paragraph,
-    // making `find_block_at_position` fall back to the wrong block and
-    // potentially trigger a spurious cell replacement.
-    let all_block_ids: Vec<EntityId> = {
-        let get_table_cell_frames = |table_id: &EntityId| -> Result<Vec<EntityId>> {
-            let cell_ids = uow.get_table_relationship(table_id, &TableRelationshipField::Cells)?;
-            let cells = uow.get_table_cell_multi(&cell_ids)?;
-            let mut sorted: Vec<_> = cells.into_iter().flatten().collect();
-            sorted.sort_by(|a, b| a.row.cmp(&b.row).then(a.column.cmp(&b.column)));
-            Ok(sorted.into_iter().filter_map(|c| c.cell_frame).collect())
-        };
-        collect_block_ids_recursive(
-            &|id| uow.get_frame(id),
-            &|id, field| uow.get_frame_relationship(id, field),
-            &get_table_cell_frames,
-            &frame_id,
-        )?
-    };
-    let blocks_opt = uow.get_block_multi(&all_block_ids)?;
-    let mut all_blocks: Vec<Block> = blocks_opt.into_iter().flatten().collect();
-    all_blocks.sort_by_key(|b| b.document_position);
-
-    let (cursor_block, _, _) = find_block_at_position(&all_blocks, dto.position, &uow.store())?;
-
-    let target_table_id = match block_to_cell.get(&cursor_block.id) {
-        Some((_, tid)) => *tid,
-        None => return Ok(None),
+    let Some((cursor_cf, target_table_id)) = caret.cell else {
+        return Ok(None);
     };
 
     let target_table = uow
@@ -517,11 +730,9 @@ fn try_replace_table_cells(
     let target_cells_opt = uow.get_table_cell_multi(&target_cell_ids)?;
     let target_cells: Vec<TableCell> = target_cells_opt.into_iter().flatten().collect();
 
-    let now = chrono::Utc::now();
-    let snapshot = uow.snapshot_document(&[doc_id])?;
-
-    let cursor_cf = block_to_cell.get(&cursor_block.id).map(|(cf, _)| *cf);
-    let cursor_cell = target_cells.iter().find(|c| c.cell_frame == cursor_cf);
+    let cursor_cell = target_cells
+        .iter()
+        .find(|c| c.cell_frame == Some(cursor_cf));
     let (base_row, base_col) = cursor_cell
         .map(|c| (c.row as usize, c.column as usize))
         .unwrap_or((0, 0));
@@ -534,70 +745,127 @@ fn try_replace_table_cells(
         return Ok(None);
     }
 
+    // Each pasted cell with the frame of the cell it lands on and that
+    // frame's blocks, in their order; nothing is written until every target
+    // is known to hold paragraphs only.
+    let mut targets: Vec<(&FragmentTableCell, Frame, Vec<EntityId>)> = Vec::new();
     for frag_cell in &frag_table.cells {
         let target_row = base_row + frag_cell.row;
         let target_col = base_col + frag_cell.column;
-
-        let target = target_cells
+        let Some(cf_id) = target_cells
             .iter()
-            .find(|c| c.row as usize == target_row && c.column as usize == target_col);
-        let target = match target {
-            Some(t) => t,
-            None => continue,
+            .find(|c| c.row as usize == target_row && c.column as usize == target_col)
+            .and_then(|c| c.cell_frame)
+        else {
+            continue;
         };
-
-        let cf_id = match target.cell_frame {
-            Some(id) => id,
-            None => continue,
+        let frame = uow
+            .get_frame(&cf_id)?
+            .ok_or_else(|| anyhow!("Cell frame {cf_id} not found"))?;
+        if frame.child_order.iter().any(|entry| *entry < 0) {
+            return Ok(None);
+        }
+        let block_ids: Vec<EntityId> = if frame.child_order.is_empty() {
+            uow.get_frame_relationship(&cf_id, &FrameRelationshipField::Blocks)?
+        } else {
+            frame
+                .child_order
+                .iter()
+                .map(|entry| *entry as EntityId)
+                .collect()
         };
-
-        let existing_blk_ids =
-            uow.get_frame_relationship(&cf_id, &FrameRelationshipField::Blocks)?;
-        let existing_blks_opt = uow.get_block_multi(&existing_blk_ids)?;
-        let existing_blks: Vec<Block> = existing_blks_opt.into_iter().flatten().collect();
-
-        // Drop all blocks except the first (we'll reuse it).
-        for blk in existing_blks.iter().skip(1) {
-            clear_block_state(uow, blk.id);
-            uow.remove_block(&blk.id)?;
+        if block_ids.is_empty() {
+            continue;
         }
-
-        if let Some(first_blk) = existing_blks.first() {
-            clear_block_state(uow, first_blk.id);
-
-            if let Some(first_frag_blk) = frag_cell.blocks.first() {
-                let inline_runs = frag_block_state(first_frag_blk);
-                let mut updated = first_blk.clone();
-                updated.updated_at = now;
-                uow.update_block(&updated)?;
-                write_block_state(uow, first_blk.id, inline_runs);
-
-                for extra_frag in &frag_cell.blocks[1..] {
-                    let inline_xruns = frag_block_state(extra_frag);
-                    let extra_block = Block {
-                        id: 0,
-                        created_at: now,
-                        updated_at: now,
-                        list: None,
-                        document_position: 0,
-                        ..Default::default()
-                    };
-                    let created = uow.create_block(&extra_block, cf_id, -1)?;
-                    write_block_state(uow, created.id, inline_xruns);
-                }
-            } else {
-                let mut updated = first_blk.clone();
-                updated.updated_at = now;
-                uow.update_block(&updated)?;
-                write_block_state(uow, first_blk.id, BlockInline::default());
-            }
-        }
+        targets.push((frag_cell, frame, block_ids));
     }
 
+    let now = chrono::Utc::now();
+    let snapshot = uow.snapshot_document(&[doc_id])?;
+    let store = uow.store();
+
+    let mut leaving_rope: Vec<OffsetMarker> = Vec::new();
+    let mut blocks_added: i64 = 0;
+    // The last block written, where the caret goes.
+    let mut last_written: Option<EntityId> = None;
+    for (frag_cell, frame, block_ids) in targets {
+        let first_id = block_ids[0];
+        for extra in &block_ids[1..] {
+            clear_block_state(uow, *extra);
+            uow.remove_block(extra)?;
+            leaving_rope.push(OffsetMarker::Block(*extra));
+            blocks_added -= 1;
+        }
+
+        let first = uow
+            .get_block(&first_id)?
+            .ok_or_else(|| anyhow!("Block {first_id} not found"))?;
+        let mut updated = first.clone();
+        updated.updated_at = now;
+        uow.update_block(&updated)?;
+        clear_block_state(uow, first_id);
+        let (first_text, first_inline) = match frag_cell.blocks.first() {
+            Some(first_frag) => (first_frag.plain_text.as_str(), frag_block_state(first_frag)),
+            None => ("", BlockInline::default()),
+        };
+        rope_replace_block_content(&store, first_id, first_text);
+        write_block_state(uow, first_id, first_inline);
+        last_written = Some(first_id);
+
+        let mut new_ids: Vec<EntityId> = Vec::new();
+        let mut run: Vec<(OffsetMarker, &str)> = Vec::new();
+        for extra_frag in frag_cell.blocks.iter().skip(1) {
+            let extra_block = Block {
+                id: 0,
+                created_at: now,
+                updated_at: now,
+                list: None,
+                document_position: 0,
+                ..Default::default()
+            };
+            let created = uow.create_orphan_block(&extra_block)?;
+            write_block_state(uow, created.id, frag_block_state(extra_frag));
+            run.push((
+                OffsetMarker::Block(created.id),
+                extra_frag.plain_text.as_str(),
+            ));
+            new_ids.push(created.id);
+            blocks_added += 1;
+        }
+        if !new_ids.is_empty() {
+            rope_insert_run_after(&store, OffsetMarker::Block(first_id), &run);
+            attach_blocks_at(uow, frame.id, 1, &new_ids)?;
+            last_written = new_ids.last().copied();
+        }
+        let mut updated_frame = frame.clone();
+        updated_frame.child_order = std::iter::once(first_id)
+            .chain(new_ids.iter().copied())
+            .map(|id| id as i64)
+            .collect();
+        updated_frame.updated_at = now;
+        uow.update_frame(&updated_frame)?;
+    }
+    rope_remove_markers(&store, &leaving_rope);
+
+    if blocks_added != 0 {
+        let mut document = uow
+            .get_document(&doc_id)?
+            .ok_or_else(|| anyhow!("Document not found"))?;
+        document.block_count += blocks_added;
+        document.updated_at = now;
+        uow.update_document(&document)?;
+    }
+
+    // After the pasted text, as for every paste: at the end of the last
+    // paragraph written.
+    let new_position = match last_written.and_then(|id| uow.get_block(&id).ok().flatten()) {
+        Some(block) => block_document_position(&block, &store) + block_char_length(&block, &store),
+        None => dto.position,
+    };
     Ok(Some((
         InsertFragmentResultDto {
-            new_position: dto.position,
-            blocks_added: 0,
+            new_position,
+            blocks_added: blocks_added.max(0),
         },
         snapshot,
     )))
@@ -619,10 +887,6 @@ fn insert_table_fragment(
         .first()
         .ok_or_else(|| anyhow!("Root has no document"))?;
 
-    if let Some(result) = try_replace_table_cells(uow, dto, fragment_data, doc_id)? {
-        return Ok(result);
-    }
-
     let document = uow
         .get_document(&doc_id)?
         .ok_or_else(|| anyhow!("Document not found"))?;
@@ -634,39 +898,19 @@ fn insert_table_fragment(
         .first()
         .ok_or_else(|| anyhow!("Document has no frames"))?;
 
-    // Resolve every block in the frame tree (blockquote sub-frames and
-    // table cell frames included) and remember each block's owning frame,
-    // so a paste with the cursor inside a blockquote anchors the table to
-    // the blockquote frame — not the root frame.
-    let mut block_to_frame: HashMap<EntityId, EntityId> = HashMap::new();
-    collect_all_blocks_with_frame(&**uow, &root_frame_id, &mut block_to_frame)?;
-
-    let all_block_ids: Vec<EntityId> = {
-        let get_table_cell_frames = |table_id: &EntityId| -> Result<Vec<EntityId>> {
-            let cell_ids = uow.get_table_relationship(table_id, &TableRelationshipField::Cells)?;
-            let cells = uow.get_table_cell_multi(&cell_ids)?;
-            let mut sorted: Vec<_> = cells.into_iter().flatten().collect();
-            sorted.sort_by(|a, b| a.row.cmp(&b.row).then(a.column.cmp(&b.column)));
-            Ok(sorted.into_iter().filter_map(|c| c.cell_frame).collect())
-        };
-        collect_block_ids_recursive(
-            &|id| uow.get_frame(id),
-            &|id, field| uow.get_frame_relationship(id, field),
-            &get_table_cell_frames,
-            &root_frame_id,
-        )?
-    };
-
-    let blocks_opt = uow.get_block_multi(&all_block_ids)?;
-    let mut blocks: Vec<Block> = blocks_opt.into_iter().flatten().collect();
-    blocks.sort_by_key(|b| b.document_position);
+    // Resolve every block in the frame tree (blockquote sub-frames, table
+    // cell frames and footnote definitions included) and remember each
+    // block's owning frame, so a paste with the cursor inside a blockquote
+    // anchors the table to the blockquote frame, not the root frame.
+    let (blocks, block_to_frame) = document_blocks_with_frames(&**uow, &frame_ids)?;
 
     let insert_pos = dto.position;
 
     // The frame that receives the table anchor: the owning frame of the
-    // block at the cursor position (root frame when the document is empty).
-    let (frame_id, child_order_insert_idx) = if blocks.is_empty() {
-        (root_frame_id, 0usize)
+    // block at the cursor position (root frame when the document is empty),
+    // and the block the tables follow, in the frame and in the rope.
+    let (frame_id, child_order_insert_idx, target_block_id) = if blocks.is_empty() {
+        (root_frame_id, 0usize, None)
     } else {
         let (target_block, _, _) = find_block_at_position(&blocks, insert_pos, &uow.store())?;
         let owning_frame_id = block_to_frame
@@ -685,52 +929,29 @@ fn insert_table_fragment(
             .position(|&e| e > 0 && e as EntityId == target_block.id)
             .map(|i| i + 1)
             .unwrap_or(owning_frame.child_order.len());
-        (owning_frame_id, idx)
+        (owning_frame_id, idx, Some(target_block.id))
     };
 
     let mut total_blocks_added: i64 = 0;
     let mut total_chars_added: i64 = 0;
-    let mut current_child_idx = child_order_insert_idx;
     let mut current_pos = insert_pos;
 
-    // For the rope mirror at the end: per table, remember
-    //   (created_table_id, target_block_id, anchor_after,
-    //    cell_payload: Vec<Vec<(block_id, plain_text)>>)
-    // so we can replay the same shape into the rope after entity mutations.
-    type CellPayload = Vec<(EntityId, String)>;
-    type TableMirror = (EntityId, EntityId, bool, Vec<CellPayload>);
-    let mut table_mirror: Vec<TableMirror> = Vec::new();
+    // What the tables add to the rope, in the order the frame lists them:
+    // each table's anchor, then its cells' blocks in reading order. It goes
+    // into the rope in one piece after the entity mutations, right after the
+    // block the tables follow in the frame.
+    let mut rope_run: Vec<(OffsetMarker, String)> = Vec::new();
+    // The tables and frames created below, handed to the document in one write
+    // each at the end (see `attach_to_document`), and the anchors, spliced
+    // into the frame's `child_order` in one write too.
+    let mut new_tables: Vec<EntityId> = Vec::new();
+    let mut new_frames: Vec<EntityId> = Vec::new();
+    let mut new_anchor_entries: Vec<i64> = Vec::new();
 
     for frag_table in &fragment_data.tables {
         if frag_table.rows == 0 || frag_table.columns == 0 || frag_table.cells.is_empty() {
             continue;
         }
-
-        // Per-table rope-mirror info. We capture cell payloads as the
-        // entity mutations proceed so the rope replay below has the
-        // exact IDs to wire up.
-        let mut this_table_cells: Vec<CellPayload> = Vec::new();
-        // Determine the target block + anchor side for this table.
-        let (anchor_target, anchor_after) = if let Some(first) = blocks.first() {
-            // Find the block currently at `insert_pos` (or fall back to
-            // the first block) and decide before/after based on offset.
-            //
-            // `offset > 0` is the right test (rather than `offset >=
-            // text_length`): for an empty block at the cursor we want
-            // `after=false` so the anchor takes the empty block's
-            // position and the (shifted) block lands after it. Without
-            // this, `rope_insert_table_anchor` with `after=true` on a
-            // last-and-empty target produces an unsorted block_offsets
-            // vec, breaking range lookups.
-            match find_block_at_position(&blocks, insert_pos, &uow.store()) {
-                Ok((tb, _, offset)) => (tb.id, offset > 0),
-                Err(_) => (first.id, false),
-            }
-        } else {
-            // Empty-frame edge case: defer the rope mirror for this
-            // table (no rope target exists to anchor against).
-            (0, false)
-        };
 
         let table = Table {
             id: 0,
@@ -750,13 +971,19 @@ fn insert_table_fragment(
             fmt_width: frag_table.fmt_width,
             fmt_alignment: frag_table.fmt_alignment.clone(),
         };
-        let created_table = uow.create_table(&table, doc_id, -1)?;
+        let created_table = uow.create_orphan_table(&table)?;
+        new_tables.push(created_table.id);
+        rope_run.push((
+            OffsetMarker::TableAnchor(created_table.id),
+            TABLE_ANCHOR.to_string(),
+        ));
 
         let mut cell_blocks_to_update: Vec<Block> = Vec::new();
 
         for frag_cell in &frag_table.cells {
-            let (cell_frame_id, created_block) = create_cell_frame(uow, doc_id, now)?;
-            let mut this_cell_blocks: CellPayload = Vec::new();
+            let (cell_frame_id, created_block) = create_orphan_cell_frame(uow, now)?;
+            new_frames.push(cell_frame_id);
+            let mut this_cell_blocks: Vec<(EntityId, String)> = Vec::new();
 
             if !frag_cell.blocks.is_empty() {
                 let first_frag = &frag_cell.blocks[0];
@@ -801,7 +1028,12 @@ fn insert_table_fragment(
                 current_pos += 1;
                 total_blocks_added += 1;
             }
-            this_table_cells.push(this_cell_blocks);
+            order_cell_blocks(uow, cell_frame_id, &this_cell_blocks, now)?;
+            rope_run.extend(
+                this_cell_blocks
+                    .into_iter()
+                    .map(|(block_id, text)| (OffsetMarker::Block(block_id), text)),
+            );
 
             let cell = TableCell {
                 id: 0,
@@ -846,65 +1078,38 @@ fn insert_table_fragment(
             byte_range: (0, 0),
             footnote_label: None,
         };
-        let created_anchor = uow.create_frame(&anchor_frame, doc_id, -1)?;
+        let created_anchor = uow.create_orphan_frame(&anchor_frame)?;
+        new_frames.push(created_anchor.id);
+        new_anchor_entries.push(-(created_anchor.id as i64));
+    }
 
-        let parent_frame = uow
+    attach_to_document(uow, doc_id, &DocumentRelationshipField::Tables, &new_tables)?;
+    attach_to_document(uow, doc_id, &DocumentRelationshipField::Frames, &new_frames)?;
+    if !new_anchor_entries.is_empty() {
+        let mut updated_parent = uow
             .get_frame(&frame_id)?
             .ok_or_else(|| anyhow!("Parent frame not found"))?;
-        let mut updated_parent = parent_frame;
-        let idx = current_child_idx.min(updated_parent.child_order.len());
+        let idx = child_order_insert_idx.min(updated_parent.child_order.len());
         updated_parent
             .child_order
-            .insert(idx, -(created_anchor.id as i64));
+            .splice(idx..idx, new_anchor_entries.iter().copied());
         updated_parent.updated_at = now;
         uow.update_frame(&updated_parent)?;
-
-        current_child_idx += 1;
-
-        // Remember this table for the rope mirror at the end (only if
-        // we have a valid anchor target — empty-frame edge case skipped).
-        if anchor_target != 0 {
-            table_mirror.push((
-                created_table.id,
-                anchor_target,
-                anchor_after,
-                this_table_cells,
-            ));
-        }
     }
 
     // ── Rope mirror (insert_table_fragment) ──
-    // For each table created above, insert its anchor sentinel in the
-    // rope and place each cell's block(s) at the end of the containing
-    // top-level frame's range, splitting subsequent cell-internal
-    // blocks off the first cell block.
-    // No-op under default backend.
-    {
-        let store = uow.store();
-        for (table_id, target_block_id, after, cells) in &table_mirror {
-            rope_insert_table_anchor(&store, *table_id, *target_block_id, *after);
-            for cell_blocks in cells {
-                let mut iter = cell_blocks.iter();
-                if let Some((first_id, first_text)) = iter.next() {
-                    // First cell-block goes at top_level_frame_end_byte
-                    // of the table's parent frame. `frame_id` may be a
-                    // nested blockquote frame; the helper walks up
-                    // `parent_frame` to the top-level ancestor.
-                    let pos = top_level_frame_end_byte(&store, frame_id);
-                    rope_insert_block_at(&store, pos, *first_id, first_text);
-                    let mut prev_id = *first_id;
-                    let mut prev_byte_len = first_text.len() as u32;
-                    for (extra_id, extra_text) in iter {
-                        rope_split_block(&store, prev_id, prev_byte_len, *extra_id);
-                        if !extra_text.is_empty() {
-                            rope_insert_in_block(&store, *extra_id, 0, extra_text);
-                        }
-                        prev_id = *extra_id;
-                        prev_byte_len = extra_text.len() as u32;
-                    }
-                }
-            }
-        }
+    // The tables follow the target block in the frame, so they follow it in
+    // the rope: each anchor, then that table's cells, in reading order. The
+    // cells used to go to the end of the enclosing top-level frame, which is
+    // where they belong only when the table is the last thing in it: pasted
+    // anywhere else, the cells and everything after them were out of flow
+    // order, and every position past the paste was wrong.
+    if let Some(target_block_id) = target_block_id {
+        let run: Vec<(OffsetMarker, &str)> = rope_run
+            .iter()
+            .map(|(marker, text)| (*marker, text.as_str()))
+            .collect();
+        rope_insert_run_after(&uow.store(), OffsetMarker::Block(target_block_id), &run);
     }
 
     let pos_shift = current_pos - insert_pos;
@@ -983,46 +1188,14 @@ fn build_tail_state(
     }
 }
 
-/// Hand the blocks `insert_mixed_fragment` created since its last flush to
-/// their frame, appended as creating each with `create_block(.., frame_id, -1)`
-/// would have, and to the rope at `next_rope_byte`, which then moves past them,
-/// as inserting each with `rope_insert_block_at` would have. With no rope
-/// position (the head block is not in the rope) the rope is left alone, as
-/// before. Empties `pending`.
-fn flush_pending_blocks(
-    uow: &mut Box<dyn InsertFragmentUnitOfWorkTrait>,
-    frame_id: EntityId,
-    next_rope_byte: &mut Option<u32>,
-    pending: &mut Vec<(EntityId, String)>,
-) -> Result<()> {
-    if pending.is_empty() {
-        return Ok(());
-    }
-    let block_ids: Vec<EntityId> = pending.iter().map(|(id, _)| *id).collect();
-    attach_blocks_at(uow, frame_id, usize::MAX, &block_ids)?;
-    if let Some(byte) = next_rope_byte.as_mut() {
-        let run: Vec<(EntityId, &str)> = pending
-            .iter()
-            .map(|(id, text)| (*id, text.as_str()))
-            .collect();
-        *byte = rope_insert_blocks_at(&uow.store(), *byte, &run);
-    }
-    pending.clear();
-    Ok(())
-}
-
 /// Insert a mixed fragment (both blocks and tables) at the cursor position.
 ///
 /// Handles a paste containing BOTH blocks and tables interleaved (e.g.
 /// copying a section that contains prose AND a table). Updates both the
 /// entity tree and the global rope: the head block is replaced in place,
 /// then each subsequent block and each table (a 1-char anchor sentinel
-/// plus its cell content) is mirrored into the rope in document order —
-/// see the "Rope mirror" sections below. Table anchors are placed
-/// relative to the last inserted block via `rope_insert_table_anchor`
-/// (with an `after` flag that handles the still-empty-head case), and
-/// cell blocks at the parent frame's `top_level_frame_end_byte`, so no
-/// "insert after a table anchor" primitive is required.
+/// followed by its cells' blocks) is mirrored into the rope right after
+/// the head, in the order the frame lists them, as one run.
 fn insert_mixed_fragment(
     uow: &mut Box<dyn InsertFragmentUnitOfWorkTrait>,
     dto: &InsertFragmentDto,
@@ -1053,28 +1226,7 @@ fn insert_mixed_fragment(
         .first()
         .ok_or_else(|| anyhow!("Document has no frames"))?;
 
-    let mut block_to_frame: HashMap<EntityId, EntityId> = HashMap::new();
-    collect_all_blocks_with_frame(&**uow, &root_frame_id, &mut block_to_frame)?;
-
-    let all_block_ids: Vec<EntityId> = {
-        let get_table_cell_frames = |table_id: &EntityId| -> Result<Vec<EntityId>> {
-            let cell_ids = uow.get_table_relationship(table_id, &TableRelationshipField::Cells)?;
-            let cells = uow.get_table_cell_multi(&cell_ids)?;
-            let mut sorted: Vec<_> = cells.into_iter().flatten().collect();
-            sorted.sort_by(|a, b| a.row.cmp(&b.row).then(a.column.cmp(&b.column)));
-            Ok(sorted.into_iter().filter_map(|c| c.cell_frame).collect())
-        };
-        collect_block_ids_recursive(
-            &|id| uow.get_frame(id),
-            &|id, field| uow.get_frame_relationship(id, field),
-            &get_table_cell_frames,
-            &root_frame_id,
-        )?
-    };
-
-    let blocks_opt = uow.get_block_multi(&all_block_ids)?;
-    let mut blocks: Vec<Block> = blocks_opt.into_iter().flatten().collect();
-    blocks.sort_by_key(|b| b.document_position);
+    let (blocks, block_to_frame) = document_blocks_with_frames(&**uow, &frame_ids)?;
 
     let (current_block, block_idx, offset) =
         find_block_at_position(&blocks, dto.position, &uow.store())?;
@@ -1086,6 +1238,8 @@ fn insert_mixed_fragment(
     let frame = uow
         .get_frame(&frame_id)?
         .ok_or_else(|| anyhow!("Frame not found"))?;
+    let (child_order_insert_pos, blocks_insert_pos) =
+        insertion_indices_after(&**uow, &frame, current_block.id)?;
 
     let store = uow.store();
     let current_inline = read_block_inline(&store, current_block.id);
@@ -1204,26 +1358,21 @@ fn insert_mixed_fragment(
     write_block_state(uow, current_block.id, head_inline);
 
     // ── Rope mirror: head ──
-    // Push the new head content into the rope so subsequent block /
-    // table inserts can be placed at a known cursor byte. `last_block_id`
-    // tracks the most recent block to use as a target for table-anchor
-    // insertion (`after = true`).
+    // The head's new content goes into the rope now; everything the paste
+    // adds after it goes in as one run at the end (see `rope_run`).
     let store = uow.store();
-    let head_rope_start = store
+    if store
         .block_offsets
         .read()
         .range_of_block(current_block.id)
-        .map(|(s, _)| s);
-    let mut next_rope_byte_opt = head_rope_start.map(|s| {
+        .is_some()
+    {
         common::database::rope_helpers::rope_replace_block_content(
             &store,
             current_block.id,
             &head_plain,
         );
-        s + head_plain.len() as u32
-    });
-    let mut last_block_id: EntityId = current_block.id;
-    let mut last_block_has_content = !head_plain.is_empty();
+    }
 
     let mut running_position =
         current_block.document_position + block_char_length(&updated_current, &store) + 1;
@@ -1255,11 +1404,25 @@ fn insert_mixed_fragment(
         );
     }
 
-    // Blocks created since the last table, not yet in the frame's `blocks`
-    // nor in the rope: both receive the whole run in one write when a table
-    // needs them (its rope placement reads the frame's blocks and the rope)
-    // and after the tail. See `attach_blocks_at` and `rope_insert_blocks_at`.
-    let mut pending: Vec<(EntityId, String)> = Vec::new();
+    // What the paste adds after the head, in the order the frame lists it:
+    // its paragraphs, each table's anchor followed by the table's cells in
+    // reading order, and the tail. It goes into the rope in one piece at the
+    // end, right after the head (see `rope_insert_run_after`). The frame's
+    // block list receives the new blocks in one write as well (see
+    // `attach_blocks_at`).
+    //
+    // The cells used to go to the end of the enclosing top-level frame, and
+    // every paragraph after a table after them: where they belong only when
+    // the table closes the frame. A paste in the middle of a document left
+    // the table's cells and everything after them out of flow order, and
+    // finding that end walked the whole frame for every cell, which made
+    // restoring a text of many small tables quadratic in them.
+    let mut rope_run: Vec<(OffsetMarker, String)> = Vec::new();
+    let mut new_frame_blocks: Vec<EntityId> = Vec::new();
+    // The tables and frames created below, handed to the document in one write
+    // each at the end (see `attach_to_document`).
+    let mut new_tables: Vec<EntityId> = Vec::new();
+    let mut new_frames: Vec<EntityId> = Vec::new();
 
     for item in &items {
         match item {
@@ -1330,11 +1493,11 @@ fn insert_mixed_fragment(
                 write_block_state(uow, created_block.id, inline_runs);
 
                 // ── Rope mirror: middle block ── (written with the run)
-                pending.push((created_block.id, frag_block.plain_text.clone()));
-                if next_rope_byte_opt.is_some() {
-                    last_block_id = created_block.id;
-                    last_block_has_content = !frag_block.plain_text.is_empty();
-                }
+                rope_run.push((
+                    OffsetMarker::Block(created_block.id),
+                    frag_block.plain_text.clone(),
+                ));
+                new_frame_blocks.push(created_block.id);
 
                 new_child_order_entries.push(created_block.id as i64);
                 total_new_chars += block_text_len;
@@ -1345,7 +1508,6 @@ fn insert_mixed_fragment(
                 if frag_table.rows == 0 || frag_table.columns == 0 || frag_table.cells.is_empty() {
                     continue;
                 }
-                flush_pending_blocks(uow, frame_id, &mut next_rope_byte_opt, &mut pending)?;
 
                 let table = Table {
                     id: 0,
@@ -1365,15 +1527,18 @@ fn insert_mixed_fragment(
                     fmt_width: frag_table.fmt_width,
                     fmt_alignment: frag_table.fmt_alignment.clone(),
                 };
-                let created_table = uow.create_table(&table, doc_id, -1)?;
+                let created_table = uow.create_orphan_table(&table)?;
+                new_tables.push(created_table.id);
+                rope_run.push((
+                    OffsetMarker::TableAnchor(created_table.id),
+                    TABLE_ANCHOR.to_string(),
+                ));
 
                 let mut cell_blocks_to_update: Vec<Block> = Vec::new();
-                // (block_id, content) tuples in cell order, for the
-                // rope mirror below.
-                let mut this_table_cell_blocks: Vec<Vec<(EntityId, String)>> = Vec::new();
 
                 for frag_cell in &frag_table.cells {
-                    let (cell_frame_id, created_block) = create_cell_frame(uow, doc_id, now)?;
+                    let (cell_frame_id, created_block) = create_orphan_cell_frame(uow, now)?;
+                    new_frames.push(cell_frame_id);
                     let mut this_cell_blocks: Vec<(EntityId, String)> = Vec::new();
 
                     if !frag_cell.blocks.is_empty() {
@@ -1437,7 +1602,12 @@ fn insert_mixed_fragment(
                         fmt_background_color: frag_cell.fmt_background_color.clone(),
                     };
                     uow.create_table_cell(&cell, created_table.id, -1)?;
-                    this_table_cell_blocks.push(this_cell_blocks);
+                    order_cell_blocks(uow, cell_frame_id, &this_cell_blocks, now)?;
+                    rope_run.extend(
+                        this_cell_blocks
+                            .into_iter()
+                            .map(|(block_id, text)| (OffsetMarker::Block(block_id), text)),
+                    );
                 }
 
                 if !cell_blocks_to_update.is_empty() {
@@ -1466,83 +1636,9 @@ fn insert_mixed_fragment(
                     byte_range: (0, 0),
                     footnote_label: None,
                 };
-                let created_anchor = uow.create_frame(&anchor_frame, doc_id, -1)?;
+                let created_anchor = uow.create_orphan_frame(&anchor_frame)?;
+                new_frames.push(created_anchor.id);
                 new_child_order_entries.push(-(created_anchor.id as i64));
-
-                // Splice the anchor into the parent frame's child_order
-                // NOW (rather than after the items loop) so the per-cell
-                // `top_level_frame_end_byte` walks include the
-                // TableAnchor's bytes — otherwise it returns the byte
-                // position BEFORE the sentinel and cells end up spliced
-                // in front of the anchor, corrupting their content
-                // ranges. The post-loop update below is then idempotent
-                // for entries we already added here.
-                {
-                    let parent = uow
-                        .get_frame(&frame_id)?
-                        .ok_or_else(|| anyhow!("Parent frame not found"))?;
-                    let neg_anchor = -(created_anchor.id as i64);
-                    if !parent.child_order.contains(&neg_anchor) {
-                        let mut updated_parent = parent;
-                        updated_parent.child_order.push(neg_anchor);
-                        updated_parent.updated_at = now;
-                        uow.update_frame(&updated_parent)?;
-                    }
-                }
-
-                // ── Rope mirror: table anchor + cells ──
-                // Insert anchor sentinel relative to `last_block_id`
-                // (after=true except when the head block is still
-                // empty — same fix as the empty-target case in
-                // `insert_table_fragment`). Cells go at
-                // `top_level_frame_end_byte` for the parent frame, in
-                // the same per-cell shape as `insert_table_fragment`.
-                if next_rope_byte_opt.is_some() {
-                    let after = last_block_id != current_block.id || last_block_has_content;
-                    common::database::rope_helpers::rope_insert_table_anchor(
-                        &store,
-                        created_table.id,
-                        last_block_id,
-                        after,
-                    );
-                    for cell_blocks in &this_table_cell_blocks {
-                        let mut iter = cell_blocks.iter();
-                        if let Some((first_id, first_text)) = iter.next() {
-                            let pos = common::database::rope_helpers::top_level_frame_end_byte(
-                                &store, frame_id,
-                            );
-                            common::database::rope_helpers::rope_insert_block_at(
-                                &store, pos, *first_id, first_text,
-                            );
-                            let mut prev_id = *first_id;
-                            let mut prev_byte_len = first_text.len() as u32;
-                            for (extra_id, extra_text) in iter {
-                                common::database::rope_helpers::rope_split_block(
-                                    &store,
-                                    prev_id,
-                                    prev_byte_len,
-                                    *extra_id,
-                                );
-                                if !extra_text.is_empty() {
-                                    common::database::rope_helpers::rope_insert_in_block(
-                                        &store, *extra_id, 0, extra_text,
-                                    );
-                                }
-                                prev_id = *extra_id;
-                                prev_byte_len = extra_text.len() as u32;
-                            }
-                        }
-                    }
-                    // The anchor + cells together extend to
-                    // `top_level_frame_end_byte` of the parent frame.
-                    // Cursor advances past them so the next block
-                    // (or tail) lands AFTER all table-related bytes.
-                    if let Some(next_rope_byte) = next_rope_byte_opt.as_mut() {
-                        *next_rope_byte = common::database::rope_helpers::top_level_frame_end_byte(
-                            &store, frame_id,
-                        );
-                    }
-                }
             }
         }
     }
@@ -1678,7 +1774,8 @@ fn insert_mixed_fragment(
         write_block_state(uow, created_tail.id, tail_inline);
 
         // ── Rope mirror: tail block ── (written with the run)
-        pending.push((created_tail.id, tail_plain.clone()));
+        rope_run.push((OffsetMarker::Block(created_tail.id), tail_plain.clone()));
+        new_frame_blocks.push(created_tail.id);
 
         new_child_order_entries.push(created_tail.id as i64);
         total_blocks_added += 1;
@@ -1686,11 +1783,19 @@ fn insert_mixed_fragment(
     if last_frag.is_some() {
         total_new_chars += last_chars;
     }
-    flush_pending_blocks(uow, frame_id, &mut next_rope_byte_opt, &mut pending)?;
+    attach_blocks_at(uow, frame_id, blocks_insert_pos, &new_frame_blocks)?;
     attach_lists(uow, doc_id, &new_list_ids)?;
+    attach_to_document(uow, doc_id, &DocumentRelationshipField::Tables, &new_tables)?;
+    attach_to_document(uow, doc_id, &DocumentRelationshipField::Frames, &new_frames)?;
+    {
+        let run: Vec<(OffsetMarker, &str)> = rope_run
+            .iter()
+            .map(|(marker, text)| (*marker, text.as_str()))
+            .collect();
+        rope_insert_run_after(&store, OffsetMarker::Block(current_block.id), &run);
+    }
 
     let mut updated_frame = frame.clone();
-    let child_order_insert_pos = (block_idx + 1).min(updated_frame.child_order.len());
     updated_frame.child_order.splice(
         child_order_insert_pos..child_order_insert_pos,
         new_child_order_entries.iter().copied(),
@@ -1757,22 +1862,13 @@ fn execute_insert_fragment(
         ));
     }
 
-    let fragment_data: FragmentData = serde_json::from_str(&dto.fragment_data)
+    let mut fragment_data: FragmentData = serde_json::from_str(&dto.fragment_data)
         .map_err(|e| anyhow!("Invalid fragment_data JSON: {}", e))?;
 
     if fragment_data.blocks.is_empty() && fragment_data.tables.is_empty() {
         return Err(anyhow!("Fragment contains no blocks or tables"));
     }
 
-    if !fragment_data.tables.is_empty() && fragment_data.blocks.is_empty() {
-        return insert_table_fragment(uow, dto, &fragment_data);
-    }
-
-    if !fragment_data.tables.is_empty() && !fragment_data.blocks.is_empty() {
-        return insert_mixed_fragment(uow, dto, &fragment_data);
-    }
-
-    // ── Block-only fragment ──
     let root = uow
         .get_root(&ROOT_ENTITY_ID)?
         .ok_or_else(|| anyhow!("Root entity not found"))?;
@@ -1781,11 +1877,50 @@ fn execute_insert_fragment(
         .first()
         .ok_or_else(|| anyhow!("Root has no document"))?;
 
+    if !fragment_data.tables.is_empty() {
+        // A paste holding tables with the caret in a table cell either fills
+        // the cells from the caret's on, when it is a table alone that fits,
+        // or goes in as paragraphs: never as a table nested in the cell.
+        match caret_in_table(&**uow, doc_id, dto.position)? {
+            Some(caret) if caret.inside_table => {
+                if let Some(result) =
+                    try_replace_table_cells(uow, dto, &fragment_data, doc_id, &caret)?
+                {
+                    return Ok(result);
+                }
+                fragment_data = tables_as_paragraphs(&fragment_data);
+            }
+            // A footnote's body holds paragraphs: the Djot reader keeps
+            // nothing else of a definition, so a table pasted into a body was
+            // in the saved text and gone after the next load. It goes in as
+            // paragraphs, as it does in a table cell.
+            Some(caret) if caret.in_note => {
+                fragment_data = tables_as_paragraphs(&fragment_data);
+            }
+            _ if fragment_data.blocks.is_empty() => {
+                return insert_table_fragment(uow, dto, &fragment_data);
+            }
+            _ => return insert_mixed_fragment(uow, dto, &fragment_data),
+        }
+    }
+
+    // ── Block-only fragment ──
     let document = uow
         .get_document(&doc_id)?
         .ok_or_else(|| anyhow!("Document not found"))?;
 
     let snapshot = uow.snapshot_document(&[doc_id])?;
+
+    if fragment_data.blocks.is_empty() {
+        // Tables of empty cells, laid out as paragraphs: nothing to insert.
+        return Ok((
+            InsertFragmentResultDto {
+                new_position: dto.position,
+                blocks_added: 0,
+            },
+            snapshot,
+        ));
+    }
 
     if dto.position != dto.anchor {
         return Err(anyhow!(
@@ -1798,28 +1933,7 @@ fn execute_insert_fragment(
         .first()
         .ok_or_else(|| anyhow!("Document has no frames"))?;
 
-    let mut block_to_frame: HashMap<EntityId, EntityId> = HashMap::new();
-    collect_all_blocks_with_frame(&**uow, &root_frame_id, &mut block_to_frame)?;
-
-    let all_block_ids: Vec<EntityId> = {
-        let get_table_cell_frames = |table_id: &EntityId| -> Result<Vec<EntityId>> {
-            let cell_ids = uow.get_table_relationship(table_id, &TableRelationshipField::Cells)?;
-            let cells = uow.get_table_cell_multi(&cell_ids)?;
-            let mut sorted: Vec<_> = cells.into_iter().flatten().collect();
-            sorted.sort_by(|a, b| a.row.cmp(&b.row).then(a.column.cmp(&b.column)));
-            Ok(sorted.into_iter().filter_map(|c| c.cell_frame).collect())
-        };
-        collect_block_ids_recursive(
-            &|id| uow.get_frame(id),
-            &|id, field| uow.get_frame_relationship(id, field),
-            &get_table_cell_frames,
-            &root_frame_id,
-        )?
-    };
-
-    let blocks_opt = uow.get_block_multi(&all_block_ids)?;
-    let mut blocks: Vec<Block> = blocks_opt.into_iter().flatten().collect();
-    blocks.sort_by_key(|b| b.document_position);
+    let (blocks, block_to_frame) = document_blocks_with_frames(&**uow, &frame_ids)?;
 
     let (current_block, block_idx, offset) =
         find_block_at_position(&blocks, dto.position, &uow.store())?;
@@ -1831,6 +1945,8 @@ fn execute_insert_fragment(
     let frame = uow
         .get_frame(&frame_id)?
         .ok_or_else(|| anyhow!("Frame not found"))?;
+    let (child_order_insert_pos, blocks_insert_pos) =
+        insertion_indices_after(&**uow, &frame, current_block.id)?;
 
     let store = uow.store();
 
@@ -1955,9 +2071,14 @@ fn execute_insert_fragment(
         updated_doc.updated_at = now;
         uow.update_document(&updated_doc)?;
 
+        // After the pasted text, where it went: counted from the block that
+        // received it, not from the caller's position. The two differ when
+        // the caret stood on a table's anchor, which the text goes past into
+        // the first cell: a caret left on the anchor put the next paste in
+        // front of this one.
         return Ok((
             InsertFragmentResultDto {
-                new_position: dto.position + inserted_len,
+                new_position: current_block.document_position + offset + inserted_len,
                 blocks_added: 0,
             },
             snapshot,
@@ -2282,11 +2403,10 @@ fn execute_insert_fragment(
         // The middle blocks, then the tail, right after the current block.
         let mut inserted_ids = new_block_ids.clone();
         inserted_ids.extend(created_tail_id);
-        attach_blocks_at(uow, frame_id, block_idx + 1, &inserted_ids)?;
+        attach_blocks_at(uow, frame_id, blocks_insert_pos, &inserted_ids)?;
         attach_lists(uow, doc_id, &new_list_ids)?;
 
         let mut updated_frame = frame.clone();
-        let child_order_insert_pos = (block_idx + 1).min(updated_frame.child_order.len());
         updated_frame.child_order.splice(
             child_order_insert_pos..child_order_insert_pos,
             inserted_ids.iter().map(|id| *id as i64),
@@ -2463,14 +2583,13 @@ fn execute_insert_fragment(
                 };
 
                 let created_tail =
-                    uow.create_block(&tail_block, frame_id, (block_idx + 1) as i32)?;
+                    uow.create_block(&tail_block, frame_id, blocks_insert_pos as i32)?;
                 tail_text_len = block_char_length(&created_tail, &store);
                 blocks_added = 1;
                 created_tail_id_overwrite = Some(created_tail.id);
                 write_block_state(uow, created_tail.id, right.clone());
 
                 let mut updated_frame = frame.clone();
-                let child_order_insert_pos = (block_idx + 1).min(updated_frame.child_order.len());
                 updated_frame
                     .child_order
                     .insert(child_order_insert_pos, created_tail.id as i64);
@@ -2592,7 +2711,7 @@ fn execute_insert_fragment(
                 fmt_language: frag_block.language.clone(),
             };
 
-            let created_block = uow.create_block(&new_block, frame_id, (block_idx + 1) as i32)?;
+            let created_block = uow.create_block(&new_block, frame_id, blocks_insert_pos as i32)?;
             write_block_state(uow, created_block.id, inline_block_runs);
 
             running_position += block_text_len + 1;
@@ -2627,11 +2746,11 @@ fn execute_insert_fragment(
                 fmt_language: current_block.fmt_language.clone(),
             };
 
-            let created_tail = uow.create_block(&tail_block, frame_id, (block_idx + 2) as i32)?;
+            let created_tail =
+                uow.create_block(&tail_block, frame_id, (blocks_insert_pos + 1) as i32)?;
             write_block_state(uow, created_tail.id, right.clone());
 
             let mut updated_frame = frame.clone();
-            let child_order_insert_pos = (block_idx + 1).min(updated_frame.child_order.len());
             let new_child_ids = [created_block.id as i64, created_tail.id as i64];
             for (i, id) in new_child_ids.iter().enumerate() {
                 updated_frame

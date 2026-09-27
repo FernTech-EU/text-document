@@ -178,6 +178,15 @@ impl<'a> BlockTable for BlockHashMapTable<'a> {
                 images.remove(id);
             }
         }
+        // And its footnote references: kept past the block, they were still
+        // counted by every reader walking the map, which numbered notes and
+        // reported reference positions for text that no longer existed.
+        {
+            let mut notes = self.store.block_footnote_refs.write();
+            for id in ids {
+                notes.remove(id);
+            }
+        }
 
         Ok(())
     }

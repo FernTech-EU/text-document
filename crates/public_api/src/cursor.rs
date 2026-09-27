@@ -61,6 +61,133 @@ fn max_cursor_position_of(inner: &TextDocumentInner) -> Option<usize> {
     })
 }
 
+/// Delete `[pos, anchor)` (either order) and say how many positions went: the
+/// document's length before the deletion less its length after.
+///
+/// That is not always the selection's length. Backspace or Delete across the
+/// boundary of a table joins nothing and removes nothing, and a range across
+/// cells empties the cells it touches rather than taking out the positions
+/// between its ends. Reporting the selection's length for those moved every
+/// other cursor on the document back by characters that were still there, and
+/// told listeners about a change that never happened.
+fn measured_delete(
+    inner: &TextDocumentInner,
+    pos: usize,
+    anchor: usize,
+) -> Result<(frontend::document_editing::DeleteTextResultDto, usize)> {
+    let before = max_cursor_position_of(inner);
+    let dto = frontend::document_editing::DeleteTextDto {
+        position: to_i64(pos),
+        anchor: to_i64(anchor),
+    };
+    let result =
+        match document_editing_commands::delete_text(&inner.ctx, Some(inner.stack_id), &dto) {
+            Ok(result) => result,
+            // Refused because it would remove nothing, so that no undo entry
+            // records it: an edit that removed nothing, the caret where the use
+            // case put it.
+            Err(error) => match error.downcast_ref::<frontend::document_editing::NothingToDelete>()
+            {
+                Some(nothing) => {
+                    return Ok((
+                        frontend::document_editing::DeleteTextResultDto {
+                            new_position: nothing.new_position,
+                            deleted_text: String::new(),
+                        },
+                        0,
+                    ));
+                }
+                None => return Err(error.into()),
+            },
+        };
+    let removed = match (before, max_cursor_position_of(inner)) {
+        (Some(before), Some(after)) => before.saturating_sub(after),
+        // The counts could not be read: the selection's length, as before.
+        _ => pos.max(anchor) - pos.min(anchor),
+    };
+    Ok((result, removed))
+}
+
+/// Delete `[pos, anchor)` (either order), then run `insert` where the
+/// deletion left the caret, as one undo entry. Returns what `insert` returned,
+/// how many positions the deletion took (see [`measured_delete`]) and where
+/// the deletion left the caret, which is not always where the range started:
+/// a range that empties a table cell takes the cell's text from its start and
+/// leaves the caret there.
+///
+/// When either half fails, the composite is cancelled, which undoes the half
+/// that ran, and the error is returned with the document as it was. The
+/// composite used to be left open on an error: every later edit of the
+/// document joined it and none reached the undo stack, while the deletion
+/// stayed applied behind a cached text that still showed the selection.
+fn delete_then<R>(
+    inner: &TextDocumentInner,
+    pos: usize,
+    anchor: usize,
+    insert: impl FnOnce(usize) -> Result<R>,
+) -> Result<(R, usize, usize)> {
+    undo_redo_commands::begin_composite(&inner.ctx, Some(inner.stack_id));
+    let outcome = measured_delete(inner, pos, anchor).and_then(|(deleted, removed)| {
+        let at = to_usize(deleted.new_position);
+        insert(at).map(|value| (value, removed, at))
+    });
+    match outcome {
+        Ok(done) => {
+            undo_redo_commands::end_composite(&inner.ctx);
+            Ok(done)
+        }
+        Err(error) => {
+            undo_redo_commands::cancel_composite(&inner.ctx);
+            Err(error)
+        }
+    }
+}
+
+/// How many positions an edit took away when it put in `added` of them: the
+/// document's length before it (`before`) and `added`, less its length now.
+/// `selection`, the length of the range the edit replaced, when a length
+/// cannot be read.
+///
+/// The selection's length is what it takes only when nothing in the range is
+/// a table: a range that starts on a table's anchor starts in the first cell,
+/// a range across a table empties the cells it touches, and one that holds
+/// a whole table takes it, anchor and all.
+fn removed_since(
+    inner: &TextDocumentInner,
+    before: Option<usize>,
+    added: usize,
+    selection: usize,
+) -> usize {
+    match (before, max_cursor_position_of(inner)) {
+        (Some(before), Some(after)) => (before + added).saturating_sub(after),
+        _ => selection,
+    }
+}
+
+/// What an insertion did to the document's positions: from `at`, `removed`
+/// of them replaced by `added`. Only a paste into a table's cells replaces
+/// anything; every other insertion only adds.
+#[derive(Debug, Clone, Copy)]
+struct Insertion {
+    at: usize,
+    removed: usize,
+    added: usize,
+}
+
+impl Insertion {
+    /// `added` positions put in right before `new_pos`, where the caret was
+    /// left. Where they went in is where the use case resolved the caret,
+    /// which is not always where it was asked to: a caret on a table's
+    /// anchor types in the table's first cell.
+    fn ending_at(new_pos: usize, added: usize) -> Self {
+        Insertion {
+            at: new_pos.saturating_sub(added),
+            removed: 0,
+            added,
+        }
+    }
+}
+
 /// A cursor into a [`TextDocument`](crate::TextDocument).
 ///
 /// Multiple cursors can coexist on the same document (like Qt's `QTextCursor`).
@@ -114,17 +241,28 @@ impl TextCursor {
         inner: &mut TextDocumentInner,
         edit_pos: usize,
         removed: usize,
+        inserted: Insertion,
         new_pos: usize,
         blocks_affected: usize,
     ) -> QueuedEvents {
-        self.finish_edit_ext(inner, edit_pos, removed, new_pos, blocks_affected, true)
+        self.finish_edit_ext(
+            inner,
+            edit_pos,
+            removed,
+            inserted,
+            new_pos,
+            blocks_affected,
+            true,
+        )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn finish_edit_ext(
         &self,
         inner: &mut TextDocumentInner,
         edit_pos: usize,
         removed: usize,
+        inserted: Insertion,
         new_pos: usize,
         blocks_affected: usize,
         flow_may_change: bool,
@@ -133,6 +271,7 @@ impl TextCursor {
             inner,
             edit_pos,
             removed,
+            inserted,
             new_pos,
             blocks_affected,
             flow_may_change,
@@ -148,12 +287,21 @@ impl TextCursor {
     /// through each method's own idea of what it did — which is what keeps
     /// `TextInserted` and `ContentsChanged` describing the same edit instead of
     /// two edits that happen to coincide.
+    ///
+    /// `removed` positions went from `edit_pos` on, then `inserted` changed
+    /// the document, and this cursor goes to `new_pos`. What was added does
+    /// not always start at `edit_pos` (a deletion that empties a table cell
+    /// puts the caret at the cell's start, see [`delete_then`]), and the caret
+    /// does not always follow it (a pasted table leaves the caret in front of
+    /// it): counting what was added from `edit_pos` to the caret moved every
+    /// other cursor by the difference.
     #[allow(clippy::too_many_arguments)]
     fn finish_edit_from(
         &self,
         inner: &mut TextDocumentInner,
         edit_pos: usize,
         removed: usize,
+        inserted: Insertion,
         new_pos: usize,
         blocks_affected: usize,
         flow_may_change: bool,
@@ -165,8 +313,23 @@ impl TextCursor {
         // is no longer valid — fuzz finds this). Treat the edit as adding
         // 0 chars rather than overflowing; the cursor still moves to
         // `new_pos` below.
-        let added = new_pos.saturating_sub(edit_pos);
-        inner.adjust_cursors(edit_pos, removed, added);
+        let Insertion {
+            at: inserted_at,
+            removed: replaced,
+            added,
+        } = inserted;
+        if inserted_at > edit_pos || replaced > 0 {
+            // The text went in past where the deletion was (a table pasted
+            // into a paragraph goes in after it), or it replaced text of its
+            // own (a table pasted into cells): the cursors between stay in
+            // front of it.
+            inner.adjust_cursors(edit_pos, removed, 0);
+            inner.adjust_cursors(inserted_at, replaced, added);
+        } else {
+            inner.adjust_cursors(inserted_at, removed, added);
+        }
+        let removed = removed + replaced;
+        let edit_pos = edit_pos.min(inserted_at);
         {
             let mut d = self.data.lock();
             d.position = new_pos;
@@ -186,7 +349,7 @@ impl TextCursor {
         // would put a channel's name on text that never arrived.
         if added > 0 {
             inner.queue_event(DocumentEvent::TextInserted {
-                position: edit_pos,
+                position: inserted_at,
                 chars_inserted: added,
                 origin,
             });
@@ -583,52 +746,44 @@ impl TextCursor {
 
         let queued = {
             let mut inner = self.doc.lock();
+            let edit_pos = pos.min(anchor);
+            let before = max_cursor_position_of(&inner);
             let result = match document_editing_commands::insert_text(
                 &inner.ctx,
                 Some(inner.stack_id),
                 &dto,
             ) {
                 Ok(r) => r,
+                // Cross-block selection: compose delete + insert as a single
+                // undo unit.
                 Err(_) if pos != anchor => {
-                    // Cross-block selection: compose delete + insert as a single undo unit
-                    undo_redo_commands::begin_composite(&inner.ctx, Some(inner.stack_id));
-
-                    let del_dto = frontend::document_editing::DeleteTextDto {
-                        position: to_i64(pos),
-                        anchor: to_i64(anchor),
-                    };
-                    let del_result = document_editing_commands::delete_text(
-                        &inner.ctx,
-                        Some(inner.stack_id),
-                        &del_dto,
-                    )?;
-                    let del_pos = to_usize(del_result.new_position);
-
-                    let ins_dto = frontend::document_editing::InsertTextDto {
-                        format_policy: Default::default(),
-                        position: to_i64(del_pos),
-                        anchor: to_i64(del_pos),
-                        text: text.into(),
-                    };
-                    let ins_result = document_editing_commands::insert_text(
-                        &inner.ctx,
-                        Some(inner.stack_id),
-                        &ins_dto,
-                    )?;
-
-                    undo_redo_commands::end_composite(&inner.ctx);
-                    ins_result
+                    delete_then(&inner, pos, anchor, |at| {
+                        let ins_dto = frontend::document_editing::InsertTextDto {
+                            format_policy: Default::default(),
+                            position: to_i64(at),
+                            anchor: to_i64(at),
+                            text: text.into(),
+                        };
+                        Ok(document_editing_commands::insert_text(
+                            &inner.ctx,
+                            Some(inner.stack_id),
+                            &ins_dto,
+                        )?)
+                    })?
+                    .0
                 }
                 Err(e) => return Err(e.into()),
             };
 
-            let edit_pos = pos.min(anchor);
-            let removed = pos.max(anchor) - edit_pos;
+            let new_pos = to_usize(result.new_position);
+            let added = text.chars().count();
+            let removed = removed_since(&inner, before, added, pos.max(anchor) - edit_pos);
             self.finish_edit_from(
                 &mut inner,
                 edit_pos,
                 removed,
-                to_usize(result.new_position),
+                Insertion::ending_at(new_pos, added),
+                new_pos,
                 to_usize(result.blocks_affected),
                 false,
                 origin,
@@ -669,54 +824,45 @@ impl TextCursor {
 
         let queued = {
             let mut inner = self.doc.lock();
+            let edit_pos = pos.min(anchor);
+            let before = max_cursor_position_of(&inner);
             let result = match document_editing_commands::insert_text(
                 &inner.ctx,
                 Some(inner.stack_id),
                 &dto,
             ) {
                 Ok(r) => r,
+                // Cross-block selection: compose delete + insert as a single undo unit,
+                // same as insert_text. format_policy is dropped here — it has no
+                // single-block meaning across a boundary.
                 Err(_) if pos != anchor => {
-                    // Cross-block selection: compose delete + insert as a single undo unit,
-                    // same as insert_text. format_policy is dropped here — it has no
-                    // single-block meaning across a boundary.
-                    undo_redo_commands::begin_composite(&inner.ctx, Some(inner.stack_id));
-
-                    let del_dto = frontend::document_editing::DeleteTextDto {
-                        position: to_i64(pos),
-                        anchor: to_i64(anchor),
-                    };
-                    let del_result = document_editing_commands::delete_text(
-                        &inner.ctx,
-                        Some(inner.stack_id),
-                        &del_dto,
-                    )?;
-                    let del_pos = to_usize(del_result.new_position);
-
-                    let ins_dto = frontend::document_editing::InsertTextDto {
-                        format_policy: Default::default(),
-                        position: to_i64(del_pos),
-                        anchor: to_i64(del_pos),
-                        text: text.into(),
-                    };
-                    let ins_result = document_editing_commands::insert_text(
-                        &inner.ctx,
-                        Some(inner.stack_id),
-                        &ins_dto,
-                    )?;
-
-                    undo_redo_commands::end_composite(&inner.ctx);
-                    ins_result
+                    delete_then(&inner, pos, anchor, |at| {
+                        let ins_dto = frontend::document_editing::InsertTextDto {
+                            format_policy: Default::default(),
+                            position: to_i64(at),
+                            anchor: to_i64(at),
+                            text: text.into(),
+                        };
+                        Ok(document_editing_commands::insert_text(
+                            &inner.ctx,
+                            Some(inner.stack_id),
+                            &ins_dto,
+                        )?)
+                    })?
+                    .0
                 }
                 Err(e) => return Err(e.into()),
             };
 
-            let edit_pos = pos.min(anchor);
-            let removed = pos.max(anchor) - edit_pos;
+            let new_pos = to_usize(result.new_position);
+            let added = text.chars().count();
+            let removed = removed_since(&inner, before, added, pos.max(anchor) - edit_pos);
             self.finish_edit_ext(
                 &mut inner,
                 edit_pos,
                 removed,
-                to_usize(result.new_position),
+                Insertion::ending_at(new_pos, added),
+                new_pos,
                 to_usize(result.blocks_affected),
                 false,
             )
@@ -755,46 +901,37 @@ impl TextCursor {
 
         let queued = {
             let mut inner = self.doc.lock();
+            let edit_pos = pos.min(anchor);
+            let before = max_cursor_position_of(&inner);
             let result = match document_editing_commands::insert_formatted_text(
                 &inner.ctx,
                 Some(inner.stack_id),
                 &make_dto(pos, anchor),
             ) {
                 Ok(r) => r,
+                // Cross-block selection: compose delete + insert as a single undo unit
                 Err(_) if pos != anchor => {
-                    // Cross-block selection: compose delete + insert as a single undo unit
-                    undo_redo_commands::begin_composite(&inner.ctx, Some(inner.stack_id));
-
-                    let del_dto = frontend::document_editing::DeleteTextDto {
-                        position: to_i64(pos),
-                        anchor: to_i64(anchor),
-                    };
-                    let del_result = document_editing_commands::delete_text(
-                        &inner.ctx,
-                        Some(inner.stack_id),
-                        &del_dto,
-                    )?;
-                    let del_pos = to_usize(del_result.new_position);
-
-                    let ins_result = document_editing_commands::insert_formatted_text(
-                        &inner.ctx,
-                        Some(inner.stack_id),
-                        &make_dto(del_pos, del_pos),
-                    )?;
-
-                    undo_redo_commands::end_composite(&inner.ctx);
-                    ins_result
+                    delete_then(&inner, pos, anchor, |at| {
+                        Ok(document_editing_commands::insert_formatted_text(
+                            &inner.ctx,
+                            Some(inner.stack_id),
+                            &make_dto(at, at),
+                        )?)
+                    })?
+                    .0
                 }
                 Err(e) => return Err(e.into()),
             };
 
-            let edit_pos = pos.min(anchor);
-            let removed = pos.max(anchor) - edit_pos;
+            let new_pos = to_usize(result.new_position);
+            let added = text.chars().count();
+            let removed = removed_since(&inner, before, added, pos.max(anchor) - edit_pos);
             self.finish_edit_from(
                 &mut inner,
                 edit_pos,
                 removed,
-                to_usize(result.new_position),
+                Insertion::ending_at(new_pos, added),
+                new_pos,
                 1,
                 false,
                 origin,
@@ -810,43 +947,35 @@ impl TextCursor {
         let queued = {
             let mut inner = self.doc.lock();
 
-            let (insert_pos, removed) = if pos != anchor {
-                // Selection active: delete first, then split (Word convention)
-                undo_redo_commands::begin_composite(&inner.ctx, Some(inner.stack_id));
-                let del_dto = frontend::document_editing::DeleteTextDto {
-                    position: to_i64(pos),
-                    anchor: to_i64(anchor),
+            let split_at = |at: usize| -> Result<_> {
+                let dto = frontend::document_editing::InsertBlockDto {
+                    position: to_i64(at),
+                    anchor: to_i64(at),
                 };
-                let del_result = document_editing_commands::delete_text(
+                Ok(document_editing_commands::insert_block(
                     &inner.ctx,
                     Some(inner.stack_id),
-                    &del_dto,
-                )?;
-                (
-                    to_usize(del_result.new_position),
-                    pos.max(anchor) - pos.min(anchor),
-                )
+                    &dto,
+                )?)
+            };
+            let before = max_cursor_position_of(&inner);
+            let result = if pos != anchor {
+                // Selection active: delete first, then split (Word convention)
+                delete_then(&inner, pos, anchor, split_at)?.0
             } else {
-                (pos, 0)
+                split_at(pos)?
             };
-
-            let dto = frontend::document_editing::InsertBlockDto {
-                position: to_i64(insert_pos),
-                anchor: to_i64(insert_pos),
-            };
-            let result =
-                document_editing_commands::insert_block(&inner.ctx, Some(inner.stack_id), &dto)?;
-
-            if pos != anchor {
-                undo_redo_commands::end_composite(&inner.ctx);
-            }
 
             let edit_pos = pos.min(anchor);
+            let new_pos = to_usize(result.new_position);
+            // One position: the boundary between the two halves.
+            let removed = removed_since(&inner, before, 1, pos.max(anchor) - edit_pos);
             self.finish_edit(
                 &mut inner,
                 edit_pos,
                 removed,
-                to_usize(result.new_position),
+                Insertion::ending_at(new_pos, 1),
+                new_pos,
                 2,
             )
         };
@@ -932,43 +1061,69 @@ impl TextCursor {
         let queued = {
             let mut inner = self.doc.lock();
 
-            let (insert_pos, removed) = if pos != anchor {
-                undo_redo_commands::begin_composite(&inner.ctx, Some(inner.stack_id));
-                let del_dto = frontend::document_editing::DeleteTextDto {
-                    position: to_i64(pos),
-                    anchor: to_i64(anchor),
+            // Where the paste went in and what it added are measured, as a
+            // deletion's removal is: the caret after a paste does not always
+            // follow what it added. A table pasted into a paragraph goes in
+            // after the paragraph and leaves the caret in front of it, and the
+            // tail of a paragraph pasted into stays after the caret.
+            let paste_at = |at: usize| -> Result<_> {
+                let store = inner.ctx.db_context.get_store();
+                let rope_before = store.rope.read().clone();
+                let before = max_cursor_position_of(&inner);
+                let dto = frontend::document_editing::InsertFragmentDto {
+                    position: to_i64(at),
+                    anchor: to_i64(at),
+                    fragment_data: fragment.raw_data().into(),
                 };
-                let del_result = document_editing_commands::delete_text(
+                let result = document_editing_commands::insert_fragment(
                     &inner.ctx,
                     Some(inner.stack_id),
-                    &del_dto,
+                    &dto,
                 )?;
-                (
-                    to_usize(del_result.new_position),
-                    pos.max(anchor) - pos.min(anchor),
-                )
+                let inserted = if common::database::rope_helpers::rope_positions_match_flow(store) {
+                    let (start, old_end, new_end) = common::database::rope_helpers::changed_span(
+                        &rope_before,
+                        &store.rope.read(),
+                        at,
+                    );
+                    Insertion {
+                        at: start,
+                        removed: old_end - start,
+                        added: new_end - start,
+                    }
+                } else {
+                    // What the paste added, in all; up to the caret when the
+                    // lengths cannot be read, as before.
+                    let new_pos = to_usize(result.new_position);
+                    let added = before
+                        .zip(max_cursor_position_of(&inner))
+                        .map_or(new_pos.saturating_sub(at), |(before, after)| {
+                            after.saturating_sub(before)
+                        });
+                    Insertion {
+                        at,
+                        removed: 0,
+                        added,
+                    }
+                };
+                Ok((result, inserted))
+            };
+            let ((result, inserted), removed, deleted_from) = if pos != anchor {
+                delete_then(&inner, pos, anchor, paste_at)?
             } else {
-                (pos, 0)
+                (paste_at(pos)?, 0, pos)
             };
 
-            let dto = frontend::document_editing::InsertFragmentDto {
-                position: to_i64(insert_pos),
-                anchor: to_i64(insert_pos),
-                fragment_data: fragment.raw_data().into(),
-            };
-            let result =
-                document_editing_commands::insert_fragment(&inner.ctx, Some(inner.stack_id), &dto)?;
-
-            if pos != anchor {
-                undo_redo_commands::end_composite(&inner.ctx);
-            }
-
-            let edit_pos = pos.min(anchor);
+            // What the deletion took starts where it left the caret when that
+            // is before the range's start (see `delete_then`).
+            let edit_pos = pos.min(anchor).min(deleted_from);
+            let new_pos = to_usize(result.new_position);
             self.finish_edit_from(
                 &mut inner,
                 edit_pos,
                 removed,
-                to_usize(result.new_position),
+                inserted,
+                new_pos,
                 to_usize(result.blocks_added),
                 true,
                 origin,
@@ -1039,47 +1194,39 @@ impl TextCursor {
         let queued = {
             let mut inner = self.doc.lock();
 
-            let (insert_pos, removed) = if pos != anchor {
-                undo_redo_commands::begin_composite(&inner.ctx, Some(inner.stack_id));
-                let del_dto = frontend::document_editing::DeleteTextDto {
-                    position: to_i64(pos),
-                    anchor: to_i64(anchor),
+            let image_at = |at: usize| -> Result<_> {
+                let dto = frontend::document_editing::InsertImageDto {
+                    position: to_i64(at),
+                    anchor: to_i64(at),
+                    image_name: name.into(),
+                    alt: alt.into(),
+                    width: width as i64,
+                    height: height as i64,
+                    quality: 100,
                 };
-                let del_result = document_editing_commands::delete_text(
+                Ok(document_editing_commands::insert_image(
                     &inner.ctx,
                     Some(inner.stack_id),
-                    &del_dto,
-                )?;
-                (
-                    to_usize(del_result.new_position),
-                    pos.max(anchor) - pos.min(anchor),
-                )
+                    &dto,
+                )?)
+            };
+            let before = max_cursor_position_of(&inner);
+            let result = if pos != anchor {
+                delete_then(&inner, pos, anchor, image_at)?.0
             } else {
-                (pos, 0)
+                image_at(pos)?
             };
-
-            let dto = frontend::document_editing::InsertImageDto {
-                position: to_i64(insert_pos),
-                anchor: to_i64(insert_pos),
-                image_name: name.into(),
-                alt: alt.into(),
-                width: width as i64,
-                height: height as i64,
-                quality: 100,
-            };
-            let result =
-                document_editing_commands::insert_image(&inner.ctx, Some(inner.stack_id), &dto)?;
-
-            if pos != anchor {
-                undo_redo_commands::end_composite(&inner.ctx);
-            }
 
             let edit_pos = pos.min(anchor);
+            let new_pos = to_usize(result.new_position);
+            // One position: the image's `U+FFFC`.
+            let removed = removed_since(&inner, before, 1, pos.max(anchor) - edit_pos);
             self.finish_edit_ext(
                 &mut inner,
                 edit_pos,
                 removed,
-                to_usize(result.new_position),
+                Insertion::ending_at(new_pos, 1),
+                new_pos,
                 1,
                 false,
             )
@@ -2302,32 +2449,8 @@ impl TextCursor {
         }
         let queued = {
             let mut inner = self.doc.lock();
-            let dto = frontend::document_editing::DeleteTextDto {
-                position: to_i64(pos),
-                anchor: to_i64(anchor),
-            };
-            let result =
-                document_editing_commands::delete_text(&inner.ctx, Some(inner.stack_id), &dto)?;
-            let edit_pos = pos.min(anchor);
-            let removed = pos.max(anchor) - edit_pos;
-            let new_pos = to_usize(result.new_position);
-            inner.adjust_cursors(edit_pos, removed, 0);
-            {
-                let mut d = self.data.lock();
-                d.position = new_pos;
-                d.anchor = new_pos;
-            }
-            inner.modified = true;
-            inner.invalidate_text_cache();
-            inner.rehighlight_affected(edit_pos);
-            inner.queue_event(DocumentEvent::ContentsChanged {
-                position: edit_pos,
-                chars_removed: removed,
-                chars_added: 0,
-                blocks_affected: 1,
-            });
-            inner.check_block_count_changed();
-            inner.check_flow_changed();
+            let (result, removed) = measured_delete(&inner, pos, anchor)?;
+            self.finish_delete(&mut inner, pos.min(anchor), removed, result.new_position);
             // Return the deleted text alongside the queued events
             (result.deleted_text, self.queue_undo_redo_event(&mut inner))
         };
@@ -2394,11 +2517,17 @@ impl TextCursor {
                 document_editing_commands::insert_list(&inner.ctx, Some(inner.stack_id), &dto)?;
             let edit_pos = pos.min(anchor);
             let removed = pos.max(anchor) - edit_pos;
+            let new_pos = to_usize(result.new_position);
             self.finish_edit_ext(
                 &mut inner,
                 edit_pos,
                 removed,
-                to_usize(result.new_position),
+                Insertion {
+                    at: edit_pos,
+                    removed: 0,
+                    added: new_pos.saturating_sub(edit_pos),
+                },
+                new_pos,
                 1,
                 false,
             )
@@ -2769,21 +2898,39 @@ impl TextCursor {
     fn do_delete(&self, pos: usize, anchor: usize) -> Result<()> {
         let queued = {
             let mut inner = self.doc.lock();
-            let dto = frontend::document_editing::DeleteTextDto {
-                position: to_i64(pos),
-                anchor: to_i64(anchor),
-            };
-            let result =
-                document_editing_commands::delete_text(&inner.ctx, Some(inner.stack_id), &dto)?;
-            let edit_pos = pos.min(anchor);
-            let removed = pos.max(anchor) - edit_pos;
-            let new_pos = to_usize(result.new_position);
+            let (result, removed) = measured_delete(&inner, pos, anchor)?;
+            self.finish_delete(&mut inner, pos.min(anchor), removed, result.new_position);
+            self.queue_undo_redo_event(&mut inner)
+        };
+        crate::inner::dispatch_queued_events(queued);
+        Ok(())
+    }
+
+    /// What follows a deletion: this cursor to where the use case put the
+    /// caret, and, when anything went, the other cursors moved back by what
+    /// went and the change announced. A deletion that removed nothing (see
+    /// [`measured_delete`]) changed nothing to announce.
+    fn finish_delete(
+        &self,
+        inner: &mut TextDocumentInner,
+        edit_pos: usize,
+        removed: usize,
+        new_position: i64,
+    ) {
+        let new_pos = to_usize(new_position);
+        // A range that empties a table cell takes the cell's text from its
+        // start, which can lie before the range's: the caret goes there, and
+        // so does the start of what went.
+        let edit_pos = edit_pos.min(new_pos);
+        if removed > 0 {
             inner.adjust_cursors(edit_pos, removed, 0);
-            {
-                let mut d = self.data.lock();
-                d.position = new_pos;
-                d.anchor = new_pos;
-            }
+        }
+        {
+            let mut d = self.data.lock();
+            d.position = new_pos;
+            d.anchor = new_pos;
+        }
+        if removed > 0 {
             inner.modified = true;
             inner.invalidate_text_cache();
             inner.rehighlight_affected(edit_pos);
@@ -2793,12 +2940,9 @@ impl TextCursor {
                 chars_added: 0,
                 blocks_affected: 1,
             });
-            inner.check_block_count_changed();
-            inner.check_flow_changed();
-            self.queue_undo_redo_event(&mut inner)
-        };
-        crate::inner::dispatch_queued_events(queued);
-        Ok(())
+        }
+        inner.check_block_count_changed();
+        inner.check_flow_changed();
     }
 
     /// Resolve a MoveOperation to a concrete position.

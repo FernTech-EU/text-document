@@ -845,12 +845,19 @@ impl TextDocument {
         }
 
         // Block order, then byte order within a block — the order they are read.
+        // Where a block starts is read from the rope: the stored field lags it by
+        // whatever was typed since something last wrote it, which reported every
+        // reference after an edit at a position the reference was not at.
         let mut blocks: Vec<(i64, u64)> = store
             .blocks
             .read()
             .values()
             .map(|b| (b.document_position, b.id))
             .collect();
+        frontend::common::database::rope_helpers::refresh_positions_from_rope(
+            store,
+            blocks.iter_mut().map(|(position, id)| (*id, position)),
+        );
         blocks.sort_unstable();
 
         let mut out = Vec::new();

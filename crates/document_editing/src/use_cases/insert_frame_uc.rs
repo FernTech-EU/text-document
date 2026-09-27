@@ -4,9 +4,7 @@ use anyhow::{Result, anyhow};
 use common::database::CommandUnitOfWork;
 use common::database::block_offset_index::OffsetMarker;
 use common::database::rope_helpers::block_char_length;
-use common::database::rope_helpers::{
-    find_block_at_char_position, rope_append_empty_block, rope_insert_block_at,
-};
+use common::database::rope_helpers::{rope_append_empty_block, rope_insert_run_after};
 use common::direct_access::document::document_repository::DocumentRelationshipField;
 use common::direct_access::frame::frame_repository::FrameRelationshipField;
 use common::direct_access::root::root_repository::RootRelationshipField;
@@ -43,12 +41,12 @@ pub struct InsertFrameUseCase {
 
 /// Find which frame contains the given document position by walking
 /// frames -> blocks and checking document_position ranges.
-/// Returns the frame and the block index within it closest to position.
+/// Returns the frame and the id of its block closest to position.
 fn find_frame_at_position(
     uow: &dyn InsertFrameUnitOfWorkTrait,
     frame_ids: &[EntityId],
     position: i64,
-) -> Result<Option<(Frame, usize)>> {
+) -> Result<Option<(Frame, EntityId)>> {
     let store = uow.store();
     for frame_id in frame_ids {
         let frame = match uow.get_frame(frame_id)? {
@@ -79,7 +77,7 @@ fn find_frame_at_position(
                     }
                     block_idx = i;
                 }
-                return Ok(Some((frame, block_idx)));
+                return Ok(Some((frame, blocks[block_idx].id)));
             }
         }
     }
@@ -111,17 +109,23 @@ fn execute_insert_frame(
     // Determine the parent frame from the position
     let frame_ids = uow.get_document_relationship(&doc_id, &DocumentRelationshipField::Frames)?;
 
-    let (parent_frame_id, child_order_insert_idx) =
+    let (parent_frame_id, child_order_insert_idx, host_block) =
         match find_frame_at_position(&**uow, &frame_ids, dto.position)? {
-            Some((parent_frame, block_idx)) => {
+            Some((parent_frame, block_id)) => {
                 // Insert the new sub-frame into the parent's child_order
-                // after the block at block_idx
-                let insert_idx = (block_idx + 1).min(parent_frame.child_order.len());
-                (Some(parent_frame.id), insert_idx)
+                // right after that block. Its index among the frame's blocks
+                // alone put the sub-frame earlier whenever another sub-frame
+                // came before the block.
+                let insert_idx = parent_frame
+                    .child_order
+                    .iter()
+                    .position(|entry| *entry == block_id as i64)
+                    .map_or(parent_frame.child_order.len(), |i| i + 1);
+                (Some(parent_frame.id), insert_idx, Some(block_id))
             }
             None => {
                 // Position doesn't fall in any frame — append as top-level
-                (None, 0)
+                (None, 0, None)
             }
         };
 
@@ -210,26 +214,21 @@ fn execute_insert_frame(
     //   the fast path), fall back to `rope_append_empty_block` to at
     //   least register the new block in the index — that closes the
     //   gap going forward without trying to retrofit the past.
-    if let Some(_parent_id) = parent_frame_id {
+    //
+    // The block the new frame follows is the one it follows in the parent's
+    // `child_order`. It used to be looked up in the rope by position after the
+    // new block had been created, when the index no longer held every block,
+    // so the lookup always failed and every new sub-frame went to the end of
+    // the rope, whatever it followed in the frames.
+    if parent_frame_id.is_some() {
         let store = uow.store();
-        let inserted = {
-            let block_at_pos = find_block_at_char_position(&store, dto.position);
-            if let Some((current_block_id, _, _)) = block_at_pos {
-                let range = {
-                    let offsets = store.block_offsets.read();
-                    offsets.range_with_successor(OffsetMarker::Block(current_block_id))
-                };
-                if let Some((bs, be, has_successor)) = range {
-                    let content_end = if has_successor && be > bs { be - 1 } else { be };
-                    rope_insert_block_at(&store, content_end, created_block.id, "");
-                    true
-                } else {
-                    false
-                }
-            } else {
-                false
-            }
-        };
+        let inserted = host_block.is_some_and(|block_id| {
+            rope_insert_run_after(
+                &store,
+                OffsetMarker::Block(block_id),
+                &[(OffsetMarker::Block(created_block.id), "")],
+            )
+        });
         if !inserted {
             rope_append_empty_block(&store, created_block.id);
         }

@@ -5,3 +5,4 @@ mod units_of_work;
 pub(crate) mod use_cases;
 
 pub use dtos::*;
+pub use use_cases::delete_text_uc::NothingToDelete;

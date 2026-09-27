@@ -2,13 +2,16 @@ use crate::InsertTableDto;
 use crate::InsertTableResultDto;
 use anyhow::{Result, anyhow};
 use common::database::CommandUnitOfWork;
+use common::database::block_offset_index::OffsetMarker;
 use common::database::rope_helpers::{
-    block_char_length, rope_insert_block_at, rope_insert_table_anchor,
+    block_char_length, outermost_table_around, rope_insert_block_at, rope_insert_run_after_table,
+    rope_insert_table_anchor, table_block_ids,
 };
 use common::direct_access::document::document_repository::DocumentRelationshipField;
 use common::direct_access::frame::frame_repository::FrameRelationshipField;
 use common::direct_access::root::root_repository::RootRelationshipField;
 use common::entities::{Block, Document, Frame, Root, Table, TableCell};
+use common::parser_tools::TABLE_ANCHOR;
 use common::snapshot::EntityTreeSnapshot;
 use common::types::{EntityId, ROOT_ENTITY_ID};
 use common::undo_redo::UndoRedoCommand;
@@ -16,6 +19,7 @@ use std::any::Any;
 
 use super::editing_helpers::{
     CellFrameCreator, create_cell_frame, find_block_at_position, impl_cell_frame_creator,
+    position_roots,
 };
 
 pub trait InsertTableUnitOfWorkFactoryTrait: Send + Sync {
@@ -43,6 +47,52 @@ pub trait InsertTableUnitOfWorkFactoryTrait: Send + Sync {
 pub trait InsertTableUnitOfWorkTrait: CommandUnitOfWork {}
 
 impl_cell_frame_creator!(dyn InsertTableUnitOfWorkTrait);
+
+/// Where the new table's anchor goes in the rope.
+enum RopePlacement {
+    /// Next to a block of the frame the table joins: after it, or before it
+    /// when the caret stands at its start.
+    NextTo(EntityId, bool),
+    /// After everything the given table holds: the new table was hoisted out
+    /// of one of its cells.
+    AfterTable(EntityId),
+}
+
+/// Whether `block_id` is in a footnote's body, at any depth of the frames the
+/// body nests (a quotation pasted into it).
+fn in_a_note_body(
+    uow: &dyn InsertTableUnitOfWorkTrait,
+    frame_ids: &[EntityId],
+    block_id: EntityId,
+) -> Result<bool> {
+    fn holds(
+        uow: &dyn InsertTableUnitOfWorkTrait,
+        frame_id: EntityId,
+        block_id: EntityId,
+    ) -> Result<bool> {
+        let Some(frame) = uow.get_frame(&frame_id)? else {
+            return Ok(false);
+        };
+        for entry in &frame.child_order {
+            if *entry == block_id as i64 {
+                return Ok(true);
+            }
+            if *entry < 0 && holds(uow, (-*entry) as EntityId, block_id)? {
+                return Ok(true);
+            }
+        }
+        Ok(frame.blocks.contains(&block_id))
+    }
+    for note in position_roots(&|id| uow.get_frame(id), frame_ids)?
+        .into_iter()
+        .skip(1)
+    {
+        if holds(uow, note, block_id)? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
 
 pub struct InsertTableUseCase {
     uow_factory: Box<dyn InsertTableUnitOfWorkFactoryTrait>,
@@ -155,7 +205,7 @@ fn execute_insert_table(
     let (parent_frame_id, child_order_insert_idx, rope_anchor, cell_start_pos): (
         EntityId,
         usize,
-        Option<(EntityId, bool)>,
+        Option<RopePlacement>,
         i64,
     ) = if all_blocks.is_empty() {
         // Empty document — use the first frame. No host block, so the
@@ -184,6 +234,14 @@ fn execute_insert_table(
         // `insert_table_after_imported_gfm_table_lands_at_doc_end` and
         // `rich_text_editor_demo_end_to_end_insert_table_at_end` in
         // `crates/public_api/tests/table_editing_tests.rs`.
+        // A footnote's body holds paragraphs: the Djot reader keeps nothing
+        // else of a definition, so a table put in one was in the saved text
+        // and gone after the next load.
+        if in_a_note_body(&**uow, &frame_ids, target_block.id)? {
+            return Err(anyhow!(
+                "A footnote's body holds paragraphs only: a table cannot go in one"
+            ));
+        }
         let target_block_entry = target_block.id as i64;
         let mut found_frame_id = frame_ids[0];
         let mut found_child_idx = 0usize;
@@ -220,60 +278,44 @@ fn execute_insert_table(
         // If the target block lives inside a table cell, the user
         // clicked "Insert Table" from within an existing table. Don't
         // nest — that produces an invisible block because the renderer
-        // doesn't recurse into cell-nested anchor frames. Instead,
-        // hoist the new table OUT to be a sibling of the containing
-        // table, immediately after it. Reproduced by
+        // doesn't recurse into cell-nested anchor frames, and a pipe
+        // table cannot hold one, so a save drops it. Instead, hoist the
+        // new table OUT to be a sibling of the outermost table holding
+        // the cell, immediately after it: in that table's parent frame,
+        // and in the rope after everything the table holds. Reproduced by
         // `insert_table_from_inside_cell_lands_after_containing_table`.
-        let owning_frame = uow
-            .get_frame(&found_frame_id)?
-            .ok_or_else(|| anyhow!("Owning frame {found_frame_id} not found"))?;
-        let mut cell_anchor: Option<(EntityId, EntityId)> = None;
-        if let Some(parent_id) = owning_frame.parent_frame {
-            let parent = uow
-                .get_frame(&parent_id)?
-                .ok_or_else(|| anyhow!("Parent frame {parent_id} not found"))?;
-            if parent.table.is_some()
-                && let Some(grandparent_id) = parent.parent_frame
-            {
-                cell_anchor = Some((parent_id, grandparent_id));
-            }
-        }
-
-        if let Some((anchor_frame_id, grandparent_id)) = cell_anchor {
-            let grandparent = uow
-                .get_frame(&grandparent_id)?
-                .ok_or_else(|| anyhow!("Grandparent frame {grandparent_id} not found"))?;
+        //
+        // The containing table is found through the tables' cell lists,
+        // not the cell frame's `parent_frame`, which a pasted table's
+        // cell frames do not carry: a caret in such a cell (or on its
+        // table's anchor, which stands at the first cell) nested the new
+        // table in the cell. And the new anchor went into the rope after
+        // the caret's cell rather than after the table, out of flow order
+        // whenever that cell was not the table's last.
+        if let Some((containing_table, anchor_frame_id, host_frame_id)) =
+            outermost_table_around(&uow.store(), found_frame_id)
+        {
+            let host = uow
+                .get_frame(&host_frame_id)?
+                .ok_or_else(|| anyhow!("Frame {host_frame_id} not found"))?;
             let anchor_entry = -(anchor_frame_id as i64);
-            let anchor_idx = grandparent
+            let anchor_idx = host
                 .child_order
                 .iter()
                 .position(|e| *e == anchor_entry)
-                .ok_or_else(|| anyhow!("Anchor frame missing from grandparent child_order"))?;
+                .ok_or_else(|| anyhow!("Anchor frame missing from its frame's child_order"))?;
 
             // cell_start: position right after the existing table's
-            // last cell. Cells of the existing table are blocks in
-            // frames whose `parent_frame == anchor_frame_id`. The
-            // snapshot walker assigns running positions where each
-            // block contributes (length + 1) — the +1 is the per-block
-            // boundary the walker emits between siblings. So the next
-            // free slot in the grandparent's flow is
+            // last cell. The snapshot walker assigns running positions
+            // where each block contributes (length + 1): the +1 is the
+            // per-block boundary the walker emits between siblings. So
+            // the next free slot in the host's flow is
             // `max(cell_block.document_position + cell_block.length) + 1`.
             let mut last_end: i64 = 0;
             let mut any = false;
-            for fid in &frame_ids {
-                let f = uow
-                    .get_frame(fid)?
-                    .ok_or_else(|| anyhow!("Frame {fid} not found"))?;
-                if f.parent_frame != Some(anchor_frame_id) {
-                    continue;
-                }
-                let block_ids = uow.get_frame_relationship(fid, &FrameRelationshipField::Blocks)?;
-                if block_ids.is_empty() {
-                    continue;
-                }
-                let blocks_opt = uow.get_block_multi(&block_ids)?;
-                for b in blocks_opt.into_iter().flatten() {
-                    let end = b.document_position + block_char_length(&b, &uow.store());
+            for block_id in table_block_ids(&uow.store(), containing_table) {
+                if let Some(b) = all_blocks.iter().find(|b| b.id == block_id) {
+                    let end = b.document_position + block_char_length(b, &uow.store());
                     if !any || end > last_end {
                         last_end = end;
                         any = true;
@@ -282,18 +324,16 @@ fn execute_insert_table(
             }
             let hoisted_cell_start = last_end + 1;
             (
-                grandparent_id,
+                host_frame_id,
                 anchor_idx + 1,
-                // Rope mirror: anchor after target_block (a cell of the
-                // existing table). No-op under the default backend.
-                Some((target_block.id, true)),
+                Some(RopePlacement::AfterTable(containing_table)),
                 hoisted_cell_start,
             )
         } else {
             (
                 found_frame_id,
                 found_child_idx + after_idx,
-                Some((target_block.id, after)),
+                Some(RopePlacement::NextTo(target_block.id, after)),
                 cell_start,
             )
         }
@@ -408,11 +448,25 @@ fn execute_insert_table(
 
     // Inserts a U+FFFC sentinel + boundary newline into the global
     // rope and registers a TableAnchor(table_id) marker in the
-    // offset index. Cell-internal content is not yet tracked in
-    // BlockOffsetIndex — plan §1.6's Frame.byte_range model is a
-    // follow-up commit.
-    if let Some((target_block_id, after)) = rope_anchor {
-        rope_insert_table_anchor(&uow.store(), created_table.id, target_block_id, after);
+    // offset index. A table hoisted out of a cell goes in after
+    // everything the table holding that cell holds, its cells with it
+    // (see below).
+    let mut cells_placed = false;
+    match rope_anchor {
+        Some(RopePlacement::NextTo(target_block_id, after)) => {
+            rope_insert_table_anchor(&uow.store(), created_table.id, target_block_id, after);
+        }
+        Some(RopePlacement::AfterTable(containing_table)) => {
+            let mut run: Vec<(OffsetMarker, &str)> =
+                vec![(OffsetMarker::TableAnchor(created_table.id), TABLE_ANCHOR)];
+            run.extend(
+                cell_blocks
+                    .iter()
+                    .map(|cell_block| (OffsetMarker::Block(cell_block.id), "")),
+            );
+            cells_placed = rope_insert_run_after_table(&uow.store(), containing_table, &run);
+        }
+        None => {}
     }
 
     // 4. Assign document_position to all cell blocks in row-major
@@ -476,14 +530,12 @@ fn execute_insert_table(
     // contiguously. Newly-created cells are empty (`content_len == 0`).
     //
     // No-op under a backend that doesn't register the anchor.
-    {
+    if !cells_placed {
         let store = uow.store();
         let anchor_start = store
             .block_offsets
             .read()
-            .range_of(
-                common::database::block_offset_index::OffsetMarker::TableAnchor(created_table.id),
-            )
+            .range_of(OffsetMarker::TableAnchor(created_table.id))
             .map(|(start, _)| start);
         if let Some(anchor_start) = anchor_start {
             const SENTINEL_BYTES: u32 = 3; // U+FFFC

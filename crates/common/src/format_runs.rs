@@ -800,6 +800,39 @@ pub fn shift_images_for_delete(
     removed
 }
 
+/// Apply a "delete" mutation to a block's footnote references: the rule
+/// [`shift_images_for_delete`] applies, for the same reason, since a reference
+/// occupies one `U+FFFC` exactly as an image does. References inside
+/// `[byte_start..byte_end)` are removed with the text that held them;
+/// references at or past `byte_end` move back by the deleted length.
+/// Returns the number of references removed.
+///
+/// Every edit that moves a block's images has to move its references too. The
+/// editing use cases used to move only the images, so a reference kept the
+/// byte offset it was loaded with: typing in front of it left it pointing into
+/// the word, a paragraph break in front of it left it past the end of its
+/// block (and every export that sliced the block there panicked), and deleting
+/// the sentence around it left it behind, dangling past the text.
+pub fn shift_footnote_refs_for_delete(
+    notes: &mut Vec<FootnoteRefAnchor>,
+    byte_start: u32,
+    byte_end: u32,
+) -> usize {
+    if byte_end <= byte_start {
+        return 0;
+    }
+    let before = notes.len();
+    notes.retain(|n| !(n.byte_offset >= byte_start && n.byte_offset < byte_end));
+    let removed = before - notes.len();
+    let delta = byte_end - byte_start;
+    for note in notes.iter_mut() {
+        if note.byte_offset >= byte_end {
+            note.byte_offset -= delta;
+        }
+    }
+    removed
+}
+
 /// Translate a logical character offset (counting text characters AND
 /// image positions interleaved by their `byte_offset`) into a UTF-8
 /// byte offset within `plain_text`. Used by writer use cases to map a

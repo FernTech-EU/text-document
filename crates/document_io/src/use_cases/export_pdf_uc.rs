@@ -223,6 +223,9 @@ impl ExportPdfUseCase {
                 )?;
                 let blocks_opt = uow.get_block_multi(&block_ids)?;
                 let mut blocks: Vec<Block> = blocks_opt.into_iter().flatten().collect();
+                // Ordered by where each block starts in the rope: the stored field lags it by
+                // whatever was typed since something last wrote it.
+                common::database::rope_helpers::refresh_block_positions(&mut blocks, &uow.store());
                 blocks.sort_by_key(|b| b.document_position);
                 let body = crate::typst_markup::render_blocks_typst(
                     &uow.store(),
@@ -329,6 +332,9 @@ impl ExportPdfUseCase {
 
         let blocks_opt = uow.get_block_multi(&block_ids)?;
         let mut blocks: Vec<Block> = blocks_opt.into_iter().flatten().collect();
+        // Ordered by where each block starts in the rope: the stored field lags it by
+        // whatever was typed since something last wrote it.
+        common::database::rope_helpers::refresh_block_positions(&mut blocks, &uow.store());
         blocks.sort_by_key(|b| b.document_position);
 
         Ok(render_blocks_typst(

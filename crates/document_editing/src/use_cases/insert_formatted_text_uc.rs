@@ -1,17 +1,19 @@
-use super::editing_helpers::collect_block_ids_recursive;
+use super::editing_helpers::{collect_block_ids_recursive, find_block_at_position, position_roots};
 use crate::InsertFormattedTextDto;
 use crate::InsertFormattedTextResultDto;
 use anyhow::{Result, anyhow};
 use common::database::CommandUnitOfWork;
 use common::database::rope_helpers::{
-    block_char_length, block_content_via_store, rope_delete_in_block, rope_insert_in_block,
+    block_char_length, block_content_via_store, refresh_block_positions, rope_delete_in_block,
+    rope_insert_in_block,
 };
 use common::direct_access::document::document_repository::DocumentRelationshipField;
 use common::direct_access::root::root_repository::RootRelationshipField;
 use common::direct_access::table::TableRelationshipField;
 use common::entities::{Block, Document, Frame, Root, TableCell};
 use common::format_runs::{
-    CharacterFormat, FormatRun, ImageAnchor, debug_assert_well_formed, logical_offset_to_byte,
+    CharacterFormat, FootnoteRefAnchor, FormatRun, ImageAnchor, debug_assert_well_formed,
+    logical_offset_to_byte, shift_footnote_refs_for_delete, shift_footnote_refs_for_insert,
     shift_images_for_delete, shift_images_for_insert, shift_runs_for_delete, shift_runs_for_insert,
     splice_range,
 };
@@ -49,6 +51,7 @@ struct SimpleUndoData {
     original_block: Block,
     original_format_runs: Vec<FormatRun>,
     original_block_images: Vec<ImageAnchor>,
+    original_footnote_refs: Vec<FootnoteRefAnchor>,
     doc_id: EntityId,
     original_character_count: i64,
     /// Byte offset inside the block where the new text was inserted.
@@ -90,8 +93,8 @@ fn dto_to_character_format(dto: &InsertFormattedTextDto) -> CharacterFormat {
 }
 
 /// Delete a logical char range from a single block, mutating
-/// plain_text + format_runs + block_images consistently. Returns the
-/// count of logical positions removed.
+/// plain_text + format_runs + block_images + footnote references
+/// consistently. Returns the count of logical positions removed.
 fn delete_range_in_block(
     uow: &mut Box<dyn InsertFormattedTextUnitOfWorkTrait>,
     block: &Block,
@@ -132,6 +135,9 @@ fn delete_range_in_block(
         let images = images_map.entry(block.id).or_default();
         shift_images_for_delete(images, byte_start, byte_end) as i64
     };
+    if let Some(notes) = store.block_footnote_refs.write().get_mut(&block.id) {
+        shift_footnote_refs_for_delete(notes, byte_start, byte_end);
+    }
 
     rope_delete_in_block(&store, block.id, byte_start, byte_end);
 
@@ -195,6 +201,9 @@ fn insert_formatted_at(
             shift_images_for_insert(images, byte_offset, inserted_byte_len);
         }
     }
+    if let Some(notes) = store.block_footnote_refs.write().get_mut(&block.id) {
+        shift_footnote_refs_for_insert(notes, byte_offset, inserted_byte_len);
+    }
 
     rope_insert_in_block(&store, block.id, byte_offset, &dto.text);
 
@@ -219,46 +228,25 @@ fn execute_with_selection(
 
     let snapshot = uow.snapshot_document(&[doc_id])?;
 
-    let frame_ids = uow.get_document_relationship(&doc_id, &DocumentRelationshipField::Frames)?;
-    let frame_id = *frame_ids
-        .first()
-        .ok_or_else(|| anyhow!("Document has no frames"))?;
-
-    let get_table_cell_frames = |table_id: &EntityId| -> anyhow::Result<Vec<EntityId>> {
-        let cell_ids = uow.get_table_relationship(table_id, &TableRelationshipField::Cells)?;
-        let cells_opt = uow.get_table_cell_multi(&cell_ids)?;
-        let mut cells: Vec<TableCell> = cells_opt.into_iter().flatten().collect();
-        cells.sort_by(|a, b| a.row.cmp(&b.row).then(a.column.cmp(&b.column)));
-        Ok(cells.into_iter().filter_map(|c| c.cell_frame).collect())
-    };
-    let ordered_block_ids = collect_block_ids_recursive(
-        &|id| uow.get_frame(id),
-        &|id, field| uow.get_frame_relationship(id, field),
-        &get_table_cell_frames,
-        &frame_id,
-    )?;
-
-    if ordered_block_ids.is_empty() {
-        return Err(anyhow!("No blocks in document"));
-    }
+    let blocks = blocks_in_rope_order(&**uow, doc_id)?;
 
     let sel_start = std::cmp::min(dto.position, dto.anchor);
     let sel_end = std::cmp::max(dto.position, dto.anchor);
 
-    let (sel_block, sel_block_idx, sel_block_pos) =
-        find_block_at_position_sequential(&**uow, &ordered_block_ids, sel_start)?;
-    let (_end_block, sel_end_block_idx, _) =
-        find_block_at_position_sequential(&**uow, &ordered_block_ids, sel_end)?;
+    let (sel_block, sel_block_idx, start_offset) =
+        find_block_at_position(&blocks, sel_start, &uow.store())?;
+    let (_end_block, sel_end_block_idx, end_offset) =
+        find_block_at_position(&blocks, sel_end, &uow.store())?;
 
-    if sel_block_idx != sel_end_block_idx {
+    if sel_block_idx != sel_end_block_idx || end_offset < start_offset {
         return Err(anyhow!(
             "Cross-block selection replacement is not supported by insert_formatted_text. \
              Use delete_text first, then insert_formatted_text."
         ));
     }
-
-    let start_offset = sel_start - sel_block_pos;
-    let end_offset = sel_end - sel_block_pos;
+    // Where the replacement goes: the start of the range, off a table's
+    // anchor when it began on one.
+    let inserted_at = sel_block.document_position + start_offset;
 
     let chars_removed = delete_range_in_block(uow, &sel_block, start_offset, end_offset)?;
 
@@ -283,7 +271,7 @@ fn execute_with_selection(
 
     Ok((
         InsertFormattedTextResultDto {
-            new_position: sel_start + text_len,
+            new_position: inserted_at + text_len,
         },
         InsertFormattedTextUndo::SelectionReplacement(snapshot),
     ))
@@ -307,33 +295,13 @@ fn execute_insert_simple(
         .get_document(&doc_id)?
         .ok_or_else(|| anyhow!("Document not found"))?;
 
-    let frame_ids = uow.get_document_relationship(&doc_id, &DocumentRelationshipField::Frames)?;
-    let frame_id = *frame_ids
-        .first()
-        .ok_or_else(|| anyhow!("Document has no frames"))?;
-
-    let get_table_cell_frames = |table_id: &EntityId| -> anyhow::Result<Vec<EntityId>> {
-        let cell_ids = uow.get_table_relationship(table_id, &TableRelationshipField::Cells)?;
-        let cells_opt = uow.get_table_cell_multi(&cell_ids)?;
-        let mut cells: Vec<TableCell> = cells_opt.into_iter().flatten().collect();
-        cells.sort_by(|a, b| a.row.cmp(&b.row).then(a.column.cmp(&b.column)));
-        Ok(cells.into_iter().filter_map(|c| c.cell_frame).collect())
-    };
-    let ordered_block_ids = collect_block_ids_recursive(
-        &|id| uow.get_frame(id),
-        &|id, field| uow.get_frame_relationship(id, field),
-        &get_table_cell_frames,
-        &frame_id,
-    )?;
-
-    if ordered_block_ids.is_empty() {
-        return Err(anyhow!("No blocks in document"));
-    }
-
-    let (block, _block_idx, block_pos) =
-        find_block_at_position_sequential(&**uow, &ordered_block_ids, position)?;
+    let blocks = blocks_in_rope_order(&**uow, doc_id)?;
+    let (block, _block_idx, offset) = find_block_at_position(&blocks, position, &uow.store())?;
     let store = uow.store();
-    let offset = (position - block_pos).clamp(0, block_char_length(&block, &store));
+    let offset = offset.clamp(0, block_char_length(&block, &store));
+    // Where the text goes: the caret, off a table's anchor when it stood on
+    // one.
+    let inserted_at = block.document_position + offset;
 
     let original_block = block.clone();
     let original_format_runs = store
@@ -344,6 +312,12 @@ fn execute_insert_simple(
         .unwrap_or_default();
     let original_block_images = store
         .block_images
+        .read()
+        .get(&block.id)
+        .cloned()
+        .unwrap_or_default();
+    let original_footnote_refs = store
+        .block_footnote_refs
         .read()
         .get(&block.id)
         .cloned()
@@ -362,6 +336,7 @@ fn execute_insert_simple(
         original_block,
         original_format_runs,
         original_block_images,
+        original_footnote_refs,
         doc_id,
         original_character_count: document.character_count,
         inserted_byte_offset,
@@ -370,46 +345,57 @@ fn execute_insert_simple(
 
     Ok((
         InsertFormattedTextResultDto {
-            new_position: position + text_len,
+            new_position: inserted_at + text_len,
         },
         InsertFormattedTextUndo::Simple(Box::new(undo_data)),
     ))
 }
 
-fn find_block_at_position_sequential(
+/// Every block a position can fall in, in the order the rope holds them: the
+/// main text with everything nested in it, and each footnote's body.
+///
+/// This used to walk the main frame's blocks and count positions itself, one
+/// per character and one per boundary. That count left out the two positions
+/// each table's anchor takes and every footnote body the rope holds between
+/// the paragraphs, so text typed after a table landed two characters early
+/// per table, and a range reaching past the last paragraph of the main text
+/// resolved both its ends to that paragraph's end: nothing was deleted and the
+/// text went there instead.
+fn blocks_in_rope_order(
     uow: &dyn InsertFormattedTextUnitOfWorkTrait,
-    ordered_block_ids: &[EntityId],
-    position: i64,
-) -> Result<(Block, usize, i64)> {
-    if ordered_block_ids.is_empty() {
+    doc_id: EntityId,
+) -> Result<Vec<Block>> {
+    let frame_ids = uow.get_document_relationship(&doc_id, &DocumentRelationshipField::Frames)?;
+    if frame_ids.is_empty() {
+        return Err(anyhow!("Document has no frames"));
+    }
+    let get_table_cell_frames = |table_id: &EntityId| -> anyhow::Result<Vec<EntityId>> {
+        let cell_ids = uow.get_table_relationship(table_id, &TableRelationshipField::Cells)?;
+        let cells_opt = uow.get_table_cell_multi(&cell_ids)?;
+        let mut cells: Vec<TableCell> = cells_opt.into_iter().flatten().collect();
+        cells.sort_by(|a, b| a.row.cmp(&b.row).then(a.column.cmp(&b.column)));
+        Ok(cells.into_iter().filter_map(|c| c.cell_frame).collect())
+    };
+    let mut block_ids: Vec<EntityId> = Vec::new();
+    for root in position_roots(&|id| uow.get_frame(id), &frame_ids)? {
+        block_ids.extend(collect_block_ids_recursive(
+            &|id| uow.get_frame(id),
+            &|id, field| uow.get_frame_relationship(id, field),
+            &get_table_cell_frames,
+            &root,
+        )?);
+    }
+    if block_ids.is_empty() {
         return Err(anyhow!("No blocks in document"));
     }
-
-    let store = uow.store();
-    let mut running_pos: i64 = 0;
-    for (idx, &block_id) in ordered_block_ids.iter().enumerate() {
-        let block = uow
-            .get_block(&block_id)?
-            .ok_or_else(|| anyhow!("Block not found"))?;
-        let block_end = running_pos + block_char_length(&block, &store);
-
-        if position >= running_pos && position <= block_end {
-            return Ok((block, idx, running_pos));
-        }
-        running_pos = block_end + 1;
-    }
-
-    let last_idx = ordered_block_ids.len() - 1;
-    let block = uow
-        .get_block(&ordered_block_ids[last_idx])?
-        .ok_or_else(|| anyhow!("Block not found"))?;
-    let mut pos: i64 = 0;
-    for &id in &ordered_block_ids[..last_idx] {
-        if let Some(b) = uow.get_block(&id)? {
-            pos += block_char_length(&b, &store) + 1;
-        }
-    }
-    Ok((block, last_idx, pos))
+    let mut blocks: Vec<Block> = uow
+        .get_block_multi(&block_ids)?
+        .into_iter()
+        .flatten()
+        .collect();
+    refresh_block_positions(&mut blocks, &uow.store());
+    blocks.sort_by_key(|b| b.document_position);
+    Ok(blocks)
 }
 
 impl InsertFormattedTextUseCase {
@@ -478,6 +464,14 @@ impl UndoRedoCommand for InsertFormattedTextUseCase {
                     .block_images
                     .write()
                     .insert(data.block_id, data.original_block_images.clone());
+                {
+                    let mut notes_map = store.block_footnote_refs.write();
+                    if data.original_footnote_refs.is_empty() {
+                        notes_map.remove(&data.block_id);
+                    } else {
+                        notes_map.insert(data.block_id, data.original_footnote_refs.clone());
+                    }
+                }
 
                 let mut doc = uow
                     .get_document(&data.doc_id)?

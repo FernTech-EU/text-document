@@ -1,11 +1,12 @@
-use super::editing_helpers::{collect_block_ids_recursive, is_word_boundary_punct};
+use super::editing_helpers::{collect_block_ids_recursive, is_word_boundary_punct, position_roots};
 use crate::InsertTextDto;
 use crate::InsertTextResultDto;
 use anyhow::{Result, anyhow};
 use common::database::CommandUnitOfWork;
 use common::database::rope_helpers::{
-    block_char_length, block_content_via_store, find_block_at_char_position, replace_in_block,
-    rope_delete_in_block, rope_insert_in_block,
+    block_char_length, block_content_via_store, find_block_at_char_position,
+    refresh_block_positions, replace_in_block, rope_delete_in_block, rope_insert_in_block,
+    snap_off_table_anchor,
 };
 use common::direct_access::document::document_repository::DocumentRelationshipField;
 use common::direct_access::frame::frame_repository::FrameRelationshipField;
@@ -13,8 +14,8 @@ use common::direct_access::root::root_repository::RootRelationshipField;
 use common::direct_access::table::TableRelationshipField;
 use common::entities::{Block, Document, Frame, Root, TableCell};
 use common::format_runs::{
-    FormatRun, ImageAnchor, debug_assert_well_formed, logical_offset_to_byte,
-    shift_images_for_insert, shift_runs_for_insert,
+    FootnoteRefAnchor, FormatRun, ImageAnchor, debug_assert_well_formed, logical_offset_to_byte,
+    shift_footnote_refs_for_insert, shift_images_for_insert, shift_runs_for_insert,
 };
 
 use common::types::{EntityId, ROOT_ENTITY_ID};
@@ -45,13 +46,14 @@ pub trait InsertTextUnitOfWorkFactoryTrait: Send + Sync {
 pub trait InsertTextUnitOfWorkTrait: CommandUnitOfWork {}
 
 /// Lightweight undo data for the no-selection insert path. The cloned
-/// format_runs / block_images vectors serve as a per-block backup so
-/// undo can restore the run table verbatim.
+/// format_runs / block_images / footnote reference vectors serve as a
+/// per-block backup so undo can restore them verbatim.
 struct UndoData {
     block_id: EntityId,
     original_block: Block,
     original_format_runs: Vec<FormatRun>,
     original_block_images: Vec<ImageAnchor>,
+    original_footnote_refs: Vec<FootnoteRefAnchor>,
     doc_id: EntityId,
     original_character_count: i64,
     /// Byte range in the block where the text was inserted. Used by
@@ -84,9 +86,9 @@ fn execute_insert_with_selection(
     let snapshot = uow.snapshot_document(&[doc_id])?;
 
     let frame_ids = uow.get_document_relationship(&doc_id, &DocumentRelationshipField::Frames)?;
-    let frame_id = *frame_ids
-        .first()
-        .ok_or_else(|| anyhow!("Document has no frames"))?;
+    if frame_ids.is_empty() {
+        return Err(anyhow!("Document has no frames"));
+    }
 
     let get_table_cell_frames = |table_id: &EntityId| -> anyhow::Result<Vec<EntityId>> {
         let cell_ids = uow.get_table_relationship(table_id, &TableRelationshipField::Cells)?;
@@ -95,14 +97,20 @@ fn execute_insert_with_selection(
         cells.sort_by(|a, b| a.row.cmp(&b.row).then(a.column.cmp(&b.column)));
         Ok(cells.into_iter().filter_map(|c| c.cell_frame).collect())
     };
-    let all_block_ids = collect_block_ids_recursive(
-        &|id| uow.get_frame(id),
-        &|id, field| uow.get_frame_relationship(id, field),
-        &get_table_cell_frames,
-        &frame_id,
-    )?;
+    let mut all_block_ids: Vec<EntityId> = Vec::new();
+    for root in position_roots(&|id| uow.get_frame(id), &frame_ids)? {
+        all_block_ids.extend(collect_block_ids_recursive(
+            &|id| uow.get_frame(id),
+            &|id, field| uow.get_frame_relationship(id, field),
+            &get_table_cell_frames,
+            &root,
+        )?);
+    }
     let blocks_opt = uow.get_block_multi(&all_block_ids)?;
     let mut blocks: Vec<Block> = blocks_opt.into_iter().flatten().collect();
+    // In the order the rope holds them: the stored field lags it by whatever
+    // was typed since something last wrote it.
+    refresh_block_positions(&mut blocks, &uow.store());
     blocks.sort_by_key(|b| b.document_position);
 
     let sel_start = std::cmp::min(dto.position, dto.anchor);
@@ -113,7 +121,7 @@ fn execute_insert_with_selection(
     let (_, sel_end_block_idx, sel_end_offset) =
         super::editing_helpers::find_block_at_position(&blocks, sel_end, &uow.store())?;
 
-    if sel_block_idx != sel_end_block_idx {
+    if sel_block_idx != sel_end_block_idx || sel_end_offset < sel_start_offset {
         return Err(anyhow!(
             "Cross-block selection replacement is not supported by insert_text. \
              Use delete_text first, then insert_text."
@@ -188,6 +196,8 @@ fn execute_insert_simple(
     // None for tabled documents — they need the per-block walk below
     // because table cell content lives at separate rope byte ranges
     // (plan §1.6) so byte→block lookup would find the wrong block.
+    // A table's anchor belongs to no block: type in the table's first cell.
+    let position = snap_off_table_anchor(&store, position, true);
     let (block, block_pos, offset) = match find_block_at_char_position(&store, position) {
         Some((block_id, char_in_block, block_char_start)) => {
             let block = uow
@@ -241,6 +251,12 @@ fn execute_insert_simple(
         .get(&block.id)
         .cloned()
         .unwrap_or_default();
+    let original_footnote_refs = store
+        .block_footnote_refs
+        .read()
+        .get(&block.id)
+        .cloned()
+        .unwrap_or_default();
 
     let block_text = block_content_via_store(&block, &store);
     let byte_offset = logical_offset_to_byte(&block_text, &original_block_images, offset);
@@ -264,6 +280,12 @@ fn execute_insert_simple(
         let mut images_map = store.block_images.write();
         if let Some(images) = images_map.get_mut(&block.id) {
             shift_images_for_insert(images, byte_offset, inserted_byte_len);
+        }
+    }
+    {
+        let mut notes_map = store.block_footnote_refs.write();
+        if let Some(notes) = notes_map.get_mut(&block.id) {
+            shift_footnote_refs_for_insert(notes, byte_offset, inserted_byte_len);
         }
     }
 
@@ -312,6 +334,7 @@ fn execute_insert_simple(
         original_block,
         original_format_runs,
         original_block_images,
+        original_footnote_refs,
         doc_id,
         original_character_count: document.character_count,
         inserted_byte_offset: byte_offset,
@@ -437,6 +460,14 @@ impl UndoRedoCommand for InsertTextUseCase {
                     .block_images
                     .write()
                     .insert(data.block_id, data.original_block_images.clone());
+                {
+                    let mut notes_map = store.block_footnote_refs.write();
+                    if data.original_footnote_refs.is_empty() {
+                        notes_map.remove(&data.block_id);
+                    } else {
+                        notes_map.insert(data.block_id, data.original_footnote_refs.clone());
+                    }
+                }
 
                 // Revert the rope mutation done by the forward path.
                 if data.inserted_byte_len > 0 {

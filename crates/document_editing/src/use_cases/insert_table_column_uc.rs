@@ -6,7 +6,7 @@ use crate::InsertTableColumnDto;
 use crate::InsertTableColumnResultDto;
 use anyhow::{Result, anyhow};
 use common::database::CommandUnitOfWork;
-use common::database::rope_helpers::{rope_insert_block_at, top_level_frame_end_byte};
+use common::database::rope_helpers::rope_place_new_cell_blocks;
 use common::direct_access::document::document_repository::DocumentRelationshipField;
 use common::direct_access::frame::frame_repository::FrameRelationshipField;
 use common::direct_access::root::root_repository::RootRelationshipField;
@@ -145,24 +145,12 @@ fn execute_insert_table_column(
     updated_table.updated_at = now;
     uow.update_table(&updated_table)?;
 
-    // Mirror the new cell blocks into the global rope. Place them at
-    // the end of the table's parent top-level frame (matching the
-    // convention from `insert_table_uc`). Each cell is empty so the
-    // text is `""`; `rope_insert_block_at` prepends a `\n` boundary.
+    // Mirror the new cell blocks into the global rope where reading order
+    // puts them, among the table's other cells (see
+    // `rope_place_new_cell_blocks`).
     {
-        let store = uow.store();
-        let parent_frame_id_opt = {
-            let frames = store.frames.read();
-            let anchor = frames.values().find(|f| f.table == Some(table_id)).cloned();
-            anchor.and_then(|f| f.parent_frame)
-        };
-        if let Some(parent_frame_id) = parent_frame_id_opt {
-            let start_byte = top_level_frame_end_byte(&store, parent_frame_id);
-            for (next_byte, cell_block) in (start_byte..).zip(new_cell_blocks.iter()) {
-                // Newly-created cells are empty (`""`).
-                rope_insert_block_at(&store, next_byte, cell_block.id, "");
-            }
-        }
+        let new_block_ids: Vec<EntityId> = new_cell_blocks.iter().map(|b| b.id).collect();
+        rope_place_new_cell_blocks(&uow.store(), table_id, &new_block_ids);
     }
 
     // Recalculate document positions for all table cell blocks (using base_pos computed earlier)
