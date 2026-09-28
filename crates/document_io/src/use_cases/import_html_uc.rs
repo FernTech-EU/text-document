@@ -40,6 +40,8 @@ pub trait ImportHtmlUnitOfWorkFactoryTrait: Send + Sync {
     thread_safe = true
 )]
 #[macros::uow_action(entity = "Frame", action = "RemoveMulti", thread_safe = true)]
+#[macros::uow_action(entity = "Table", action = "RemoveMulti", thread_safe = true)]
+#[macros::uow_action(entity = "List", action = "RemoveMulti", thread_safe = true)]
 #[macros::uow_action(entity = "Frame", action = "GetRelationship", thread_safe = true)]
 #[macros::uow_action(entity = "Frame", action = "SetRelationship", thread_safe = true)]
 #[macros::uow_action(entity = "Block", action = "Create", thread_safe = true)]
@@ -85,9 +87,9 @@ struct OrphanedChildren {
 }
 
 impl OrphanedChildren {
-    /// Give the document its new frames, lists and tables, one write each, after
-    /// whatever it already holds: its lists and tables outlive a re-import, while
-    /// its frames were all removed first.
+    /// Give the document its new frames, lists and tables, one write each. The
+    /// frames, tables and lists it held before were all removed first, so each list
+    /// written is exactly what the import created.
     fn attach(self, uow: &mut Box<dyn ImportHtmlUnitOfWorkTrait>, doc_id: EntityId) -> Result<()> {
         for (field, children) in [
             (DocumentRelationshipField::Frames, self.frames),
@@ -231,6 +233,13 @@ impl LongOperation for ImportHtmlUseCase {
         let frame_ids =
             uow.get_document_relationship(&doc_id, &DocumentRelationshipField::Frames)?;
         uow.remove_frame_multi(&frame_ids)?;
+        // The replaced content's tables (their cells with them) and lists go too:
+        // see the Djot importer.
+        let table_ids =
+            uow.get_document_relationship(&doc_id, &DocumentRelationshipField::Tables)?;
+        uow.remove_table_multi(&table_ids)?;
+        let list_ids = uow.get_document_relationship(&doc_id, &DocumentRelationshipField::Lists)?;
+        uow.remove_list_multi(&list_ids)?;
 
         if cancel_flag.load(Ordering::Relaxed) {
             uow.rollback()?;
@@ -417,7 +426,7 @@ impl LongOperation for ImportHtmlUseCase {
                     // A table always interrupts a list, regardless of depth.
                     list_grouper.reset();
                     let num_rows = parsed_table.rows.len() as i64;
-                    let num_cols = parsed_table.rows.first().map_or(0, |r| r.len()) as i64;
+                    let num_cols = parsed_table.column_count() as i64;
                     if num_rows == 0 || num_cols == 0 {
                         continue;
                     }
@@ -452,7 +461,9 @@ impl LongOperation for ImportHtmlUseCase {
                     let mut created_cell_ids: Vec<EntityId> = Vec::new();
 
                     for (r, row) in parsed_table.rows.iter().enumerate() {
-                        for (c, cell) in row.iter().enumerate() {
+                        // A row shorter than the widest is completed with empty cells.
+                        for c in 0..num_cols as usize {
+                            let spans = row.get(c).map_or(&[][..], |cell| cell.spans.as_slice());
                             let cell_frame = Frame::default();
                             let created_cell_frame = uow.create_orphan_frame(&cell_frame)?;
                             orphans.frames.push(created_cell_frame.id);
@@ -463,7 +474,7 @@ impl LongOperation for ImportHtmlUseCase {
                                 runs: format_runs,
                                 images: block_images,
                                 footnote_refs: block_footnote_refs,
-                            } = format_runs_from_spans(&cell.spans, false);
+                            } = format_runs_from_spans(spans, false);
 
                             let block = Block {
                                 document_position,

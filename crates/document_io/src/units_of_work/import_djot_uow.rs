@@ -104,6 +104,8 @@ impl CommandUnitOfWork for ImportDjotUnitOfWork {
     thread_safe = true
 )]
 #[macros::uow_action(entity = "Frame", action = "RemoveMulti", thread_safe = true)]
+#[macros::uow_action(entity = "Table", action = "RemoveMulti", thread_safe = true)]
+#[macros::uow_action(entity = "List", action = "RemoveMulti", thread_safe = true)]
 #[macros::uow_action(entity = "Frame", action = "GetRelationship", thread_safe = true)]
 #[macros::uow_action(entity = "Frame", action = "SetRelationship", thread_safe = true)]
 #[macros::uow_action(entity = "Block", action = "Create", thread_safe = true)]

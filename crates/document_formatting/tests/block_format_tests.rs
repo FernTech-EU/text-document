@@ -201,7 +201,7 @@ fn test_set_block_format_in_table_cell() -> Result<()> {
     let cell_pos =
         common::database::rope_helpers::block_document_position(&cell_block.into(), db.get_store());
 
-    // Format the cell's block as a code block
+    // Format the cell's block as a code block, with other formats alongside
     document_formatting_controller::set_block_format(
         &db,
         &hub,
@@ -219,9 +219,11 @@ fn test_set_block_format_in_table_cell() -> Result<()> {
         },
     )?;
 
+    // A pipe table writes a cell's paragraphs as one line of inline text: a cell's paragraph
+    // is never made a code block, and the other formats asked for still apply.
     let cell_block_after = block_controller::get(&db, &cell_block_ids[0])?.unwrap();
-    assert_eq!(cell_block_after.fmt_is_code_block, Some(true));
-    assert_eq!(cell_block_after.fmt_code_language, Some("python".into()));
+    assert_eq!(cell_block_after.fmt_is_code_block, None);
+    assert_eq!(cell_block_after.fmt_code_language, None);
     assert_eq!(cell_block_after.fmt_hyphenate, Some(true));
     assert_eq!(cell_block_after.fmt_language, Some("fr".into()));
     assert_eq!(
@@ -238,6 +240,7 @@ fn test_set_block_format_in_table_cell() -> Result<()> {
     let main_block_ids = get_block_ids(&db)?;
     let main_block = block_controller::get(&db, &main_block_ids[0])?.unwrap();
     assert_eq!(main_block.fmt_is_code_block, None);
+    assert_eq!(main_block.fmt_language, None);
 
     // ...and so are the sibling cells. Same bug, one step further: a caret
     // resolves to exactly one block, so the other three cells must be
@@ -248,7 +251,7 @@ fn test_set_block_format_in_table_cell() -> Result<()> {
         for id in ids {
             let b = block_controller::get(&db, &id)?.unwrap();
             assert_eq!(
-                b.fmt_is_code_block, None,
+                b.fmt_language, None,
                 "cell {i} must not have been formatted along with cell 0"
             );
         }

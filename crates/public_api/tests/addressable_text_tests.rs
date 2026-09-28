@@ -210,6 +210,59 @@ fn the_addressable_text_stays_true_after_an_edit() {
     assert_eq!(captured, "salt-bleached");
 }
 
+/// `replace_text` searched a text of its own, the blocks joined without the anchor a table
+/// takes, and placed what it found in the document's positions: every match after a table
+/// was placed two characters early for each table before it. "The cat sat" after a table
+/// became "Thdogat sat", and a match next to an image took the image with it.
+/// `find_and_replace` searched the addressable text and was right. Both replace exactly the
+/// text `find_all` finds now, and agree.
+#[test]
+fn replace_text_rewrites_the_matches_find_all_finds_after_a_table() {
+    let texts = [
+        "| a |\n\nThe cat sat ![pic](p.png) on the mat.",
+        "| cat | dog cat |\n\nA cat[^n] with ![img](cat.png) cat.\n\n| x |\n\nLast cat.\n\n\
+         [^n]: The cat's note.",
+        "> | cat |\n\nOut cat.",
+    ];
+    for text in BATTERY.iter().copied().chain(texts) {
+        for (query, replacement) in [("cat", "tiger"), ("a", ""), ("t", "TT")] {
+            let options = ReplaceOptions::default();
+            let doc = doc_of(text);
+            let before: Vec<char> = doc.to_addressable_text().unwrap().chars().collect();
+            let matches = doc.find_all(query, &options.find).unwrap();
+            let mut expected = String::new();
+            let mut at = 0;
+            for found in &matches {
+                expected.extend(&before[at..found.position]);
+                expected.push_str(replacement);
+                at = found.position + found.length;
+            }
+            expected.extend(&before[at..]);
+
+            let replaced = doc
+                .replace_text(query, replacement, true, &options)
+                .unwrap();
+            assert_eq!(replaced, matches.len(), "{query:?} in {text:?}");
+            assert_eq!(
+                doc.to_addressable_text().unwrap(),
+                expected,
+                "replacing {query:?} by {replacement:?} in {text:?}"
+            );
+            assert_blocks_index_the_addressable_text(&doc, "after replace_text");
+
+            let other = doc_of(text);
+            other
+                .find_and_replace(query, &options, |_, _| Some(replacement.to_string()))
+                .unwrap();
+            assert_eq!(
+                doc.to_djot().unwrap(),
+                other.to_djot().unwrap(),
+                "replace_text and find_and_replace of {query:?} in {text:?}"
+            );
+        }
+    }
+}
+
 /// Current behaviour, pinned deliberately: a footnote definition's body IS part of the
 /// live document's addressable text — its blocks are mirrored into the rope, an
 /// in-document search runs over them, and their `position()` counts them.
@@ -236,6 +289,53 @@ fn footnote_bodies_are_searched_in_the_live_document() {
         slice, "The note body",
         "to_addressable_text() must include what search searches — the note body"
     );
+}
+
+/// The live document holds a footnote's body after the main text, wherever the definition
+/// was written, so every offset the Djot view gives for the main text is the live
+/// document's: the Djot view is the start of the live one. With the body held where it was
+/// written, every offset after a definition was off by the body's length.
+#[test]
+fn the_djot_view_is_the_start_of_the_live_view_of_a_document_with_notes() {
+    let djot = "One[^a].\n\n[^a]: The note body.\n\nTwo after.\n\n[^b]: Second.\n\nThree.";
+    let doc = doc_of(djot);
+    let live = doc.to_addressable_text().unwrap();
+    let from_djot = djot_to_plain_text(djot, &DjotImportOptions::default());
+    assert!(
+        live.starts_with(&from_djot),
+        "live {live:?} does not start with the Djot view {from_djot:?}"
+    );
+    assert_eq!(live, format!("{from_djot}\nThe note body.\nSecond."));
+}
+
+/// A table whose rows differ in length holds an empty cell for every one a short row lacks,
+/// one position each, and the Djot view counts them as the document does.
+#[test]
+fn the_djot_view_counts_the_empty_cells_of_a_ragged_table() {
+    let djot = "Before.\n\n| a |\n| b | c |\n\nAfter.";
+    let doc = doc_of(djot);
+    assert_eq!(
+        doc.to_addressable_text().unwrap(),
+        djot_to_plain_text(djot, &DjotImportOptions::default())
+    );
+    assert_blocks_index_the_addressable_text(&doc, "ragged table");
+
+    // A table too ragged to complete is read as its cells' paragraphs, by both.
+    let mut djot = String::from("Before.\n\n|");
+    for column in 0..70 {
+        djot.push_str(&format!(" h{column} |"));
+    }
+    djot.push('\n');
+    for row in 0..70 {
+        djot.push_str(&format!("| r{row} |\n"));
+    }
+    djot.push_str("\nAfter.");
+    let doc = doc_of(&djot);
+    assert_eq!(
+        doc.to_addressable_text().unwrap(),
+        djot_to_plain_text(&djot, &DjotImportOptions::default())
+    );
+    assert_blocks_index_the_addressable_text(&doc, "a table read as paragraphs");
 }
 
 /// An empty document still answers, with an empty string, and its single empty block

@@ -76,10 +76,29 @@ fn execute_set_block_format(
     // Get frames
     let frame_ids = uow.get_document_relationship(&doc_id, &DocumentRelationshipField::Frames)?;
 
+    // The frames of table cells. A pipe table writes a cell's paragraphs as one line of
+    // inline text, whatever their format: a cell's paragraph made a code block was one in
+    // the editor only, lost at the next save, and it refused an image the save would have
+    // kept. No paragraph of a cell is made a code block.
+    let cell_frames: std::collections::HashSet<EntityId> = if dto.is_code_block == Some(true) {
+        uow.store()
+            .table_cells
+            .read()
+            .values()
+            .filter_map(|cell| cell.cell_frame)
+            .collect()
+    } else {
+        std::collections::HashSet::new()
+    };
+
     // Get block IDs from all frames
     let mut all_block_ids = Vec::new();
+    let mut in_cells: std::collections::HashSet<EntityId> = std::collections::HashSet::new();
     for fid in &frame_ids {
         let block_ids = uow.get_frame_relationship(fid, &FrameRelationshipField::Blocks)?;
+        if cell_frames.contains(fid) {
+            in_cells.extend(block_ids.iter().copied());
+        }
         all_block_ids.extend(block_ids);
     }
 
@@ -183,11 +202,15 @@ fn execute_set_block_format(
             if let Some(ref c) = dto.background_color {
                 updated.fmt_background_color = Some(c.clone());
             }
-            if let Some(v) = dto.is_code_block {
-                updated.fmt_is_code_block = Some(v);
-            }
-            if let Some(ref l) = dto.code_language {
-                updated.fmt_code_language = Some(l.clone());
+            // A cell's paragraph stays one (see `cell_frames`).
+            let becomes_code = dto.is_code_block == Some(true);
+            if !(becomes_code && in_cells.contains(&block.id)) {
+                if let Some(v) = dto.is_code_block {
+                    updated.fmt_is_code_block = Some(v);
+                }
+                if let Some(ref l) = dto.code_language {
+                    updated.fmt_code_language = Some(l.clone());
+                }
             }
             if let Some(v) = dto.hyphenate {
                 updated.fmt_hyphenate = Some(v);
@@ -212,6 +235,32 @@ fn execute_set_block_format(
             }
             updated.updated_at = chrono::Utc::now();
             blocks_to_update.push(updated);
+        }
+    }
+
+    // A code block is verbatim text: the save writes its characters and nothing else, so an
+    // image or a note's reference in one was shown and then lost. A paragraph holding either
+    // is not made a code block.
+    if dto.is_code_block == Some(true) {
+        let images = store.block_images.read();
+        let notes = store.block_footnote_refs.read();
+        let holds_objects = |block: &Block| {
+            images
+                .get(&block.id)
+                .is_some_and(|anchors| !anchors.is_empty())
+                || notes
+                    .get(&block.id)
+                    .is_some_and(|anchors| !anchors.is_empty())
+        };
+        if blocks_to_update
+            .iter()
+            .filter(|block| !in_cells.contains(&block.id))
+            .any(holds_objects)
+        {
+            return Err(anyhow!(
+                "a code block holds text only: a paragraph holding an image or a footnote \
+                 reference cannot become one"
+            ));
         }
     }
 

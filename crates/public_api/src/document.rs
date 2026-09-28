@@ -45,6 +45,35 @@ pub struct TextDocument {
     pub(crate) inner: Arc<Mutex<TextDocumentInner>>,
 }
 
+/// A load in place's result reader, made to clear the document's undo history the first time
+/// it hands over a successful result.
+///
+/// An import in place runs on a thread of its own, and the document learns of its end through
+/// the completion event, which reaches it on the event thread, possibly after the caller's
+/// [`Operation::wait`] has returned. Clearing only there left the history of the replaced
+/// content undoable for a while after `wait`, and would clear the entry of an edit made in
+/// that while. So the reader and the completion handler share one flag, registered here under
+/// the operation's id: whichever sees the new content first clears the history, and the
+/// other finds the flag set and leaves the history alone.
+fn clearing_history_on_success<T: 'static>(
+    inner: &mut TextDocumentInner,
+    op_id: &str,
+    read: impl Fn(&frontend::AppContext, &str) -> Option<Result<T>> + Send + 'static,
+) -> crate::operation::ResultFn<T> {
+    let cleared = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    inner
+        .history_resets
+        .insert(op_id.to_string(), Arc::clone(&cleared));
+    let stack_id = inner.stack_id;
+    Box::new(move |ctx, id| {
+        let result = read(ctx, id)?;
+        if result.is_ok() && !cleared.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            undo_redo_commands::clear_stack(ctx, stack_id);
+        }
+        Some(result)
+    })
+}
+
 /// Test-only accessor for the underlying rope-backed store. Not part
 /// of the stable public API.
 impl TextDocument {
@@ -154,6 +183,17 @@ impl TextDocument {
                 inner.queue_event(DocumentEvent::DocumentReset);
                 inner.check_block_count_changed();
                 inner.reset_cached_child_order();
+                // A load in place leaves no history behind it, unless a read of its
+                // result cleared it first (see `clearing_history_on_success`).
+                if let Some(cleared) = inner.history_resets.remove(&op_id) {
+                    if !cleared.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                        undo_redo_commands::clear_stack(&inner.ctx, inner.stack_id);
+                    }
+                    let stack = Some(inner.stack_id);
+                    let can_undo = undo_redo_commands::can_undo(&inner.ctx, stack);
+                    let can_redo = undo_redo_commands::can_redo(&inner.ctx, stack);
+                    inner.queue_event(DocumentEvent::UndoRedoChanged { can_undo, can_redo });
+                }
                 inner.queue_event(DocumentEvent::LongOperationFinished {
                     operation_id: op_id,
                     success: true,
@@ -172,6 +212,7 @@ impl TextDocument {
                     return;
                 }
                 inner.own_operations.remove(&op_id);
+                inner.history_resets.remove(&op_id);
                 inner.queue_event(DocumentEvent::LongOperationFinished {
                     operation_id: op_id,
                     success: false,
@@ -189,6 +230,7 @@ impl TextDocument {
                     return;
                 }
                 inner.own_operations.remove(&op_id);
+                inner.history_resets.remove(&op_id);
                 inner.queue_event(DocumentEvent::LongOperationFinished {
                     operation_id: op_id,
                     success: false,
@@ -314,7 +356,8 @@ impl TextDocument {
         Ok(dto.text)
     }
 
-    /// Replace the entire document with Markdown. Clears undo history.
+    /// Replace the entire document with Markdown. Clears undo history once the new content
+    /// is in (see [`set_djot`](Self::set_djot)).
     ///
     /// This is a **long operation**. Returns a typed [`Operation`] handle.
     pub fn set_markdown(&self, markdown: &str) -> Result<Operation<MarkdownImportResult>> {
@@ -325,20 +368,17 @@ impl TextDocument {
         };
         let op_id = document_io_commands::import_markdown(&inner.ctx, &dto)?;
         inner.own_operations.insert(op_id.clone());
-        Ok(Operation::new(
-            op_id,
-            &inner.ctx,
-            Box::new(|ctx, id| {
-                document_io_commands::get_import_markdown_result(ctx, id)
-                    .ok()
-                    .flatten()
-                    .map(|r| {
-                        Ok(MarkdownImportResult {
-                            block_count: to_usize(r.block_count),
-                        })
+        let read = clearing_history_on_success(&mut inner, &op_id, |ctx, id| {
+            document_io_commands::get_import_markdown_result(ctx, id)
+                .ok()
+                .flatten()
+                .map(|r| {
+                    Ok(MarkdownImportResult {
+                        block_count: to_usize(r.block_count),
                     })
-            }),
-        ))
+                })
+        });
+        Ok(Operation::new(op_id, &inner.ctx, read))
     }
 
     /// Export the entire document as Markdown.
@@ -359,14 +399,21 @@ impl TextDocument {
 
     /// Replace the entire document with djot markup. Clears undo history.
     ///
-    /// This is a **long operation**. Returns a typed [`Operation`] handle.
+    /// This is a **long operation**. Returns a typed [`Operation`] handle. The history is
+    /// cleared once the new content is in, by the first of these to happen: a read of the
+    /// operation's result ([`Operation::wait`], [`Operation::try_result`]), or the
+    /// completion reaching this document, which also announces
+    /// [`DocumentEvent::UndoRedoChanged`]. So [`can_undo`](Self::can_undo) is `false` as
+    /// soon as `wait` returns, and an edit made after that keeps its own entry. A load that
+    /// fails or is cancelled leaves the history as it was.
     pub fn set_djot(&self, djot: &str) -> Result<Operation<DjotImportResult>> {
         self.set_djot_with_options(djot, DjotImportOptions::default())
     }
 
     /// Replace the entire document with djot markup, selecting which optional
     /// block attributes (alignment, line height, direction, non-breakable
-    /// lines, background color) are applied via `options`. Clears undo history.
+    /// lines, background color) are applied via `options`. Clears undo history
+    /// once the new content is in (see [`set_djot`](Self::set_djot)).
     ///
     /// This is a **long operation**. Returns a typed [`Operation`] handle.
     pub fn set_djot_with_options(
@@ -382,20 +429,17 @@ impl TextDocument {
         };
         let op_id = document_io_commands::import_djot(&inner.ctx, &dto)?;
         inner.own_operations.insert(op_id.clone());
-        Ok(Operation::new(
-            op_id,
-            &inner.ctx,
-            Box::new(|ctx, id| {
-                document_io_commands::get_import_djot_result(ctx, id)
-                    .ok()
-                    .flatten()
-                    .map(|r| {
-                        Ok(DjotImportResult {
-                            block_count: to_usize(r.block_count),
-                        })
+        let read = clearing_history_on_success(&mut inner, &op_id, |ctx, id| {
+            document_io_commands::get_import_djot_result(ctx, id)
+                .ok()
+                .flatten()
+                .map(|r| {
+                    Ok(DjotImportResult {
+                        block_count: to_usize(r.block_count),
                     })
-            }),
-        ))
+                })
+        });
+        Ok(Operation::new(op_id, &inner.ctx, read))
     }
 
     /// Replace the entire document with djot markup, **synchronously**, on the
@@ -414,8 +458,8 @@ impl TextDocument {
     /// the caller must stay responsive (it reports progress and can be
     /// cancelled); prefer this when the caller just wants the content in.
     ///
-    /// Observationally equivalent to `set_djot(..).wait()` — same import, same
-    /// `DocumentReset`, same cache/block bookkeeping — except that, having no
+    /// Observationally equivalent to `set_djot(..).wait()`: same import, same
+    /// `DocumentReset`, same cache/block bookkeeping, same cleared history. Having no
     /// operation, it emits no `LongOperation*` events and cannot be cancelled.
     pub fn set_djot_sync(&self, djot: &str) -> Result<DjotImportResult> {
         self.set_djot_sync_with_options(djot, DjotImportOptions::default())
@@ -436,12 +480,20 @@ impl TextDocument {
                 options,
             };
             let result = document_io_commands::import_djot_sync(&inner.ctx, &dto)?;
+            // The history held edits of the content just replaced: undoing one of
+            // them put that content back over the load. Cleared as `set_plain_text`
+            // clears it.
+            undo_redo_commands::clear_stack(&inner.ctx, inner.stack_id);
             // The same settling the async path performs when its operation
             // completes (see `subscribe_long_operation_events`), done inline here
             // because there is no completion event to hang it off.
             inner.queue_event(DocumentEvent::DocumentReset);
             inner.check_block_count_changed();
             inner.reset_cached_child_order();
+            inner.queue_event(DocumentEvent::UndoRedoChanged {
+                can_undo: false,
+                can_redo: false,
+            });
             (inner.take_queued_events(), result.block_count)
         };
         // Dispatch outside the lock — a subscriber is free to call back in.
@@ -465,7 +517,8 @@ impl TextDocument {
         Ok(dto.djot_text)
     }
 
-    /// Replace the entire document with HTML. Clears undo history.
+    /// Replace the entire document with HTML. Clears undo history once the new content is
+    /// in (see [`set_djot`](Self::set_djot)).
     ///
     /// This is a **long operation**. Returns a typed [`Operation`] handle.
     pub fn set_html(&self, html: &str) -> Result<Operation<HtmlImportResult>> {
@@ -476,20 +529,17 @@ impl TextDocument {
         };
         let op_id = document_io_commands::import_html(&inner.ctx, &dto)?;
         inner.own_operations.insert(op_id.clone());
-        Ok(Operation::new(
-            op_id,
-            &inner.ctx,
-            Box::new(|ctx, id| {
-                document_io_commands::get_import_html_result(ctx, id)
-                    .ok()
-                    .flatten()
-                    .map(|r| {
-                        Ok(HtmlImportResult {
-                            block_count: to_usize(r.block_count),
-                        })
+        let read = clearing_history_on_success(&mut inner, &op_id, |ctx, id| {
+            document_io_commands::get_import_html_result(ctx, id)
+                .ok()
+                .flatten()
+                .map(|r| {
+                    Ok(HtmlImportResult {
+                        block_count: to_usize(r.block_count),
                     })
-            }),
-        ))
+                })
+        });
+        Ok(Operation::new(op_id, &inner.ctx, read))
     }
 
     /// Export the entire document as HTML.

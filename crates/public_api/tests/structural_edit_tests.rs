@@ -14,22 +14,29 @@
 //! after it wrong.
 //!
 //! [`check`] states the model: every block in exactly one frame and in the rope, the rope's
-//! order the frames' order, runs and anchors inside their block's text and every anchor on a
-//! `U+FFFC` of its own, and every export (and a reload of the document's own Djot) reading
-//! the same text, footnote bodies included. The random test drives pastes of Djot, Markdown
-//! and HTML fragments holding footnotes, quotations, lists and tables, copies of the document's
-//! own selections pasted back, deletions (whole tables among them), Backspace and Delete
-//! anywhere and at block starts, typing, formatted typing and replacement over ranges,
-//! paragraph breaks, images, footnote references, table rows, columns, cells and whole
-//! tables, quotation and list changes (list items moved a level in and out as an editor's
-//! Tab does among them), headings, italics, replace-all and undo/redo over
-//! documents holding all of those. Range ends favour the boundaries of blocks, table anchors
-//! and note bodies. It checks the model after every step and, around each edit of a range,
-//! that another cursor past the range still stands before the same text. Its size is bounded
-//! so it runs in every build; set
-//! `STRUCTURAL_EDIT_SEEDS` (and `STRUCTURAL_EDIT_STEPS`) to run it longer, in a release
-//! build for speed, and `STRUCTURAL_EDIT_FIRST_SEED` with `STRUCTURAL_EDIT_TRACE` to replay
-//! one failing seed step by step.
+//! order the frames' order with every note's body after the main text, runs and anchors inside
+//! their block's text and every anchor on a `U+FFFC` of its own, no image or note reference in
+//! a code block and no code block in a table cell, the document naming exactly the tables and
+//! lists the store holds, and every export (and a reload of the document's own Djot) reading
+//! the same text, the same note references and the same footnote bodies. The random test drives
+//! pastes of Djot, Markdown and HTML fragments holding footnotes, quotations (epigraphs, lists
+//! in quotations, nested ones), code blocks, lists and tables (ragged ones among them, and one
+//! too ragged to complete), copies of the document's own selections pasted back, deletions
+//! (whole tables among them), Backspace and Delete anywhere and at block starts, typing,
+//! formatted typing and replacement over ranges, paragraph breaks, images, footnote references,
+//! table rows, columns, cells and whole tables, quotation, list and code-block changes (list
+//! items moved a level in and out as an editor's Tab does among them), headings, italics,
+//! replace-all, loads in place through every setter, and undo/redo over documents holding all
+//! of those. Range ends favour the boundaries of blocks, table anchors and note bodies. It
+//! checks the model after every step and, around each edit of a range, that another cursor past
+//! the range still stands before the same text; that a text put back over everything reads as
+//! the same text loaded through the setter for its syntax, when neither holds a note's body;
+//! that a copy starting in the text holds none of a body's words and a paste changes no body
+//! but the one it goes into; and that a load in place leaves no history and no list of the
+//! content it replaced. Its size is bounded so it runs in every build; set
+//! `STRUCTURAL_EDIT_SEEDS` (and `STRUCTURAL_EDIT_STEPS`) to run it longer, in a release build
+//! for speed, and `STRUCTURAL_EDIT_FIRST_SEED` with `STRUCTURAL_EDIT_TRACE` to replay one
+//! failing seed step by step.
 //!
 //! The tests after it are the defects that differential found, each named after what broke.
 
@@ -37,7 +44,10 @@ use common::database::block_offset_index::OffsetMarker;
 use common::entities::{Block, Document, Frame, Table, TableCell};
 use common::format_runs::{FootnoteRefAnchor, FormatRun, ImageAnchor, check_well_formed};
 use std::collections::{HashMap, HashSet};
-use text_document::{FlowElementSnapshot, MoveMode, SelectionType, TextDocument, TextFormat};
+use text_document::{
+    DocumentFragment, FlowElementSnapshot, MoveMode, MoveOperation, SelectionType, TextDocument,
+    TextFormat,
+};
 
 const SENTINEL: char = '\u{FFFC}';
 
@@ -93,6 +103,24 @@ fn check(doc: &TextDocument) -> Result<(), String> {
         }
     }
 
+    // A code block is verbatim text: the save writes its characters and nothing else. No
+    // edit may leave an image or a note's reference in one.
+    if let Some(block) = code_block_holding_objects(doc) {
+        return Err(format!(
+            "code block {block} holds an image or a footnote reference, which the saved Djot \
+             leaves out: {djot:?}"
+        ));
+    }
+
+    // A pipe table writes a cell's paragraphs as one line of inline text: a code block in a
+    // cell is one in the editor only. No edit may make one.
+    if let Some(block) = code_block_in_a_cell(doc) {
+        return Err(format!(
+            "block {block} of a table cell is a code block, which the saved Djot leaves out: \
+             {djot:?}"
+        ));
+    }
+
     // A table nested in a table cell is more than a pipe table can say: the save drops it.
     // No edit may build one.
     if table_in_a_cell(doc) {
@@ -113,6 +141,21 @@ fn check(doc: &TextDocument) -> Result<(), String> {
         return Err(format!(
             "the reloaded Djot reads differently:\n djot {djot:?}\n plain {plain:?}\n again \
              {again:?}"
+        ));
+    }
+    // And the same references to notes, in the same order.
+    let labels = |doc: &TextDocument| -> Vec<String> {
+        doc.footnote_references()
+            .into_iter()
+            .map(|(_, label)| label)
+            .collect()
+    };
+    if labels(doc) != labels(&reloaded) {
+        return Err(format!(
+            "the reloaded Djot holds other note references:\n djot {djot:?}\n references {:?}\n \
+             again {:?}",
+            labels(doc),
+            labels(&reloaded)
         ));
     }
     // The plain text leaves footnote bodies out, so they are compared on their own, note by
@@ -214,6 +257,101 @@ fn table_in_a_cell(doc: &TextDocument) -> bool {
         .values()
         .filter_map(|cell| cell.cell_frame)
         .any(|frame| holds_table(frame, &frames, 0))
+}
+
+/// A code block holding an image or a footnote reference, if any. A table cell's block is
+/// left out: a pipe table writes a cell as inline text, whatever its block format says, so
+/// the save keeps what it holds.
+fn code_block_holding_objects(doc: &TextDocument) -> Option<u64> {
+    let store = doc.rope_store_for_test();
+    let blocks: HashMap<u64, Block> = copied(store.blocks.read().iter());
+    let frames: HashMap<u64, Frame> = copied(store.frames.read().iter());
+    let in_cells: HashSet<u64> = store
+        .table_cells
+        .read()
+        .values()
+        .filter_map(|cell| cell.cell_frame)
+        .filter_map(|frame| frames.get(&frame))
+        .flat_map(|frame| frame.blocks.iter().copied())
+        .collect();
+    let images = store.block_images.read();
+    let notes = store.block_footnote_refs.read();
+    blocks
+        .values()
+        .filter(|block| block.fmt_is_code_block == Some(true) && !in_cells.contains(&block.id))
+        .map(|block| block.id)
+        .find(|id| {
+            images.get(id).is_some_and(|anchors| !anchors.is_empty())
+                || notes.get(id).is_some_and(|anchors| !anchors.is_empty())
+        })
+}
+
+/// A block of a table cell that is a code block, if any.
+fn code_block_in_a_cell(doc: &TextDocument) -> Option<u64> {
+    let store = doc.rope_store_for_test();
+    let frames: HashMap<u64, Frame> = copied(store.frames.read().iter());
+    let blocks = store.blocks.read();
+    let cell_frames: Vec<u64> = store
+        .table_cells
+        .read()
+        .values()
+        .filter_map(|cell| cell.cell_frame)
+        .collect();
+    cell_frames
+        .iter()
+        .filter_map(|frame| frames.get(frame))
+        .flat_map(|frame| frame.blocks.iter().copied())
+        .find(|id| {
+            blocks
+                .get(id)
+                .is_some_and(|block| block.fmt_is_code_block == Some(true))
+        })
+}
+
+/// The label of the footnote whose body holds `position`, if one does.
+fn note_body_at(doc: &TextDocument, position: usize) -> Option<String> {
+    let store = doc.rope_store_for_test();
+    let frames: HashMap<u64, Frame> = copied(store.frames.read().iter());
+    let rope = store.rope.read();
+    let offsets = store.block_offsets.read();
+    for frame in frames.values() {
+        let Some(label) = &frame.footnote_label else {
+            continue;
+        };
+        let mut pending = vec![frame.id];
+        while let Some(frame_id) = pending.pop() {
+            let Some(frame) = frames.get(&frame_id) else {
+                continue;
+            };
+            pending.extend(
+                frame
+                    .child_order
+                    .iter()
+                    .filter(|entry| **entry < 0)
+                    .map(|entry| (-entry) as u64),
+            );
+            for block in &frame.blocks {
+                let Some((start, end, has_successor)) =
+                    offsets.range_with_successor(OffsetMarker::Block(*block))
+                else {
+                    continue;
+                };
+                let end = if has_successor && end > start {
+                    end - 1
+                } else {
+                    end
+                };
+                let (start, end) = (
+                    rope.byte_to_char(start as usize),
+                    rope.byte_to_char(end as usize),
+                );
+                if (start..=end).contains(&position) {
+                    return Some(label.clone());
+                }
+            }
+        }
+    }
+    None
 }
 
 /// The flow a view lays out: block positions increasing, each block's text at its position
@@ -396,6 +534,24 @@ fn check_store(doc: &TextDocument) -> Result<(), String> {
             return Err(format!("table {table_id} is in no flow"));
         }
     }
+    // The document names the tables and lists the store holds: a load in place kept the
+    // tables, cells and lists of the content it replaced out of the document's own lists.
+    // (Edits merging paragraphs can leave a list without an item behind; a load in place
+    // leaves none, which `reload_in_place` checks.)
+    let stored_tables: HashSet<u64> = tables.keys().copied().collect();
+    let named_tables: HashSet<u64> = document.tables.iter().copied().collect();
+    if stored_tables != named_tables {
+        return Err(format!(
+            "the store holds tables {stored_tables:?}, the document names {named_tables:?}"
+        ));
+    }
+    let stored_lists: HashSet<u64> = store.lists.read().keys().copied().collect();
+    let named_lists: HashSet<u64> = document.lists.iter().copied().collect();
+    if stored_lists != named_lists {
+        return Err(format!(
+            "the store holds lists {stored_lists:?}, the document names {named_lists:?}"
+        ));
+    }
 
     // What the rope says, through its index.
     let entries = offsets.entries.clone();
@@ -461,6 +617,20 @@ fn check_store(doc: &TextDocument) -> Result<(), String> {
     if indexed_flow != flow {
         return Err(format!(
             "the rope holds {indexed_flow:?}, the frames order {flow:?}"
+        ));
+    }
+    // The rope holds every note's body after the main text: the loads put them there, and
+    // the caret's moves stop at the end of the main text on that ground. No edit may leave
+    // a body before a paragraph of the text.
+    if let Some(first_body) = indexed
+        .iter()
+        .position(|item| in_definitions.contains(item))
+        && let Some(item) = indexed[first_body..]
+            .iter()
+            .find(|item| !in_definitions.contains(item))
+    {
+        return Err(format!(
+            "the rope holds {item:?} of the main text after a note's body: {indexed:?}"
         ));
     }
     for items in &definitions {
@@ -568,6 +738,25 @@ fn corpus() -> Vec<(&'static str, String)> {
                  1. first\n2. second\n\n| h1 | h2 |\n| c1[^t] | c2 |\n\nNoted[^a].\n\n\
                  [^a]: The note.\n\nLast line.\n"
         .to_string();
+    // Code blocks, each followed by a paragraph holding a note's reference or an image, and
+    // one in a quotation.
+    let code: String = (0..3)
+        .map(|i| {
+            format!(
+                "```\ncode {i}\n```\n\nNoted {i}[^k{i}] here ![pic](p{i}.png).\n\n> ```\n> quoted \
+                 code {i}\n> ```\n\n{}\n\n",
+                paragraph(i)
+            )
+        })
+        .collect();
+    // Quotations of every shape a text holds: an epigraph with its attribution set right, a
+    // list and a table in a quotation, quotations nested three deep.
+    let quotations = "> {semantic_role=epigraph}\n> The sea is not a place.\n>\n> \
+                      {alignment=right}\n> Anon.\n\nChapter text.\n\n> - a\n> - b\n\n\
+                      > | q1 | q2 |\n\n> > > deep\n> >\n> > less\n>\n> least\n\nEnd.\n"
+        .to_string();
+    // Rows of differing length, from Djot and from an HTML heading spanning two columns.
+    let ragged = "Before.\n\n| a |\n| b | c |\n| d | e | f |\n\nAfter.\n".to_string();
     vec![
         ("prose", plain),
         ("lists", lists),
@@ -576,6 +765,9 @@ fn corpus() -> Vec<(&'static str, String)> {
         ("notes", notes),
         ("bare notes", bare),
         ("mixed", mixed),
+        ("code", code),
+        ("quotations", quotations),
+        ("ragged", ragged),
     ]
 }
 
@@ -618,12 +810,89 @@ fn fragments() -> Vec<(&'static str, String)> {
                 .into(),
         ),
         ("markdown", "| x | y |\n|---|---|\n| 1 | 2 |\n".into()),
+        // Code blocks, alone and among paragraphs, and a `<pre>` holding an image.
+        ("djot", "```\npasted code\n```\n".into()),
+        (
+            "djot",
+            "before\n\n```rust\nfn f() {}\n```\n\nafter[^cb]".into(),
+        ),
+        ("markdown", "```\nmd code\n```\n\ntext\n".into()),
+        (
+            "html",
+            "<pre>pre code <img src=\"p.png\" alt=\"pic\"></pre><p>p</p>".into(),
+        ),
+        (
+            "html",
+            "<pre>line one\nline two <img src=\"p.png\" alt=\"pic\"> tail\n\nline three</pre>\
+             <p>after</p>"
+                .into(),
+        ),
+        // A passage a web page sets as a `<pre>`, which a paste reads as its lines, and a
+        // phrase copied from one, which goes into the paragraph at the caret.
+        (
+            "html",
+            "<pre>verse one\n  verse two\n\nverse three</pre>".into(),
+        ),
+        ("html", "<span>a <b>pasted</b> phrase</span>".into()),
+        // Quotations of the other shapes: an epigraph, a list in a quotation, one nested
+        // deeper than the one before it.
+        (
+            "djot",
+            "> {semantic_role=epigraph}\n> Epi.\n>\n> {alignment=right}\n> Who\n".into(),
+        ),
+        ("djot", "> - qa\n> - qb\n\nout".into()),
+        ("djot", "> > deep first\n>\n> shallow\n".into()),
+        // Tables whose rows differ in length.
+        ("djot", "| r1 |\n| r2 | r3 |\n".into()),
+        (
+            "html",
+            "<table><tr><th colspan=\"2\">Cast</th></tr><tr><td>Anna</td><td>widow</td></tr>\
+             </table>"
+                .into(),
+        ),
+        // A span closing a row, wider than any row reaches, and a table too ragged to
+        // complete, which is read as its cells' paragraphs.
+        (
+            "html",
+            "<table><tr><th colspan=\"900\">Title</th></tr><tr><td>one</td><td>two</td></tr>\
+             </table>"
+                .into(),
+        ),
+        ("djot", ragged_table(65, 64)),
     ]
+}
+
+/// A Djot table whose first row has `columns` cells and whose `rows` other rows have one
+/// each: completing its rows would make it many times the cells it has.
+fn ragged_table(columns: usize, rows: usize) -> String {
+    let mut table = String::from("|");
+    for column in 0..columns {
+        table.push_str(&format!(" h{column} |"));
+    }
+    table.push('\n');
+    for row in 0..rows {
+        table.push_str(&format!("| r{row} |\n"));
+    }
+    table
 }
 
 fn load(djot: &str) -> TextDocument {
     let doc = TextDocument::new();
     doc.set_djot_sync(djot).unwrap();
+    doc
+}
+
+/// A document holding `text`, loaded through the setter for its `syntax`.
+fn loaded_as(syntax: &str, text: &str) -> TextDocument {
+    let doc = TextDocument::new();
+    let loaded = match syntax {
+        "djot" => doc.set_djot_sync(text).map(|_| ()),
+        "markdown" => doc.set_markdown(text).and_then(|op| op.wait()).map(|_| ()),
+        _ => doc.set_html(text).and_then(|op| op.wait()).map(|_| ()),
+    };
+    if let Err(error) = loaded {
+        panic!("loading {syntax} {text:?}: {error}");
+    }
     doc
 }
 
@@ -926,7 +1195,7 @@ fn random_edit(doc: &TextDocument, rng: &mut Rng, fragments: &[(&str, String)]) 
         let (syntax, text) = &fragments[rng.below(fragments.len())];
         (*syntax, text.clone())
     };
-    match rng.below(40) {
+    match rng.below(42) {
         0 | 1 => {
             let (syntax, text) = pick_fragment(rng);
             let cursor = doc.cursor_at(from);
@@ -986,12 +1255,38 @@ fn random_edit(doc: &TextDocument, rng: &mut Rng, fragments: &[(&str, String)]) 
         }
         6 => {
             let (syntax, text) = pick_fragment(rng);
+            // A text put back reads as the same text loaded, as long as neither holds a
+            // footnote definition: a fragment carries no note's body, and the bodies of the
+            // text it replaces stay.
+            let comparable = !text.contains("]:") && !holds_definitions(doc);
             let cursor = doc.cursor();
             cursor.begin_edit_block();
             cursor.select(SelectionType::Document);
             paste(&cursor, syntax, &text);
             cursor.end_edit_block();
-            format!("restore {syntax} {text:?}")
+            let edit = format!("restore {syntax} {text:?}");
+            if comparable {
+                let restored = doc.to_djot().unwrap_or_default();
+                // Djot and Markdown are whole texts: put back, they read as the same text
+                // loaded. HTML is a paste: several paragraphs or a table read as pasted into
+                // an empty text, and a phrase goes into the paragraph the removal leaves, as
+                // typing does, which this leaves to its own test.
+                let expected = if syntax == "html" {
+                    let pasted = TextDocument::new();
+                    paste(&pasted.cursor(), syntax, &text);
+                    (pasted.blocks().len() > 1 || pasted.stats().table_count > 0)
+                        .then(|| pasted.to_djot().unwrap_or_default())
+                } else {
+                    Some(loaded_as(syntax, &text).to_djot().unwrap_or_default())
+                };
+                if let Some(expected) = expected {
+                    assert_eq!(
+                        restored, expected,
+                        "{edit}: the text put back reads otherwise loaded"
+                    );
+                }
+            }
+            edit
         }
         7 => {
             let cursor = doc.cursor_at(from);
@@ -1149,8 +1444,34 @@ fn random_edit(doc: &TextDocument, rng: &mut Rng, fragments: &[(&str, String)]) 
             let word = words[rng.below(words.len())];
             let replacement = ["X", "", "longer text"][rng.below(3)];
             let options = text_document::ReplaceOptions::new(text_document::FindOptions::default());
-            let _ = doc.replace_text(word, replacement, true, &options);
-            format!("replace every {word:?} by {replacement:?}")
+            let edit = format!("replace every {word:?} by {replacement:?}");
+            // Every match `find_all` reports is the text replaced, in the text it searched:
+            // after a table, the matches were placed two characters early for each table
+            // before them, and other characters were rewritten, an image with them.
+            let before = doc.to_addressable_text().unwrap_or_default();
+            let matches = doc.find_all(word, &options.find).unwrap_or_default();
+            if let Ok(replaced) = doc.replace_text(word, replacement, true, &options) {
+                let chars: Vec<char> = before.chars().collect();
+                let mut expected = String::new();
+                let mut at = 0;
+                for found in &matches {
+                    expected.extend(&chars[at..found.position]);
+                    expected.push_str(replacement);
+                    at = found.position + found.length;
+                }
+                expected.extend(&chars[at..]);
+                assert_eq!(
+                    replaced,
+                    matches.len(),
+                    "{edit}: not every match was replaced"
+                );
+                assert_eq!(
+                    doc.to_addressable_text().unwrap_or_default(),
+                    expected,
+                    "{edit}: other text than the matches changed"
+                );
+            }
+            edit
         }
         26 => with_other_cursor(doc, rng, (from, to), false, || {
             let done = doc
@@ -1198,8 +1519,37 @@ fn random_edit(doc: &TextDocument, rng: &mut Rng, fragments: &[(&str, String)]) 
             let fragment = select(doc, from, to).selection();
             let (x, y) = (random_position(doc, n, rng), random_position(doc, n, rng));
             let (x, y) = (x.min(y), x.max(y));
+            let edit = format!("copy {from}..{to} and paste it over {x}..{y}");
+            // A copy of a range starting in the text holds the text's words only, never a
+            // note's body.
+            if note_body_at(doc, from).is_none() {
+                let text = doc
+                    .to_plain_text()
+                    .unwrap_or_default()
+                    .replace(SENTINEL, " ");
+                let copied = fragment.to_plain_text().replace(SENTINEL, " ");
+                if let Some(word) = copied.split_whitespace().find(|word| !text.contains(word)) {
+                    panic!("{edit}: the copy holds {word:?}, which the text does not: {copied:?}");
+                }
+            }
+            // The paste edits the tree it starts in: no other note's body changes.
+            let pasted_into = note_body_at(doc, x);
+            let bodies_before = note_bodies(doc);
             let _ = select(doc, x, y).insert_fragment(&fragment);
-            format!("copy {from}..{to} and paste it over {x}..{y}")
+            let bodies_after = note_bodies(doc);
+            let others = |bodies: &std::collections::BTreeMap<String, String>| {
+                bodies
+                    .iter()
+                    .filter(|(label, _)| Some(*label) != pasted_into.as_ref())
+                    .map(|(label, body)| (label.clone(), body.clone()))
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(
+                others(&bodies_after),
+                others(&bodies_before),
+                "{edit}: a note's body changed"
+            );
+            edit
         }
         32 => {
             let cursor = select(doc, from, to);
@@ -1211,9 +1561,64 @@ fn random_edit(doc: &TextDocument, rng: &mut Rng, fragments: &[(&str, String)]) 
             let _ = cursor.insert_image("image.png", "alt", 4, 4);
             format!("insert an image over {from}..{to}")
         }
+        35 => reload_in_place(doc, rng, fragments),
+        36 => {
+            let code = rng.below(2) == 0;
+            let format = text_document::BlockFormat {
+                is_code_block: Some(code),
+                ..Default::default()
+            };
+            let _ = select(doc, from, to).set_block_format(&format);
+            format!("code block {code} over {from}..{to}")
+        }
         34 if doc.can_redo() => {
             let _ = doc.redo();
             "redo".into()
+        }
+        37 => {
+            // Select all, cut and paste back at the same caret, as one edit: the text is as
+            // it was, and so is the text a save of it reads back as. A copy held a quoted
+            // paragraph once for each quotation around it, one of a text opening with a
+            // quoted table held nothing, and the paste put every paragraph into the
+            // quotation the first one stood in. Two quotations side by side are one after a
+            // reload, as after this paste, so the saved text is compared as a reload reads
+            // it; and an empty paragraph, which no save keeps, can be left before a table the
+            // text opens with or dropped at its end, so the text is compared line by line,
+            // every line that holds anything once and in its place.
+            let edit = "cut everything and paste it back".to_string();
+            let Ok((djot, text)) = seen(doc) else {
+                return edit;
+            };
+            let cursor = doc.cursor();
+            cursor.select(SelectionType::Document);
+            let cut = cursor.selection();
+            if cut.is_empty() {
+                return edit;
+            }
+            cursor.begin_edit_block();
+            let pasted = cursor
+                .remove_selected_text()
+                .and_then(|_| cursor.insert_fragment(&cut));
+            cursor.end_edit_block();
+            if let Err(error) = pasted {
+                panic!("{edit}: {error}");
+            }
+            let (djot_after, text_after) =
+                seen(doc).unwrap_or_else(|error| panic!("{edit}: {error}"));
+            let lines = |text: &str| -> Vec<String> {
+                text.split('\n')
+                    .filter(|line| !line.is_empty())
+                    .map(str::to_string)
+                    .collect()
+            };
+            assert_eq!(lines(&text_after), lines(&text), "{edit}: the text changed");
+            let reloaded = |djot: &str| load(djot).to_djot().unwrap_or_default();
+            assert_eq!(
+                reloaded(&djot_after),
+                reloaded(&djot),
+                "{edit}: the saved text changed, from {djot:?} to {djot_after:?}"
+            );
+            edit
         }
         _ => {
             let _ = doc.undo();
@@ -1248,6 +1653,55 @@ fn nest_list_item(doc: &TextDocument, at: usize, deeper: bool) -> text_document:
         });
     cursor.end_edit_block();
     result
+}
+
+/// Whether `doc` holds a footnote definition.
+fn holds_definitions(doc: &TextDocument) -> bool {
+    doc.rope_store_for_test()
+        .frames
+        .read()
+        .values()
+        .any(|frame| frame.footnote_label.is_some())
+}
+
+/// Load a text over the document, as a host reloads a scene another command rewrote: the
+/// document's own Djot, or a fragment in its syntax, through the setter for it. Nothing of
+/// the content replaced stays: no table, cell or list outside the new content, and no
+/// history to undo into it.
+fn reload_in_place(doc: &TextDocument, rng: &mut Rng, fragments: &[(&str, String)]) -> String {
+    let (syntax, text) = if rng.below(3) == 0 {
+        ("djot", doc.to_djot().unwrap_or_default())
+    } else {
+        let (syntax, text) = &fragments[rng.below(fragments.len())];
+        (*syntax, text.clone())
+    };
+    let loaded = match syntax {
+        "djot" if rng.below(2) == 0 => doc.set_djot_sync(&text).map(|_| ()),
+        "djot" => doc.set_djot(&text).and_then(|op| op.wait()).map(|_| ()),
+        "markdown" => doc.set_markdown(&text).and_then(|op| op.wait()).map(|_| ()),
+        _ => doc.set_html(&text).and_then(|op| op.wait()).map(|_| ()),
+    };
+    let edit = format!("reload {syntax} {text:?}");
+    if let Err(error) = loaded {
+        panic!("{edit}: {error}");
+    }
+    assert!(
+        !doc.can_undo() && !doc.can_redo(),
+        "{edit}: the history of the replaced content survived"
+    );
+    let store = doc.rope_store_for_test();
+    let used_lists: HashSet<u64> = store
+        .blocks
+        .read()
+        .values()
+        .filter_map(|block| block.list)
+        .collect();
+    let stored_lists: HashSet<u64> = store.lists.read().keys().copied().collect();
+    assert_eq!(
+        stored_lists, used_lists,
+        "{edit}: lists of the replaced content stayed"
+    );
+    edit
 }
 
 fn env_count(name: &str, default: u64) -> u64 {
@@ -1590,6 +2044,647 @@ fn a_paste_after_a_quotation_lands_where_the_caret_is() {
     );
 }
 
+/// Putting back a version of a text selects all of it and inserts the version's Djot. The
+/// fragment a Djot, Markdown or HTML text becomes carried no quotation depth, and dropped the
+/// code-block flag and the alignment: every quotation and code block of the restored text came
+/// back as a plain paragraph, an epigraph lost its quotation and its alignment, and the next
+/// save kept it so. A text put back reads as the same text loaded.
+#[test]
+fn putting_back_a_version_keeps_its_quotations_and_code_blocks() {
+    for text in [
+        "First.\n\n> A quotation.\n\nLast.",
+        "Para.\n\n> quoted",
+        "> - a\n> - b",
+        "```\ncode\n```",
+        "```rust\nfn main() {}\n```\n\nAfter.",
+        "> {semantic_role=epigraph}\n> The sea is not a place; it is a going.\n>\n> \
+         {alignment=right}\n> Anon., *Tidewater*\n\nChapter text.",
+        "> quoted *a*\n>\n> > nested b\n\nAfter.",
+        "> > Deep first.\n>\n> Shallow.\n\nOut.",
+        "Before.\n\n> In the quote.\n>\n> | a | b |\n\nAfter.",
+        "{alignment=center}\nCentered.\n\n> Quoted.",
+        "> Quote one.\n\nBetween.\n\n> Quote two.",
+    ] {
+        let expected = load(text).to_djot().unwrap();
+        let doc = load("Now.");
+        restore(&doc, text);
+        assert_model(&doc, &format!("restoring {text:?}"));
+        assert_eq!(doc.to_djot().unwrap(), expected, "restoring {text:?}");
+    }
+
+    // The same holds for Markdown, and for HTML but its `<pre>`, which a paste reads as
+    // paragraphs (see `a_preformatted_passage_pasted_as_html_goes_in_as_its_lines`).
+    let doc = load("Now.");
+    let cursor = doc.cursor();
+    cursor.select(SelectionType::Document);
+    cursor
+        .insert_markdown("Para.\n\n> quoted\n\n```\ncode\n```\n")
+        .unwrap();
+    assert_eq!(
+        doc.to_djot().unwrap(),
+        "Para.\n\n> quoted\n\n```\ncode\n```"
+    );
+    let doc = load("Now.");
+    let cursor = doc.cursor();
+    cursor.select(SelectionType::Document);
+    cursor
+        .insert_html("<p>Para.</p><blockquote><p>quoted</p></blockquote><pre>code</pre>")
+        .unwrap();
+    assert_eq!(doc.to_djot().unwrap(), "Para.\n\n> quoted\n\ncode");
+}
+
+/// Deleting everything leaves one empty paragraph, which keeps the formatting of the first
+/// one deleted and stays in its quotations. A version put back over everything merged its first
+/// paragraph into it: it came back a heading, a code block, a list item or an epigraph it
+/// never was. Pasted into an empty text, a text keeps its own formatting, and one Undo gives
+/// back the empty paragraph as it was.
+#[test]
+fn putting_back_a_version_over_any_text_reads_as_the_version_loaded() {
+    let versions = [
+        "First.\n\n> A quotation.\n\nLast.",
+        "See this[^f1] and that.",
+        "| p | q |\n\nafter",
+    ];
+    for current in [
+        "# Title\n\nText.",
+        "```\ncode\n```\n\nText.",
+        "> {semantic_role=epigraph}\n> Epi.\n\nText.",
+        "> > Deep.\n\nText.",
+        "- item\n- two",
+        "| solo |",
+        "|  |",
+    ] {
+        for version in versions {
+            let doc = load(current);
+            restore(&doc, version);
+            assert_model(&doc, &format!("putting {version:?} back over {current:?}"));
+            assert_eq!(
+                doc.to_djot().unwrap(),
+                load(version).to_djot().unwrap(),
+                "putting {version:?} back over {current:?}"
+            );
+        }
+    }
+
+    // Removing a table a quotation held alone leaves the quotation, holding nothing, which
+    // no export shows. The empty text around it is still empty.
+    let doc = load("# Title\n\n> | a | b |\n");
+    doc.cursor_at(position_of(&doc, "a"))
+        .remove_current_table()
+        .unwrap();
+    assert_eq!(doc.to_djot().unwrap(), "# Title");
+    restore(&doc, "Plain.");
+    assert_model(&doc, "a text put back over a quotation holding nothing");
+    assert_eq!(doc.to_djot().unwrap(), "Plain.");
+
+    let doc = load("# Heading\n\nText.\n");
+    let cursor = select(&doc, 0, length(&doc));
+    cursor.begin_edit_block();
+    cursor.insert_djot("plain").unwrap();
+    cursor.end_edit_block();
+    assert_eq!(doc.to_djot().unwrap(), "plain");
+    doc.undo().unwrap();
+    assert_eq!(
+        doc.to_djot().unwrap(),
+        "# Heading\n\nText.",
+        "one Undo gives the text back"
+    );
+}
+
+/// Pasting at a caret in an empty paragraph is an edit of that paragraph: a fragment of one
+/// plain paragraph takes its formatting, as typed text does. A heading line, a code block, a
+/// centred line, a list item or a quotation the writer made of an empty line lost its
+/// formatting to a paste, because every paste into an empty text first made its paragraph
+/// plain, for the sake of a text put back over everything. Only a paste over a selection of
+/// the whole text replaces the text with the pasted one, formatting and all: a selection
+/// from its start to its end, or `select(SelectionType::Document)`, which in an empty text
+/// selects nothing and still means the whole text.
+#[test]
+fn pasting_into_an_empty_formatted_line_keeps_its_format() {
+    let heading = text_document::BlockFormat {
+        heading_level: Some(1),
+        ..Default::default()
+    };
+    let code = text_document::BlockFormat {
+        is_code_block: Some(true),
+        ..Default::default()
+    };
+    let centred = text_document::BlockFormat {
+        alignment: Some(text_document::Alignment::Center),
+        ..Default::default()
+    };
+    for (name, format, expected) in [
+        ("a heading", &heading, "# Pasted title"),
+        ("a code block", &code, "```\nPasted title\n```"),
+        (
+            "a centred line",
+            &centred,
+            "{alignment=center}\nPasted title",
+        ),
+    ] {
+        for syntax in ["djot", "markdown", "html"] {
+            let doc = TextDocument::new();
+            doc.cursor().set_block_format(format).unwrap();
+            paste(&doc.cursor(), syntax, "Pasted title");
+            assert_eq!(
+                doc.to_djot().unwrap(),
+                expected,
+                "{syntax} pasted into {name}"
+            );
+        }
+        let doc = TextDocument::new();
+        doc.cursor().set_block_format(format).unwrap();
+        doc.cursor().insert_text("Pasted title").unwrap();
+        assert_eq!(doc.to_djot().unwrap(), expected, "typed into {name}");
+    }
+
+    let doc = TextDocument::new();
+    doc.cursor()
+        .create_list(text_document::ListStyle::Disc)
+        .unwrap();
+    doc.cursor().insert_djot("milk").unwrap();
+    assert_eq!(doc.to_djot().unwrap(), "- milk");
+
+    let doc = TextDocument::new();
+    doc.cursor().insert_blockquote().unwrap();
+    doc.cursor().insert_djot("A quote").unwrap();
+    assert_model(&doc, "the paste into the empty quotation");
+    assert_eq!(doc.to_djot().unwrap(), "> A quote");
+
+    // Deleting everything, then pasting at the caret: the empty paragraph keeps the first
+    // paragraph's heading, as it does for typing.
+    let doc = load("# Title\n\nText.\n");
+    select(&doc, 0, length(&doc))
+        .remove_selected_text()
+        .unwrap();
+    doc.cursor().insert_djot("New").unwrap();
+    assert_eq!(doc.to_djot().unwrap(), "# New");
+    // Pasting over the whole text: the text is the one pasted.
+    let doc = load("# Title\n\nText.\n");
+    select(&doc, 0, length(&doc)).insert_djot("New").unwrap();
+    assert_eq!(doc.to_djot().unwrap(), "New");
+    // Deleting everything, then putting a version back over all of the empty text, as a
+    // host does it: the text is the version.
+    let doc = load("# Title\n\nText.\n");
+    select(&doc, 0, length(&doc))
+        .remove_selected_text()
+        .unwrap();
+    restore(&doc, "New");
+    assert_eq!(doc.to_djot().unwrap(), "New");
+    for (name, format) in [("a heading", &heading), ("a code block", &code)] {
+        let doc = TextDocument::new();
+        doc.cursor().set_block_format(format).unwrap();
+        restore(&doc, "Put back.\n\n> Quoted.");
+        assert_model(&doc, &format!("a text put back over {name}"));
+        assert_eq!(
+            doc.to_djot().unwrap(),
+            "Put back.\n\n> Quoted.",
+            "a text put back over {name}"
+        );
+    }
+    // Moving the caret after selecting everything is a caret again.
+    let doc = TextDocument::new();
+    doc.cursor().set_block_format(&heading).unwrap();
+    let cursor = doc.cursor();
+    cursor.select(SelectionType::Document);
+    cursor.set_position(0, MoveMode::MoveAnchor);
+    cursor.insert_djot("Kept").unwrap();
+    assert_eq!(doc.to_djot().unwrap(), "# Kept");
+}
+
+/// Selecting all of a text and pasting a phrase over it, a few words copied from the text or
+/// from a web page, is an edit of the text's first paragraph, as typing over everything is:
+/// the phrase takes that paragraph's direction, alignment, heading level and quotation. Every
+/// paste over all of a text made that paragraph plain first, for the sake of a version put
+/// back: a right-to-left scene came back left to right, a quoted letter unquoted and a
+/// centred line uncentred. A whole text (Djot or Markdown a host inserts, or a whole
+/// document) and a fragment with a structure of its own still replace the text with theirs.
+#[test]
+fn pasting_a_phrase_over_the_whole_text_keeps_its_first_paragraph_as_typing_does() {
+    let rtl = text_document::BlockFormat {
+        direction: Some(text_document::TextDirection::RightToLeft),
+        ..Default::default()
+    };
+    for (name, text) in [
+        (
+            "right to left",
+            "\u{645}\u{631}\u{62d}\u{628}\u{627} \u{628}\u{627}\u{644}\u{639}\u{627}\u{644}\u{645}.",
+        ),
+        (
+            "centred",
+            "{alignment=center}\nA centred line here.\n\nMore.",
+        ),
+        ("quoted", "> A letter, here.\n>\n> Signed.\n\nAfter."),
+        ("a heading", "# A title here\n\nText."),
+    ] {
+        let source = load(text);
+        if name == "right to left" {
+            source.cursor_at(1).set_block_format(&rtl).unwrap();
+        }
+        let original = source.to_djot().unwrap();
+        let phrase = select(&source, 2, 5).selection();
+        let words = phrase.to_plain_text().to_string();
+
+        let typed = load(&original);
+        let cursor = typed.cursor();
+        cursor.select(SelectionType::Document);
+        cursor.insert_text(&words).unwrap();
+        let typed = typed.to_djot().unwrap();
+
+        let pasted = load(&original);
+        let cursor = pasted.cursor();
+        cursor.select(SelectionType::Document);
+        cursor.insert_fragment(&phrase).unwrap();
+        assert_model(&pasted, &format!("a phrase pasted over {name}"));
+        assert_eq!(
+            pasted.to_djot().unwrap(),
+            typed,
+            "a phrase copied from {name} and pasted over all of it"
+        );
+        let html = load(&original);
+        let cursor = html.cursor();
+        cursor.select(SelectionType::Document);
+        cursor
+            .insert_html(&format!("<span>{words}</span>"))
+            .unwrap();
+        assert_eq!(
+            html.to_djot().unwrap(),
+            typed,
+            "a phrase pasted as HTML over all of {name}"
+        );
+    }
+
+    // A whole text replaces the text, a phrase as much as a longer one.
+    for (syntax, text) in [("djot", "New"), ("markdown", "New")] {
+        let doc = load("# Title\n\nText.\n");
+        paste(&select(&doc, 0, length(&doc)), syntax, text);
+        assert_eq!(doc.to_djot().unwrap(), "New", "{syntax} over all of a text");
+    }
+    let whole = DocumentFragment::from_document(&load("Plain.")).unwrap();
+    let doc = load("> # Title\n\nText.\n");
+    select(&doc, 0, length(&doc))
+        .insert_fragment(&whole)
+        .unwrap();
+    assert_eq!(
+        doc.to_djot().unwrap(),
+        "Plain.",
+        "a whole document over all of a text"
+    );
+
+    // A fragment with a structure of its own replaces the text too: two paragraphs copied,
+    // and one heading pasted as HTML.
+    let copied = {
+        let source = load("First.\n\nSecond.\n");
+        let cursor = source.cursor();
+        cursor.select(SelectionType::Document);
+        cursor.selection()
+    };
+    let doc = load("# Title\n\n> Text.\n");
+    select(&doc, 0, length(&doc))
+        .insert_fragment(&copied)
+        .unwrap();
+    assert_model(&doc, "two paragraphs pasted over all of a text");
+    assert_eq!(doc.to_djot().unwrap(), "First.\n\nSecond.");
+    let doc = load("> A letter.\n\nText.\n");
+    select(&doc, 0, length(&doc))
+        .insert_html("<h2>Heading</h2>")
+        .unwrap();
+    assert_model(&doc, "a heading pasted over all of a text");
+    assert_eq!(doc.to_djot().unwrap(), "## Heading");
+}
+
+/// A quotation pasted into a paragraph goes in as a quotation, between the two halves of the
+/// paragraph; pasted into a quotation it is not quoted twice; pasted into a table cell or a
+/// note's body, which hold paragraphs only, it goes in as paragraphs.
+#[test]
+fn a_pasted_quotation_stays_a_quotation_where_one_can_stand() {
+    let doc = load("Before after.\n");
+    doc.cursor_at(7).insert_djot("> quoted").unwrap();
+    assert_model(&doc, "the paste into a paragraph");
+    assert_eq!(doc.to_djot().unwrap(), "Before {}\n\n> quoted\n\nafter.");
+
+    let doc = load("> One two.\n\nOut.\n");
+    doc.cursor_at(3).insert_djot("> in\n\nplain").unwrap();
+    assert_model(&doc, "the paste into a quotation");
+    assert_eq!(
+        doc.to_djot().unwrap(),
+        "> One\n>\n> in\n>\n> plain two.\n\nOut."
+    );
+
+    let doc = load("> One.\n\nOut.\n");
+    doc.cursor_at(3).insert_djot("> > nested\n").unwrap();
+    assert_model(&doc, "a nested quotation pasted into a quotation");
+    assert_eq!(
+        doc.to_djot().unwrap(),
+        "> One\n>\n> > nested\n>\n> .\n\nOut."
+    );
+
+    let doc = load("Start.\n\n| abc | d |\n\nEnd.\n");
+    doc.cursor_at(position_of(&doc, "bc"))
+        .insert_djot("x\n\n> q\n\ny")
+        .unwrap();
+    assert_model(&doc, "the paste into a cell");
+
+    let doc = load("Noted[^a] here.\n\n[^a]: The note.\n");
+    doc.cursor_at(position_of(&doc, "note."))
+        .insert_djot("x\n\n> q\n\ny")
+        .unwrap();
+    assert_model(&doc, "the paste into a note");
+}
+
+/// A selection across a quotation copies each of its paragraphs once. Every frame of the
+/// document was read, each quotation's once for itself and once more for every frame it is
+/// nested in: a paragraph of a quotation nested in another was copied three times.
+#[test]
+fn copying_across_quotations_copies_each_paragraph_once_and_keeps_them_quoted() {
+    let text = "Para.\n\n> quoted\n>\n> > deeper\n\n| a | b |\n\nEnd.\n";
+    let doc = load(text);
+    let cursor = doc.cursor();
+    cursor.select(SelectionType::Document);
+    let copied = cursor.selection();
+    assert_eq!(copied.to_plain_text(), "Para.\nquoted\ndeeper\na\nb\nEnd.");
+    let pasted = load("");
+    pasted.cursor().insert_fragment(&copied).unwrap();
+    assert_model(&pasted, "the paste of the copy");
+    assert_eq!(pasted.to_djot().unwrap(), load(text).to_djot().unwrap());
+}
+
+// ── Code blocks ──────────────────────────────────────────────────────────────
+
+/// The labels of `doc`'s footnote references, in order, and those of a reload of its Djot.
+fn references_and_reloaded(doc: &TextDocument) -> (Vec<String>, Vec<String>) {
+    let labels = |doc: &TextDocument| -> Vec<String> {
+        doc.footnote_references()
+            .into_iter()
+            .map(|(_, label)| label)
+            .collect()
+    };
+    (labels(doc), labels(&load(&doc.to_djot().unwrap())))
+}
+
+/// A code block is verbatim text: the save writes its characters and nothing else. Joining a
+/// paragraph holding a note's reference or an image into one kept them in the model, so the
+/// editor showed them, while the save dropped them: the note lost its place in the text at
+/// the next reopening. Backspace and Delete there join nothing now, and a range across them
+/// takes the text it covers and joins nothing, and says which text it took.
+#[test]
+fn nothing_joins_a_note_reference_or_an_image_into_a_code_block() {
+    let text = "```\ncode\n```\n\nNoted[^a] here ![pic](p.png).\n";
+    let original = load(text).to_djot().unwrap();
+    let doc = load(text);
+    doc.cursor_at(position_of(&doc, "Noted"))
+        .delete_previous_char()
+        .unwrap();
+    assert_model(&doc, "Backspace after the code block");
+    assert_eq!(doc.to_djot().unwrap(), original);
+
+    let doc = load(text);
+    doc.cursor_at("code".len()).delete_char().unwrap();
+    assert_model(&doc, "Delete at the end of the code block");
+    assert_eq!(doc.to_djot().unwrap(), original);
+
+    let doc = load(text);
+    let removed = select(&doc, 2, position_of(&doc, "ted"))
+        .remove_selected_text()
+        .unwrap();
+    assert_model(&doc, "a deletion from the code block into the paragraph");
+    assert_eq!(removed, "de\nNo", "the text the deletion took");
+    assert_eq!(
+        doc.to_djot().unwrap(),
+        "```\nco\n```\n\nted[^a] here ![pic](p.png)."
+    );
+    let (references, reloaded) = references_and_reloaded(&doc);
+    assert_eq!(references, vec!["a".to_string()]);
+    assert_eq!(references, reloaded);
+
+    // Text alone still joins.
+    let doc = load("```\ncode\n```\n\nplain words\n");
+    doc.cursor_at(position_of(&doc, "plain"))
+        .delete_previous_char()
+        .unwrap();
+    assert_model(&doc, "Backspace joining text into the code block");
+    assert_eq!(doc.to_djot().unwrap(), "```\ncodeplain words\n```");
+}
+
+/// An image, a note's reference, or a paste carrying either, goes into no code block: the
+/// insertion is refused and the text left as it was. Making a paragraph that holds one a
+/// code block is refused the same way.
+#[test]
+fn a_code_block_takes_no_image_and_no_note_reference() {
+    let text = "```\ncode\n```\n\nPlain[^a].\n";
+    let original = load(text).to_djot().unwrap();
+
+    let doc = load(text);
+    assert!(doc.cursor_at(2).insert_image("p.png", "pic", 4, 4).is_err());
+    assert!(doc.cursor_at(2).insert_footnote_reference("z").is_err());
+    assert!(doc.cursor_at(2).insert_djot("see[^y] this").is_err());
+    assert!(
+        doc.cursor_at(2)
+            .insert_djot("one\n\ntwo ![pic](p.png)")
+            .is_err()
+    );
+    assert_model(&doc, "the refused insertions");
+    assert_eq!(doc.to_djot().unwrap(), original);
+    // Text still goes in, and so does a paragraph of its own.
+    doc.cursor_at(2).insert_djot("XY").unwrap();
+    assert_eq!(doc.to_djot().unwrap(), "```\ncoXYde\n```\n\nPlain[^a].");
+
+    let doc = load(text);
+    let code = text_document::BlockFormat {
+        is_code_block: Some(true),
+        ..Default::default()
+    };
+    assert!(
+        select(&doc, position_of(&doc, "Plain"), length(&doc))
+            .set_block_format(&code)
+            .is_err()
+    );
+    assert_eq!(doc.to_djot().unwrap(), original);
+
+    // A `<pre>` holding an image is read as a paragraph, the image kept.
+    let doc = TextDocument::new();
+    doc.set_html("<pre>code <img src=\"p.png\" alt=\"pic\"></pre>")
+        .unwrap()
+        .wait()
+        .unwrap();
+    assert_model(&doc, "the HTML load");
+    assert!(
+        doc.to_djot().unwrap().contains("![pic](p.png)"),
+        "{:?}",
+        doc.to_djot()
+    );
+}
+
+/// A `<pre>` holding an image is read as paragraphs, and a paragraph holds no line break: its
+/// lines were kept in one paragraph, which the editor showed on several lines and the save
+/// wrote as one, so they ran together at the next reopening. Each line is a paragraph of
+/// its own, loaded or pasted, an empty line an empty paragraph, as a preformatted paragraph
+/// is split (see `split_block_at_line_breaks`), and the saved text reads back the same, but
+/// for the empty paragraph, which a reload keeps no block for.
+#[test]
+fn a_pre_holding_an_image_keeps_its_lines() {
+    let html = "<pre>line one\nline two <img src=\"p.png\" alt=\"pic\"> tail\n\nline three\n</pre>\
+                <p>After.</p>";
+    let lines = [
+        "line one",
+        "line two \u{FFFC} tail",
+        "",
+        "line three",
+        "After.",
+    ];
+    let doc = TextDocument::new();
+    doc.set_html(html).unwrap().wait().unwrap();
+    assert_model(&doc, "the HTML load");
+    assert_eq!(doc.to_addressable_text().unwrap(), lines.join("\n"));
+    let reloaded = load(&doc.to_djot().unwrap());
+    let written: Vec<&str> = lines.iter().copied().filter(|l| !l.is_empty()).collect();
+    assert_eq!(
+        reloaded.to_addressable_text().unwrap(),
+        written.join("\n"),
+        "the saved text reads back line for line"
+    );
+
+    let doc = load("Before.\n");
+    doc.cursor_at("Before.".len()).insert_html(html).unwrap();
+    assert_model(&doc, "the HTML paste");
+    assert_eq!(
+        doc.to_addressable_text().unwrap(),
+        format!("Before.{}", lines.join("\n"))
+    );
+}
+
+/// A passage pasted from a web page as a `<pre>`, a poem set line by line, went in as a code
+/// block once fragments carried code blocks for the sake of a version put back: a code block
+/// keeps no emphasis at the next save and takes no footnote reference, and a host with no
+/// command to make it prose again left the writer with the passage set as code. Pasted as
+/// HTML, a `<pre>` goes in as paragraphs, one for each line, an empty line an empty paragraph
+/// and each line keeping its spaces; loaded as HTML, and pasted as Djot or Markdown, it stays
+/// a code block.
+#[test]
+fn a_preformatted_passage_pasted_as_html_goes_in_as_its_lines() {
+    let verses: String = (0..4).map(|i| format!("verse {i} of the poem\n")).collect();
+    let html = format!("<pre>{verses}\n  the last verse</pre>");
+    let lines: Vec<String> = (0..4)
+        .map(|i| format!("verse {i} of the poem"))
+        .chain(["".to_string(), "  the last verse".to_string()])
+        .collect();
+
+    let doc = TextDocument::new();
+    doc.cursor_at(0).insert_html(&html).unwrap();
+    assert_model(&doc, "the passage pasted");
+    assert_eq!(doc.to_addressable_text().unwrap(), lines.join("\n"));
+    let cursor = doc.cursor_at(0);
+    cursor.move_position(MoveOperation::End, MoveMode::KeepAnchor, 1);
+    cursor
+        .merge_char_format(&TextFormat {
+            font_italic: Some(true),
+            ..Default::default()
+        })
+        .unwrap();
+    // Emphasis cannot open on a space, so the writer puts the kept spaces in front of it,
+    // behind the `{}` that keeps them.
+    let emphasised: Vec<String> = lines
+        .iter()
+        .map(|line| match line.strip_prefix("  ") {
+            Some(rest) => format!("{{}}  _{rest}_"),
+            None if line.is_empty() => String::new(),
+            None => format!("_{line}_"),
+        })
+        .collect();
+    assert_eq!(
+        doc.to_djot().unwrap(),
+        emphasised.join("\n\n"),
+        "the emphasis is saved"
+    );
+    doc.cursor_at("verse 0".len())
+        .insert_footnote_reference("n1")
+        .unwrap();
+    let (references, reloaded) = references_and_reloaded(&doc);
+    assert_eq!(references, ["n1"]);
+    assert_eq!(reloaded, ["n1"], "the reference is saved");
+
+    // Into prose, the lines go in as pasted paragraphs do, and into a quotation too.
+    let doc = load("She read aloud: and then stopped.\n");
+    doc.cursor_at("She read aloud: ".len())
+        .insert_html("<pre>Two roads diverged\nin a yellow wood</pre>")
+        .unwrap();
+    assert_model(&doc, "the passage pasted into prose");
+    assert_eq!(
+        doc.to_djot().unwrap(),
+        "She read aloud: Two roads diverged\n\nin a yellow woodand then stopped."
+    );
+    let doc = load("Before.\n");
+    doc.cursor_at("Before.".len())
+        .insert_html("<blockquote><pre>one\ntwo</pre></blockquote>")
+        .unwrap();
+    assert_model(&doc, "the passage pasted from a quotation");
+    assert_eq!(doc.to_djot().unwrap(), "Before.\n\n> one\n>\n> two");
+
+    // Loaded as HTML, and pasted as Djot or Markdown, it stays a code block.
+    let doc = TextDocument::new();
+    doc.set_html("<pre>line one\nline two</pre>")
+        .unwrap()
+        .wait()
+        .unwrap();
+    assert_eq!(doc.to_djot().unwrap(), "```\nline one\nline two\n```");
+    for (syntax, text) in [
+        ("djot", "```\nline one\nline two\n```\n"),
+        ("markdown", "```\nline one\nline two\n```\n"),
+    ] {
+        let doc = TextDocument::new();
+        paste(&doc.cursor(), syntax, text);
+        assert_eq!(
+            doc.to_djot().unwrap(),
+            "```\nline one\nline two\n```",
+            "{syntax} pasted"
+        );
+    }
+}
+
+/// A pipe table writes a cell's paragraphs as one line of inline text, whatever their
+/// format. A code block pasted into a cell stayed one in the editor, lost at the next save,
+/// and refused an image the save would have kept; making a cell's paragraph a code block did
+/// the same. A cell's paragraph is never a code block: the paste goes in as a paragraph, and
+/// the other formats asked for alongside the code block still apply.
+#[test]
+fn a_table_cell_holds_no_code_block() {
+    let doc = load("| a | b |\n");
+    doc.cursor_at(position_of(&doc, "a"))
+        .insert_djot("```rust\ncode\n```\n\nnext")
+        .unwrap();
+    assert_model(&doc, "the paste into a cell");
+    assert!(code_block_in_a_cell(&doc).is_none(), "{:?}", doc.to_djot());
+    assert!(
+        doc.cursor_at(position_of(&doc, "code"))
+            .insert_image("p.png", "pic", 4, 4)
+            .is_ok()
+    );
+    assert_model(&doc, "the image in the cell");
+    assert_eq!(
+        load(&doc.to_djot().unwrap()).to_djot().unwrap(),
+        doc.to_djot().unwrap()
+    );
+
+    let doc = load("Before.\n\n| a | b |\n\nAfter.\n");
+    let format = text_document::BlockFormat {
+        is_code_block: Some(true),
+        alignment: Some(text_document::Alignment::Center),
+        ..Default::default()
+    };
+    select(&doc, 0, length(&doc))
+        .set_block_format(&format)
+        .unwrap();
+    assert_model(&doc, "a code block over the paragraphs and the cells");
+    assert!(code_block_in_a_cell(&doc).is_none());
+    let cell = doc.block_format_at(position_of(&doc, "a")).unwrap();
+    assert_eq!(cell.alignment, Some(text_document::Alignment::Center));
+    assert_eq!(
+        doc.block_format_at(0).unwrap().is_code_block,
+        Some(true),
+        "the paragraph outside the table is one"
+    );
+}
+
 // ── Tables ───────────────────────────────────────────────────────────────────
 
 /// A pasted table's cells went into the rope at the end of the enclosing frame, after
@@ -1688,6 +2783,52 @@ fn edits_at_a_table_anchor_land_in_its_first_cell() {
             doc.to_addressable_text().unwrap(),
             "Before.\n\u{FFFC}\npasteda\nb\nAfter."
         );
+    }
+}
+
+/// A caret on a table's anchor, or on the boundary after it, is read as every edit reads it,
+/// at the start of the table's first cell, by what a cursor reports of it (its block, its
+/// list, its cell) as by what an edit changes there. The lookup of the caret's block walked
+/// the blocks without the anchor's two positions: past the anchor it answered the second
+/// paragraph of the first cell, so a list item made there read back as out of its list,
+/// and moving it a level in failed ("cursor is not inside a list").
+#[test]
+fn a_caret_on_a_table_anchor_reads_the_first_cell() {
+    let doc = load("Before.\n\n| a | b |\n\nAfter.\n");
+    let anchor = position_of(&doc, "\u{FFFC}");
+    let first_cell = position_of(&doc, "a\nb");
+    // A second paragraph in the first cell, a list item.
+    doc.cursor_at(first_cell + 1)
+        .insert_list(text_document::ListStyle::Decimal)
+        .unwrap();
+    assert_model(&doc, "the list item in the cell");
+    let item = doc.cursor_at(first_cell + 2);
+    assert!(item.current_list().is_some(), "{:?}", doc.to_djot());
+    let first_block = doc.block_at_caret(first_cell).unwrap();
+    for at in [anchor, anchor + 1] {
+        let cursor = doc.cursor_at(at);
+        assert_eq!(
+            doc.block_at_caret(at).unwrap(),
+            first_block,
+            "the caret at {at} on the anchor"
+        );
+        assert!(cursor.current_list().is_none(), "the caret at {at}");
+        let cell = cursor
+            .current_table_cell()
+            .expect("the caret stands in a cell");
+        assert_eq!((cell.row, cell.column), (0, 0), "the caret at {at}");
+        // Making a list there makes one of the first paragraph, which then reads as listed.
+        let doc = load(&doc.to_djot().unwrap());
+        let cursor = doc.cursor_at(at);
+        cursor.create_list(text_document::ListStyle::Disc).unwrap();
+        assert!(cursor.current_list().is_some(), "the list made at {at}");
+        cursor
+            .set_current_list_format(&text_document::ListFormat {
+                indent: Some(1),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_model(&doc, &format!("the list made at {at}"));
     }
 }
 
@@ -2013,6 +3154,32 @@ fn deleting_a_selection_over_a_table_of_one_cell_removes_the_table() {
     assert_eq!(doc.to_djot().unwrap(), "Start.\n\nEnd.");
 }
 
+/// A selection from a table's anchor to the end of its last cell holds the whole table, as
+/// one from the paragraph before it does. Its start moved into the first cell, so over a table
+/// of one cell it read as a range inside that cell: select all over a text that is one such
+/// table emptied the cell and kept the table, and a text put back over everything went into
+/// the cell.
+#[test]
+fn selecting_all_of_a_text_that_is_a_table_of_one_cell_removes_the_table() {
+    let doc = load("| solo |\n");
+    let cursor = doc.cursor();
+    cursor.select(SelectionType::Document);
+    cursor.remove_selected_text().unwrap();
+    assert_model(&doc, "the deletion");
+    assert_eq!(doc.to_addressable_text().unwrap(), "");
+
+    let doc = load("| solo |\n");
+    restore(&doc, "See this[^f1].");
+    assert_model(&doc, "the restore");
+    assert_eq!(doc.to_djot().unwrap(), "See this[^f1].");
+
+    // The cell empty: the range's start, moved past the anchor, meets its end.
+    let doc = load("|  |\n");
+    restore(&doc, "> quoted");
+    assert_model(&doc, "the restore over an empty cell");
+    assert_eq!(doc.to_djot().unwrap(), "> quoted");
+}
+
 /// Removing a row, a column or a table removes its cells' blocks through the block store,
 /// which kept their footnote references: readers walking the references still counted them,
 /// and reported and numbered notes whose text was gone.
@@ -2075,22 +3242,63 @@ fn a_frame_without_an_order_keeps_its_paragraph_order_in_the_saved_text() {
 
 // ── Footnote bodies ──────────────────────────────────────────────────────────
 
-/// The rope holds a footnote's body between the paragraphs around it, where no view shows it.
-/// Backspace at the start of the paragraph after a body joined that paragraph to the hidden
-/// note, and Delete at the end of the paragraph before one pulled the note into the prose and
-/// left its reference without a body. Neither joins anything now, nor does Backspace at the
-/// start of the body.
+/// No view shows a footnote's body, and the rope used to hold it where the definition was
+/// written, between the paragraphs around it. Backspace at the start of the paragraph after a
+/// body, and Delete at the end of the paragraph before one, joined nothing there, so a writer
+/// could not join the two paragraphs they saw; the Right arrow from the end of the first went
+/// into the hidden body, and typing there edited the note unseen. A load now puts every body
+/// after the main text: the two paragraphs join as any two do, and the note keeps its body.
 #[test]
-fn backspace_or_delete_at_a_note_body_edge_joins_nothing() {
-    let text = "Line one has a note[^n0].\n\n[^n0]: Note zero.\n\nLine two here.\n";
-    let original = load(text).to_djot().unwrap();
+fn a_note_body_written_between_paragraphs_stays_out_of_their_way() {
+    let text = "One[^a].\n\n[^a]: Note text.\n\nTwo.\n";
     let doc = load(text);
-    doc.cursor_at(position_of(&doc, "Line two"))
+    assert_eq!(
+        doc.to_addressable_text().unwrap(),
+        "One\u{FFFC}.\nTwo.\nNote text."
+    );
+    assert_model(&doc, "the load");
+
+    let doc = load(text);
+    doc.cursor_at(position_of(&doc, "Two"))
         .delete_previous_char()
         .unwrap();
-    assert_model(&doc, "Backspace after the body");
-    assert_eq!(doc.to_djot().unwrap(), original);
+    assert_model(&doc, "Backspace at the start of the second paragraph");
+    assert_eq!(doc.to_djot().unwrap(), "One[^a].Two.\n\n[^a]: Note text.");
 
+    let doc = load(text);
+    doc.cursor_at(position_of(&doc, ".\nTwo") + 1)
+        .delete_char()
+        .unwrap();
+    assert_model(&doc, "Delete at the end of the first paragraph");
+    assert_eq!(doc.to_djot().unwrap(), "One[^a].Two.\n\n[^a]: Note text.");
+
+    // The Right arrow goes from one paragraph to the other, and stops at the end of the text.
+    let doc = load(text);
+    let cursor = doc.cursor_at(position_of(&doc, ".\nTwo") + 1);
+    cursor.move_position(text_document::MoveOperation::Right, MoveMode::MoveAnchor, 1);
+    assert_eq!(cursor.position(), position_of(&doc, "Two"));
+    let end_of_text = position_of(&doc, "\nNote");
+    let cursor = doc.cursor_at(end_of_text);
+    cursor.move_position(text_document::MoveOperation::Right, MoveMode::MoveAnchor, 1);
+    assert_eq!(
+        cursor.position(),
+        end_of_text,
+        "the Right arrow went into the note"
+    );
+    cursor.insert_text("X").unwrap();
+    assert_eq!(
+        doc.to_djot().unwrap(),
+        "One[^a].\n\nTwo.X\n\n[^a]: Note text."
+    );
+}
+
+/// The last paragraph and a note's body are still two texts, not two paragraphs of one: Delete
+/// at the end of the text, and Backspace at the start of the body, join nothing. And the arrows
+/// and the jumps to the end of the text stop at its end.
+#[test]
+fn the_edge_between_the_text_and_the_notes_joins_nothing() {
+    let text = "Line one has a note[^n0].\n\n[^n0]: Note zero.\n\nLine two here.\n";
+    let original = load(text).to_djot().unwrap();
     let doc = load(text);
     doc.cursor_at(position_of(&doc, ".\nNote") + 1)
         .delete_char()
@@ -2104,6 +3312,90 @@ fn backspace_or_delete_at_a_note_body_edge_joins_nothing() {
         .unwrap();
     assert_model(&doc, "Backspace at the start of the body");
     assert_eq!(doc.to_djot().unwrap(), original);
+
+    let doc = load(text);
+    let end_of_text = position_of(&doc, ".\nNote") + 1;
+    for operation in [
+        text_document::MoveOperation::End,
+        text_document::MoveOperation::NextCharacter,
+        text_document::MoveOperation::NextBlock,
+        text_document::MoveOperation::NextWord,
+        text_document::MoveOperation::Down,
+    ] {
+        let cursor = doc.cursor_at(position_of(&doc, "here"));
+        cursor.move_position(operation, MoveMode::KeepAnchor, 3);
+        assert!(
+            cursor.position() <= end_of_text,
+            "{operation:?} went into the note, to {}",
+            cursor.position()
+        );
+    }
+}
+
+/// A selection runs from where it starts: in the text it copies and deletes text only, in a
+/// note's body that body only. Copying or cutting a range that ran across a body carried the
+/// body's text as a paragraph, and pasting put the note's text into the prose; cutting took the
+/// body away, so select all, cut and paste left every note without its body.
+#[test]
+fn copying_or_cutting_across_a_note_body_leaves_the_body_where_it_is() {
+    let text = "Intro[^a] text.\n\n[^a]: Body a.\n\nMiddle[^b].\n\n[^b]: Body b.\n\nEnd.\n";
+    let original = load(text).to_djot().unwrap();
+
+    let doc = load(text);
+    let cursor = doc.cursor();
+    cursor.select(SelectionType::Document);
+    let copied = cursor.selection();
+    assert!(
+        !copied.to_plain_text().contains("Body"),
+        "{:?}",
+        copied.to_plain_text()
+    );
+    cursor.insert_fragment(&copied).unwrap();
+    assert_model(&doc, "select all, copy and paste");
+    assert_eq!(doc.to_djot().unwrap(), original);
+
+    let doc = load(text);
+    let cursor = doc.cursor();
+    cursor.select(SelectionType::Document);
+    let cut = cursor.selection();
+    cursor.remove_selected_text().unwrap();
+    assert_model(&doc, "select all and cut");
+    assert_eq!(
+        note_bodies(&doc).len(),
+        2,
+        "the cut took the notes' bodies: {:?}",
+        doc.to_djot()
+    );
+    doc.cursor().insert_fragment(&cut).unwrap();
+    assert_model(&doc, "the paste after the cut");
+    assert_eq!(doc.to_djot().unwrap(), original);
+
+    // From a paragraph to the end, from the text's side: a note referenced before the range
+    // keeps its body.
+    let doc = load("A[^a] first.\n\nB second.\n\nC third.\n\n[^a]: Body a.\n");
+    let cursor = doc.cursor_at(position_of(&doc, "\nC third"));
+    cursor.move_position(text_document::MoveOperation::End, MoveMode::KeepAnchor, 1);
+    cursor.set_position(length(&doc), MoveMode::KeepAnchor);
+    let cut = cursor.selection();
+    assert_eq!(cut.to_plain_text(), "\nC third.");
+    cursor.remove_selected_text().unwrap();
+    assert_model(&doc, "cutting to the end");
+    assert_eq!(
+        doc.to_djot().unwrap(),
+        "A[^a] first.\n\nB second.\n\n[^a]: Body a."
+    );
+
+    // A selection inside a body copies from that body.
+    let doc = load("One[^a].\n\n[^a]: Note text.\n\nTwo.\n");
+    let body = position_of(&doc, "Note text");
+    assert_eq!(
+        select(&doc, body, body + 4).selection().to_plain_text(),
+        "Note"
+    );
+    assert_eq!(
+        select(&doc, 0, length(&doc)).selection().to_plain_text(),
+        "One\u{FFFC}.\nTwo."
+    );
 }
 
 /// A cursor is placed where it is asked, and a selection reads the text it covers, after a

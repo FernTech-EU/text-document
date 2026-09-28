@@ -4,7 +4,7 @@ use crate::ReplaceResultDto;
 use crate::ReplaceTextDto;
 use anyhow::{Result, anyhow};
 use common::database::CommandUnitOfWork;
-use common::database::rope_helpers::rope_flat_text_if_simple;
+use common::database::rope_helpers::rope_full_text_if_flow_matches;
 use common::direct_access::document::document_repository::DocumentRelationshipField;
 use common::direct_access::frame::frame_repository::FrameRelationshipField;
 use common::direct_access::root::root_repository::RootRelationshipField;
@@ -15,7 +15,6 @@ use common::snapshot::EntityTreeSnapshot;
 use common::types::{EntityId, ROOT_ENTITY_ID};
 use common::undo_redo::UndoRedoCommand;
 use std::any::Any;
-use std::collections::HashMap;
 
 pub trait ReplaceTextUnitOfWorkFactoryTrait: Send + Sync {
     fn create(&self) -> Box<dyn ReplaceTextUnitOfWorkTrait>;
@@ -64,8 +63,13 @@ fn fetch_blocks_and_build_text(
     common::database::rope_helpers::refresh_block_positions(&mut blocks, &uow.store());
     blocks.sort_by_key(|b| b.document_position);
 
-    // Fast path: flat single-frame doc — rope contents == full plain text.
-    let full_text = rope_flat_text_if_simple(&uow.store(), frame_ids.len())
+    // The text `find_all` searches, built as it builds it: the rope, whenever its positions
+    // are the flow's, which is the space the matches are placed in. The rope was read only
+    // for a text of one frame and no table, and every other text was joined block by block
+    // without the character a table's anchor takes: every match after a table was placed
+    // two characters early for each table before it, and rewrote the wrong characters, an
+    // image with them.
+    let full_text = rope_full_text_if_flow_matches(&uow.store())
         .unwrap_or_else(|| build_full_text_via_store(&blocks, &uow.store()));
 
     Ok((full_text, blocks))
@@ -142,25 +146,11 @@ fn apply_specs(
         });
     }
 
-    // DESCENDING. An earlier edit's length change must not move a range a later edit still
-    // has to address.
-    let mut delta_by_block_id: HashMap<EntityId, i64> = HashMap::new();
-    for edit in plan.edits.iter().rev() {
-        let block = uow
-            .get_block(&blocks[edit.block_idx].id)?
-            .ok_or_else(|| anyhow!("Block not found"))?;
-
-        let updated = replace_core::apply_in_block(
-            &store,
-            &block,
-            edit.block_offset,
-            edit.block_offset + edit.length,
-            &edit.replacement,
-            policy,
-        )?;
-        uow.update_block(&updated)?;
-
-        *delta_by_block_id.entry(block.id).or_insert(0) += replace_core::char_delta(edit);
+    // Every edit in one pass over the document (see `replace_core::apply_plan`), then the
+    // blocks it changed, persisted.
+    let (changed, delta_by_block_id) = replace_core::apply_plan(&store, blocks, &plan, policy)?;
+    if !changed.is_empty() {
+        uow.update_block_multi(&changed)?;
     }
 
     let (moved, total_delta) = replace_core::rebase_positions(blocks, &delta_by_block_id);

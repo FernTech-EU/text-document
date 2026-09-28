@@ -51,6 +51,14 @@ pub(crate) struct CursorData {
     /// instead — [`TextDocument::sentence_at`](crate::TextDocument::sentence_at) takes the same
     /// value per call for callers that would rather not hold a cursor at all.
     pub content_locale: Option<String>,
+    /// Whether the cursor's selection is the whole text, as
+    /// [`select(SelectionType::Document)`](crate::SelectionType::Document) made it. Set there,
+    /// and by a removal of a selection that left the text empty (a cut of all of it), and
+    /// cleared by every other change of the cursor's position or anchor and by every edit. In
+    /// an empty text that selection is empty, the same positions as a caret, and a paste over
+    /// it still replaces the text, as a paste over any whole-text selection does (see
+    /// `TextCursor::insert_fragment_with_origin`).
+    pub whole_text_selected: bool,
 }
 
 /// Callback entry for document event subscriptions.
@@ -143,6 +151,11 @@ pub(crate) struct TextDocumentInner {
     /// a standalone document, which is the only subscriber on its own hub and
     /// can accept everything it is handed.
     pub own_operations: std::collections::HashSet<String>,
+    /// The loads in place this document started that are still to clear its undo history,
+    /// each with the flag its result reader shares with the completion handler: whichever
+    /// of the two sees the new content first clears the history and sets the flag, so the
+    /// other leaves alone the history of any edit made since.
+    pub history_resets: HashMap<String, Arc<AtomicBool>>,
     // Holds SubscriptionTokens for LongOperation event bridges. Dropping a
     // token unsubscribes the callback, so these must outlive the document.
     pub long_op_subscriptions: Vec<SubscriptionToken>,
@@ -168,6 +181,8 @@ impl TextDocumentInner {
                 // Cell selection override references table coordinates that may be
                 // invalidated by the edit, so always clear it.
                 data.cell_selection_override = None;
+                // The text is not the one that was selected whole any more.
+                data.whole_text_selected = false;
             }
         }
     }
@@ -180,6 +195,7 @@ impl TextDocumentInner {
             anchor: position,
             content_locale: None,
             cell_selection_override: None,
+            whole_text_selected: false,
         }));
         self.cursors.push(Arc::downgrade(&data));
         data
@@ -488,6 +504,7 @@ impl TextDocumentInner {
             long_op_subscriptions: Vec::new(),
             backend: None,
             own_operations: std::collections::HashSet::new(),
+            history_resets: HashMap::new(),
         })
     }
 }
@@ -605,9 +622,12 @@ pub(crate) fn refresh_block_positions(
 /// pinned by its own tests — but a caret on that same offset has not left the paragraph it
 /// just finished typing, and every cursor-driven query wants the other answer.
 ///
-/// The correction is exact rather than heuristic: the separator rule is the only way the
-/// command can report a block starting *after* the position asked for, and a separator is
-/// exactly one character wide, so the caret belongs to whatever owns `position - 1`.
+/// The correction is exact rather than heuristic: past a table's anchor, the separator
+/// rule is the only way the command can report a block starting *after* the position asked
+/// for, and a separator is exactly one character wide, so the caret belongs to whatever owns
+/// `position - 1`. A caret on a table's anchor stands at the table's first cell, as every
+/// edit reads it: the command reports that cell's block, which starts after the anchor, and
+/// it is the caret's.
 ///
 /// Lives here so the document-level query, the cursor's own, and anything else needing
 /// caret semantics share one rule instead of three copies that can drift.
@@ -621,6 +641,15 @@ pub(crate) fn block_at_caret_dto(
             &frontend::document_inspection::GetBlockAtPositionDto { position: p as i64 },
         )
     };
+    let store = ctx.db_context.get_store();
+    let past_anchor = frontend::common::database::rope_helpers::snap_off_table_anchor(
+        store,
+        position as i64,
+        true,
+    );
+    if past_anchor != position as i64 {
+        return Ok(at(past_anchor.max(0) as usize)?);
+    }
     let info = at(position)?;
     if position > 0 && (info.block_start as usize) > position {
         return Ok(at(position - 1)?);

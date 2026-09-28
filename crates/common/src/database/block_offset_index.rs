@@ -157,6 +157,21 @@ impl BlockOffsetIndex {
         }
     }
 
+    /// Replace the entries from `position` on with `run`, one for one: the markers the run
+    /// holds are the markers those entries held, in another order and at other byte starts.
+    /// The caller keeps the `byte_start`s ordered, as for [`insert_at`](Self::insert_at).
+    /// Nothing outside the run moves, so only the run's own markers are re-indexed.
+    pub fn reorder_run(&mut self, position: usize, run: &[(OffsetMarker, u32)]) {
+        let entries = Arc::make_mut(&mut self.entries);
+        let Some(slots) = entries.get_mut(position..position + run.len()) else {
+            return;
+        };
+        slots.copy_from_slice(run);
+        for (offset, (marker, _)) in run.iter().enumerate() {
+            self.marker_index.insert(*marker, position + offset);
+        }
+    }
+
     /// Take bytes out after several entries at once: for each
     /// `(position, bytes)`, every entry past `position` moves back by
     /// `bytes`, and so does `total_bytes`. The result is exactly what calling
@@ -184,6 +199,36 @@ impl BlockOffsetIndex {
             }
         }
         self.total_bytes = self.total_bytes.saturating_sub(removed);
+    }
+
+    /// Shift the entries past several thresholds at once: for each
+    /// `(threshold, delta)`, every entry starting at or past `threshold` moves
+    /// by `delta`, and so does `total_bytes`. The result is exactly what calling
+    /// [`shift_after`](Self::shift_after) once per pair leaves, every threshold
+    /// read in the offsets as they stand before any of them moves, as the edits
+    /// of one text applied from its end back do. The entries are walked once
+    /// for the whole list instead of once per pair. `shifts` is in increasing
+    /// `threshold` order.
+    pub fn shift_after_each(&mut self, shifts: &[(u32, i32)]) {
+        if shifts.is_empty() {
+            return;
+        }
+        let first = self.entries.partition_point(|(_, bs)| *bs < shifts[0].0);
+        entries_rewritten(self.entries.len() - first);
+        let mut delta: i32 = 0;
+        let mut pending = shifts.iter().peekable();
+        for (_, byte_start) in Arc::make_mut(&mut self.entries)[first..].iter_mut() {
+            while let Some(&&(threshold, shift)) = pending.peek() {
+                if threshold > *byte_start {
+                    break;
+                }
+                delta += shift;
+                pending.next();
+            }
+            *byte_start = apply_delta(*byte_start, delta);
+        }
+        let total: i32 = shifts.iter().map(|(_, shift)| shift).sum();
+        self.total_bytes = apply_delta(self.total_bytes, total);
     }
 
     /// Drop the entries `dropped` flags (one flag per entry, by position) and

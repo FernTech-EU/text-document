@@ -10,11 +10,13 @@ use crate::database::Store;
 use crate::database::block_offset_index::OffsetMarker;
 use crate::entities::Block;
 use crate::format_runs::{
-    FormatRunError, ReplaceFormatPolicy, check_well_formed, logical_offset_to_byte,
-    shift_footnote_refs_for_delete, shift_footnote_refs_for_insert, shift_images_for_delete,
-    shift_images_for_insert, shift_runs_for_replace,
+    FootnoteRefAnchor, FormatRun, FormatRunError, ImageAnchor, ReplaceFormatPolicy,
+    check_well_formed, logical_offset_to_byte, shift_footnote_refs_for_delete,
+    shift_footnote_refs_for_insert, shift_images_for_delete, shift_images_for_insert,
+    shift_runs_for_replace,
 };
 use crate::types::EntityId;
+use std::collections::HashMap;
 
 /// Read a block's content from the global rope via `block_offsets`,
 /// stripping the trailing `\n` boundary that `range_of` includes for
@@ -154,6 +156,99 @@ pub fn rope_positions_match_flow(store: &Store) -> bool {
     drop(offsets);
     let total_block_count = store.blocks.read().len();
     indexed_block_count == total_block_count
+}
+
+/// Where the main text ends, as a position, when the rope holds anything after it, which
+/// is the footnote bodies: the end of the main frame's last entry. `None` when nothing
+/// follows the main text, or when the rope's positions are not the flow's.
+///
+/// No view shows a footnote's body, and the loads put every body after the main text: a
+/// caret moved on from the end of the text went into the first note, and typing there
+/// edited it unseen. The cursor's moves stop here.
+///
+/// Read down from the end of the main frame, so it costs the depth of the frames the text
+/// ends in (and the cells of a table it ends with), whatever the length of the text and
+/// however many notes follow it. Every forward move of a caret asks it; it gathered every
+/// block of every body first, milliseconds a keystroke in a document of many notes.
+pub fn main_text_end(store: &Store) -> Option<i64> {
+    if !rope_positions_match_flow(store) {
+        return None;
+    }
+    let main_frame = store
+        .documents
+        .read()
+        .values()
+        .next()
+        .and_then(|document| document.frames.first().copied())?;
+    let last = {
+        let tables = store.tables.read();
+        let cells = store.table_cells.read();
+        let frames = store.frames.read();
+        last_flow_entry(main_frame, &tables, &cells, &frames)?
+    };
+    let offsets = store.block_offsets.read();
+    let last_of_text = offsets.position_of(last)?;
+    looked_at(1);
+    // The text of that entry ends at the boundary before whatever follows it.
+    let next_start = offsets.entries.get(last_of_text + 1)?.1;
+    drop(offsets);
+    let end_byte = next_start.saturating_sub(1) as usize;
+    Some(store.rope.read().byte_to_char(end_byte) as i64)
+}
+
+/// The last entry of the flow of `frame_id`, in reading order: its last block, or the last
+/// entry of the quotation or the table it ends with. `None` when it holds nothing.
+fn last_flow_entry(
+    frame_id: EntityId,
+    tables: &im::HashMap<EntityId, crate::entities::Table>,
+    cells: &im::HashMap<EntityId, crate::entities::TableCell>,
+    frames: &im::HashMap<EntityId, crate::entities::Frame>,
+) -> Option<OffsetMarker> {
+    // Each frame on the way down, with how many of its entries are still to look at: an
+    // empty quotation at the end sends the walk back to the entry before it.
+    let mut stack: Vec<(EntityId, usize)> =
+        vec![(frame_id, frames.get(&frame_id)?.child_order.len())];
+    let mut seen: std::collections::HashSet<EntityId> = std::collections::HashSet::new();
+    seen.insert(frame_id);
+    while let Some((id, remaining)) = stack.pop() {
+        looked_at(1);
+        let Some(entry) = remaining
+            .checked_sub(1)
+            .and_then(|at| frames.get(&id)?.child_order.get(at).copied())
+        else {
+            continue;
+        };
+        stack.push((id, remaining - 1));
+        if entry > 0 {
+            return Some(OffsetMarker::Block(entry as EntityId));
+        }
+        let sub_id = entry.unsigned_abs() as EntityId;
+        let Some(sub) = frames.get(&sub_id) else {
+            continue;
+        };
+        if !seen.insert(sub_id) {
+            continue;
+        }
+        match sub.table {
+            Some(table_id) => {
+                let mut ordered: Vec<OffsetMarker> = Vec::new();
+                table_reading_order(table_id, tables, cells, frames, &mut ordered);
+                looked_at(ordered.len());
+                return ordered.last().copied();
+            }
+            None => stack.push((sub_id, sub.child_order.len())),
+        }
+    }
+    None
+}
+
+/// Record `count` frames or index entries [`main_text_end`] looked at. Unit tests count
+/// them: it runs on every forward move of a caret, and a debug build cannot time it.
+fn looked_at(count: usize) {
+    #[cfg(test)]
+    tests::LOOKED_AT.with(|looked| looked.set(looked.get() + count));
+    #[cfg(not(test))]
+    let _ = count;
 }
 
 /// Locate which block contains a given absolute char position in the
@@ -749,6 +844,87 @@ pub fn rope_place_new_cell_blocks(store: &Store, table_id: EntityId, new_blocks:
     if !run.is_empty() {
         rope_insert_run_after(store, after, &run);
     }
+}
+
+/// Put `table_id`'s anchor and the blocks of its cells back in reading order in
+/// the rope, when an edit of the table's rows left them in another.
+///
+/// Removing the first row of a cell that spans two rows keeps the cell at its
+/// row, one row shorter, and moves the row below up beside it: a moved-up cell
+/// of an earlier column now comes before the spanning cell in reading order,
+/// while the rope still held the spanning cell's text first. Every position in
+/// the table then addressed another cell than the one the frames put there, and
+/// the text a caret walked read the cells in another order than the save.
+///
+/// The table's entries are rewritten where they stand, as one span: same texts,
+/// same boundaries, same length, so nothing outside the table moves. Leaves the
+/// rope alone when its entries are already in reading order, or are not all in
+/// the index and next to each other.
+pub fn rope_restore_table_reading_order(store: &Store, table_id: EntityId) {
+    let mut ordered: Vec<OffsetMarker> = Vec::new();
+    {
+        let tables = store.tables.read();
+        let cells = store.table_cells.read();
+        let frames = store.frames.read();
+        table_reading_order(table_id, &tables, &cells, &frames, &mut ordered);
+    }
+    let mut offsets = store.block_offsets.write();
+    let positions: Option<Vec<usize>> = ordered
+        .iter()
+        .map(|marker| offsets.position_of(*marker))
+        .collect();
+    let Some(positions) = positions else {
+        return;
+    };
+    if positions.windows(2).all(|pair| pair[0] < pair[1]) {
+        return;
+    }
+    let Some(first) = positions.iter().min().copied() else {
+        return;
+    };
+    let last = first + positions.len() - 1;
+    let mut sorted = positions.clone();
+    sorted.sort_unstable();
+    if sorted
+        .iter()
+        .enumerate()
+        .any(|(i, position)| *position != first + i)
+    {
+        return;
+    }
+    let total = offsets.total_bytes();
+    let entries = offsets.entries.clone();
+    // Where each entry's text ends: at the boundary before the next entry, or at
+    // the end of the rope for the last one.
+    let text_end = |index: usize| -> u32 {
+        entries
+            .get(index + 1)
+            .map_or(total, |(_, next)| next.saturating_sub(1))
+    };
+    let span_start = entries[first].1;
+    let span_end = text_end(last);
+    let mut rope = store.rope.write();
+    let char_of = |byte: u32| rope.byte_to_char(byte as usize);
+    let text_of = |index: usize| -> String {
+        let (start, end) = (entries[index].1, text_end(index));
+        rope.slice(char_of(start)..char_of(end)).to_string()
+    };
+    let mut rebuilt = String::with_capacity((span_end - span_start) as usize);
+    let mut run: Vec<(OffsetMarker, u32)> = Vec::with_capacity(positions.len());
+    for (marker, position) in ordered.iter().zip(&positions) {
+        if !run.is_empty() {
+            rebuilt.push('\n');
+        }
+        run.push((*marker, span_start + rebuilt.len() as u32));
+        rebuilt.push_str(&text_of(*position));
+    }
+    if rebuilt.len() as u32 != span_end - span_start {
+        return;
+    }
+    let (char_start, char_end) = (char_of(span_start), char_of(span_end));
+    rope.remove(char_start..char_end);
+    rope.insert(char_start, &rebuilt);
+    offsets.reorder_run(first, &run);
 }
 
 /// Append `table_id`'s anchor and everything in its cells to `out`, in
@@ -1742,7 +1918,8 @@ fn walk_frame_bounds(store: &Store, frame_id: EntityId, bounds: &mut Option<(u32
 /// same format-policy choice instead of being permanently pinned to
 /// [`ReplaceFormatPolicy::InheritPreceding`]. See `ReplaceFormatPolicy`'s own doc comment for
 /// the failure mode a second, independently-drifting copy of this would risk: a replace used
-/// to be an unannounced delete + insert, which silently dropped formatting.
+/// to be an unannounced delete + insert, which silently dropped formatting. It is
+/// [`replace_in_blocks`] with one replacement, so the two cannot drift either.
 ///
 /// Deliberately takes no unit of work — everything here is store-level (the block's text
 /// lives in the rope, its formatting in `format_runs`, its images in `block_images`), so the
@@ -1759,66 +1936,293 @@ pub fn replace_in_block(
     replacement: &str,
     policy: ReplaceFormatPolicy,
 ) -> Result<Block, FormatRunError> {
-    let images_before = store
-        .block_images
-        .read()
-        .get(&block.id)
-        .cloned()
-        .unwrap_or_default();
-    let block_text = block_content_via_store(block, store);
-
-    let byte_start = logical_offset_to_byte(&block_text, &images_before, char_start);
-    let byte_end = logical_offset_to_byte(&block_text, &images_before, char_end);
-    if byte_end < byte_start {
-        // A range whose end comes before its start names no text to replace;
-        // measuring it overflowed.
-        return Err(FormatRunError::ReversedRange {
-            start: byte_start,
-            end: byte_end,
-        });
-    }
-    let new_len = block_text.len() - (byte_end - byte_start) as usize + replacement.len();
-
-    let inserted_byte_len = replacement.len() as u32;
-
-    // Format runs under an explicit policy, and then CHECK the result rather than assert it:
-    // `debug_assert_well_formed` is compiled out of release, so a malformed run list produced
-    // in a shipped build went entirely undetected — and autosave wrote it to the writer's
-    // file seconds later. A replace that would corrupt a block's formatting fails loudly.
-    {
-        let mut runs_map = store.format_runs.write();
-        let runs = runs_map.entry(block.id).or_default();
-        shift_runs_for_replace(runs, byte_start, byte_end, inserted_byte_len, policy)?;
-        check_well_formed(runs, new_len)?;
-    }
-    {
-        let mut images_map = store.block_images.write();
-        let images = images_map.entry(block.id).or_default();
-        shift_images_for_delete(images, byte_start, byte_end);
-        shift_images_for_insert(images, byte_start, inserted_byte_len);
-    }
-    {
-        let mut notes_map = store.block_footnote_refs.write();
-        if let Some(notes) = notes_map.get_mut(&block.id) {
-            shift_footnote_refs_for_delete(notes, byte_start, byte_end);
-            shift_footnote_refs_for_insert(notes, byte_start, inserted_byte_len);
-        }
-    }
-
-    // Mirror the in-block splice into the global rope.
-    rope_delete_in_block(store, block.id, byte_start, byte_end);
-    rope_insert_in_block(store, block.id, byte_start, replacement);
-
+    replace_in_blocks(
+        store,
+        &[BlockReplacement {
+            block,
+            char_start,
+            char_end,
+            replacement,
+        }],
+        policy,
+    )?;
     let mut updated = block.clone();
     updated.updated_at = chrono::Utc::now();
     Ok(updated)
+}
+
+/// One replacement [`replace_in_blocks`] makes: `[char_start..char_end)` of `block`'s text, in
+/// the block's own positions (an image or a footnote reference counts one), replaced by
+/// `replacement`.
+#[derive(Debug, Clone, Copy)]
+pub struct BlockReplacement<'a> {
+    pub block: &'a Block,
+    pub char_start: i64,
+    pub char_end: i64,
+    pub replacement: &'a str,
+}
+
+/// Make every replacement of `edits` in one pass over the document: each block's format runs,
+/// image anchors and footnote references, the rope, and one walk of the offset index for all
+/// of them. The replacements of one block must not overlap; they may come in any order.
+///
+/// Replace All used to make its replacements one at a time, and each moved every index entry
+/// after it: one match per paragraph cost a walk of the index per match, so replacing a word
+/// throughout a long text grew with the square of its length and froze the editor for
+/// seconds. The rope takes each splice in logarithmic time, from the last back, so the
+/// offsets of the others still hold; the index then moves each entry once, by what the
+/// replacements before it added or took.
+///
+/// Nothing is written until every block's new state is known to be well formed: an `Err`
+/// leaves the store as it was.
+pub fn replace_in_blocks(
+    store: &Store,
+    edits: &[BlockReplacement<'_>],
+    policy: ReplaceFormatPolicy,
+) -> Result<(), FormatRunError> {
+    // The replacements of each block, blocks in the order they first appear.
+    let mut order: Vec<&Block> = Vec::new();
+    let mut of_block: HashMap<EntityId, Vec<&BlockReplacement<'_>>> = HashMap::new();
+    for edit in edits {
+        let group = of_block.entry(edit.block.id).or_default();
+        if group.is_empty() {
+            order.push(edit.block);
+        }
+        group.push(edit);
+    }
+
+    struct NewState<'a> {
+        block_id: EntityId,
+        runs: Vec<FormatRun>,
+        images: Vec<ImageAnchor>,
+        notes: Option<Vec<FootnoteRefAnchor>>,
+        /// `(byte_start, byte_end, replacement)` in the block's text, ascending.
+        splices: Vec<(u32, u32, &'a str)>,
+    }
+    let mut states: Vec<NewState<'_>> = Vec::with_capacity(order.len());
+    for block in order {
+        let group = of_block.remove(&block.id).unwrap_or_default();
+        let images_before = store
+            .block_images
+            .read()
+            .get(&block.id)
+            .cloned()
+            .unwrap_or_default();
+        let block_text = block_content_via_store(block, store);
+        let mut splices: Vec<(u32, u32, &str)> = Vec::with_capacity(group.len());
+        for edit in group {
+            let byte_start = logical_offset_to_byte(&block_text, &images_before, edit.char_start);
+            let byte_end = logical_offset_to_byte(&block_text, &images_before, edit.char_end);
+            if byte_end < byte_start {
+                // A range whose end comes before its start names no text to replace;
+                // measuring it overflowed.
+                return Err(FormatRunError::ReversedRange {
+                    start: byte_start,
+                    end: byte_end,
+                });
+            }
+            splices.push((byte_start, byte_end, edit.replacement));
+        }
+        splices.sort_by_key(|(start, end, _)| (*start, *end));
+        if let Some(pair) = splices.windows(2).find(|pair| pair[0].1 > pair[1].0) {
+            // Two replacements of the same text: the second would splice bytes the first
+            // already changed.
+            return Err(FormatRunError::ReversedRange {
+                start: pair[0].1,
+                end: pair[1].0,
+            });
+        }
+
+        let mut runs = store
+            .format_runs
+            .read()
+            .get(&block.id)
+            .cloned()
+            .unwrap_or_default();
+        let mut images = images_before;
+        let mut notes = store.block_footnote_refs.read().get(&block.id).cloned();
+        let mut new_len = block_text.len();
+        // From the last back, so each splice's offsets are still the text's own.
+        for &(byte_start, byte_end, replacement) in splices.iter().rev() {
+            let inserted = replacement.len() as u32;
+            // Format runs under an explicit policy, and then CHECK the result rather than
+            // assert it: `debug_assert_well_formed` is compiled out of release, so a
+            // malformed run list produced in a shipped build went entirely undetected, and
+            // autosave wrote it to the writer's file seconds later. A replace that would
+            // corrupt a block's formatting fails loudly.
+            shift_runs_for_replace(&mut runs, byte_start, byte_end, inserted, policy)?;
+            shift_images_for_delete(&mut images, byte_start, byte_end);
+            shift_images_for_insert(&mut images, byte_start, inserted);
+            if let Some(notes) = notes.as_mut() {
+                shift_footnote_refs_for_delete(notes, byte_start, byte_end);
+                shift_footnote_refs_for_insert(notes, byte_start, inserted);
+            }
+            new_len = new_len - (byte_end - byte_start) as usize + replacement.len();
+        }
+        check_well_formed(&runs, new_len)?;
+        states.push(NewState {
+            block_id: block.id,
+            runs,
+            images,
+            notes,
+            splices,
+        });
+    }
+
+    // Every block's new state is sound: write it.
+    let mut rope_splices: Vec<(u32, u32, &str)> = Vec::new();
+    let mut shifts: Vec<(u32, i32)> = Vec::new();
+    {
+        let offsets = store.block_offsets.read();
+        let mut runs_map = store.format_runs.write();
+        let mut images_map = store.block_images.write();
+        let mut notes_map = store.block_footnote_refs.write();
+        for state in states {
+            runs_map.insert(state.block_id, state.runs);
+            images_map.insert(state.block_id, state.images);
+            if let Some(notes) = state.notes {
+                notes_map.insert(state.block_id, notes);
+            }
+            // A block the index does not hold has no text in the rope to change.
+            let Some((block_start, _)) = offsets.range_of_block(state.block_id) else {
+                continue;
+            };
+            let mut delta: i64 = 0;
+            for (byte_start, byte_end, replacement) in state.splices {
+                rope_splices.push((
+                    block_start + byte_start,
+                    block_start + byte_end,
+                    replacement,
+                ));
+                delta += replacement.len() as i64 - (byte_end - byte_start) as i64;
+            }
+            // One byte past the block's start, so the block's own entry stays where it is.
+            if delta != 0 {
+                shifts.push((block_start + 1, delta as i32));
+            }
+        }
+    }
+    rope_splices.sort_by_key(|(start, end, _)| (*start, *end));
+    {
+        let mut rope = store.rope.write();
+        for &(byte_start, byte_end, replacement) in rope_splices.iter().rev() {
+            let char_start = rope.byte_to_char(byte_start as usize);
+            if byte_end > byte_start {
+                let char_end = rope.byte_to_char(byte_end as usize);
+                rope.remove(char_start..char_end);
+            }
+            if !replacement.is_empty() {
+                rope.insert(char_start, replacement);
+            }
+        }
+    }
+    shifts.sort_by_key(|(threshold, _)| *threshold);
+    store.block_offsets.write().shift_after_each(&shifts);
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::database::block_offset_index::tests::ENTRIES_REWRITTEN;
+    use crate::entities::{Document, Frame};
     use std::cell::Cell;
+
+    thread_local! {
+        /// What `main_text_end` looked at on this thread (see [`super::looked_at`]).
+        pub(super) static LOOKED_AT: Cell<usize> = const { Cell::new(0) };
+    }
+
+    /// A text of `paragraphs` paragraphs followed by `notes` footnote bodies of one
+    /// paragraph each, laid out as the loads lay one out: the bodies after the main text.
+    /// Returns the store and where the main text ends.
+    fn text_with_notes(paragraphs: u64, notes: u64) -> (Store, i64) {
+        let store = Store::new();
+        let main: EntityId = 1;
+        let mut frames = vec![Frame {
+            id: main,
+            ..Frame::default()
+        }];
+        let mut end = 0;
+        let mut next_block: EntityId = 1;
+        for i in 0..paragraphs {
+            if next_block > 1 {
+                rope_insert_block_boundary(&store);
+            }
+            let text = format!("Paragraph {i}.");
+            end = store.rope.read().len_chars() as i64 + text.chars().count() as i64;
+            rope_append_block(&store, next_block, &text);
+            frames[0].blocks.push(next_block);
+            frames[0].child_order.push(next_block as i64);
+            next_block += 1;
+        }
+        for i in 0..notes {
+            rope_insert_block_boundary(&store);
+            rope_append_block(&store, next_block, &format!("Note {i}."));
+            frames.push(Frame {
+                id: main + 1 + i,
+                blocks: vec![next_block],
+                child_order: vec![next_block as i64],
+                footnote_label: Some(format!("n{i}")),
+                ..Frame::default()
+            });
+            next_block += 1;
+        }
+        {
+            let mut blocks = store.blocks.write();
+            for id in 1..next_block {
+                blocks.insert(
+                    id,
+                    Block {
+                        id,
+                        ..Block::default()
+                    },
+                );
+            }
+        }
+        store.documents.write().insert(
+            1,
+            Document {
+                id: 1,
+                frames: frames.iter().map(|frame| frame.id).collect(),
+                ..Document::default()
+            },
+        );
+        let mut stored = store.frames.write();
+        for frame in frames {
+            stored.insert(frame.id, frame);
+        }
+        drop(stored);
+        (store, end)
+    }
+
+    /// Every forward move of a caret asks where the main text ends. It gathered every block
+    /// of every note's body and walked the rope index back over them: a document of
+    /// thousands of notes spent milliseconds on each arrow key. What it looks at must not
+    /// grow with the notes, nor with the text.
+    #[test]
+    fn the_end_of_the_main_text_costs_the_same_however_many_notes_follow() {
+        let mut looked = Vec::new();
+        for (paragraphs, notes) in [(50, 100), (50, 2_000), (1_000, 2_000)] {
+            let (store, end) = text_with_notes(paragraphs, notes);
+            LOOKED_AT.with(|looked| looked.set(0));
+            assert_eq!(
+                main_text_end(&store),
+                Some(end),
+                "{paragraphs} paragraphs, {notes} notes"
+            );
+            looked.push(LOOKED_AT.with(Cell::get));
+        }
+        assert!(
+            looked.windows(2).all(|pair| pair[0] == pair[1]),
+            "the end of the main text looked at {looked:?} frames and entries for 100 and \
+             2,000 notes, then 1,000 paragraphs"
+        );
+
+        // Nothing follows a text without notes, and its end needs no stop.
+        let (store, _) = text_with_notes(20, 0);
+        assert_eq!(main_text_end(&store), None);
+    }
 
     /// A store of `blocks` blocks of a few characters each, the way the importers lay a
     /// document out: separated by a `\n` boundary. Returns the ids of its blocks, in order.
@@ -1876,6 +2280,118 @@ mod tests {
              of the {BLOCKS} entries is enough",
             cleared.len()
         );
+    }
+
+    /// Replace All replaced one match at a time, and each replacement moved every index
+    /// entry after it: with a match in every paragraph, the whole index once per match. All
+    /// of them together must move each entry once, and leave what one at a time leaves.
+    #[test]
+    fn replacing_in_many_blocks_walks_the_index_once() {
+        const BLOCKS: u64 = 1_000;
+        let (one_by_one, ids) = blocks(BLOCKS);
+        let (together, _) = blocks(BLOCKS);
+        let entities: Vec<Block> = ids
+            .iter()
+            .map(|&id| Block {
+                id,
+                ..Block::default()
+            })
+            .collect();
+        // In each block, "cell {id}": "ce" becomes "k", and "!?" goes in at the end: each
+        // block grows by one byte, so every entry after it moves.
+        let edits: Vec<BlockReplacement<'_>> = entities
+            .iter()
+            .flat_map(|block| {
+                let end = format!("cell {}", block.id).chars().count() as i64;
+                [
+                    BlockReplacement {
+                        block,
+                        char_start: 0,
+                        char_end: 2,
+                        replacement: "k",
+                    },
+                    BlockReplacement {
+                        block,
+                        char_start: end,
+                        char_end: end,
+                        replacement: "!?",
+                    },
+                ]
+            })
+            .collect();
+
+        ENTRIES_REWRITTEN.with(|rewritten| rewritten.set(0));
+        for edit in edits.iter().rev() {
+            replace_in_block(
+                &one_by_one,
+                edit.block,
+                edit.char_start,
+                edit.char_end,
+                edit.replacement,
+                ReplaceFormatPolicy::default(),
+            )
+            .unwrap();
+        }
+        let edit_by_edit = ENTRIES_REWRITTEN.with(Cell::get);
+
+        ENTRIES_REWRITTEN.with(|rewritten| rewritten.set(0));
+        replace_in_blocks(&together, &edits, ReplaceFormatPolicy::default()).unwrap();
+        let in_one_walk = ENTRIES_REWRITTEN.with(Cell::get);
+
+        assert_eq!(
+            *together.rope.read(),
+            *one_by_one.rope.read(),
+            "the same text is left"
+        );
+        assert_eq!(
+            *together.block_offsets.read(),
+            *one_by_one.block_offsets.read(),
+            "the same index is left"
+        );
+        assert!(
+            together
+                .rope
+                .read()
+                .to_string()
+                .starts_with("kll 1!?\nkll 2!?\n")
+        );
+        assert!(
+            edit_by_edit > 100 * BLOCKS as usize,
+            "replacing edit by edit rewrote {edit_by_edit} entries"
+        );
+        assert!(
+            in_one_walk <= BLOCKS as usize,
+            "{} replacements together rewrote {in_one_walk} index entries, where one walk of \
+             the {BLOCKS} entries is enough",
+            edits.len()
+        );
+    }
+
+    /// Two replacements of the same characters cannot both be made: the whole call is
+    /// refused and nothing is written.
+    #[test]
+    fn overlapping_replacements_change_nothing() {
+        let store = blocks_holding(&["alpha", "beta"]);
+        let block = Block {
+            id: 1,
+            ..Block::default()
+        };
+        let edits = [
+            BlockReplacement {
+                block: &block,
+                char_start: 0,
+                char_end: 3,
+                replacement: "x",
+            },
+            BlockReplacement {
+                block: &block,
+                char_start: 2,
+                char_end: 4,
+                replacement: "y",
+            },
+        ];
+        assert!(replace_in_blocks(&store, &edits, ReplaceFormatPolicy::default()).is_err());
+        assert_eq!(store.rope.read().to_string(), "alpha\nbeta");
     }
 
     /// A store holding one block per text, in order, separated by `\n` boundaries.

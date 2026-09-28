@@ -26,6 +26,16 @@ use crate::{BlockFormat, FrameFormat, MoveMode, MoveOperation, SelectionType, Te
 
 use crate::document::get_main_frame_id;
 
+/// Whether the main text holds nothing but one empty paragraph, whatever the bodies of the
+/// footnotes after it hold.
+fn main_text_is_empty(inner: &TextDocumentInner) -> bool {
+    let store = inner.ctx.db_context.get_store();
+    match common::database::rope_helpers::main_text_end(store) {
+        Some(end) => end == 0,
+        None => max_cursor_position_of(inner) == Some(0),
+    }
+}
+
 /// The maximum valid cursor position.
 ///
 /// Cursor positions are rope positions whenever the rope is the document's position
@@ -214,6 +224,7 @@ impl Clone for TextCursor {
                 cell_selection_override: None,
                 // A clone reads the same text as its original, so it inherits the language.
                 content_locale,
+                whole_text_selected: false,
             }));
             inner.cursors.push(Arc::downgrade(&data));
             data
@@ -334,6 +345,7 @@ impl TextCursor {
             let mut d = self.data.lock();
             d.position = new_pos;
             d.anchor = new_pos;
+            d.whole_text_selected = false;
         }
         inner.modified = true;
         inner.invalidate_text_cache();
@@ -506,6 +518,7 @@ impl TextCursor {
     pub fn clear_selection(&self) {
         let mut d = self.data.lock();
         d.anchor = d.position;
+        d.whole_text_selected = false;
     }
 
     // ── Boundary queries ─────────────────────────────────────
@@ -629,6 +642,7 @@ impl TextCursor {
                 d.anchor = pos;
             }
             d.cell_selection_override = None;
+            d.whole_text_selected = false;
         }
         // Snap forward to the nearest grapheme cluster boundary so
         // a caller passing an arbitrary scalar index (e.g. computed
@@ -642,11 +656,32 @@ impl TextCursor {
     /// `n` is used as a repeat count for character-level movements
     /// (`NextCharacter`, `PreviousCharacter`, `Left`, `Right`).
     /// For all other operations it is ignored. Returns `true` if the cursor moved.
+    ///
+    /// A move starting in the main text stops at its end: the bodies of the footnote
+    /// definitions a document holds come after it, and no view shows them. A cursor placed
+    /// in a body with [`set_position`](Self::set_position) moves in the bodies freely.
     pub fn move_position(&self, operation: MoveOperation, mode: MoveMode, n: usize) -> bool {
         let old_pos = self.position();
-        let target = self.resolve_move(operation, n);
+        let target = self.kept_in_main_text(old_pos, self.resolve_move(operation, n));
         self.set_position(target, mode);
         self.position() != old_pos
+    }
+
+    /// `target`, stopped at the end of the main text when a move from `from` in the main
+    /// text would carry the caret past it. No view shows a footnote's body, and the rope
+    /// holds the bodies after the main text: the Right arrow, End or Down from the end of
+    /// the text went into the first note, and typing there edited it unseen. A move
+    /// starting in a body is left alone.
+    fn kept_in_main_text(&self, from: usize, target: usize) -> usize {
+        if target <= from {
+            return target;
+        }
+        let inner = self.doc.lock();
+        let store = inner.ctx.db_context.get_store();
+        match common::database::rope_helpers::main_text_end(store) {
+            Some(end) if from <= to_usize(end) && target > to_usize(end) => to_usize(end),
+            _ => target,
+        }
     }
 
     /// Select a region relative to the cursor position.
@@ -661,6 +696,7 @@ impl TextCursor {
                 d.anchor = 0;
                 d.position = end;
                 d.cell_selection_override = None;
+                d.whole_text_selected = true;
             }
             SelectionType::BlockUnderCursor | SelectionType::LineUnderCursor => {
                 let pos = self.position();
@@ -678,6 +714,7 @@ impl TextCursor {
                     d.anchor = start;
                     d.position = end;
                     d.cell_selection_override = None;
+                    d.whole_text_selected = false;
                 }
             }
             SelectionType::WordUnderCursor => {
@@ -687,6 +724,7 @@ impl TextCursor {
                 d.anchor = word_start;
                 d.position = word_end;
                 d.cell_selection_override = None;
+                d.whole_text_selected = false;
             }
             SelectionType::SentenceUnderCursor => {
                 let pos = self.position();
@@ -697,6 +735,7 @@ impl TextCursor {
                     d.anchor = start;
                     d.position = end;
                     d.cell_selection_override = None;
+                    d.whole_text_selected = false;
                 }
             }
         }
@@ -991,6 +1030,10 @@ impl TextCursor {
         self.insert_fragment_with_origin(&frag, origin)
     }
 
+    /// Insert an HTML fragment at the cursor position. Replaces selection if any.
+    ///
+    /// A `<pre>` goes in as paragraphs, one for each of its lines (see
+    /// [`DocumentFragment::from_html`]).
     pub fn insert_html(&self, html: &str) -> Result<()> {
         // Delegate to insert_fragment so table structure is preserved.
         let frag = DocumentFragment::from_html(html);
@@ -1039,6 +1082,9 @@ impl TextCursor {
     /// never the number — that is derived at render time from document order,
     /// so inserting a note above this one renumbers it without touching a
     /// character of the prose.
+    ///
+    /// Refused, with the text left as it was, in a code block: a code block is
+    /// verbatim text, which the save writes without a reference.
     pub fn insert_footnote_reference(&self, label: &str) -> Result<()> {
         self.insert_djot(&format!("[^{label}]"))
     }
@@ -1053,6 +1099,35 @@ impl TextCursor {
     /// [`insert_html`](Self::insert_html) and
     /// [`insert_markdown`](Self::insert_markdown) as well, which insert a
     /// fragment. Loading a document keeps its lists as they are.
+    ///
+    /// A quotation, a code block and a paragraph's alignment go in as they stood,
+    /// so selecting all of a text and inserting another's Djot gives the text a
+    /// load of that Djot gives. A quotation goes in as deep as it stood, never
+    /// less deep than the caret already is (one pasted into a quotation is not
+    /// quoted twice); in a table cell or a footnote's body, which hold paragraphs,
+    /// it goes in as its paragraphs, and in a table cell a code block goes in as a
+    /// paragraph (a table cell is written as one line of text). Inserted over a
+    /// selection holding the whole text (from its start to its end, or
+    /// [`select(SelectionType::Document)`](Self::select), even of an empty text, or at
+    /// the caret the removal of such a selection left), a
+    /// whole text (a fragment [`from_djot`](DocumentFragment::from_djot),
+    /// [`from_markdown`](DocumentFragment::from_markdown) or
+    /// [`from_document`](DocumentFragment::from_document), and so what
+    /// [`insert_djot`](Self::insert_djot) and [`insert_markdown`](Self::insert_markdown)
+    /// insert) keeps its own formatting rather than taking that of the empty paragraph the
+    /// removal leaves, which is the first removed paragraph's: the text reads as the
+    /// fragment loaded. So does any other fragment with a structure of its own: several
+    /// paragraphs, a table, a quotation, or a paragraph of its own format. A phrase, one
+    /// plain paragraph copied from a text or pasted as HTML, goes into that empty paragraph
+    /// as typed text does and keeps its formatting: its direction, alignment, heading
+    /// level and quotation. Inserted at a caret in an empty paragraph, a
+    /// fragment of one plain paragraph takes the paragraph's formatting, as typed
+    /// text does: a heading line stays a heading. The bodies of footnote definitions
+    /// the document holds stay where they are, as
+    /// [`remove_selected_text`](Self::remove_selected_text) says. A paste that
+    /// would put an image or a footnote reference into a code block is refused, the
+    /// text left as it was: a code block is verbatim text, which the save writes
+    /// without them.
     pub fn insert_fragment(&self, fragment: &DocumentFragment) -> Result<()> {
         self.insert_fragment_with_origin(fragment, InsertionOrigin::Unspecified)
     }
@@ -1066,6 +1141,9 @@ impl TextCursor {
         origin: InsertionOrigin,
     ) -> Result<()> {
         let (pos, anchor) = self.read_cursor();
+        // All of an empty text selected: nothing to remove, and still the whole text to
+        // replace (see `CursorData::whole_text_selected`).
+        let replacing_an_empty_text = pos == anchor && self.data.lock().whole_text_selected;
         let queued = {
             let mut inner = self.doc.lock();
 
@@ -1074,14 +1152,25 @@ impl TextCursor {
             // follow what it added. A table pasted into a paragraph goes in
             // after the paragraph and leaves the caret in front of it, and the
             // tail of a paragraph pasted into stays after the caret.
-            let paste_at = |at: usize| -> Result<_> {
+            // After a selection is removed, the fragment goes in marked as replacing it:
+            // when the selection held the whole text, the empty paragraph it leaves takes
+            // the fragment's formatting, unless the fragment is a phrase (see
+            // `replacing_the_text`).
+            let paste_at = |at: usize, replacing: bool| -> Result<_> {
                 let store = inner.ctx.db_context.get_store();
                 let rope_before = store.rope.read().clone();
                 let before = max_cursor_position_of(&inner);
+                let fragment_data = if replacing {
+                    frontend::common::parser_tools::fragment_schema::replacing_the_text(
+                        fragment.raw_data(),
+                    )
+                } else {
+                    fragment.raw_data().into()
+                };
                 let dto = frontend::document_editing::InsertFragmentDto {
                     position: to_i64(at),
                     anchor: to_i64(at),
-                    fragment_data: fragment.raw_data().into(),
+                    fragment_data,
                 };
                 let result = document_editing_commands::insert_fragment(
                     &inner.ctx,
@@ -1117,9 +1206,9 @@ impl TextCursor {
                 Ok((result, inserted))
             };
             let ((result, inserted), removed, deleted_from) = if pos != anchor {
-                delete_then(&inner, pos, anchor, paste_at)?
+                delete_then(&inner, pos, anchor, |at| paste_at(at, true))?
             } else {
-                (paste_at(pos)?, 0, pos)
+                (paste_at(pos, replacing_an_empty_text)?, 0, pos)
             };
 
             // What the deletion took starts where it left the caret when that
@@ -1142,6 +1231,14 @@ impl TextCursor {
     }
 
     /// Extract the current selection as a [`DocumentFragment`].
+    ///
+    /// The fragment holds the text the selection starts in: the main text, with the
+    /// quotations its whole paragraphs stand in, or the one footnote body it starts in.
+    /// A note's reference travels; its body stays where it is defined. Each paragraph is
+    /// held once, in reading order. A table the selection holds the anchor of, or runs
+    /// into from the text beside it, is held whole, in a quotation as anywhere else, as a
+    /// removal of the same selection takes it. An empty paragraph closing the text is held
+    /// when the selection reaches the text's end.
     pub fn selection(&self) -> DocumentFragment {
         let (pos, anchor) = self.read_cursor();
 
@@ -1161,10 +1258,17 @@ impl TextCursor {
                     Some(p) => p,
                     None => return DocumentFragment::new(),
                 };
+                // The whole table is selected, its anchor with it: a range from its first
+                // cell only met that cell's paragraphs when the table has one cell, and the
+                // copy held them without the table.
+                let table_start = self
+                    .table_anchor_position(cell_range.table_id)
+                    .unwrap_or(cell_start)
+                    .min(cell_start);
                 let start = if text_before {
-                    pos.min(anchor)
+                    pos.min(anchor).min(table_start)
                 } else {
-                    cell_start
+                    table_start
                 };
                 let end = if text_after {
                     pos.max(anchor)
@@ -1197,6 +1301,9 @@ impl TextCursor {
     /// `name` keys the image's bytes in the document's resource table (see
     /// [`crate::TextDocument::add_resource`]); `alt` is its accessible
     /// description and its export representation, and may be empty.
+    ///
+    /// Refused, with the text left as it was, in a code block: a code block is
+    /// verbatim text, which the save writes without an image.
     pub fn insert_image(&self, name: &str, alt: &str, width: u32, height: u32) -> Result<()> {
         let (pos, anchor) = self.read_cursor();
         let queued = {
@@ -1296,6 +1403,7 @@ impl TextCursor {
                 let mut d = self.data.lock();
                 d.position = new_pos;
                 d.anchor = new_pos;
+                d.whole_text_selected = false;
             }
             inner.modified = true;
             inner.invalidate_text_cache();
@@ -1332,26 +1440,11 @@ impl TextCursor {
     pub fn current_table_cell(&self) -> Option<TableCellRef> {
         let pos = self.position();
         let inner = self.doc.lock();
-        // Find the block at cursor position
-        let dto = frontend::document_inspection::GetBlockAtPositionDto {
-            position: to_i64(pos),
-        };
-        let block_info =
-            document_inspection_commands::get_block_at_position(&inner.ctx, &dto).ok()?;
-
-        // When position < block_start, the cursor sits on the separator between
-        // the previous block and this one. Visually the cursor belongs to the
-        // end of the previous block, so look up that block instead.
-        let block_id = if to_i64(pos) < block_info.block_start && pos > 0 {
-            let prev_dto = frontend::document_inspection::GetBlockAtPositionDto {
-                position: to_i64(pos - 1),
-            };
-            let prev_info =
-                document_inspection_commands::get_block_at_position(&inner.ctx, &prev_dto).ok()?;
-            prev_info.block_id as usize
-        } else {
-            block_info.block_id as usize
-        };
+        // The caret's block: at the end of a paragraph, that paragraph, and on a table's
+        // anchor, the table's first cell (see `block_at_caret_dto`).
+        let block_id = crate::inner::block_at_caret_dto(&inner.ctx, pos)
+            .ok()?
+            .block_id as usize;
 
         let block = crate::text_block::TextBlock {
             doc: self.doc.clone(),
@@ -2249,7 +2342,8 @@ impl TextCursor {
     fn cell_range_positions(&self, range: &CellRange) -> Option<(usize, usize)> {
         let inner = self.doc.lock();
         let main_frame_id = get_main_frame_id(&inner);
-        let flow = crate::text_frame::build_flow_elements(&inner, &self.doc, main_frame_id);
+        // A table in a quotation is found too (see `flow_in_reading_order`).
+        let flow = crate::text_frame::flow_in_reading_order(&inner, &self.doc, main_frame_id);
         drop(inner);
 
         // Find the table matching the range's table_id
@@ -2284,25 +2378,25 @@ impl TextCursor {
 
     // ── Cell selection helpers (private) ─────────────────────
 
+    /// Where the anchor of the table `table_id` stands, when the rope is the document's
+    /// position space.
+    fn table_anchor_position(&self, table_id: usize) -> Option<usize> {
+        let inner = self.doc.lock();
+        let store = inner.ctx.db_context.get_store();
+        common::database::rope_helpers::table_anchor_position(
+            store,
+            table_id as common::types::EntityId,
+        )
+        .map(to_usize)
+    }
+
     /// Look up which table cell contains the given document position, if any.
     fn table_cell_at(&self, position: usize) -> Option<TableCellRef> {
         let inner = self.doc.lock();
-        let dto = frontend::document_inspection::GetBlockAtPositionDto {
-            position: to_i64(position),
-        };
-        let block_info =
-            document_inspection_commands::get_block_at_position(&inner.ctx, &dto).ok()?;
-
-        let block_id = if to_i64(position) < block_info.block_start && position > 0 {
-            let prev_dto = frontend::document_inspection::GetBlockAtPositionDto {
-                position: to_i64(position - 1),
-            };
-            let prev_info =
-                document_inspection_commands::get_block_at_position(&inner.ctx, &prev_dto).ok()?;
-            prev_info.block_id as usize
-        } else {
-            block_info.block_id as usize
-        };
+        // The caret's block (see `block_at_caret_dto`): on a table's anchor, its first cell.
+        let block_id = crate::inner::block_at_caret_dto(&inner.ctx, position)
+            .ok()?
+            .block_id as usize;
 
         let block = crate::text_block::TextBlock {
             doc: self.doc.clone(),
@@ -2325,7 +2419,9 @@ impl TextCursor {
     fn table_boundary_position(&self, table_id: usize, before: bool) -> Option<usize> {
         let inner = self.doc.lock();
         let main_frame_id = get_main_frame_id(&inner);
-        let flow = crate::text_frame::build_flow_elements(&inner, &self.doc, main_frame_id);
+        // A table in a quotation is found too, and the paragraph beside it is the one next
+        // to it in reading order, inside the quotation or out of it.
+        let flow = crate::text_frame::flow_in_reading_order(&inner, &self.doc, main_frame_id);
         drop(inner);
 
         // Find the table in the flow and peek at the adjacent element.
@@ -2355,7 +2451,8 @@ impl TextCursor {
     fn find_table_between(&self, start: usize, end: usize) -> Option<TextTable> {
         let inner = self.doc.lock();
         let main_frame_id = get_main_frame_id(&inner);
-        let flow = crate::text_frame::build_flow_elements(&inner, &self.doc, main_frame_id);
+        // A table in a quotation is found too (see `flow_in_reading_order`).
+        let flow = crate::text_frame::flow_in_reading_order(&inner, &self.doc, main_frame_id);
         drop(inner);
 
         for elem in flow {
@@ -2429,7 +2526,7 @@ impl TextCursor {
             }
             (pos, to)
         };
-        self.do_delete(del_pos, del_anchor)
+        self.do_delete(del_pos, del_anchor, pos != anchor)
     }
 
     /// Delete the character before the cursor (Backspace key).
@@ -2446,10 +2543,30 @@ impl TextCursor {
         } else {
             return Ok(());
         };
-        self.do_delete(del_pos, del_anchor)
+        self.do_delete(del_pos, del_anchor, pos != anchor)
     }
 
     /// Delete the selected text. Returns the deleted text. No-op if no selection.
+    ///
+    /// A selection edits the text it starts in: the main text, or the one footnote body it
+    /// starts in. Selecting from the main text to the end of the document, or all of it,
+    /// takes the main text and leaves the notes' bodies, which come after it, as they are;
+    /// [`selection`](Self::selection) copies the same text. A body stays even when the
+    /// removal took every reference to its note, as a cut does before the paste that puts
+    /// the references back: the document keeps it, every save writes it as a definition no
+    /// reference names, and no move of a caret from the main text reaches it.
+    /// [`clear`](crate::TextDocument::clear) and the loads replace everything, bodies
+    /// included.
+    ///
+    /// A removal that leaves the text empty leaves this cursor standing for all of that
+    /// empty text: a fragment inserted next at the caret replaces the text, as it would have
+    /// replaced the selection (see [`insert_fragment`](Self::insert_fragment)), so a cut of
+    /// all of a text pasted back is the text as it was. Typed text keeps the formatting of
+    /// the empty paragraph, which is the first removed paragraph's.
+    ///
+    /// Backspace and Delete across a paragraph that would bring an image or a footnote
+    /// reference into a code block join nothing, and a selection across one takes its text
+    /// and joins nothing.
     pub fn remove_selected_text(&self) -> Result<String> {
         let (pos, anchor) = self.read_cursor();
         if pos == anchor {
@@ -2458,7 +2575,13 @@ impl TextCursor {
         let queued = {
             let mut inner = self.doc.lock();
             let (result, removed) = measured_delete(&inner, pos, anchor)?;
-            self.finish_delete(&mut inner, pos.min(anchor), removed, result.new_position);
+            self.finish_delete(
+                &mut inner,
+                pos.min(anchor),
+                removed,
+                result.new_position,
+                true,
+            );
             // Return the deleted text alongside the queued events
             (result.deleted_text, self.queue_undo_redo_event(&mut inner))
         };
@@ -2832,6 +2955,11 @@ impl TextCursor {
     }
 
     /// Set the block format for the current block (or all blocks in selection).
+    ///
+    /// Making a paragraph that holds an image or a footnote reference a code block is
+    /// refused, the text left as it was: a code block is verbatim text, which the save
+    /// writes without them. A table cell's paragraph is never made a code block: a table
+    /// cell is written as one line of text, and the other formats asked for still apply.
     pub fn set_block_format(&self, format: &BlockFormat) -> Result<()> {
         let (pos, anchor) = self.read_cursor();
         let queued = {
@@ -2907,11 +3035,17 @@ impl TextCursor {
         inner.take_queued_events()
     }
 
-    fn do_delete(&self, pos: usize, anchor: usize) -> Result<()> {
+    fn do_delete(&self, pos: usize, anchor: usize, selection: bool) -> Result<()> {
         let queued = {
             let mut inner = self.doc.lock();
             let (result, removed) = measured_delete(&inner, pos, anchor)?;
-            self.finish_delete(&mut inner, pos.min(anchor), removed, result.new_position);
+            self.finish_delete(
+                &mut inner,
+                pos.min(anchor),
+                removed,
+                result.new_position,
+                selection,
+            );
             self.queue_undo_redo_event(&mut inner)
         };
         crate::inner::dispatch_queued_events(queued);
@@ -2922,12 +3056,23 @@ impl TextCursor {
     /// caret, and, when anything went, the other cursors moved back by what
     /// went and the change announced. A deletion that removed nothing (see
     /// [`measured_delete`]) changed nothing to announce.
+    ///
+    /// A `selection` removed that left the text empty leaves this cursor
+    /// standing for all of that empty text, as
+    /// [`select(SelectionType::Document)`](Self::select) would: a paste that
+    /// follows at the caret replaces the text, as a paste over the selection
+    /// would have. Cutting all of a text and pasting it back put every
+    /// paragraph into the formatting and quotations the empty paragraph the
+    /// cut left had kept from the first one: a scene opening with an epigraph
+    /// came back quoted from end to end. Typing keeps that formatting, as it
+    /// does over a selection, and any other move or edit ends it.
     fn finish_delete(
         &self,
         inner: &mut TextDocumentInner,
         edit_pos: usize,
         removed: usize,
         new_position: i64,
+        selection: bool,
     ) {
         let new_pos = to_usize(new_position);
         // A range that empties a table cell takes the cell's text from its
@@ -2937,10 +3082,13 @@ impl TextCursor {
         if removed > 0 {
             inner.adjust_cursors(edit_pos, removed, 0);
         }
+        let stands_for_the_empty_text =
+            selection && removed > 0 && new_pos == 0 && main_text_is_empty(inner);
         {
             let mut d = self.data.lock();
             d.position = new_pos;
             d.anchor = new_pos;
+            d.whole_text_selected = stands_for_the_empty_text;
         }
         if removed > 0 {
             inner.modified = true;
@@ -3195,6 +3343,7 @@ impl TextCursor {
             if data.anchor == pos {
                 data.anchor = snapped;
             }
+            data.whole_text_selected = false;
         }
     }
 

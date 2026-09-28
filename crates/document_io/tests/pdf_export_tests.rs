@@ -475,7 +475,7 @@ fn a_page_break_in_a_note_is_left_out() {
         let store = db.get_store();
         let mut blocks = store.blocks.write();
         let mut set = 0;
-        for block in blocks.values_mut() {
+        for (_, block) in blocks.iter_mut() {
             if common::database::rope_helpers::block_content_via_store(block, store)
                 == "Second note paragraph."
             {

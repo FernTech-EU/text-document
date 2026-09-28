@@ -1470,3 +1470,275 @@ fn rich_text_editor_demo_end_to_end_insert_table_at_end() {
         ),
     }
 }
+
+// ── Tables whose rows differ in length ──────────────────────────────────────
+
+/// Every word a document holds survives a save and a reload.
+#[track_caller]
+fn assert_every_word_saved(doc: &TextDocument, words: &[&str]) {
+    let djot = doc.to_djot().unwrap();
+    let reloaded = TextDocument::new();
+    reloaded.set_djot_sync(&djot).unwrap();
+    let again = reloaded.to_plain_text().unwrap();
+    let html = doc.to_html().unwrap();
+    let markdown = doc.to_markdown().unwrap();
+    for word in words {
+        assert!(
+            djot.contains(word),
+            "{word} is not in the saved Djot {djot:?}"
+        );
+        assert!(
+            again.contains(word),
+            "{word} is gone after a reload: {again:?}"
+        );
+        assert!(html.contains(word), "{word} is not in the HTML {html:?}");
+        assert!(
+            markdown.contains(word),
+            "{word} is not in the Markdown {markdown:?}"
+        );
+    }
+}
+
+/// A loaded table took its width from its first row. The cells of a longer row after it were
+/// still created, and shown, but every export writes a row's cells up to the table's width
+/// only, so the first save dropped them.
+#[test]
+fn a_loaded_table_is_as_wide_as_its_widest_row() {
+    let doc = TextDocument::new();
+    doc.set_djot_sync("Before.\n\n| a |\n| b | c |\n\nAfter.\n")
+        .unwrap();
+    assert_eq!(doc.to_plain_text().unwrap(), "Before.\na\n\nb\nc\nAfter.");
+    assert_every_word_saved(&doc, &["a", "b", "c", "After"]);
+
+    // A row shorter than the rows after it gets empty cells, in Markdown too.
+    let doc = TextDocument::new();
+    doc.set_markdown("| h1 | h2 |\n|---|---|\n| x |\n| y | z |\n")
+        .unwrap()
+        .wait()
+        .unwrap();
+    assert_every_word_saved(&doc, &["h1", "h2", "x", "y", "z"]);
+}
+
+/// A header spanning two columns is how Qt and most HTML writers head a two-column table. The
+/// spanning cell counted as one column, the table was sized from it, and the second column of
+/// every row after it was lost on the first save: legacy and imported projects lost the text
+/// of a column without a word said.
+#[test]
+fn a_loaded_html_table_with_a_spanning_header_keeps_every_column() {
+    let html = "<p>Before.</p><table><tr><th colspan=\"2\">Cast</th></tr>\
+                <tr><td>Anna</td><td>the widow</td></tr>\
+                <tr><td>Boris</td><td>her son</td></tr></table>";
+    let doc = TextDocument::new();
+    doc.set_html(html).unwrap().wait().unwrap();
+    assert_every_word_saved(&doc, &["Cast", "Anna", "widow", "Boris", "her son"]);
+    assert_eq!(
+        doc.to_djot().unwrap(),
+        "Before.\n\n| Cast |  |\n|---|---|\n| Anna | the widow |\n| Boris | her son |"
+    );
+
+    // A spanning cell keeps the cells after it in their columns: `B` stands over `z`.
+    let doc = TextDocument::new();
+    doc.set_html(
+        "<table><tr><td colspan=\"2\">A</td><td>B</td></tr>\
+         <tr><td>x</td><td>y</td><td>z</td></tr></table>",
+    )
+    .unwrap()
+    .wait()
+    .unwrap();
+    assert_eq!(
+        doc.to_djot().unwrap(),
+        "| A |  | B |\n|---|---|---|\n| x | y | z |"
+    );
+
+    // The paste path reads the same HTML the same way.
+    let doc = TextDocument::new();
+    doc.set_plain_text("Before.").unwrap();
+    doc.cursor_at(7).insert_html(html).unwrap();
+    assert_every_word_saved(&doc, &["Cast", "Anna", "widow", "Boris", "her son"]);
+}
+
+/// How many table cells the document holds.
+fn cell_count(doc: &TextDocument) -> usize {
+    doc.rope_store_for_test().table_cells.read().len()
+}
+
+/// An HTML table whose first row is one cell spanning a thousand columns, over rows of one
+/// cell each: its rows were completed to a thousand cells, a hundred thousand empty cells
+/// out of a few kilobytes, and the load or the paste took seconds. A span closing a row
+/// widens the table only as far as another row's cells reach.
+#[test]
+fn a_span_closing_a_row_widens_the_table_no_further_than_its_cells_reach() {
+    let mut html = String::from("<table><tr><th colspan=\"1000\">Wide</th></tr>");
+    for row in 0..20 {
+        html.push_str(&format!("<tr><td>r{row}</td></tr>"));
+    }
+    html.push_str("</table>");
+
+    let doc = TextDocument::new();
+    doc.set_html(&html).unwrap().wait().unwrap();
+    assert_eq!(cell_count(&doc), 21, "one column of 21 rows");
+    assert_every_word_saved(&doc, &["Wide", "r0", "r19"]);
+
+    let doc = TextDocument::new();
+    doc.set_plain_text("Before.").unwrap();
+    doc.cursor_at(7).insert_html(&html).unwrap();
+    assert_eq!(cell_count(&doc), 21, "the paste reads it the same way");
+    assert_every_word_saved(&doc, &["Before", "Wide", "r0", "r19"]);
+}
+
+/// A table a writer makes with a wide heading row over rows of one cell grows, completed, to
+/// about as many times its own cells as it has columns. Read as paragraphs past four times,
+/// a table of ten columns heading five hundred rows lost its grid, though it loads in a few
+/// milliseconds; it stays a table, every cell kept, loaded or pasted.
+#[test]
+fn a_table_as_ragged_as_a_writer_makes_one_keeps_its_grid() {
+    let mut djot = String::from("|");
+    for column in 0..10 {
+        djot.push_str(&format!(" h{column} |"));
+    }
+    djot.push('\n');
+    for row in 0..500 {
+        djot.push_str(&format!("| r{row} |\n"));
+    }
+    let doc = TextDocument::new();
+    doc.set_djot_sync(&djot).unwrap();
+    assert_eq!(doc.stats().table_count, 1);
+    assert_eq!(cell_count(&doc), 10 * 501);
+    assert_every_word_saved(&doc, &["h0", "h9", "r0", "r499"]);
+
+    let doc = TextDocument::new();
+    doc.set_plain_text("Before.").unwrap();
+    doc.cursor_at(7).insert_djot(&djot).unwrap();
+    assert_eq!(
+        doc.stats().table_count,
+        1,
+        "the paste reads it the same way"
+    );
+    assert_eq!(cell_count(&doc), 10 * 501);
+
+    // The same shape in HTML: a heading row of ten cells over rows of one.
+    let mut html = String::from("<table><tr>");
+    for column in 0..10 {
+        html.push_str(&format!("<th>h{column}</th>"));
+    }
+    html.push_str("</tr>");
+    for row in 0..500 {
+        html.push_str(&format!("<tr><td>r{row}</td></tr>"));
+    }
+    html.push_str("</table>");
+    let doc = TextDocument::new();
+    doc.set_html(&html).unwrap().wait().unwrap();
+    assert_eq!(cell_count(&doc), 10 * 501);
+}
+
+/// Completing the rows of a table many times ragged made far more cells than the table has:
+/// a Djot table with a wide first row over rows of one cell, or HTML rows each starting with
+/// an empty cell spanning a thousand columns. Such a table is read as the paragraphs of its
+/// cells that hold anything, in reading order, loaded or pasted: every word stays.
+#[test]
+fn a_table_too_ragged_to_complete_is_read_as_its_cells_paragraphs() {
+    let mut djot = String::from("|");
+    for column in 0..100 {
+        djot.push_str(&format!(" h{column} |"));
+    }
+    djot.push('\n');
+    for row in 0..100 {
+        djot.push_str(&format!("| r{row} |\n"));
+    }
+    let doc = TextDocument::new();
+    doc.set_djot_sync(&djot).unwrap();
+    assert_eq!(cell_count(&doc), 0);
+    assert_eq!(doc.stats().table_count, 0);
+    let words: Vec<String> = (0..100)
+        .map(|column| format!("h{column}"))
+        .chain((0..100).map(|row| format!("r{row}")))
+        .collect();
+    assert_eq!(doc.to_plain_text().unwrap(), words.join("\n"));
+
+    let doc = TextDocument::new();
+    doc.set_plain_text("Before.").unwrap();
+    doc.cursor_at(7).insert_djot(&djot).unwrap();
+    assert_eq!(cell_count(&doc), 0, "the paste reads it the same way");
+    assert_eq!(
+        doc.to_plain_text().unwrap(),
+        format!("Before.{}", words.join("\n"))
+    );
+
+    let mut html = String::from("<table>");
+    for row in 0..10 {
+        html.push_str(&format!(
+            "<tr><td colspan=\"1000\"></td><td>x{row}</td></tr>"
+        ));
+    }
+    html.push_str("</table>");
+    let doc = TextDocument::new();
+    doc.set_html(&html).unwrap().wait().unwrap();
+    assert_eq!(cell_count(&doc), 0);
+    let cells: Vec<String> = (0..10).map(|row| format!("x{row}")).collect();
+    assert_eq!(doc.to_plain_text().unwrap(), cells.join("\n"));
+}
+
+// ── Row removal under a cell spanning rows ──────────────────────────────────
+
+/// The words of `text`, for comparing texts that differ in their empty paragraphs.
+fn words(text: &str) -> Vec<String> {
+    text.replace('\u{FFFC}', " ")
+        .split_whitespace()
+        .map(str::to_string)
+        .collect()
+}
+
+/// Removing the first row of a cell that spans two rows keeps the cell, one row shorter, and
+/// moves the next row up beside it. The rope kept the spanning cell's text in front of the
+/// moved-up cells of earlier columns, so the text the positions address read the cells in
+/// another order than the saved Djot, the flow gave a cell a position before the cell ahead
+/// of it, and the caret skipped a cell.
+#[test]
+fn removing_the_first_row_of_a_row_spanning_cell_keeps_the_reading_order() {
+    let doc = TextDocument::new();
+    doc.set_djot_sync(
+        "Intro.\n\n| c00 | c01 | c02 |\n| c10 | c11 | c12 |\n| c20 | c21 | c22 |\n\nOutro.\n",
+    )
+    .unwrap();
+    let at = |doc: &TextDocument, needle: &str| {
+        let text = doc.to_addressable_text().unwrap();
+        text[..text.find(needle).unwrap()].chars().count()
+    };
+    let cursor = doc.cursor_at(at(&doc, "c00"));
+    let table = cursor.current_table().unwrap().id();
+    cursor.merge_table_cells(table, 0, 1, 1, 1).unwrap();
+    doc.cursor_at(at(&doc, "c00")).remove_current_row().unwrap();
+
+    let saved = doc.to_djot().unwrap();
+    let reloaded = TextDocument::new();
+    reloaded.set_djot_sync(&saved).unwrap();
+    assert_eq!(
+        words(&doc.to_addressable_text().unwrap()),
+        words(&reloaded.to_addressable_text().unwrap()),
+        "the positions read the cells in another order than the save: {saved:?}"
+    );
+    let positions = all_block_positions(&doc);
+    assert!(
+        positions.windows(2).all(|pair| pair[0].0 < pair[1].0),
+        "the flow's positions go back: {positions:?}"
+    );
+    for (position, _, text) in &positions {
+        assert_eq!(
+            doc.to_addressable_text()
+                .unwrap()
+                .chars()
+                .skip(*position)
+                .take(text.chars().count())
+                .collect::<String>(),
+            *text,
+            "a block of the flow is not at its position"
+        );
+    }
+    // The next row inserted below stays in order too.
+    doc.cursor_at(at(&doc, "c10")).insert_row_below().unwrap();
+    let positions = all_block_positions(&doc);
+    assert!(
+        positions.windows(2).all(|pair| pair[0].0 < pair[1].0),
+        "the flow's positions go back after inserting a row: {positions:?}"
+    );
+}

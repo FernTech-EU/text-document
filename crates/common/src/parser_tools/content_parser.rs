@@ -63,6 +63,67 @@ pub struct ParsedTable {
     pub blockquote_depth: u32,
 }
 
+impl ParsedTable {
+    /// How many columns the table needs to hold every cell it has: as many as its widest
+    /// row has cells. A row shorter than that is completed with empty cells by whoever
+    /// builds the table.
+    ///
+    /// The first row does not say it. The rows of a Djot table differ in length when their
+    /// source does, and an HTML table's first row is often one heading cell spanning every
+    /// column: a table sized from its first row kept the cells of a longer row in the model,
+    /// where they showed, while every export writes a row up to the table's width only, so
+    /// the first save dropped them.
+    pub fn column_count(&self) -> usize {
+        self.rows.iter().map(Vec::len).max().unwrap_or(0)
+    }
+}
+
+/// How many cells a table may reach once its short rows are completed (see
+/// [`ParsedTable::column_count`]), however few it has of its own: a table this size loads
+/// in a moment.
+const SQUARED_CELLS_ALWAYS: usize = 4096;
+
+/// How many times the cells it has of its own a larger table may reach once its short
+/// rows are completed.
+///
+/// A table whose rows differ in length because its source wrote them so, a wide heading
+/// row over rows of one cell or a few, grows to about as many times its own cells as it has
+/// columns: a dozen or so for a table a writer makes. The tables that made hundreds of
+/// thousands of cells out of a few kilobytes grow hundreds of times. At four times, a table
+/// of ten columns heading five hundred rows of one cell was read as paragraphs, its grid
+/// lost for a table that loads in a few milliseconds.
+const SQUARED_CELLS_PER_OWN_CELL: usize = 16;
+
+/// Push `table`, which has `own_cells` cells of its own in its source, onto `elements`: as
+/// a table, or as the paragraphs of its cells when completing its short rows would make it
+/// many times that.
+///
+/// Every row of a loaded table is completed to the widest one. A few kilobytes of a table
+/// whose first row is wide and whose other rows hold one cell each, or of HTML cells each
+/// spanning a thousand columns, made hundreds of thousands of empty cells, and held a load
+/// or a paste for seconds. Such a table is read as the paragraphs of its cells that hold
+/// anything, in reading order, at the table's quotation depth: every word stays, the grid
+/// goes.
+fn push_table(elements: &mut Vec<ParsedElement>, table: ParsedTable, own_cells: usize) {
+    let squared = table.rows.len().saturating_mul(table.column_count());
+    let allowed = SQUARED_CELLS_ALWAYS.max(own_cells.saturating_mul(SQUARED_CELLS_PER_OWN_CELL));
+    if squared <= allowed {
+        elements.push(ParsedElement::Table(table));
+        return;
+    }
+    elements.extend(
+        ParsedElement::flatten_to_blocks(vec![ParsedElement::Table(table)])
+            .into_iter()
+            .filter(|block| spans_carry_content(&block.spans))
+            .map(ParsedElement::Block),
+    );
+}
+
+/// The cells a table's rows hold, for [`push_table`].
+fn cells_in_rows(rows: &[Vec<ParsedTableCell>]) -> usize {
+    rows.iter().map(Vec::len).sum()
+}
+
 /// A parsed element: either a block or a table.
 #[derive(Debug, Clone)]
 pub enum ParsedElement {
@@ -551,11 +612,16 @@ pub fn parse_markdown(markdown: &str) -> Vec<ParsedElement> {
                 table_header_rows = 0;
             }
             Event::End(TagEnd::Table) => {
-                elements.push(ParsedElement::Table(ParsedTable {
-                    header_rows: table_header_rows,
-                    rows: std::mem::take(&mut table_rows),
-                    blockquote_depth,
-                }));
+                let own_cells = cells_in_rows(&table_rows);
+                push_table(
+                    &mut elements,
+                    ParsedTable {
+                        header_rows: table_header_rows,
+                        rows: std::mem::take(&mut table_rows),
+                        blockquote_depth,
+                    },
+                    own_cells,
+                );
                 in_table = false;
             }
             Event::Start(Tag::TableHead) => {
@@ -1545,24 +1611,36 @@ pub fn parse_html_elements(html: &str) -> Vec<ParsedElement> {
         }
     }
 
-    /// Parse a `<table>` element into a ParsedTable.
-    fn parse_table_element(table_node: ego_tree::NodeRef<Node>) -> ParsedTable {
+    /// The widest a `colspan` makes a row: HTML's own limit on the attribute. A row of
+    /// ordinary cells may be wider; only the empty cells a span adds stop here.
+    const MAX_HTML_COLSPAN: usize = 1000;
+
+    /// Parse a `<table>` element into a ParsedTable, with the number of `<td>` and `<th>`
+    /// cells it has (see `push_table`).
+    fn parse_table_element(table_node: ego_tree::NodeRef<Node>) -> (ParsedTable, usize) {
         let mut rows: Vec<Vec<ParsedTableCell>> = Vec::new();
         let mut header_rows: usize = 0;
+        let mut own_cells: usize = 0;
 
         fn collect_rows(
             node: ego_tree::NodeRef<Node>,
             rows: &mut Vec<Vec<ParsedTableCell>>,
             header_rows: &mut usize,
+            own_cells: &mut usize,
             in_thead: bool,
         ) {
             for child in node.children() {
                 if let Node::Element(el) = child.value() {
                     match el.name() {
-                        "thead" => collect_rows(child, rows, header_rows, true),
-                        "tbody" | "tfoot" => collect_rows(child, rows, header_rows, false),
+                        "thead" => collect_rows(child, rows, header_rows, own_cells, true),
+                        "tbody" | "tfoot" => {
+                            collect_rows(child, rows, header_rows, own_cells, false)
+                        }
                         "tr" => {
                             let mut cells: Vec<ParsedTableCell> = Vec::new();
+                            // The cells of the row up to its last `<td>` or `<th>`: the
+                            // empty cells a span adds after it hold no cell's place.
+                            let mut own_end = 0;
                             for td in child.children() {
                                 if let Node::Element(td_el) = td.value()
                                     && matches!(td_el.name(), "td" | "th")
@@ -1575,8 +1653,31 @@ pub fn parse_html_elements(html: &str) -> Vec<ParsedElement> {
                                         spans.push(ParsedSpan::default());
                                     }
                                     cells.push(ParsedTableCell { spans });
+                                    *own_cells += 1;
+                                    own_end = cells.len();
+                                    // A cell spanning columns covers the cells after it
+                                    // in its row: empty ones hold its place, so the cells
+                                    // that follow stay in their own columns and the
+                                    // table is as wide as the columns it spans.
+                                    let span = td_el
+                                        .attr("colspan")
+                                        .and_then(|value| value.trim().parse::<usize>().ok())
+                                        .unwrap_or(1)
+                                        .clamp(1, MAX_HTML_COLSPAN);
+                                    for _ in 1..span {
+                                        if cells.len() >= MAX_HTML_COLSPAN {
+                                            break;
+                                        }
+                                        cells.push(ParsedTableCell {
+                                            spans: vec![ParsedSpan::default()],
+                                        });
+                                    }
                                 }
                             }
+                            // A span closing a row widens the table only as far as another
+                            // row's cells reach: `<th colspan="1000">` over rows of one
+                            // cell is a table of one column, not of a thousand.
+                            cells.truncate(own_end);
                             if !cells.is_empty() {
                                 rows.push(cells);
                                 if in_thead {
@@ -1590,20 +1691,29 @@ pub fn parse_html_elements(html: &str) -> Vec<ParsedElement> {
             }
         }
 
-        collect_rows(table_node, &mut rows, &mut header_rows, false);
+        collect_rows(
+            table_node,
+            &mut rows,
+            &mut header_rows,
+            &mut own_cells,
+            false,
+        );
 
         // Tables without explicit <thead> but with <th> cells: treat first row as header
         if header_rows == 0 && !rows.is_empty() {
             header_rows = 1;
         }
 
-        ParsedTable {
-            header_rows,
-            rows,
-            // The caller (`walk_node`) sets the real depth — this helper has
-            // no visibility into the surrounding blockquote nesting.
-            blockquote_depth: 0,
-        }
+        (
+            ParsedTable {
+                header_rows,
+                rows,
+                // The caller (`walk_node`) sets the real depth: this helper has
+                // no visibility into the surrounding blockquote nesting.
+                blockquote_depth: 0,
+            },
+            own_cells,
+        )
     }
 
     fn walk_node(
@@ -1725,10 +1835,10 @@ pub fn parse_html_elements(html: &str) -> Vec<ParsedElement> {
 
                 if tag == "table" {
                     // Parse table structure into a ParsedTable
-                    let mut parsed_table = parse_table_element(node);
+                    let (mut parsed_table, own_cells) = parse_table_element(node);
                     if !parsed_table.rows.is_empty() {
                         parsed_table.blockquote_depth = bq_depth;
-                        elements.push(ParsedElement::Table(parsed_table));
+                        push_table(elements, parsed_table, own_cells);
                     }
                     return;
                 }
@@ -1820,6 +1930,13 @@ pub fn parse_html_elements(html: &str) -> Vec<ParsedElement> {
                         spans_carry_content(&spans) || nested_elements.is_empty();
 
                     if (!spans.is_empty() && own_run_is_content) || heading_level.is_some() {
+                        // A code block is verbatim text, which no save can write an image or
+                        // a note's reference into: a `<pre>` holding one is read as prose,
+                        // which keeps it, one paragraph for each of its lines (see below).
+                        let is_code_block = is_code_block
+                            && !spans
+                                .iter()
+                                .any(|span| span.image.is_some() || span.footnote_ref.is_some());
                         let block = ParsedBlock {
                             spans,
                             heading_level,
@@ -1829,7 +1946,7 @@ pub fn parse_html_elements(html: &str) -> Vec<ParsedElement> {
                             list_suffix: String::new(),
                             marker: None,
                             is_code_block,
-                            code_language,
+                            code_language: code_language.filter(|_| is_code_block),
                             blockquote_depth: bq_depth,
                             line_height: css.line_height,
                             non_breakable_lines: css.non_breakable_lines,
@@ -2947,11 +3064,16 @@ pub fn parse_djot(djot: &str, options: &DjotImportOptions) -> Vec<ParsedElement>
                 table_header_rows = 0;
             }
             E::End(C::Table) => {
-                elements.push(ParsedElement::Table(ParsedTable {
-                    header_rows: table_header_rows,
-                    rows: std::mem::take(&mut table_rows),
-                    blockquote_depth,
-                }));
+                let own_cells = cells_in_rows(&table_rows);
+                push_table(
+                    &mut elements,
+                    ParsedTable {
+                        header_rows: table_header_rows,
+                        rows: std::mem::take(&mut table_rows),
+                        blockquote_depth,
+                    },
+                    own_cells,
+                );
             }
             E::Start(C::TableRow { head }, _) => {
                 row_is_head = head;
@@ -4047,10 +4169,12 @@ fn cell_prose(cell: &ParsedTableCell) -> String {
 /// **Known exception: a footnote *definition*'s body.** This function treats it as out of
 /// flow and omits it — matching `character_count()`, which does not count it — but the
 /// live document mirrors its blocks into the rope, so today an in-document search DOES
-/// run over the note's body and `to_addressable_text()` includes it. On a document with
-/// footnote definitions the two strings differ by exactly those bodies; which side is
-/// wrong is an open product question (should search see notes?), pinned as current
-/// behaviour in `addressable_text_tests::footnote_bodies_are_searched_in_the_live_document`.
+/// run over the note's body and `to_addressable_text()` includes it. The live document
+/// holds every body after the main text, so this string is the start of that one, and
+/// every offset of the main text agrees between the two; they differ by the bodies at
+/// the end. Which side is wrong is an open product question (should search see notes?),
+/// pinned as current behaviour in
+/// `addressable_text_tests::footnote_bodies_are_searched_in_the_live_document`.
 ///
 /// ⚠ It is **not** the same as `TextDocument::to_plain_text()`. That is the human-readable
 /// *export* — same prose, same order, but with every object anchor omitted, so its offsets
@@ -4107,9 +4231,13 @@ pub fn djot_to_plain_text(djot: &str, options: &DjotImportOptions) -> String {
                 // short by two characters, and a snippet taken from this string would be
                 // sliced in the wrong place.
                 push(TABLE_ANCHOR, &mut out, &mut first);
+                // A row shorter than the widest holds empty cells in the document, one
+                // position each: the import completes it (see `ParsedTable::column_count`).
+                let columns = table.column_count();
                 for row in &table.rows {
-                    for cell in row {
-                        push(&cell_prose(cell), &mut out, &mut first);
+                    for column in 0..columns {
+                        let prose = row.get(column).map(cell_prose).unwrap_or_default();
+                        push(&prose, &mut out, &mut first);
                     }
                 }
             }

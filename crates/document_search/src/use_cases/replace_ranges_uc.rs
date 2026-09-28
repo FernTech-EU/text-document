@@ -24,7 +24,6 @@ use crate::ReplaceRangesDto;
 use crate::ReplaceRangesResultDto;
 use anyhow::{Result, anyhow};
 use common::database::CommandUnitOfWork;
-use common::database::rope_helpers::rope_flat_text_if_simple;
 use common::direct_access::document::document_repository::DocumentRelationshipField;
 use common::direct_access::frame::frame_repository::FrameRelationshipField;
 use common::direct_access::root::root_repository::RootRelationshipField;
@@ -34,10 +33,8 @@ use common::snapshot::EntityTreeSnapshot;
 use common::types::{EntityId, ROOT_ENTITY_ID};
 use common::undo_redo::UndoRedoCommand;
 use std::any::Any;
-use std::collections::HashMap;
 
 use super::replace_core::{self, RangeSpec};
-use super::search_helpers::build_full_text_via_store;
 
 pub trait ReplaceRangesUnitOfWorkFactoryTrait: Send + Sync {
     fn create(&self) -> Box<dyn ReplaceRangesUnitOfWorkTrait>;
@@ -61,14 +58,14 @@ pub trait ReplaceRangesUnitOfWorkFactoryTrait: Send + Sync {
 #[macros::uow_action(entity = "Block", action = "GetRelationship")]
 pub trait ReplaceRangesUnitOfWorkTrait: CommandUnitOfWork {}
 
-/// The document's blocks in reading order, and the text a range's offsets address.
+/// The document's blocks in reading order, and the document's id.
 ///
 /// Blocks are pooled across every frame and sorted **once, globally**, by
 /// `document_position` — a blockquote's prose lives in a child frame, and sorting per frame
-/// would put it in the wrong place (which is exactly the bug `to_plain_text` had).
-fn fetch_blocks_and_build_text(
-    uow: &dyn ReplaceRangesUnitOfWorkTrait,
-) -> Result<(String, Vec<Block>, EntityId)> {
+/// would put it in the wrong place (which is exactly the bug `to_plain_text` had). The
+/// ranges come from the caller, placed in the text `find_all` searched: no text is built
+/// here.
+fn fetch_blocks(uow: &dyn ReplaceRangesUnitOfWorkTrait) -> Result<(Vec<Block>, EntityId)> {
     let root = uow
         .get_root(&ROOT_ENTITY_ID)?
         .ok_or_else(|| anyhow!("Root entity not found"))?;
@@ -95,10 +92,7 @@ fn fetch_blocks_and_build_text(
     common::database::rope_helpers::refresh_block_positions(&mut blocks, &uow.store());
     blocks.sort_by_key(|b| b.document_position);
 
-    let full_text = rope_flat_text_if_simple(&uow.store(), frame_ids.len())
-        .unwrap_or_else(|| build_full_text_via_store(&blocks, &uow.store()));
-
-    Ok((full_text, blocks, doc_id))
+    Ok((blocks, doc_id))
 }
 
 /// Apply `specs` through the shared splice (see [`replace_core`]), and persist the result.
@@ -125,25 +119,11 @@ fn apply_specs(
         });
     }
 
-    // DESCENDING. An earlier edit's length change must not move a range a later edit still
-    // has to address.
-    let mut delta_by_block_id: HashMap<EntityId, i64> = HashMap::new();
-    for edit in plan.edits.iter().rev() {
-        let block = uow
-            .get_block(&blocks[edit.block_idx].id)?
-            .ok_or_else(|| anyhow!("Block not found"))?;
-
-        let updated = replace_core::apply_in_block(
-            &store,
-            &block,
-            edit.block_offset,
-            edit.block_offset + edit.length,
-            &edit.replacement,
-            policy,
-        )?;
-        uow.update_block(&updated)?;
-
-        *delta_by_block_id.entry(block.id).or_insert(0) += replace_core::char_delta(edit);
+    // Every edit in one pass over the document (see `replace_core::apply_plan`), then the
+    // blocks it changed, persisted.
+    let (changed, delta_by_block_id) = replace_core::apply_plan(&store, blocks, &plan, policy)?;
+    if !changed.is_empty() {
+        uow.update_block_multi(&changed)?;
     }
 
     let (moved, total_delta) = replace_core::rebase_positions(blocks, &delta_by_block_id);
@@ -204,7 +184,7 @@ fn execute_replace_ranges(
 ) -> Result<(ReplaceRangesResultDto, EntityTreeSnapshot)> {
     let specs = specs_from(dto)?;
 
-    let (_full_text, blocks, doc_id) = fetch_blocks_and_build_text(uow.as_ref())?;
+    let (blocks, doc_id) = fetch_blocks(uow.as_ref())?;
     let snapshot = uow.snapshot_document(&[doc_id])?;
 
     let applied = apply_specs(uow, doc_id, &blocks, &specs, dto.format_policy)?;

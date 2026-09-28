@@ -690,11 +690,11 @@ fn opens_character_reference(rest: &str) -> bool {
     // the `;` is found in the bytes, and the text before it is whole characters.
     const LONGEST_BODY: usize = 32;
     let reach = &rest.as_bytes()[..rest.len().min(LONGEST_BODY + 1)];
-    let Some(end) = reach
+    let stop = reach
         .iter()
-        .position(|b| !(b.is_ascii_alphanumeric() || *b == b'#'))
-        .filter(|at| reach[*at] == b';')
-    else {
+        .position(|b| !(b.is_ascii_alphanumeric() || *b == b'#'));
+    scanned(stop.map_or(reach.len(), |at| at + 1));
+    let Some(end) = stop.filter(|at| reach[*at] == b';') else {
         return false;
     };
     let body = &rest[..end];
@@ -707,6 +707,16 @@ fn opens_character_reference(rest: &str) -> bool {
     body.chars().next().is_some_and(|c| c.is_ascii_alphabetic())
         && body.len() <= LONGEST_BODY
         && body.chars().all(|c| c.is_ascii_alphanumeric())
+}
+
+/// Record `count` bytes [`opens_character_reference`] looked at. A unit test counts them:
+/// the scan runs once for every `&` of a text, and a debug build on a busy machine cannot
+/// time it reliably.
+fn scanned(count: usize) {
+    #[cfg(test)]
+    tests::SCANNED.with(|scanned| scanned.set(scanned.get() + count));
+    #[cfg(not(test))]
+    let _ = count;
 }
 
 /// Write `text` as a code span that reads back as exactly `text`.
@@ -845,4 +855,60 @@ fn keep_leading_whitespace(line: &str) -> String {
     }
     out.push_str(body);
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::Cell;
+
+    thread_local! {
+        /// The bytes [`opens_character_reference`] looked at on this thread (see [`scanned`]).
+        pub(super) static SCANNED: Cell<usize> = const { Cell::new(0) };
+    }
+
+    /// `text` escaped, and the bytes the reference scan looked at to escape it.
+    fn escaped_and_scanned(text: &str) -> (String, usize) {
+        SCANNED.with(|scanned| scanned.set(0));
+        let escaped = escape_markdown(text);
+        (escaped, SCANNED.with(Cell::get))
+    }
+
+    /// To tell whether a `&` opens a character reference, the writer looked for the next
+    /// `;` in the whole rest of the text, so a paragraph of many `&` and no `;` cost time in
+    /// the square of its length: 320,000 characters of `a&` took 300 times as long to
+    /// export as the same length of `a+` in a debug build. Each `&` looks at most as far as
+    /// the longest reference reaches now, and the bytes it looks at are counted here, not
+    /// timed, so a busy machine cannot fail the test and a scan past that reach cannot pass
+    /// it.
+    #[test]
+    fn each_ampersand_is_scanned_no_further_than_a_reference_reaches() {
+        // The longest body a reference has, and the `;` after it.
+        const REACH: usize = 33;
+        for units in [5_000, 320_000] {
+            // No `;` anywhere: the scan of every `&` looks at the `a` after it and stops at
+            // the next `&`, and the last `&` has nothing after it to look at.
+            let (escaped, scanned) = escaped_and_scanned(&"a&".repeat(units));
+            assert_eq!(escaped, "a&".repeat(units));
+            assert_eq!(scanned, 2 * (units - 1), "{units} ampersands");
+            // Long runs of name characters: each scan stops at the longest reach.
+            let text = format!("&{}", "b".repeat(100)).repeat(units / 100);
+            let (_, scanned) = escaped_and_scanned(&text);
+            assert!(
+                scanned <= REACH * (units / 100),
+                "{scanned} bytes looked at for {} ampersands",
+                units / 100
+            );
+        }
+        // A reference as long as one can be is still found, and escaped; one a character
+        // longer is not a reference.
+        let longest = format!("&{};", "n".repeat(32));
+        assert_eq!(escaped_and_scanned(&longest).0, format!("\\{longest}"));
+        let longer = format!("&{};", "n".repeat(33));
+        assert_eq!(escaped_and_scanned(&longer).0, longer);
+        assert_eq!(
+            escaped_and_scanned("AT&T &amp; &#169;").0,
+            "AT&T \\&amp; \\&\\#169;"
+        );
+    }
 }

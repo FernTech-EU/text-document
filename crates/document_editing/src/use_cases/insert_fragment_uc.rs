@@ -17,7 +17,9 @@ use common::direct_access::document::document_repository::DocumentRelationshipFi
 use common::direct_access::frame::frame_repository::FrameRelationshipField;
 use common::direct_access::root::root_repository::RootRelationshipField;
 use common::direct_access::table::TableRelationshipField;
-use common::entities::{Block, Document, Frame, List, Root, Table, TableCell};
+use common::entities::{
+    Block, Document, Frame, FramePosition, List, Root, SemanticRole, Table, TableCell,
+};
 use common::format_runs::{
     FootnoteRefAnchor, FormatRun, ImageAnchor, InlineSegment, character_format_from_segment,
     coalesce_in_place, logical_offset_to_byte, split_footnote_refs_at, split_images_at,
@@ -26,7 +28,8 @@ use common::format_runs::{
 
 use common::parser_tools::TABLE_ANCHOR;
 use common::parser_tools::fragment_schema::{
-    FragmentBlock, FragmentData, FragmentTable, FragmentTableCell,
+    CarriedFragment, FragmentBlock, FragmentData, FragmentQuoting, FragmentTable,
+    FragmentTableCell, fragment_from_json,
 };
 use common::parser_tools::list_depth::clamp_fragment_list_indents;
 use common::parser_tools::list_grouper::ListGrouper;
@@ -66,6 +69,7 @@ pub trait InsertFragmentUnitOfWorkFactoryTrait: Send + Sync {
 #[macros::uow_action(entity = "List", action = "CreateOrphan")]
 #[macros::uow_action(entity = "Frame", action = "Create")]
 #[macros::uow_action(entity = "Frame", action = "CreateOrphan")]
+#[macros::uow_action(entity = "Frame", action = "RemoveMulti")]
 #[macros::uow_action(entity = "Table", action = "Get")]
 #[macros::uow_action(entity = "Table", action = "Create")]
 #[macros::uow_action(entity = "Table", action = "CreateOrphan")]
@@ -533,6 +537,404 @@ fn attach_to_document(
     uow.set_document_relationship(&doc_id, field, &owned)
 }
 
+/// The one empty paragraph of an empty text, to make a plain paragraph of the main text
+/// before a paste replacing the whole text fills it.
+///
+/// Deleting all of a text leaves one empty block, which keeps the formatting of the first
+/// paragraph that was deleted (a heading, a code block, an item of a list) and stays in the
+/// quotations that paragraph stood in. A text pasted over everything, as a host puts back a
+/// past version of a scene by selecting all of it and inserting the version's Djot, then
+/// merged its first paragraph into that block, took its formatting and went into its
+/// quotations: the version came back with its first paragraph a heading or a code block it
+/// never was, or the whole of it quoted. Pasted over the whole of a text, a text keeps its
+/// own formatting. A phrase does not: it has no formatting of its own to keep, and goes into
+/// that block as typed text does (see [`is_a_phrase`]).
+///
+/// Only a block that is the only one in the main text, empty, and holding the caret is made
+/// plain, the main text holding nothing else but quotations around it and quotations
+/// holding nothing (which removing a table a quotation held alone leaves behind). See
+/// [`empty_text_to_make_plain`] and [`make_the_empty_text_plain`].
+struct EmptyText {
+    main_frame_id: EntityId,
+    /// The frame listing the block: the main frame, or a quotation.
+    frame_id: EntityId,
+    /// Every frame under the main frame: the quotations around the block and any quotation
+    /// holding nothing.
+    sub_frames: Vec<EntityId>,
+    block: Block,
+    plain: Block,
+}
+
+/// The empty text a paste at `position` replacing the whole text should make plain first, if
+/// there is one to change: see [`EmptyText`].
+fn empty_text_to_make_plain(
+    uow: &dyn InsertFragmentUnitOfWorkTrait,
+    doc_id: EntityId,
+    position: i64,
+) -> Result<Option<EmptyText>> {
+    let frame_ids = uow.get_document_relationship(&doc_id, &DocumentRelationshipField::Frames)?;
+    let Some(&main_frame_id) = frame_ids.first() else {
+        return Ok(None);
+    };
+    // Every frame under the main frame, and the one block they all hold between them. A table
+    // or a second block is a text that is not empty.
+    let mut sub_frames: Vec<EntityId> = Vec::new();
+    let mut only_block: Option<(EntityId, EntityId)> = None;
+    let mut pending: Vec<EntityId> = vec![main_frame_id];
+    let mut seen: std::collections::HashSet<EntityId> = std::collections::HashSet::new();
+    while let Some(frame_id) = pending.pop() {
+        if !seen.insert(frame_id) {
+            return Ok(None);
+        }
+        let Some(frame) = uow.get_frame(&frame_id)? else {
+            return Ok(None);
+        };
+        if frame.table.is_some() || frame.footnote_label.is_some() {
+            return Ok(None);
+        }
+        if frame_id != main_frame_id {
+            sub_frames.push(frame_id);
+        }
+        for entry in &frame.child_order {
+            if *entry > 0 {
+                if only_block.is_some() {
+                    return Ok(None);
+                }
+                only_block = Some((frame_id, *entry as EntityId));
+            } else if *entry < 0 {
+                pending.push(entry.unsigned_abs() as EntityId);
+            }
+        }
+    }
+    let Some((frame_id, block_id)) = only_block else {
+        return Ok(None);
+    };
+    let Some(block) = uow.get_block(&block_id)? else {
+        return Ok(None);
+    };
+    let store = uow.store();
+    if block_char_length(&block, &store) != 0 || block_document_position(&block, &store) != position
+    {
+        return Ok(None);
+    }
+    let plain = Block {
+        id: block.id,
+        created_at: block.created_at,
+        updated_at: block.updated_at,
+        document_position: block.document_position,
+        ..Block::default()
+    };
+    if plain == block && sub_frames.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(EmptyText {
+        main_frame_id,
+        frame_id,
+        sub_frames,
+        block,
+        plain,
+    }))
+}
+
+/// Make `empty` a plain paragraph of the main frame: its formatting and list taken off, and
+/// every frame under the main frame, empty then, removed.
+fn make_the_empty_text_plain(
+    uow: &mut Box<dyn InsertFragmentUnitOfWorkTrait>,
+    empty: EmptyText,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<()> {
+    if empty.plain != empty.block {
+        uow.update_block_with_relationships(&Block {
+            updated_at: now,
+            ..empty.plain
+        })?;
+    }
+    if !empty.sub_frames.is_empty() {
+        let block_id = empty.block.id;
+        if empty.frame_id != empty.main_frame_id {
+            uow.set_frame_relationship(&empty.frame_id, &FrameRelationshipField::Blocks, &[])?;
+        }
+        uow.set_frame_relationship(
+            &empty.main_frame_id,
+            &FrameRelationshipField::Blocks,
+            &[block_id],
+        )?;
+        let mut main_frame = uow
+            .get_frame(&empty.main_frame_id)?
+            .ok_or_else(|| anyhow!("Frame {} not found", empty.main_frame_id))?;
+        main_frame.child_order = vec![block_id as i64];
+        main_frame.updated_at = now;
+        uow.update_frame(&main_frame)?;
+        uow.remove_frame_multi(&empty.sub_frames)?;
+    }
+    Ok(())
+}
+
+/// Take the code-block format off every block of `fragment_data`, its tables' cells
+/// included, for a paste into a table cell.
+fn without_code_blocks(fragment_data: &mut FragmentData) {
+    let cells = fragment_data
+        .tables
+        .iter_mut()
+        .flat_map(|table| table.cells.iter_mut())
+        .flat_map(|cell| cell.blocks.iter_mut());
+    for block in fragment_data.blocks.iter_mut().chain(cells) {
+        block.is_code_block = None;
+        block.code_language = None;
+    }
+}
+
+/// Whether a fragment block holds an image or a footnote reference.
+fn holds_objects(block: &FragmentBlock) -> bool {
+    frag_block_state(block).object_count() > 0
+}
+
+/// The refusal of a paste that would put an image or a footnote reference into a code
+/// block. A code block is verbatim text: the save writes its characters and nothing else, so
+/// what went in was shown and then lost, and a note lost its place in the text at the next
+/// reopening.
+fn objects_into_a_code_block() -> anyhow::Error {
+    anyhow!("a code block holds text only: an image or a footnote reference cannot go into one")
+}
+
+/// The quotations one pasted block stood in, as the fragment carries them beside it (see
+/// [`FragmentQuoting`]): how many, and the role of the innermost.
+#[derive(Clone, Default)]
+struct Quote {
+    depth: u32,
+    role: Option<SemanticRole>,
+}
+
+impl Quote {
+    /// The quotations the fragment's block at `index` stood in.
+    fn of_block(quoting: &FragmentQuoting, index: usize) -> Self {
+        Quote {
+            depth: quoting.block_depth(index),
+            role: quoting.block_role(index).cloned(),
+        }
+    }
+}
+
+/// Whether the fragment's block at `index` merges into the paragraph it is pasted into: it
+/// carries no block formatting and stands in no quotation.
+fn merges_inline(fragment_data: &FragmentData, quoting: &FragmentQuoting, index: usize) -> bool {
+    fragment_data
+        .blocks
+        .get(index)
+        .is_some_and(FragmentBlock::is_inline_only)
+        && quoting.block_depth(index) == 0
+}
+
+/// Whether the fragment is a phrase: a single paragraph that merges into the one it is
+/// pasted into (see [`merges_inline`]), and no table. A phrase takes the formatting of the
+/// paragraph it goes into, as typed text does.
+fn is_a_phrase(fragment_data: &FragmentData, quoting: &FragmentQuoting) -> bool {
+    fragment_data.tables.is_empty()
+        && fragment_data.blocks.len() == 1
+        && merges_inline(fragment_data, quoting, 0)
+}
+
+/// One entry a paste added to the `child_order` of the frame it went into, with the
+/// quotations the fragment asks it to stand in (see [`FragmentQuoting`]).
+struct PastedEntry {
+    /// A block's id, or a table anchor frame's id negated, as `child_order` holds them.
+    entry: i64,
+    depth: u32,
+    role: Option<SemanticRole>,
+}
+
+impl PastedEntry {
+    fn block(block_id: EntityId, quote: Quote) -> Self {
+        PastedEntry {
+            entry: block_id as i64,
+            depth: quote.depth,
+            role: quote.role,
+        }
+    }
+}
+
+/// How many quotations `frame_id` stands in, counted down from `root_frame_id`, the main
+/// frame. `0` when the frame is not found under it.
+fn quote_depth_of_frame(
+    uow: &dyn InsertFragmentUnitOfWorkTrait,
+    root_frame_id: EntityId,
+    frame_id: EntityId,
+) -> Result<u32> {
+    // Depth first over the sub-frames, each with the depth it stands at.
+    let mut pending: Vec<(EntityId, u32)> = vec![(root_frame_id, 0)];
+    let mut seen: std::collections::HashSet<EntityId> = std::collections::HashSet::new();
+    while let Some((id, depth)) = pending.pop() {
+        if !seen.insert(id) {
+            continue;
+        }
+        let Some(frame) = uow.get_frame(&id)? else {
+            continue;
+        };
+        let depth = depth + u32::from(id != root_frame_id && frame.fmt_is_blockquote == Some(true));
+        if id == frame_id {
+            return Ok(depth);
+        }
+        pending.extend(
+            frame
+                .child_order
+                .iter()
+                .filter(|entry| **entry < 0)
+                .map(|entry| ((-entry) as EntityId, depth)),
+        );
+    }
+    Ok(0)
+}
+
+/// Put the entries a paste added to `frame_id` into the quotations the fragment asks for.
+///
+/// `pasted` are consecutive in the frame's `child_order`, in order. Each goes as deep as its
+/// fragment block (or table) stood, counted from the text it came from, and never less deep
+/// than the frame it was pasted into already is: consecutive entries asking for the same
+/// depth share a quotation, as a load reads them, and a deeper one opens a quotation nested
+/// in it. Quotations are frames, not text, so the rope, which holds the pasted text in
+/// order already, is left as it is. The pasted blocks went into the caret's frame whatever
+/// the fragment said, so a quotation pasted, or a version of a text put back, came out as
+/// plain paragraphs.
+fn nest_in_quotations(
+    uow: &mut Box<dyn InsertFragmentUnitOfWorkTrait>,
+    doc_id: EntityId,
+    frame_id: EntityId,
+    pasted: &[PastedEntry],
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<()> {
+    if pasted.iter().all(|entry| entry.depth == 0) {
+        return Ok(());
+    }
+    let frame_ids = uow.get_document_relationship(&doc_id, &DocumentRelationshipField::Frames)?;
+    let Some(&root_frame_id) = frame_ids.first() else {
+        return Ok(());
+    };
+    let base = quote_depth_of_frame(&**uow, root_frame_id, frame_id)?;
+    if pasted.iter().all(|entry| entry.depth <= base) {
+        return Ok(());
+    }
+    let mut frame = uow
+        .get_frame(&frame_id)?
+        .ok_or_else(|| anyhow!("Frame {frame_id} not found"))?;
+    let Some(first) = pasted.first() else {
+        return Ok(());
+    };
+    let Some(start) = frame
+        .child_order
+        .iter()
+        .position(|entry| *entry == first.entry)
+    else {
+        return Ok(());
+    };
+    let end = start + pasted.len();
+    let in_place = frame
+        .child_order
+        .get(start..end)
+        .is_some_and(|span| span.iter().eq(pasted.iter().map(|entry| &entry.entry)));
+    if !in_place {
+        // Not where the paste put them: leave them in the frame, as before.
+        return Ok(());
+    }
+
+    /// A quotation opened for the paste, filling up.
+    struct Open {
+        id: EntityId,
+        child_order: Vec<i64>,
+        blocks: Vec<EntityId>,
+        role: Option<SemanticRole>,
+    }
+    fn close(
+        uow: &mut Box<dyn InsertFragmentUnitOfWorkTrait>,
+        open: Open,
+        stack: &mut [Open],
+        top: &mut Vec<i64>,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<()> {
+        uow.set_frame_relationship(&open.id, &FrameRelationshipField::Blocks, &open.blocks)?;
+        let mut quotation = uow
+            .get_frame(&open.id)?
+            .ok_or_else(|| anyhow!("Frame {} not found", open.id))?;
+        quotation.child_order = open.child_order;
+        quotation.fmt_semantic_role = open.role;
+        quotation.updated_at = now;
+        uow.update_frame(&quotation)?;
+        match stack.last_mut() {
+            Some(parent) => parent.child_order.push(-(open.id as i64)),
+            None => top.push(-(open.id as i64)),
+        }
+        Ok(())
+    }
+
+    let mut stack: Vec<Open> = Vec::new();
+    let mut top: Vec<i64> = Vec::new();
+    let mut new_frames: Vec<EntityId> = Vec::new();
+    let mut moved: std::collections::HashSet<EntityId> = std::collections::HashSet::new();
+    for entry in pasted {
+        let wanted = entry.depth.saturating_sub(base) as usize;
+        while stack.len() > wanted {
+            if let Some(open) = stack.pop() {
+                close(uow, open, &mut stack, &mut top, now)?;
+            }
+        }
+        while stack.len() < wanted {
+            let parent = stack.last().map_or(frame_id, |open| open.id);
+            let created = uow.create_orphan_frame(&Frame {
+                fmt_is_blockquote: Some(true),
+                fmt_position: Some(FramePosition::InFlow),
+                parent_frame: Some(parent),
+                ..Frame::default()
+            })?;
+            new_frames.push(created.id);
+            stack.push(Open {
+                id: created.id,
+                child_order: Vec::new(),
+                blocks: Vec::new(),
+                role: None,
+            });
+        }
+        match stack.last_mut() {
+            Some(open) => {
+                open.child_order.push(entry.entry);
+                if entry.entry > 0 {
+                    open.blocks.push(entry.entry as EntityId);
+                    moved.insert(entry.entry as EntityId);
+                } else {
+                    // A table's anchor frame: its quotation is its parent now.
+                    uow.set_frame_relationship(
+                        &((-entry.entry) as EntityId),
+                        &FrameRelationshipField::ParentFrame,
+                        &[open.id],
+                    )?;
+                }
+                // The role of a block's innermost quotation, as a load lifts it.
+                if open.role.is_none() {
+                    open.role = entry.role.clone();
+                }
+            }
+            None => top.push(entry.entry),
+        }
+    }
+    while let Some(open) = stack.pop() {
+        close(uow, open, &mut stack, &mut top, now)?;
+    }
+
+    attach_to_document(uow, doc_id, &DocumentRelationshipField::Frames, &new_frames)?;
+    let blocks: Vec<EntityId> = uow
+        .get_frame_relationship(&frame_id, &FrameRelationshipField::Blocks)?
+        .into_iter()
+        .filter(|block_id| !moved.contains(block_id))
+        .collect();
+    uow.set_frame_relationship(&frame_id, &FrameRelationshipField::Blocks, &blocks)?;
+    let mut refreshed = uow
+        .get_frame(&frame_id)?
+        .ok_or_else(|| anyhow!("Frame {frame_id} not found"))?;
+    frame.child_order.splice(start..end, top);
+    refreshed.child_order = frame.child_order;
+    refreshed.updated_at = now;
+    uow.update_frame(&refreshed)?;
+    Ok(())
+}
+
 /// A table cell's frame holding one empty block, created without an owner for
 /// [`attach_to_document`], where `create_cell_frame` hands each frame to the
 /// document as it creates it.
@@ -877,6 +1279,7 @@ fn insert_table_fragment(
     uow: &mut Box<dyn InsertFragmentUnitOfWorkTrait>,
     dto: &InsertFragmentDto,
     fragment_data: &FragmentData,
+    quoting: &FragmentQuoting,
 ) -> Result<(InsertFragmentResultDto, EntityTreeSnapshot)> {
     let now = chrono::Utc::now();
 
@@ -948,8 +1351,10 @@ fn insert_table_fragment(
     let mut new_tables: Vec<EntityId> = Vec::new();
     let mut new_frames: Vec<EntityId> = Vec::new();
     let mut new_anchor_entries: Vec<i64> = Vec::new();
+    // The anchors, with the quotations each table stood in (see `nest_in_quotations`).
+    let mut pasted: Vec<PastedEntry> = Vec::new();
 
-    for frag_table in &fragment_data.tables {
+    for (table_index, frag_table) in fragment_data.tables.iter().enumerate() {
         if frag_table.rows == 0 || frag_table.columns == 0 || frag_table.cells.is_empty() {
             continue;
         }
@@ -1082,6 +1487,11 @@ fn insert_table_fragment(
         let created_anchor = uow.create_orphan_frame(&anchor_frame)?;
         new_frames.push(created_anchor.id);
         new_anchor_entries.push(-(created_anchor.id as i64));
+        pasted.push(PastedEntry {
+            entry: -(created_anchor.id as i64),
+            depth: quoting.table_depth(table_index),
+            role: None,
+        });
     }
 
     attach_to_document(uow, doc_id, &DocumentRelationshipField::Tables, &new_tables)?;
@@ -1097,6 +1507,7 @@ fn insert_table_fragment(
         updated_parent.updated_at = now;
         uow.update_frame(&updated_parent)?;
     }
+    nest_in_quotations(uow, doc_id, frame_id, &pasted, now)?;
 
     // ── Rope mirror (insert_table_fragment) ──
     // The tables follow the target block in the frame, so they follow it in
@@ -1201,6 +1612,7 @@ fn insert_mixed_fragment(
     uow: &mut Box<dyn InsertFragmentUnitOfWorkTrait>,
     dto: &InsertFragmentDto,
     fragment_data: &FragmentData,
+    quoting: &FragmentQuoting,
 ) -> Result<(InsertFragmentResultDto, EntityTreeSnapshot)> {
     let now = chrono::Utc::now();
 
@@ -1264,45 +1676,65 @@ fn insert_mixed_fragment(
         + left_image_count
         + right_image_count;
 
+    // Each block and table with its index in the fragment, for the quotations the
+    // fragment carries beside them.
     enum FragItem<'a> {
-        Block(&'a FragmentBlock),
-        Table(&'a FragmentTable),
+        Block(usize, &'a FragmentBlock),
+        Table(usize, &'a FragmentTable),
     }
 
-    let mut sorted_tables: Vec<&FragmentTable> = fragment_data.tables.iter().collect();
-    sorted_tables.sort_by_key(|t| t.block_insert_index);
+    let mut sorted_tables: Vec<(usize, &FragmentTable)> =
+        fragment_data.tables.iter().enumerate().collect();
+    sorted_tables.sort_by_key(|(_, t)| t.block_insert_index);
 
     let mut items: Vec<FragItem> = Vec::new();
     let mut blk_cursor = 0;
-    for frag_table in &sorted_tables {
+    for (table_index, frag_table) in &sorted_tables {
         let idx = frag_table
             .block_insert_index
             .min(fragment_data.blocks.len());
         while blk_cursor < idx {
-            items.push(FragItem::Block(&fragment_data.blocks[blk_cursor]));
+            items.push(FragItem::Block(
+                blk_cursor,
+                &fragment_data.blocks[blk_cursor],
+            ));
             blk_cursor += 1;
         }
-        items.push(FragItem::Table(frag_table));
+        items.push(FragItem::Table(*table_index, frag_table));
     }
     while blk_cursor < fragment_data.blocks.len() {
-        items.push(FragItem::Block(&fragment_data.blocks[blk_cursor]));
+        items.push(FragItem::Block(
+            blk_cursor,
+            &fragment_data.blocks[blk_cursor],
+        ));
         blk_cursor += 1;
     }
 
-    let merge_first = matches!(items.first(), Some(FragItem::Block(b)) if b.is_inline_only());
-    let merge_last = fragment_data.blocks.len() >= 2
-        && matches!(items.last(), Some(FragItem::Block(b)) if b.is_inline_only());
-    let overwrite_head =
-        text_before.is_empty() && !merge_first && matches!(items.first(), Some(FragItem::Block(_)));
+    let merges = |item: Option<&FragItem>| matches!(item, Some(FragItem::Block(index, _)) if merges_inline(fragment_data, quoting, *index));
+    let merge_first = merges(items.first());
+    let merge_last = fragment_data.blocks.len() >= 2 && merges(items.last());
+    let overwrite_head = text_before.is_empty()
+        && !merge_first
+        && matches!(items.first(), Some(FragItem::Block(..)));
+    // As on the block-only path: nothing holding an object merges into a code block.
+    if current_block.fmt_is_code_block == Some(true) {
+        let merges_objects = |item: Option<&FragItem>| matches!(item, Some(FragItem::Block(_, block)) if holds_objects(block));
+        if (merge_first && merges_objects(items.first()))
+            || (merge_last && !overwrite_head && merges_objects(items.last()))
+        {
+            return Err(objects_into_a_code_block());
+        }
+    }
 
-    let first_fb = if merge_first || overwrite_head {
+    let first_item = if merge_first || overwrite_head {
         items.first().and_then(|it| match it {
-            FragItem::Block(b) => Some(*b),
+            FragItem::Block(index, b) => Some((*index, *b)),
             _ => None,
         })
     } else {
         None
     };
+    let first_fb = first_item.map(|(_, block)| block);
 
     let first_chars = first_fb
         .map(|b| b.plain_text.chars().count() as i64)
@@ -1424,10 +1856,22 @@ fn insert_mixed_fragment(
     // each at the end (see `attach_to_document`).
     let mut new_tables: Vec<EntityId> = Vec::new();
     let mut new_frames: Vec<EntityId> = Vec::new();
+    // What the paste puts in the frame, in order, with the quotations each asks for
+    // (see `nest_in_quotations`): the head when the first block overwrote it, then
+    // every block and table after it, then the tail.
+    let mut pasted: Vec<PastedEntry> = Vec::new();
+    if overwrite_head && let Some((index, _)) = first_item {
+        pasted.push(PastedEntry::block(
+            current_block.id,
+            Quote::of_block(quoting, index),
+        ));
+    }
+    // A list runs on inside one quotation only, as a load reads it.
+    let mut previous_depth = first_item.map_or(0, |(index, _)| quoting.block_depth(index));
 
     for item in &items {
         match item {
-            FragItem::Block(frag_block) => {
+            FragItem::Block(fragment_index, frag_block) => {
                 let is_first = block_index == 0;
                 let is_last = block_index == fragment_data.blocks.len() - 1;
                 block_index += 1;
@@ -1442,6 +1886,11 @@ fn insert_mixed_fragment(
                 let inline_runs = frag_block_state(frag_block);
                 let block_text_len = inline_runs.logical_len(&frag_block.plain_text);
 
+                let quote = Quote::of_block(quoting, *fragment_index);
+                if quote.depth != previous_depth {
+                    list_grouper.reset();
+                    previous_depth = quote.depth;
+                }
                 let list_id = if let Some(ref frag_list) = frag_block.list {
                     if let Some(existing_id) =
                         list_grouper.try_reuse(&frag_list.style, frag_list.indent as u32)
@@ -1501,11 +1950,12 @@ fn insert_mixed_fragment(
                 new_frame_blocks.push(created_block.id);
 
                 new_child_order_entries.push(created_block.id as i64);
+                pasted.push(PastedEntry::block(created_block.id, quote));
                 total_new_chars += block_text_len;
                 total_blocks_added += 1;
                 running_position += block_text_len + 1;
             }
-            FragItem::Table(frag_table) => {
+            FragItem::Table(table_index, frag_table) => {
                 if frag_table.rows == 0 || frag_table.columns == 0 || frag_table.cells.is_empty() {
                     continue;
                 }
@@ -1640,6 +2090,13 @@ fn insert_mixed_fragment(
                 let created_anchor = uow.create_orphan_frame(&anchor_frame)?;
                 new_frames.push(created_anchor.id);
                 new_child_order_entries.push(-(created_anchor.id as i64));
+                pasted.push(PastedEntry {
+                    entry: -(created_anchor.id as i64),
+                    depth: quoting.table_depth(*table_index),
+                    role: None,
+                });
+                // A table always ends a list.
+                list_grouper.reset();
             }
         }
     }
@@ -1779,6 +2236,7 @@ fn insert_mixed_fragment(
         new_frame_blocks.push(created_tail.id);
 
         new_child_order_entries.push(created_tail.id as i64);
+        pasted.push(PastedEntry::block(created_tail.id, Quote::default()));
         total_blocks_added += 1;
     }
     if last_frag.is_some() {
@@ -1805,6 +2263,7 @@ fn insert_mixed_fragment(
     updated_frame.blocks =
         uow.get_frame_relationship(&frame_id, &FrameRelationshipField::Blocks)?;
     uow.update_frame(&updated_frame)?;
+    nest_in_quotations(uow, doc_id, frame_id, &pasted, now)?;
 
     // `original_current_char_length` was captured at the top of the
     // function — the rope has since been overwritten by the head update.
@@ -1863,7 +2322,13 @@ fn execute_insert_fragment(
         ));
     }
 
-    let mut fragment_data: FragmentData = serde_json::from_str(&dto.fragment_data)
+    let CarriedFragment {
+        data: mut fragment_data,
+        quoting,
+        replaces_text,
+        whole_text,
+        ..
+    } = fragment_from_json(&dto.fragment_data)
         .map_err(|e| anyhow!("Invalid fragment_data JSON: {}", e))?;
     // A pasted list keeps its items and their order, at most as deep as the
     // editing gestures nest one (see `list_depth`).
@@ -1881,11 +2346,74 @@ fn execute_insert_fragment(
         .first()
         .ok_or_else(|| anyhow!("Root has no document"))?;
 
+    // Only a paste over a selection that held the whole text replaces the text: the one
+    // empty paragraph the removal left keeps the formatting of the first paragraph removed,
+    // which is not the pasted text's. An empty paragraph the writer formatted (a heading
+    // line, a list item, a quotation) and then pastes into keeps its formatting, as it does
+    // for typing. And only a text replaces it: a whole text (a version put back), or a
+    // fragment with a structure of its own. A phrase copied from the text, or from a web
+    // page, pasted over everything goes into the paragraph the removal left, as typing over
+    // everything does: made plain first, a right-to-left scene came back left to right, a
+    // quoted letter unquoted and a centred line uncentred.
+    let empty = if replaces_text && (whole_text || !is_a_phrase(&fragment_data, &quoting)) {
+        empty_text_to_make_plain(&**uow, doc_id, dto.position)?
+    } else {
+        None
+    };
+    let Some(empty) = empty else {
+        return paste_fragment(uow, dto, fragment_data, quoting, doc_id);
+    };
+    // The document as it stands, for an undo: every path below takes its own snapshot,
+    // after the empty text was made plain.
+    let before = uow.snapshot_document(&[doc_id])?;
+    make_the_empty_text_plain(uow, empty, chrono::Utc::now())?;
+    let (result, _) = paste_fragment(uow, dto, fragment_data, quoting, doc_id)?;
+    Ok((result, before))
+}
+
+/// [`execute_insert_fragment`] once the fragment is read and the text it goes into is
+/// ready for it.
+fn paste_fragment(
+    uow: &mut Box<dyn InsertFragmentUnitOfWorkTrait>,
+    dto: &InsertFragmentDto,
+    mut fragment_data: FragmentData,
+    mut quoting: FragmentQuoting,
+    doc_id: EntityId,
+) -> Result<(InsertFragmentResultDto, EntityTreeSnapshot)> {
+    // Where the caret stands, when what the fragment holds depends on it.
+    let holds_code = |blocks: &[FragmentBlock]| {
+        blocks
+            .iter()
+            .any(|block| block.is_code_block == Some(true) || block.code_language.is_some())
+    };
+    let caret = if !quoting.is_empty()
+        || !fragment_data.tables.is_empty()
+        || holds_code(&fragment_data.blocks)
+    {
+        caret_in_table(&**uow, doc_id, dto.position)?
+    } else {
+        None
+    };
+    // A table cell and a note's body hold paragraphs: a quotation pasted there goes in as
+    // its paragraphs, as a table does.
+    if caret
+        .as_ref()
+        .is_some_and(|caret| caret.inside_table || caret.in_note)
+    {
+        quoting = FragmentQuoting::default();
+    }
+    // A pipe table writes a cell's paragraphs as one line of inline text, whatever their
+    // format: a code block pasted into a cell was one in the editor only, and refused the
+    // image the save would have kept. It goes in as a paragraph.
+    if caret.as_ref().is_some_and(|caret| caret.inside_table) {
+        without_code_blocks(&mut fragment_data);
+    }
+
     if !fragment_data.tables.is_empty() {
         // A paste holding tables with the caret in a table cell either fills
         // the cells from the caret's on, when it is a table alone that fits,
         // or goes in as paragraphs: never as a table nested in the cell.
-        match caret_in_table(&**uow, doc_id, dto.position)? {
+        match caret {
             Some(caret) if caret.inside_table => {
                 if let Some(result) =
                     try_replace_table_cells(uow, dto, &fragment_data, doc_id, &caret)?
@@ -1902,9 +2430,9 @@ fn execute_insert_fragment(
                 fragment_data = tables_as_paragraphs(&fragment_data);
             }
             _ if fragment_data.blocks.is_empty() => {
-                return insert_table_fragment(uow, dto, &fragment_data);
+                return insert_table_fragment(uow, dto, &fragment_data, &quoting);
             }
-            _ => return insert_mixed_fragment(uow, dto, &fragment_data),
+            _ => return insert_mixed_fragment(uow, dto, &fragment_data, &quoting),
         }
     }
 
@@ -1961,9 +2489,14 @@ fn execute_insert_fragment(
     let byte_offset = logical_offset_to_byte(&current_block_text, &current_inline.images, offset);
     let now = chrono::Utc::now();
 
+    let into_a_code_block = current_block.fmt_is_code_block == Some(true);
+
     // ── Inline merge: single block with no block-level formatting ──
-    if fragment_data.blocks.len() == 1 && fragment_data.blocks[0].is_inline_only() {
+    if fragment_data.blocks.len() == 1 && merges_inline(&fragment_data, &quoting, 0) {
         let frag_block = &fragment_data.blocks[0];
+        if into_a_code_block && holds_objects(frag_block) {
+            return Err(objects_into_a_code_block());
+        }
         let inserted_plain = &frag_block.plain_text;
         let inline_frag_runs = frag_block_state(frag_block);
         let inserted_len = inline_frag_runs.logical_len(inserted_plain);
@@ -2102,11 +2635,20 @@ fn execute_insert_fragment(
     if fragment_data.blocks.len() >= 2 {
         let first_frag = &fragment_data.blocks[0];
         let last_frag = &fragment_data.blocks[fragment_data.blocks.len() - 1];
-        let merge_first = first_frag.is_inline_only();
-        let merge_last = last_frag.is_inline_only();
+        let last_index = fragment_data.blocks.len() - 1;
+        let merge_first = merges_inline(&fragment_data, &quoting, 0);
+        let merge_last = merges_inline(&fragment_data, &quoting, last_index);
 
         let first_chars = first_frag.plain_text.chars().count() as i64;
         let overwrite_head = text_before.is_empty() && !merge_first;
+        // The first block merges into the code block's head, the last into its tail,
+        // which stays a code block unless the head was overwritten.
+        if into_a_code_block
+            && ((merge_first && holds_objects(first_frag))
+                || (merge_last && !overwrite_head && holds_objects(last_frag)))
+        {
+            return Err(objects_into_a_code_block());
+        }
 
         let (head_plain, head_inline) = build_head_state(
             &text_before,
@@ -2213,11 +2755,25 @@ fn execute_insert_fragment(
             fragment_data.blocks.len()
         };
 
-        for frag_block in &fragment_data.blocks[middle_start..middle_end] {
+        // A list runs on inside one quotation only, as a load reads it.
+        let mut previous_depth = if overwrite_head {
+            quoting.block_depth(0)
+        } else {
+            0
+        };
+        for (offset, frag_block) in fragment_data.blocks[middle_start..middle_end]
+            .iter()
+            .enumerate()
+        {
             let inline_runs = frag_block_state(frag_block);
             let block_chars = frag_block.plain_text.chars().count() as i64;
             let block_text_len = block_chars + inline_runs.object_count();
 
+            let depth = quoting.block_depth(middle_start + offset);
+            if depth != previous_depth {
+                list_grouper.reset();
+                previous_depth = depth;
+            }
             let list_id = if let Some(ref frag_list) = frag_block.list {
                 if let Some(existing_id) =
                     list_grouper.try_reuse(&frag_list.style, frag_list.indent as u32)
@@ -2420,6 +2976,21 @@ fn execute_insert_fragment(
             uow.get_frame_relationship(&frame_id, &FrameRelationshipField::Blocks)?;
         uow.update_frame(&updated_frame)?;
 
+        // The quotations the pasted blocks stood in (see `nest_in_quotations`): the head
+        // when the first block overwrote it, the blocks after it, and the tail.
+        let mut pasted: Vec<PastedEntry> = Vec::new();
+        if overwrite_head {
+            pasted.push(PastedEntry::block(
+                current_block.id,
+                Quote::of_block(&quoting, 0),
+            ));
+        }
+        pasted.extend(new_block_ids.iter().zip(middle_start..middle_end).map(
+            |(block_id, index)| PastedEntry::block(*block_id, Quote::of_block(&quoting, index)),
+        ));
+        pasted.extend(created_tail_id.map(|tail_id| PastedEntry::block(tail_id, Quote::default())));
+        nest_in_quotations(uow, doc_id, frame_id, &pasted, now)?;
+
         // ── Rope mirror (block-splitting path) ──
         // Now that entity mutations are done, replay the same shape
         // into the rope. The current block is already in the rope at
@@ -2604,6 +3175,17 @@ fn execute_insert_fragment(
 
                 running_position += tail_text_len + 1;
             }
+            // The block the paste overwrote goes into the quotations it stood in; the tail
+            // stays where the caret was.
+            let mut pasted = vec![PastedEntry::block(
+                current_block.id,
+                Quote::of_block(&quoting, 0),
+            )];
+            pasted.extend(
+                created_tail_id_overwrite
+                    .map(|tail_id| PastedEntry::block(tail_id, Quote::default())),
+            );
+            nest_in_quotations(uow, doc_id, frame_id, &pasted, now)?;
 
             // ── Rope mirror (single-block-with-formatting, overwrite_head) ──
             // Current block's content went from text_after (= original full
@@ -2765,6 +3347,18 @@ fn execute_insert_fragment(
             updated_frame.blocks =
                 uow.get_frame_relationship(&frame_id, &FrameRelationshipField::Blocks)?;
             uow.update_frame(&updated_frame)?;
+            // The pasted block goes into the quotations it stood in, between the two halves
+            // of the paragraph it was pasted into.
+            nest_in_quotations(
+                uow,
+                doc_id,
+                frame_id,
+                &[
+                    PastedEntry::block(created_block.id, Quote::of_block(&quoting, 0)),
+                    PastedEntry::block(created_tail.id, Quote::default()),
+                ],
+                now,
+            )?;
 
             let blocks_added: i64 = 2;
             // Use pre-mutation length captured at top of function — the

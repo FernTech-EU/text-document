@@ -460,3 +460,83 @@ fn replace_text_single_occurrence() {
     // Only one replacement
     assert_eq!(text.matches("foo").count(), 2);
 }
+
+// ── Loading in place ────────────────────────────────────────────
+
+/// What the store holds besides the frames and blocks: tables, cells, lists, and each
+/// block's inline state.
+fn held(doc: &TextDocument) -> (usize, usize, usize, usize, usize, usize) {
+    let store = doc.rope_store_for_test();
+    let blocks = store.blocks.read();
+    let kept_for_gone_blocks =
+        |ids: Vec<u64>| ids.iter().filter(|id| !blocks.contains_key(id)).count();
+    let runs = kept_for_gone_blocks(store.format_runs.read().keys().copied().collect());
+    let images = kept_for_gone_blocks(store.block_images.read().keys().copied().collect());
+    let notes = kept_for_gone_blocks(store.block_footnote_refs.read().keys().copied().collect());
+    (
+        store.tables.read().len(),
+        store.table_cells.read().len(),
+        store.lists.read().len(),
+        runs,
+        images,
+        notes,
+    )
+}
+
+/// A load over existing content removed its frames and blocks only. Its tables, their
+/// cells, its lists and the formatting and anchors of its blocks stayed in the store, and in
+/// the document's lists of tables and lists: every later load added its own, every edit that
+/// walks the document's tables walked the stale ones, and `stats` counted them.
+#[test]
+fn loading_in_place_keeps_nothing_of_the_replaced_content() {
+    const OLD: &str = "Intro *with* ![pic](p.png) and a note[^n].\n\n| a | b |\n| c | d |\n\n- x\n- y\n\n\
+                       1. one\n";
+    type Load = fn(&TextDocument);
+    let loads: [(&str, Load); 6] = [
+        ("set_djot_sync", |doc| {
+            doc.set_djot_sync("Just prose.").unwrap();
+        }),
+        ("set_djot", |doc| {
+            doc.set_djot("Just prose.").unwrap().wait().unwrap();
+        }),
+        ("set_markdown", |doc| {
+            doc.set_markdown("Just prose.").unwrap().wait().unwrap();
+        }),
+        ("set_html", |doc| {
+            doc.set_html("<p>Just prose.</p>").unwrap().wait().unwrap();
+        }),
+        ("set_plain_text", |doc| {
+            doc.set_plain_text("Just prose.").unwrap();
+        }),
+        ("clear", |doc| {
+            doc.clear().unwrap();
+        }),
+    ];
+    for (name, load) in loads {
+        let doc = TextDocument::new();
+        doc.set_djot_sync(OLD).unwrap();
+        assert_eq!(doc.stats().table_count, 1);
+        assert_eq!(doc.stats().list_count, 2);
+        load(&doc);
+        assert_eq!(
+            held(&doc),
+            (0, 0, 0, 0, 0, 0),
+            "{name}: the old content stayed"
+        );
+        let stats = doc.stats();
+        assert_eq!(
+            (stats.table_count, stats.list_count),
+            (0, 0),
+            "{name}: the stats count what is gone"
+        );
+    }
+
+    // Fifty reloads of the same text hold what one load holds.
+    let doc = TextDocument::new();
+    for _ in 0..50 {
+        doc.set_djot_sync(OLD).unwrap();
+    }
+    assert_eq!(held(&doc), (1, 4, 2, 0, 0, 0));
+    let stats = doc.stats();
+    assert_eq!((stats.table_count, stats.list_count), (1, 2));
+}

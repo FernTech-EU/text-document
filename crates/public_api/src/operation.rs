@@ -18,7 +18,7 @@ use frontend::AppContext;
 const COMPLETION_BACKSTOP: Duration = Duration::from_secs(1);
 
 /// Function that reads the long-operation manager for a result.
-type ResultFn<T> = Box<dyn Fn(&AppContext, &str) -> Option<Result<T>> + Send>;
+pub(crate) type ResultFn<T> = Box<dyn Fn(&AppContext, &str) -> Option<Result<T>> + Send>;
 
 /// Shared state for a single long operation.
 pub(crate) struct OperationState {

@@ -38,6 +38,8 @@ pub trait ImportDjotUnitOfWorkFactoryTrait: Send + Sync {
     thread_safe = true
 )]
 #[macros::uow_action(entity = "Frame", action = "RemoveMulti", thread_safe = true)]
+#[macros::uow_action(entity = "Table", action = "RemoveMulti", thread_safe = true)]
+#[macros::uow_action(entity = "List", action = "RemoveMulti", thread_safe = true)]
 #[macros::uow_action(entity = "Frame", action = "GetRelationship", thread_safe = true)]
 #[macros::uow_action(entity = "Frame", action = "SetRelationship", thread_safe = true)]
 #[macros::uow_action(entity = "Block", action = "Create", thread_safe = true)]
@@ -94,9 +96,9 @@ struct OrphanedChildren {
 }
 
 impl OrphanedChildren {
-    /// Give the document its new frames, lists and tables, one write each, after
-    /// whatever it already holds: its lists and tables outlive a re-import, while
-    /// its frames were all removed first.
+    /// Give the document its new frames, lists and tables, one write each. The
+    /// frames, tables and lists it held before were all removed first, so each list
+    /// written is exactly what the import created.
     fn attach(self, uow: &mut Box<dyn ImportDjotUnitOfWorkTrait>, doc_id: EntityId) -> Result<()> {
         for (field, children) in [
             (DocumentRelationshipField::Frames, self.frames),
@@ -265,6 +267,14 @@ fn import_parsed_elements(
     // every remaining frame, so one at a time is quadratic in the frames replaced.
     let frame_ids = uow.get_document_relationship(&doc_id, &DocumentRelationshipField::Frames)?;
     uow.remove_frame_multi(&frame_ids)?;
+    // The replaced content's tables (their cells with them) and lists go too. They
+    // stayed, with cells naming frames that were gone, and every load in place added
+    // its own beside them: every edit walking the document's tables walked the stale
+    // ones, and `stats` counted them.
+    let table_ids = uow.get_document_relationship(&doc_id, &DocumentRelationshipField::Tables)?;
+    uow.remove_table_multi(&table_ids)?;
+    let list_ids = uow.get_document_relationship(&doc_id, &DocumentRelationshipField::Lists)?;
+    uow.remove_list_multi(&list_ids)?;
 
     if cancel_flag.load(Ordering::Relaxed) {
         return Err(anyhow!("Operation was cancelled"));
@@ -287,7 +297,15 @@ fn import_parsed_elements(
     rope_reset(&uow.store());
 
     // Step 4: Create blocks with format runs and image anchors
-    let total_elements = parsed_elements.len();
+    // The main text first, then every footnote definition's body, in the rope. No view
+    // shows a body, and one set down where it was written, between two paragraphs, stood
+    // between them in every position: Backspace and Delete there joined nothing, and the
+    // Right arrow went into the hidden note. After the main text, as a save writes the
+    // definitions, the paragraphs around it are neighbours again.
+    let (main_elements, definitions): (Vec<&ParsedElement>, Vec<&ParsedElement>) = parsed_elements
+        .iter()
+        .partition(|element| !matches!(element, ParsedElement::FootnoteDefinition { .. }));
+    let total_elements = main_elements.len();
     let mut total_chars: i64 = 0;
     let mut total_block_count: i64 = 0;
     let mut document_position: i64 = 0;
@@ -307,101 +325,14 @@ fn import_parsed_elements(
     // per plan §1.6 and are deferred to step 5.5.
     let mut emitted_any_main_block = false;
 
-    for (i, parsed_element) in parsed_elements.iter().enumerate() {
+    for (i, &parsed_element) in main_elements.iter().enumerate() {
         if cancel_flag.load(Ordering::Relaxed) {
             return Err(anyhow!("Operation was cancelled"));
         }
 
         match parsed_element {
-            // A footnote definition becomes a **detached** frame carrying the
-            // label: owned by the document, in no frame's `child_order`, so it
-            // never appears in the flow the editor lays out. Writers reach it by
-            // label when they place the note. The frame is the same shape a
-            // table cell gets — arbitrary block content needs a frame — but
-            // deliberately not mirrored into the rope, because a note's body is
-            // not part of the prose whose offsets the document addresses.
-            ParsedElement::FootnoteDefinition { label, blocks } => {
-                let note_frame = uow.create_orphan_frame(&Frame {
-                    footnote_label: Some(label.clone()),
-                    ..Frame::default()
-                })?;
-                orphans.frames.push(note_frame.id);
-
-                let mut child_order: Vec<i64> = Vec::with_capacity(blocks.len());
-                let mut note_blocks: Vec<EntityId> = Vec::with_capacity(blocks.len());
-                // A note's lists are its own: they neither continue a list of the
-                // prose nor go on in the prose after it.
-                let mut note_lists = ListGrouper::new();
-                for nb in blocks.iter() {
-                    let ParsedInline {
-                        plain_text,
-                        runs: format_runs,
-                        images: block_images,
-                        footnote_refs: block_footnote_refs,
-                    } = format_runs_from_spans(&nb.spans, nb.is_code_block);
-
-                    // The document-wide running position, not an index within
-                    // the note. `document_position` keys the block-offset index
-                    // that `block_content_via_store` reads through, so a
-                    // definition restarting at 0 collides with the prose and the
-                    // index hands back byte ranges belonging to another block —
-                    // which slices mid-`U+FFFC` and panics the rope.
-                    let line_len = plain_text.chars().count() as i64;
-                    let block = Block {
-                        document_position,
-                        fmt_heading_level: nb.heading_level,
-                        fmt_marker: nb.marker.clone(),
-                        fmt_is_code_block: Some(nb.is_code_block),
-                        fmt_code_language: nb.code_language.clone(),
-                        ..Block::default()
-                    };
-                    let created = uow.create_orphan_block(&block)?;
-                    child_order.push(created.id as i64);
-                    note_blocks.push(created.id);
-                    // A list item of the note stays one: this used to drop the
-                    // list, so a list written in a note came back from a save as
-                    // plain paragraphs.
-                    assign_list(uow, &mut orphans, &mut note_lists, nb, created.id)?;
-
-                    // Mirrored into the rope like any other block: a definition
-                    // is real document content, and `block_content_via_store` is
-                    // the only way its text is ever read back.
-                    //
-                    // The boundary `\n` first, exactly as the main walk does.
-                    // `rope_append_block` writes no separator of its own, so
-                    // without this the preceding block's range runs straight
-                    // into the note — and since a block's content is its range
-                    // minus one trailing byte, the prose gets sliced one byte
-                    // short, landing inside the three bytes of a `U+FFFC` and
-                    // panicking the rope.
-                    if emitted_any_main_block {
-                        rope_insert_block_boundary(&uow.store());
-                        document_position += 1;
-                    }
-                    rope_append_block(&uow.store(), created.id, &plain_text);
-                    emitted_any_main_block = true;
-                    document_position += line_len;
-
-                    let store = uow.store();
-                    if !format_runs.is_empty() {
-                        store.format_runs.write().insert(created.id, format_runs);
-                    }
-                    if !block_images.is_empty() {
-                        store.block_images.write().insert(created.id, block_images);
-                    }
-                    if !block_footnote_refs.is_empty() {
-                        store
-                            .block_footnote_refs
-                            .write()
-                            .insert(created.id, block_footnote_refs);
-                    }
-                }
-
-                attach_blocks(uow, note_frame.id, &note_blocks)?;
-                let mut updated = note_frame.clone();
-                updated.child_order = child_order;
-                uow.update_frame(&updated)?;
-            }
+            // Set down after the main text: see `definitions` above.
+            ParsedElement::FootnoteDefinition { .. } => {}
             ParsedElement::Block(parsed_block) => {
                 transition_bq_depth(
                     uow,
@@ -536,7 +467,7 @@ fn import_parsed_elements(
                 // A table always interrupts a list, regardless of depth.
                 list_grouper.reset();
                 let num_rows = parsed_table.rows.len() as i64;
-                let num_cols = parsed_table.rows.first().map_or(0, |r| r.len()) as i64;
+                let num_cols = parsed_table.column_count() as i64;
                 if num_rows == 0 || num_cols == 0 {
                     continue;
                 }
@@ -571,7 +502,9 @@ fn import_parsed_elements(
                 let mut created_cell_ids: Vec<EntityId> = Vec::new();
 
                 for (r, row) in parsed_table.rows.iter().enumerate() {
-                    for (c, cell) in row.iter().enumerate() {
+                    // A row shorter than the widest is completed with empty cells.
+                    for c in 0..num_cols as usize {
+                        let spans = row.get(c).map_or(&[][..], |cell| cell.spans.as_slice());
                         // Create cell frame
                         let cell_frame = Frame::default();
                         let created_cell_frame = uow.create_orphan_frame(&cell_frame)?;
@@ -583,7 +516,7 @@ fn import_parsed_elements(
                             runs: format_runs,
                             images: block_images,
                             footnote_refs: block_footnote_refs,
-                        } = format_runs_from_spans(&cell.spans, false);
+                        } = format_runs_from_spans(spans, false);
 
                         // Create block in cell frame
                         let block = Block {
@@ -723,6 +656,101 @@ fn import_parsed_elements(
             .ok_or_else(|| anyhow!("Blockquote frame not found"))?;
         frame_entity.child_order = finished.child_order;
         uow.update_frame(&frame_entity)?;
+    }
+
+    // A footnote definition becomes a **detached** frame carrying the
+    // label: owned by the document, in no frame's `child_order`, so it
+    // never appears in the flow the editor lays out. Writers reach it by
+    // label when they place the note. The frame is the same shape a
+    // table cell gets, since arbitrary block content needs a frame. Its blocks
+    // are mirrored into the rope like any other, after the main text.
+    for &definition in &definitions {
+        if cancel_flag.load(Ordering::Relaxed) {
+            return Err(anyhow!("Operation was cancelled"));
+        }
+        let ParsedElement::FootnoteDefinition { label, blocks } = definition else {
+            continue;
+        };
+        let note_frame = uow.create_orphan_frame(&Frame {
+            footnote_label: Some(label.clone()),
+            ..Frame::default()
+        })?;
+        orphans.frames.push(note_frame.id);
+
+        let mut child_order: Vec<i64> = Vec::with_capacity(blocks.len());
+        let mut note_blocks: Vec<EntityId> = Vec::with_capacity(blocks.len());
+        // A note's lists are its own: they neither continue a list of the
+        // prose nor go on in the prose after it.
+        let mut note_lists = ListGrouper::new();
+        for nb in blocks.iter() {
+            let ParsedInline {
+                plain_text,
+                runs: format_runs,
+                images: block_images,
+                footnote_refs: block_footnote_refs,
+            } = format_runs_from_spans(&nb.spans, nb.is_code_block);
+
+            // The document-wide running position, not an index within
+            // the note. `document_position` keys the block-offset index
+            // that `block_content_via_store` reads through, so a
+            // definition restarting at 0 collides with the prose and the
+            // index hands back byte ranges belonging to another block,
+            // which slices mid-`U+FFFC` and panics the rope.
+            let line_len = plain_text.chars().count() as i64;
+            let block = Block {
+                document_position,
+                fmt_heading_level: nb.heading_level,
+                fmt_marker: nb.marker.clone(),
+                fmt_is_code_block: Some(nb.is_code_block),
+                fmt_code_language: nb.code_language.clone(),
+                ..Block::default()
+            };
+            let created = uow.create_orphan_block(&block)?;
+            child_order.push(created.id as i64);
+            note_blocks.push(created.id);
+            // A list item of the note stays one: this used to drop the
+            // list, so a list written in a note came back from a save as
+            // plain paragraphs.
+            assign_list(uow, &mut orphans, &mut note_lists, nb, created.id)?;
+
+            // Mirrored into the rope like any other block: a definition
+            // is real document content, and `block_content_via_store` is
+            // the only way its text is ever read back.
+            //
+            // The boundary `\n` first, exactly as the main walk does.
+            // `rope_append_block` writes no separator of its own, so
+            // without this the preceding block's range runs straight
+            // into the note, and since a block's content is its range
+            // minus one trailing byte, the prose gets sliced one byte
+            // short, landing inside the three bytes of a `U+FFFC` and
+            // panicking the rope.
+            if emitted_any_main_block {
+                rope_insert_block_boundary(&uow.store());
+                document_position += 1;
+            }
+            rope_append_block(&uow.store(), created.id, &plain_text);
+            emitted_any_main_block = true;
+            document_position += line_len;
+
+            let store = uow.store();
+            if !format_runs.is_empty() {
+                store.format_runs.write().insert(created.id, format_runs);
+            }
+            if !block_images.is_empty() {
+                store.block_images.write().insert(created.id, block_images);
+            }
+            if !block_footnote_refs.is_empty() {
+                store
+                    .block_footnote_refs
+                    .write()
+                    .insert(created.id, block_footnote_refs);
+            }
+        }
+
+        attach_blocks(uow, note_frame.id, &note_blocks)?;
+        let mut updated = note_frame.clone();
+        updated.child_order = child_order;
+        uow.update_frame(&updated)?;
     }
 
     // Step 5: Update root frame blocks and child_order

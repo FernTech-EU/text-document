@@ -132,6 +132,13 @@ fn execute_insert_image(
 
     // Find block at position
     let (block, block_idx, offset) = find_block_at_position(&blocks, position, &uow.store())?;
+    // A code block is verbatim text: the save writes its characters and nothing else, so an
+    // image put into one was shown and then lost.
+    if block.fmt_is_code_block == Some(true) {
+        return Err(anyhow!(
+            "a code block holds text only: an image cannot go into one"
+        ));
+    }
 
     // byte_offset = position inside the block's text where the new image is
     // anchored.

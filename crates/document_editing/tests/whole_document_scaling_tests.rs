@@ -163,6 +163,9 @@ enum Edit {
     DeleteAll,
     /// The same, every paragraph followed by a quoted one in a quote frame of its own.
     DeleteAllWithQuotes,
+    /// The same, every paragraph followed by a quotation holding a paragraph and a
+    /// quotation nested in it: one emptied sub-frame in each of `units` frames.
+    DeleteAllWithNestedQuotes,
     /// The same, with a table halfway: the deletion crosses its cells.
     DeleteAllAcrossATable,
     /// The same, with a small table after every tenth paragraph: the deletion removes each.
@@ -175,6 +178,9 @@ fn work_of(edit: Edit, units: usize) -> Result<usize> {
         Edit::PasteIntoAShortDocument(_) => vec!["Current text.".to_string()],
         Edit::DeleteAllWithQuotes => (0..units)
             .flat_map(|i| [paragraph(i), format!("Quoted {i}")])
+            .collect(),
+        Edit::DeleteAllWithNestedQuotes => (0..units)
+            .flat_map(|i| [paragraph(i), format!("Quoted {i}"), format!("Nested {i}")])
             .collect(),
         _ => (0..units).map(paragraph).collect(),
     };
@@ -207,6 +213,38 @@ fn work_of(edit: Edit, units: usize) -> Result<usize> {
                 db.get_store().frames.read().len(),
                 units + 1,
                 "one quote frame per unit, plus the root frame"
+            );
+        }
+        Edit::DeleteAllWithNestedQuotes => {
+            let block_ids = get_block_ids(&db)?;
+            let wrap = |undo: &mut _, start: EntityId, end: EntityId| {
+                editing::wrap_blocks_in_frame(
+                    &db,
+                    &ev,
+                    undo,
+                    None,
+                    &WrapBlocksInFrameDto {
+                        start_block_id: start as i64,
+                        end_block_id: end as i64,
+                        position: None,
+                        top_margin: None,
+                        bottom_margin: None,
+                        left_margin: None,
+                        right_margin: None,
+                        padding: None,
+                        border: None,
+                        is_blockquote: Some(true),
+                    },
+                )
+            };
+            for unit in block_ids.chunks(3) {
+                wrap(&mut undo, unit[1], unit[2])?;
+                wrap(&mut undo, unit[2], unit[2])?;
+            }
+            assert_eq!(
+                db.get_store().frames.read().len(),
+                2 * units + 1,
+                "a quotation and a nested one per unit, plus the root frame"
             );
         }
         Edit::DeleteAllAcrossATable => {
@@ -299,6 +337,7 @@ fn work_of(edit: Edit, units: usize) -> Result<usize> {
         }
         Edit::DeleteAll
         | Edit::DeleteAllWithQuotes
+        | Edit::DeleteAllWithNestedQuotes
         | Edit::DeleteAllAcrossATable
         | Edit::DeleteAllAcrossManyTables => {
             editing::delete_text(
@@ -316,6 +355,13 @@ fn work_of(edit: Edit, units: usize) -> Result<usize> {
                 "{edit:?}: the deletion removed the paragraphs ({} blocks left of {blocks_before})",
                 block_count(&db)
             );
+            if let Edit::DeleteAllWithQuotes | Edit::DeleteAllWithNestedQuotes = edit {
+                assert_eq!(
+                    db.get_store().frames.read().len(),
+                    1,
+                    "{edit:?}: the deletion removed every quotation"
+                );
+            }
             if let Edit::DeleteAllAcrossManyTables = edit {
                 assert!(
                     db.get_store().tables.read().is_empty(),
@@ -382,6 +428,7 @@ fn deleting_a_whole_document_writes_owner_lists_in_linear_work() -> Result<()> {
     assert_linear(&[
         Edit::DeleteAll,
         Edit::DeleteAllWithQuotes,
+        Edit::DeleteAllWithNestedQuotes,
         Edit::DeleteAllAcrossATable,
         Edit::DeleteAllAcrossManyTables,
     ])

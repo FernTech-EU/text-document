@@ -342,16 +342,19 @@ fn ampersands_over_plain_text(units: usize) -> f64 {
 /// long to export as the same length of `a+`. It looks only as far as a reference can
 /// reach now.
 ///
-/// The scan allocates nothing to count, so this times it, and never compares raw times:
-/// each export is divided by the export of the same length of text with no `&`, and the
-/// quotient has to stay about the same for sixty-four times the text. Each side is the
-/// fastest of [`EXPORTS`] exports, and the range is wide, so that a busy machine (other
-/// tests running beside this one, a shared CI runner) cannot bring the two outcomes
-/// near each other. Measured on the fix: a growth of 0.9 to 1.4 with 24 copies of this
-/// test binary running at once on 24 cores, and 3.4 at worst with 48. With the scan to
-/// the end of the text: 44. The first version of this test, the median of five exports
-/// at 20,000 and 320,000 characters against a bound of 3, measured 2.3 under load.
+/// The unit test beside the scan (`export_markdown_uc`'s
+/// `each_ampersand_is_scanned_no_further_than_a_reference_reaches`) counts the bytes it
+/// looks at, in every run. This one times the whole export, and only on demand (`cargo
+/// test --release -- --ignored`): a time depends on whatever else the machine runs, and
+/// under 48 copies of this binary at once the growth below reached 3.4 where the fix alone
+/// gives 0.9 to 1.4, too near a bound for a shared CI runner.
+///
+/// It never compares raw times: each export is divided by the export of the same length of
+/// text with no `&`, and the quotient has to stay about the same for sixty-four times the
+/// text. Each side is the fastest of [`EXPORTS`] exports. With the scan to the end of the
+/// text: a growth of 44.
 #[test]
+#[ignore = "times the export; the scan's work is counted in export_markdown_uc's unit test"]
 fn a_paragraph_of_many_ampersands_exports_in_time_proportional_to_its_length() {
     let small = ampersands_over_plain_text(5_000);
     let large = ampersands_over_plain_text(320_000);

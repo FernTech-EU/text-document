@@ -5,7 +5,7 @@ use crate::RemoveTableRowDto;
 use crate::RemoveTableRowResultDto;
 use anyhow::{Result, anyhow};
 use common::database::CommandUnitOfWork;
-use common::database::rope_helpers::rope_remove_block;
+use common::database::rope_helpers::{rope_remove_block, rope_restore_table_reading_order};
 use common::direct_access::document::document_repository::DocumentRelationshipField;
 use common::direct_access::frame::frame_repository::FrameRelationshipField;
 use common::direct_access::root::root_repository::RootRelationshipField;
@@ -169,6 +169,11 @@ fn execute_remove_table_row(
     updated_table.rows -= 1;
     updated_table.updated_at = now;
     uow.update_table(&updated_table)?;
+
+    // A cell that spanned the removed row from it keeps its row, and the row
+    // below moves up beside it: its cells of earlier columns now come first in
+    // reading order, where the rope still held the spanning cell's text first.
+    rope_restore_table_reading_order(&uow.store(), table_id);
 
     // Recalculate document_positions for remaining cell blocks
     let remaining_cell_ids =

@@ -19,6 +19,8 @@ pub trait ImportPlainTextUnitOfWorkFactoryTrait: Send + Sync {
 #[macros::uow_action(entity = "Frame", action = "Create")]
 #[macros::uow_action(entity = "Frame", action = "Update")]
 #[macros::uow_action(entity = "Frame", action = "RemoveMulti")]
+#[macros::uow_action(entity = "Table", action = "RemoveMulti")]
+#[macros::uow_action(entity = "List", action = "RemoveMulti")]
 #[macros::uow_action(entity = "Frame", action = "GetRelationship")]
 #[macros::uow_action(entity = "Block", action = "CreateMulti")]
 pub trait ImportPlainTextUnitOfWorkTrait: CommandUnitOfWork {}
@@ -55,6 +57,18 @@ impl ImportPlainTextUseCase {
         // In one call: each single removal rescans every remaining frame, so
         // removing them one by one is quadratic in the frames being replaced.
         uow.remove_frame_multi(&frame_ids)?;
+        // The replaced content's tables (their cells with them) and lists go too:
+        // see the Djot importer. `TextDocument::clear` loads through here.
+        let table_ids = uow.get_document_relationship(
+            &doc_id,
+            &common::direct_access::document::DocumentRelationshipField::Tables,
+        )?;
+        uow.remove_table_multi(&table_ids)?;
+        let list_ids = uow.get_document_relationship(
+            &doc_id,
+            &common::direct_access::document::DocumentRelationshipField::Lists,
+        )?;
+        uow.remove_list_multi(&list_ids)?;
 
         let new_frame = Frame::default();
         let created_frame = uow.create_frame(&new_frame, doc_id, -1)?;

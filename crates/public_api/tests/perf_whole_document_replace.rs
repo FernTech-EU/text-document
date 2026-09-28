@@ -336,3 +336,35 @@ fn restoring_or_pasting_a_text_with_many_small_tables_scales_linearly() {
          table's cells, or creating each table and frame with the document as its owner)."
     );
 }
+
+/// A paragraph as a manuscript holds it: emphasis and a link, about 150 characters.
+fn formatted_paragraph(i: usize) -> String {
+    format!(
+        "Paragraph {i}: the rain had *not* stopped since morning, and she walked along the \
+         [quay](https://example.org/{i}) counting the boats that would never leave.\n\n"
+    )
+}
+
+#[test]
+#[cfg_attr(
+    debug_assertions,
+    ignore = "a whole book of text, for release builds only: cargo test --release"
+)]
+fn putting_back_a_whole_book_is_not_refused_for_its_size() {
+    // A cursor inserts text as a fragment carried in JSON, and an insertion refuses JSON
+    // past 64 MiB. Every field of every block and run was written, most of them `null`,
+    // about 18 times the Djot of such a paragraph: putting back a text of 26,000 of them
+    // (3.9 MB of Djot) returned "Fragment data exceeds maximum size" and changed nothing.
+    // The unit test beside `DocumentFragment` bounds the ratio in every build.
+    const PARAGRAPHS: usize = 32_000;
+    let past: String = (0..PARAGRAPHS).map(formatted_paragraph).collect();
+    let doc = TextDocument::new();
+    doc.set_djot_sync(&djot(10, "Current")).unwrap();
+    let cursor = doc.cursor();
+    cursor.begin_edit_block();
+    cursor.select(SelectionType::Document);
+    let result = cursor.insert_djot(&past);
+    cursor.end_edit_block();
+    result.unwrap();
+    assert_eq!(doc.block_count(), PARAGRAPHS, "the whole text was put back");
+}

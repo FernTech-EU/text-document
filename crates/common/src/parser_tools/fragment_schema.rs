@@ -56,55 +56,97 @@ pub struct FragmentTableCell {
     pub fmt_background_color: Option<String>,
 }
 
+/// One block of a fragment: its text, its runs and anchors, and its block formatting.
+///
+/// A field holding nothing (`None`, an empty list) is left out of the JSON a fragment is
+/// carried as, and reads back as holding nothing. Written in full, every block and every run
+/// of a manuscript's paragraph came to about 18 times its text, and an insertion refuses a
+/// fragment past 64 MiB: putting back a whole text of some 26,000 paragraphs failed.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FragmentBlock {
     pub plain_text: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub elements: Vec<FragmentElement>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub heading_level: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub list: Option<FragmentList>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub alignment: Option<Alignment>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub indent: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub text_indent: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub marker: Option<MarkerType>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub top_margin: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bottom_margin: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub left_margin: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub right_margin: Option<i64>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tab_positions: Vec<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub line_height: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub non_breakable_lines: Option<bool>,
     /// Start this block on a new page. `#[serde(default)]` because a fragment
     /// copied by a build that predates the field carries no such key.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub page_break_before: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub direction: Option<TextDirection>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub background_color: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub is_code_block: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub code_language: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hyphenate: Option<bool>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub language: Option<String>,
 }
 
+/// One run of a fragment block: its content and its character formatting. As for
+/// [`FragmentBlock`], a field holding nothing is left out of the JSON.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FragmentElement {
     pub content: InlineContent,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fmt_font_family: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fmt_font_point_size: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fmt_font_weight: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fmt_font_bold: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fmt_font_italic: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fmt_font_underline: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fmt_font_overline: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fmt_font_strikeout: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fmt_letter_spacing: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fmt_word_spacing: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fmt_anchor_href: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub fmt_anchor_names: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fmt_is_anchor: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fmt_tooltip: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fmt_underline_style: Option<UnderlineStyle>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fmt_vertical_alignment: Option<CharVerticalAlignment>,
 }
 
@@ -143,6 +185,10 @@ impl FragmentElement {
 impl FragmentBlock {
     /// Returns `true` when this block carries no block-level formatting,
     /// meaning its content is purely inline.
+    ///
+    /// The quotations a block stands in are not its own formatting: they are carried
+    /// beside the fragment (see [`FragmentQuoting`]), and a quoted block is not inline
+    /// only whatever this says.
     pub fn is_inline_only(&self) -> bool {
         self.heading_level.is_none()
             && self.list.is_none()
@@ -185,5 +231,382 @@ impl FragmentList {
             prefix: self.prefix.clone(),
             suffix: self.suffix.clone(),
         }
+    }
+}
+
+/// Where the blocks and tables of a fragment stood in quotations, counted from the text
+/// they were taken from: `0` for a paragraph of the text itself, `2` for one of a
+/// quotation nested in another, with the role of the innermost quotation (an epigraph).
+///
+/// An insertion puts each block and table that deep, and never less deep than the caret
+/// already is: a quotation pasted into a paragraph goes in as a quotation, one pasted into
+/// a quotation is not quoted twice. A fragment carried no depth, and every quotation of a
+/// text put back by a select all and a paste of its Djot came back as plain paragraphs.
+///
+/// It travels beside [`FragmentData`] in the JSON an insertion takes (see
+/// [`fragment_to_json`]), not in [`FragmentBlock`] or [`FragmentTable`]: every field of
+/// those two is public and earlier releases of the other text-document crates build them
+/// field by field, so a field added to either stops those releases from compiling against
+/// this crate. A reader that does not know it ignores it, and reads the fragment unquoted.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct FragmentQuoting {
+    /// The quoted blocks, by their index in [`FragmentData::blocks`], in increasing order.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    blocks: Vec<QuotedEntry>,
+    /// The quoted tables, by their index in [`FragmentData::tables`], in increasing order.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    tables: Vec<QuotedEntry>,
+}
+
+/// One quoted block or table of a [`FragmentQuoting`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+struct QuotedEntry {
+    index: usize,
+    depth: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    role: Option<SemanticRole>,
+}
+
+impl FragmentQuoting {
+    /// Whether no block and no table stands in a quotation.
+    pub fn is_empty(&self) -> bool {
+        self.blocks.is_empty() && self.tables.is_empty()
+    }
+
+    /// Record that the block at `index` stands `depth` quotations deep, the innermost with
+    /// `role`. A depth of `0` records nothing.
+    pub fn set_block(&mut self, index: usize, depth: u32, role: Option<SemanticRole>) {
+        set_entry(&mut self.blocks, index, depth, role);
+    }
+
+    /// Record that the table at `index` stands `depth` quotations deep. A depth of `0`
+    /// records nothing.
+    pub fn set_table(&mut self, index: usize, depth: u32) {
+        set_entry(&mut self.tables, index, depth, None);
+    }
+
+    /// How many quotations the block at `index` stands in.
+    pub fn block_depth(&self, index: usize) -> u32 {
+        find_entry(&self.blocks, index).map_or(0, |entry| entry.depth)
+    }
+
+    /// The role of the innermost quotation the block at `index` stands in.
+    pub fn block_role(&self, index: usize) -> Option<&SemanticRole> {
+        find_entry(&self.blocks, index).and_then(|entry| entry.role.as_ref())
+    }
+
+    /// How many quotations the table at `index` stands in.
+    pub fn table_depth(&self, index: usize) -> u32 {
+        find_entry(&self.tables, index).map_or(0, |entry| entry.depth)
+    }
+}
+
+fn set_entry(entries: &mut Vec<QuotedEntry>, index: usize, depth: u32, role: Option<SemanticRole>) {
+    let at = entries.partition_point(|entry| entry.index < index);
+    let replaces = entries.get(at).is_some_and(|entry| entry.index == index);
+    if depth == 0 {
+        if replaces {
+            entries.remove(at);
+        }
+        return;
+    }
+    let entry = QuotedEntry { index, depth, role };
+    if replaces {
+        entries[at] = entry;
+    } else {
+        entries.insert(at, entry);
+    }
+}
+
+fn find_entry(entries: &[QuotedEntry], index: usize) -> Option<&QuotedEntry> {
+    entries
+        .binary_search_by_key(&index, |entry| entry.index)
+        .ok()
+        .and_then(|at| entries.get(at))
+}
+
+/// A fragment as an insertion reads it back from its JSON (see [`fragment_from_json`]).
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct CarriedFragment {
+    /// The blocks and tables.
+    pub data: FragmentData,
+    /// Where they stood in quotations.
+    pub quoting: FragmentQuoting,
+    /// Whether the insertion replaces a selection its caller removed first, one that held
+    /// the whole of a text (see [`replacing_the_text`]).
+    pub replaces_text: bool,
+    /// Whether the fragment is a whole text, written in a syntax a text is saved in (Djot,
+    /// Markdown) or taken from a whole document, rather than a passage copied from a text
+    /// or from another application (see [`whole_text_to_json`]).
+    pub whole_text: bool,
+}
+
+/// The JSON a fragment is written as for an insertion.
+#[derive(Serialize)]
+struct CarriedRef<'a> {
+    #[serde(skip_serializing_if = "is_false")]
+    replaces_text: bool,
+    #[serde(skip_serializing_if = "is_false")]
+    whole_text: bool,
+    blocks: &'a [FragmentBlock],
+    #[serde(skip_serializing_if = "no_tables")]
+    tables: &'a [FragmentTable],
+    #[serde(skip_serializing_if = "no_quoting")]
+    quoting: &'a FragmentQuoting,
+}
+
+/// The JSON a fragment is read from for an insertion. Every key but `blocks` may be absent,
+/// and an unknown one is ignored, as [`FragmentData`] reads it.
+#[derive(Deserialize)]
+struct Carried {
+    #[serde(default)]
+    replaces_text: bool,
+    #[serde(default)]
+    whole_text: bool,
+    blocks: Vec<FragmentBlock>,
+    #[serde(default)]
+    tables: Vec<FragmentTable>,
+    #[serde(default)]
+    quoting: FragmentQuoting,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
+fn no_tables(tables: &&[FragmentTable]) -> bool {
+    tables.is_empty()
+}
+
+fn no_quoting(quoting: &&FragmentQuoting) -> bool {
+    quoting.is_empty()
+}
+
+/// Write `data` and its `quoting` as the JSON an insertion takes. With nothing quoted it is
+/// exactly the JSON of `data` alone, and every reader of [`FragmentData`] reads it.
+pub fn fragment_to_json(
+    data: &FragmentData,
+    quoting: &FragmentQuoting,
+) -> serde_json::Result<String> {
+    carried_to_json(data, quoting, false)
+}
+
+/// As [`fragment_to_json`], for a fragment that is a whole text: parsed from a syntax a text
+/// is saved in (Djot, Markdown), as a host puts back a past version of a text by selecting
+/// all of it and inserting the version.
+///
+/// Inserted over a selection holding the whole of a text, a whole text replaces it and
+/// reads as the same text loaded, even when it is a single plain paragraph. Any other
+/// fragment of a single plain paragraph, a phrase copied from a text or pasted from another
+/// application, goes into the paragraph the removal leaves as typed text does, and keeps
+/// that paragraph's formatting.
+pub fn whole_text_to_json(
+    data: &FragmentData,
+    quoting: &FragmentQuoting,
+) -> serde_json::Result<String> {
+    carried_to_json(data, quoting, true)
+}
+
+fn carried_to_json(
+    data: &FragmentData,
+    quoting: &FragmentQuoting,
+    whole_text: bool,
+) -> serde_json::Result<String> {
+    serde_json::to_string(&CarriedRef {
+        replaces_text: false,
+        whole_text,
+        blocks: &data.blocks,
+        tables: &data.tables,
+        quoting,
+    })
+}
+
+/// Read a fragment written by [`fragment_to_json`] or [`whole_text_to_json`], or as JSON of
+/// a [`FragmentData`] alone.
+pub fn fragment_from_json(json: &str) -> serde_json::Result<CarriedFragment> {
+    let carried: Carried = serde_json::from_str(json)?;
+    Ok(CarriedFragment {
+        data: FragmentData {
+            blocks: carried.blocks,
+            tables: carried.tables,
+        },
+        quoting: carried.quoting,
+        replaces_text: carried.replaces_text,
+        whole_text: carried.whole_text,
+    })
+}
+
+/// The mark [`replacing_the_text`] puts in front of a fragment's keys.
+const REPLACES_TEXT_MARK: &str = "\"replaces_text\":true";
+
+/// The mark [`as_a_whole_text`] puts in front of a fragment's keys, and
+/// [`whole_text_to_json`] writes.
+const WHOLE_TEXT_MARK: &str = "\"whole_text\":true";
+
+/// `json`, a fragment's JSON, marked as replacing a whole text: the caller removed a
+/// selection holding all of a text before inserting it. An insertion into the one empty
+/// paragraph such a removal leaves then gives it the fragment's own formatting, where it
+/// otherwise keeps the formatting the paragraph has (see the insertion's use case), when the
+/// fragment is a whole text (see [`whole_text_to_json`]) or more than a phrase: several
+/// paragraphs, a table, a quotation, or a paragraph of its own format.
+///
+/// The mark is spliced in front of the other keys: the JSON is not parsed again, which for
+/// a whole book put back over itself is most of the insertion's reading. JSON that is not
+/// an object is returned as it is, for the insertion to refuse.
+pub fn replacing_the_text(json: &str) -> String {
+    marked(json, REPLACES_TEXT_MARK)
+}
+
+/// `json`, a fragment's JSON, marked as a whole text, as [`whole_text_to_json`] writes it:
+/// for a fragment made from a whole document. Spliced in as [`replacing_the_text`] is.
+pub fn as_a_whole_text(json: &str) -> String {
+    marked(json, WHOLE_TEXT_MARK)
+}
+
+/// `json` with `mark` in front of its keys, where the marks stand, unless it holds it there
+/// already.
+fn marked(json: &str, mark: &str) -> String {
+    let Some(rest) = json.strip_prefix('{') else {
+        return json.to_string();
+    };
+    // The marks lead the object, in whichever order they were put in.
+    let mut leading = rest;
+    while let Some(present) = [REPLACES_TEXT_MARK, WHOLE_TEXT_MARK]
+        .into_iter()
+        .find(|present| leading.starts_with(present))
+    {
+        if present == mark {
+            return json.to_string();
+        }
+        let after = &leading[present.len()..];
+        leading = after.strip_prefix(',').unwrap_or(after);
+    }
+    let separator = if rest.trim_start().starts_with('}') {
+        ""
+    } else {
+        ","
+    };
+    let mut marked = String::with_capacity(json.len() + mark.len() + 1);
+    marked.push('{');
+    marked.push_str(mark);
+    marked.push_str(separator);
+    marked.push_str(rest);
+    marked
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn block(text: &str) -> FragmentBlock {
+        FragmentBlock {
+            plain_text: text.to_string(),
+            elements: Vec::new(),
+            heading_level: None,
+            list: None,
+            alignment: None,
+            indent: None,
+            text_indent: None,
+            marker: None,
+            top_margin: None,
+            bottom_margin: None,
+            left_margin: None,
+            right_margin: None,
+            tab_positions: Vec::new(),
+            line_height: None,
+            non_breakable_lines: None,
+            page_break_before: None,
+            direction: None,
+            background_color: None,
+            is_code_block: None,
+            code_language: None,
+            hyphenate: None,
+            language: None,
+        }
+    }
+
+    fn data() -> FragmentData {
+        FragmentData {
+            blocks: vec![block("One"), block("Two"), block("Three")],
+            tables: Vec::new(),
+        }
+    }
+
+    /// Nothing quoted, the carried JSON is the fragment's own JSON: a reader of
+    /// `FragmentData` alone reads it, and the carrier cannot drift from it unseen.
+    #[test]
+    fn an_unquoted_fragment_is_written_as_its_data_alone() {
+        let data = data();
+        let carried = fragment_to_json(&data, &FragmentQuoting::default()).unwrap();
+        assert_eq!(carried, serde_json::to_string(&data).unwrap());
+    }
+
+    /// The quotations come back from the JSON, and a reader of `FragmentData` alone, as
+    /// an earlier release is, still reads the blocks.
+    #[test]
+    fn the_quotations_travel_beside_the_data() {
+        let data = data();
+        let mut quoting = FragmentQuoting::default();
+        quoting.set_block(2, 1, None);
+        quoting.set_block(1, 2, Some(SemanticRole::Epigraph));
+        quoting.set_block(0, 0, None);
+        let json = fragment_to_json(&data, &quoting).unwrap();
+        let back = fragment_from_json(&json).unwrap();
+        assert_eq!(back.quoting, quoting);
+        assert_eq!(back.quoting.block_depth(0), 0);
+        assert_eq!(back.quoting.block_depth(1), 2);
+        assert_eq!(back.quoting.block_role(1), Some(&SemanticRole::Epigraph));
+        assert_eq!(back.quoting.block_depth(2), 1);
+        assert!(!back.replaces_text);
+        let alone: FragmentData = serde_json::from_str(&json).unwrap();
+        assert_eq!(alone.blocks.len(), 3);
+    }
+
+    /// The mark of a whole text replaced reads back, whatever the fragment holds, and is
+    /// put in once.
+    #[test]
+    fn a_fragment_marked_as_replacing_a_text_reads_back_marked() {
+        let json = fragment_to_json(&data(), &FragmentQuoting::default()).unwrap();
+        let marked = replacing_the_text(&json);
+        assert!(fragment_from_json(&marked).unwrap().replaces_text);
+        assert_eq!(replacing_the_text(&marked), marked);
+        let alone: FragmentData = serde_json::from_str(&marked).unwrap();
+        assert_eq!(alone.blocks.len(), 3);
+        assert!(
+            fragment_from_json(&replacing_the_text("{\"blocks\":[]}"))
+                .is_ok_and(|f| f.replaces_text)
+        );
+        assert_eq!(replacing_the_text("not json"), "not json");
+    }
+
+    /// A whole text reads back as one, written so or marked afterwards, beside the mark of a
+    /// whole text replaced and in either order; each mark goes in once, and a reader of
+    /// `FragmentData` alone still reads the blocks.
+    #[test]
+    fn a_whole_text_reads_back_as_one_beside_the_mark_of_a_text_replaced() {
+        let quoting = FragmentQuoting::default();
+        let plain = fragment_to_json(&data(), &quoting).unwrap();
+        assert!(!fragment_from_json(&plain).unwrap().whole_text);
+
+        let written = whole_text_to_json(&data(), &quoting).unwrap();
+        let spliced = as_a_whole_text(&plain);
+        for whole in [&written, &spliced] {
+            let back = fragment_from_json(whole).unwrap();
+            assert!(back.whole_text && !back.replaces_text, "{whole}");
+            let replacing = replacing_the_text(whole);
+            let back = fragment_from_json(&replacing).unwrap();
+            assert!(back.whole_text && back.replaces_text, "{replacing}");
+            assert_eq!(as_a_whole_text(&replacing), replacing);
+            assert_eq!(replacing_the_text(&replacing), replacing);
+            let alone: FragmentData = serde_json::from_str(&replacing).unwrap();
+            assert_eq!(alone.blocks.len(), 3);
+        }
+        let replacing_first = as_a_whole_text(&replacing_the_text(&plain));
+        let back = fragment_from_json(&replacing_first).unwrap();
+        assert!(back.whole_text && back.replaces_text, "{replacing_first}");
+        assert_eq!(as_a_whole_text(&replacing_first), replacing_first);
+        assert_eq!(replacing_the_text(&replacing_first), replacing_first);
+        assert_eq!(as_a_whole_text("not json"), "not json");
     }
 }

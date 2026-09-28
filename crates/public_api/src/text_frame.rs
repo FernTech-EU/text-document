@@ -80,6 +80,40 @@ impl TextFrame {
 // Shared flow traversal (used by TextDocument and TextFrame)
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
+/// The blocks and tables under `frame_id` in reading order, each quotation's own flow in its
+/// place rather than as a [`FlowElement::Frame`]: the text a caret or a selection runs
+/// through, however deep the quotations nest. A table's cells are its own and are not
+/// listed.
+///
+/// Read only at the top of the main frame, a table standing in a quotation was not found:
+/// a selection of all of a text opening or ending with a quoted table copied nothing, and
+/// cutting it put nothing on the clipboard. Walked with a stack of its own, so a quotation
+/// nested past any depth costs no recursion, and a frame met twice is read once.
+pub(crate) fn flow_in_reading_order(
+    inner: &TextDocumentInner,
+    doc_arc: &Arc<Mutex<TextDocumentInner>>,
+    frame_id: EntityId,
+) -> Vec<FlowElement> {
+    let mut out = Vec::new();
+    let mut seen: HashSet<EntityId> = HashSet::from([frame_id]);
+    let mut stack = vec![build_flow_elements(inner, doc_arc, frame_id).into_iter()];
+    while let Some(frame) = stack.last_mut() {
+        match frame.next() {
+            None => {
+                stack.pop();
+            }
+            Some(FlowElement::Frame(sub_frame)) => {
+                let sub_frame_id = sub_frame.frame_id as EntityId;
+                if seen.insert(sub_frame_id) {
+                    stack.push(build_flow_elements(inner, doc_arc, sub_frame_id).into_iter());
+                }
+            }
+            Some(element) => out.push(element),
+        }
+    }
+    out
+}
+
 /// Build flow elements for a frame, returning FlowElement variants.
 ///
 /// This is the main entry point. `doc_arc` is the shared document handle

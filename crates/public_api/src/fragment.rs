@@ -5,7 +5,8 @@ use frontend::common::parser_tools::content_parser::{
     ParsedBlock, ParsedElement, ParsedSpan, split_block_at_line_breaks,
 };
 use frontend::common::parser_tools::fragment_schema::{
-    FragmentBlock, FragmentData, FragmentElement, FragmentTable, FragmentTableCell,
+    FragmentBlock, FragmentData, FragmentElement, FragmentQuoting, FragmentTable,
+    FragmentTableCell, as_a_whole_text, fragment_to_json, whole_text_to_json,
 };
 
 /// A piece of rich text that can be inserted into a [`TextDocument`](crate::TextDocument).
@@ -91,30 +92,42 @@ impl DocumentFragment {
         }
     }
 
-    /// Create a fragment from HTML.
+    /// Create a fragment from HTML, as a clipboard carries a passage copied from a web page
+    /// or another application.
+    ///
+    /// A `<pre>` goes in as paragraphs, one for each of its lines, each keeping its spaces,
+    /// where [`TextDocument::set_html`](crate::TextDocument::set_html) loads it as a code
+    /// block: a preformatted passage pasted into prose is most often a poem or a letter set
+    /// line by line, and a code block keeps no emphasis and takes no footnote reference.
     pub fn from_html(html: &str) -> Self {
         let parsed = frontend::common::parser_tools::content_parser::parse_html_elements(html);
-        parsed_elements_to_fragment(parsed)
+        parsed_elements_to_fragment(parsed, ParsedFrom::Html)
     }
 
-    /// Create a fragment from Markdown.
+    /// Create a fragment from Markdown. The fragment is a whole text: see
+    /// [`from_djot`](Self::from_djot).
     pub fn from_markdown(markdown: &str) -> Self {
         let parsed = frontend::common::parser_tools::content_parser::parse_markdown(markdown);
-        parsed_elements_to_fragment(parsed)
+        parsed_elements_to_fragment(parsed, ParsedFrom::SavedSyntax)
     }
 
     /// Create a fragment from djot markup. Paste always uses the lossless
     /// default [`crate::DjotImportOptions`]; per-feature selection is exposed on
     /// the document-level import path (`TextDocument::set_djot_with_options`).
+    ///
+    /// The fragment is a whole text: inserted over a selection holding the whole of a
+    /// text, it reads as the same Djot loaded, even as a single plain paragraph (see
+    /// [`TextCursor::insert_fragment`](crate::TextCursor::insert_fragment)).
     pub fn from_djot(djot: &str) -> Self {
         let parsed = frontend::common::parser_tools::content_parser::parse_djot(
             djot,
             &frontend::common::parser_tools::DjotImportOptions::default(),
         );
-        parsed_elements_to_fragment(parsed)
+        parsed_elements_to_fragment(parsed, ParsedFrom::SavedSyntax)
     }
 
-    /// Create a fragment from an entire document.
+    /// Create a fragment from an entire document. The fragment is a whole text: see
+    /// [`from_djot`](Self::from_djot).
     pub fn from_document(doc: &crate::TextDocument) -> crate::Result<Self> {
         let inner = doc.inner.lock();
         // Use i64::MAX as anchor to ensure the full document is captured.
@@ -126,7 +139,10 @@ impl DocumentFragment {
         };
         let result =
             frontend::commands::document_inspection_commands::extract_fragment(&inner.ctx, &dto)?;
-        Ok(Self::from_raw(result.fragment_data, result.plain_text))
+        Ok(Self::from_raw(
+            as_a_whole_text(&result.fragment_data),
+            result.plain_text,
+        ))
     }
 
     /// Create a fragment from the serialized internal format.
@@ -764,9 +780,13 @@ fn span_to_fragment_element(span: &ParsedSpan) -> FragmentElement {
     }
 }
 
-/// A parsed block as a fragment block: its text and spans, and the block formats a
-/// fragment carries.
-fn parsed_block_to_fragment_block(pb: ParsedBlock) -> FragmentBlock {
+/// A parsed block as a fragment block: its text and spans, and everything a load of the
+/// same text keeps of the block, so a text put back by selecting all and inserting it reads
+/// as the text loaded: its alignment, marker, spacing and list markers, and its code-block
+/// format when `keep_code_block` says so. Only the heading and the line attributes were
+/// carried, and every code block of a restored version came back as a plain paragraph. The
+/// quotations the block stands in travel beside it (see [`FragmentQuoting`]).
+fn parsed_block_to_fragment_block(pb: ParsedBlock, keep_code_block: bool) -> FragmentBlock {
     use frontend::common::parser_tools::fragment_schema::FragmentList;
 
     let elements: Vec<FragmentElement> = pb.spans.iter().map(span_to_fragment_element).collect();
@@ -774,19 +794,20 @@ fn parsed_block_to_fragment_block(pb: ParsedBlock) -> FragmentBlock {
     let list = pb.list_style.map(|style| FragmentList {
         style,
         indent: pb.list_indent as i64,
-        prefix: String::new(),
-        suffix: String::new(),
+        prefix: pb.list_prefix,
+        suffix: pb.list_suffix,
     });
+    let is_code_block = keep_code_block && pb.is_code_block;
     FragmentBlock {
         plain_text,
         elements,
         heading_level: pb.heading_level,
         list,
-        alignment: None,
+        alignment: pb.alignment,
         indent: None,
-        text_indent: None,
-        marker: None,
-        top_margin: None,
+        text_indent: pb.text_indent,
+        marker: pb.marker,
+        top_margin: pb.top_margin,
         bottom_margin: None,
         left_margin: None,
         right_margin: None,
@@ -796,18 +817,38 @@ fn parsed_block_to_fragment_block(pb: ParsedBlock) -> FragmentBlock {
         page_break_before: pb.page_break_before,
         direction: pb.direction,
         background_color: pb.background_color,
-        is_code_block: None,
-        code_language: None,
+        is_code_block: is_code_block.then_some(true),
+        code_language: if is_code_block {
+            pb.code_language
+        } else {
+            None
+        },
         hyphenate: None,
         language: None,
     }
 }
 
+/// What a fragment was parsed from, which decides what an insertion makes of it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ParsedFrom {
+    /// A text in a syntax a text is saved in, Djot or Markdown: a whole text, whose code
+    /// blocks are code blocks. Inserted over a selection holding the whole of a text, it
+    /// reads as the same text loaded (see `whole_text_to_json`).
+    SavedSyntax,
+    /// HTML, as a clipboard carries a passage from a web page or another application. A
+    /// `<pre>` is read as paragraphs, one for each of its lines: a code block keeps no
+    /// emphasis, takes no footnote reference, and a host with no command to make it prose
+    /// again left the writer with a passage set as code.
+    Html,
+}
+
 /// Convert parsed elements (blocks + tables) into a `DocumentFragment`,
 /// preserving table structure as `FragmentTable` entries.
-fn parsed_elements_to_fragment(parsed: Vec<ParsedElement>) -> DocumentFragment {
+fn parsed_elements_to_fragment(parsed: Vec<ParsedElement>, from: ParsedFrom) -> DocumentFragment {
     let mut blocks: Vec<FragmentBlock> = Vec::new();
     let mut tables: Vec<FragmentTable> = Vec::new();
+    // The quotations each block and table stands in, carried beside them.
+    let mut quoting = FragmentQuoting::default();
 
     for elem in parsed {
         match elem {
@@ -816,27 +857,46 @@ fn parsed_elements_to_fragment(parsed: Vec<ParsedElement>) -> DocumentFragment {
             // splice a note's text into the middle of a sentence. The reference
             // travels; the body stays where it is defined.
             ParsedElement::FootnoteDefinition { .. } => {}
-            // A fragment's blocks are prose, a code block's included (it keeps its
-            // lines, not its code-block format), and a line break in prose is a new
-            // block: one line a block, as a plain-text paste gives. Kept in one block,
-            // a pasted `<pre>` held line breaks, which the Djot writer used to write as
-            // they were, and its lines read back as whatever their markers spelled.
+            // A code block of a text in a saved syntax is a code block, and holds its lines.
+            // Any other block is prose, and a line break in prose is a new block: one line a
+            // block, as a plain-text paste gives. A pasted `<pre>` is prose too (see
+            // `ParsedFrom::Html`). Kept in one block, it held line breaks, which the Djot
+            // writer used to write as they were, and its lines read back as whatever their
+            // markers spelled.
             ParsedElement::Block(pb) => {
-                for pb in split_block_at_line_breaks(pb) {
-                    blocks.push(parsed_block_to_fragment_block(pb));
+                let depth = pb.blockquote_depth;
+                // The quotation's role rides on its first block, as the parsers put it.
+                let mut role = pb.semantic_role.clone();
+                let keep_code_block = pb.is_code_block && from == ParsedFrom::SavedSyntax;
+                let lines = if keep_code_block {
+                    vec![pb]
+                } else {
+                    split_block_at_line_breaks(pb)
+                };
+                for pb in lines {
+                    blocks.push(parsed_block_to_fragment_block(pb, keep_code_block));
+                    if depth > 0 {
+                        quoting.set_block(blocks.len() - 1, depth, role.take());
+                    }
                 }
             }
             ParsedElement::Table(pt) => {
                 let block_insert_index = blocks.len();
-                let num_columns = pt.rows.iter().map(|r| r.len()).max().unwrap_or(0);
+                let num_columns = pt.column_count();
                 let num_rows = pt.rows.len();
 
                 let mut frag_cells: Vec<FragmentTableCell> = Vec::new();
                 for (row_idx, row) in pt.rows.iter().enumerate() {
-                    for (col_idx, cell) in row.iter().enumerate() {
+                    // A row shorter than the widest is completed with empty cells, as a
+                    // load completes it: a table with holes in its grid is one no edit
+                    // expects.
+                    for col_idx in 0..num_columns {
+                        let spans = row
+                            .get(col_idx)
+                            .map_or(&[][..], |cell| cell.spans.as_slice());
                         let cell_elements: Vec<FragmentElement> =
-                            cell.spans.iter().map(span_to_fragment_element).collect();
-                        let cell_text: String = spans_plain_text(&cell.spans);
+                            spans.iter().map(span_to_fragment_element).collect();
+                        let cell_text: String = spans_plain_text(spans);
 
                         frag_cells.push(FragmentTableCell {
                             row: row_idx,
@@ -887,29 +947,80 @@ fn parsed_elements_to_fragment(parsed: Vec<ParsedElement>) -> DocumentFragment {
                     fmt_alignment: None,
                     column_widths: vec![],
                 });
+                quoting.set_table(tables.len() - 1, pt.blockquote_depth);
             }
         }
     }
 
-    let data = serde_json::to_string(&FragmentData { blocks, tables })
-        .expect("fragment serialization should not fail");
-
-    let plain_text = parsed_plain_text_from_data(&data);
+    // The blocks' own text, read before they are serialized: reading it back out of the
+    // JSON parsed the whole fragment a second time.
+    let plain_text = blocks
+        .iter()
+        .map(|b| b.plain_text.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    let data = FragmentData { blocks, tables };
+    let data = match from {
+        ParsedFrom::SavedSyntax => whole_text_to_json(&data, &quoting),
+        ParsedFrom::Html => fragment_to_json(&data, &quoting),
+    }
+    .expect("fragment serialization should not fail");
 
     DocumentFragment { data, plain_text }
 }
 
-/// Extract plain text from serialized fragment data.
-fn parsed_plain_text_from_data(data: &str) -> String {
-    let fragment_data: FragmentData = match serde_json::from_str(data) {
-        Ok(d) => d,
-        Err(_) => return String::new(),
-    };
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-    fragment_data
-        .blocks
-        .iter()
-        .map(|b| b.plain_text.as_str())
-        .collect::<Vec<_>>()
-        .join("\n")
+    /// A paragraph as a manuscript holds it: emphasis, a link, a note reference.
+    fn paragraph(i: usize) -> String {
+        format!(
+            "Paragraph {i} with *emphasis* and a [link](https://example.org/{i}) in it, and a \
+             note[^n{i}] after the words that run on to a full line of prose."
+        )
+    }
+
+    /// A fragment is the text a cursor inserts, carried as JSON, and an insertion refuses
+    /// JSON past 64 MiB. Every field of every block and every run was written, `null` or
+    /// empty as most are: the JSON came to about 18 times the Djot it was made from, and
+    /// putting back a whole text of 26,000 paragraphs failed. Fields holding nothing are
+    /// left out now.
+    #[test]
+    fn a_fragment_holds_little_more_than_its_text() {
+        let djot: String = (0..200).map(|i| format!("{}\n\n", paragraph(i))).collect();
+        let fragment = DocumentFragment::from_djot(&djot);
+        let ratio = fragment.raw_data().len() as f64 / djot.len() as f64;
+        println!("fragment JSON: {ratio:.2} times the Djot");
+        assert!(
+            ratio < 4.0,
+            "the fragment's JSON is {ratio:.1} times the Djot it was made from"
+        );
+        assert_eq!(fragment.to_plain_text().lines().count(), 200);
+    }
+
+    /// A fragment written in full, as the builds before the compact form wrote it, still
+    /// reads: every field left out reads as holding nothing.
+    #[test]
+    fn a_fragment_written_in_full_still_reads() {
+        let full = r#"{"blocks":[{"plain_text":"Old","elements":[{"content":{"Text":"Old"},
+            "fmt_font_family":null,"fmt_font_point_size":null,"fmt_font_weight":null,
+            "fmt_font_bold":true,"fmt_font_italic":null,"fmt_font_underline":null,
+            "fmt_font_overline":null,"fmt_font_strikeout":null,"fmt_letter_spacing":null,
+            "fmt_word_spacing":null,"fmt_anchor_href":null,"fmt_anchor_names":[],
+            "fmt_is_anchor":null,"fmt_tooltip":null,"fmt_underline_style":null,
+            "fmt_vertical_alignment":null}],"heading_level":2,"list":null,"alignment":null,
+            "indent":null,"text_indent":null,"marker":null,"top_margin":null,
+            "bottom_margin":null,"left_margin":null,"right_margin":null,"tab_positions":[],
+            "line_height":null,"non_breakable_lines":null,"direction":null,
+            "background_color":null,"is_code_block":null,"code_language":null}]}"#;
+        let data: FragmentData = serde_json::from_str(full).unwrap();
+        assert_eq!(data.blocks[0].heading_level, Some(2));
+        assert_eq!(data.blocks[0].elements[0].fmt_font_bold, Some(true));
+        let compact = serde_json::to_string(&data).unwrap();
+        let again: FragmentData = serde_json::from_str(&compact).unwrap();
+        assert_eq!(again.blocks[0].heading_level, Some(2));
+        assert_eq!(again.blocks[0].elements[0].fmt_font_bold, Some(true));
+        assert!(compact.len() < full.len() / 3, "{compact}");
+    }
 }

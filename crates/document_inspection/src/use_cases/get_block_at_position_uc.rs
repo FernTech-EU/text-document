@@ -4,7 +4,9 @@ use crate::GetBlockAtPositionDto;
 use anyhow::{Result, anyhow};
 use common::database::QueryUnitOfWork;
 use common::database::block_offset_index::OffsetMarker;
-use common::database::rope_helpers::{block_char_length, find_block_at_char_position};
+use common::database::rope_helpers::{
+    block_char_length, find_block_at_char_position, snap_off_table_anchor,
+};
 use common::direct_access::document::document_repository::DocumentRelationshipField;
 use common::direct_access::frame::frame_repository::FrameRelationshipField;
 use common::direct_access::root::root_repository::RootRelationshipField;
@@ -42,8 +44,13 @@ impl GetBlockAtPositionUseCase {
         let uow = self.uow_factory.create();
         uow.begin_transaction()?;
 
-        let position = dto.position;
         let store = uow.store();
+        // A position on a table's anchor (the anchor or the separator after it) stands at the
+        // table's first cell, as every edit reads it. The anchor is no block, so it went to the
+        // walk below, which counts no anchor: it answered with a block two positions on for
+        // each table before it, the second block of the first cell for the separator after
+        // the anchor, where making a list and reading the list back met different blocks.
+        let position = snap_off_table_anchor(&store, dto.position, true);
 
         // Fast path: O(log n) via the rope index. Only valid for flat
         // (no-table) documents — table cell content lives at separate

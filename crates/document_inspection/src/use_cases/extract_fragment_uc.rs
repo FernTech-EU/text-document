@@ -2,16 +2,19 @@ use crate::ExtractFragmentDto;
 use crate::ExtractFragmentResultDto;
 use anyhow::{Result, anyhow};
 use common::database::QueryUnitOfWork;
-use common::database::rope_helpers::{block_char_length, block_content_via_store};
+use common::database::rope_helpers::{
+    block_char_length, block_content_via_store, range_covers_table_anchor,
+};
 use common::direct_access::document::document_repository::DocumentRelationshipField;
 use common::direct_access::frame::frame_repository::FrameRelationshipField;
 use common::direct_access::root::root_repository::RootRelationshipField;
 use common::direct_access::table::TableRelationshipField;
-use common::entities::{Block, Frame, List, Root, Table, TableCell};
+use common::entities::{Block, Frame, List, Root, SemanticRole, Table, TableCell};
 use common::format_runs::{InlineContent, InlineSegment};
 use common::format_runs_query::inline_segments_for_block;
 use common::parser_tools::fragment_schema::{
-    FragmentBlock, FragmentData, FragmentElement, FragmentList, FragmentTable, FragmentTableCell,
+    FragmentBlock, FragmentData, FragmentElement, FragmentList, FragmentQuoting, FragmentTable,
+    FragmentTableCell, fragment_to_json,
 };
 use common::types::{EntityId, ROOT_ENTITY_ID};
 use std::collections::{HashMap, HashSet};
@@ -97,10 +100,34 @@ impl ExtractFragmentUseCase {
             }
         }
 
-        // ── Collect ALL blocks recursively (root frames, blockquotes, cell frames) ──
+        // ── Collect the blocks of every tree: the main text (its quotations and table
+        // cells included) and each footnote's body ──
         let mut all_block_ids: Vec<EntityId> = Vec::new();
-        for frame_id in &frame_ids {
-            collect_block_ids_recursive_ro(&*uow, frame_id, &mut all_block_ids)?;
+        let mut tree_of_block: HashMap<EntityId, EntityId> = HashMap::new();
+        // The quotations each block, and each table, stands in.
+        let mut quoted_of_block: HashMap<EntityId, Quoted> = HashMap::new();
+        let mut table_quoted: HashMap<EntityId, Quoted> = HashMap::new();
+        for (i, frame_id) in frame_ids.iter().enumerate() {
+            let is_tree = i == 0
+                || uow
+                    .get_frame(frame_id)?
+                    .is_some_and(|frame| frame.footnote_label.is_some());
+            if !is_tree {
+                continue;
+            }
+            let mut tree_blocks: Vec<(EntityId, Quoted)> = Vec::new();
+            collect_tree_blocks_ro(
+                &*uow,
+                frame_id,
+                Quoted::default(),
+                &mut tree_blocks,
+                &mut table_quoted,
+            )?;
+            for (block_id, quoted) in tree_blocks {
+                tree_of_block.insert(block_id, *frame_id);
+                quoted_of_block.insert(block_id, quoted);
+                all_block_ids.push(block_id);
+            }
         }
 
         let blocks_opt = uow.get_block_multi(&all_block_ids)?;
@@ -110,16 +137,46 @@ impl ExtractFragmentUseCase {
         common::database::rope_helpers::refresh_block_positions(&mut blocks, &store);
         blocks.sort_by_key(|b| b.document_position);
 
+        // A selection copies from the tree it starts in: the main text, or the one note's
+        // body it starts in. Every document frame used to be read, footnote definitions
+        // included, and a selection running across a body (select all, or from a paragraph
+        // to the end) copied the note's text as a paragraph: a paste put it into the prose.
+        // A clipboard fragment carries prose, not note bodies, as one made from Djot does.
+        let starting_tree = blocks
+            .iter()
+            .find(|block| block.document_position + block_char_length(block, &store) >= start)
+            .and_then(|block| tree_of_block.get(&block.id).copied());
+        blocks.retain(|block| tree_of_block.get(&block.id).copied() == starting_tree);
+
+        // Whether the range takes anything of `block`. An empty paragraph closing the tree
+        // stands where a range reaching the tree's end ends, and is taken with it: left out,
+        // a cut of all of a text and its paste dropped the empty code block or heading the
+        // text ended with, which a save keeps.
+        let last_block_id = blocks.last().map(|block| block.id);
+        let takes = |block: &Block| {
+            let block_start = block.document_position;
+            let length = block_char_length(block, &store);
+            if block_start + length < start {
+                return false;
+            }
+            block_start < end
+                || (block_start == end
+                    && length == 0
+                    && start < end
+                    && Some(block.id) == last_block_id)
+        };
+
         // ── Detect cross-cell selection ───────────────────────────
         // Check ALL blocks in range (not just endpoints) — an intermediate
-        // block could be in a different cell.
-        let is_cross_cell = {
+        // block could be in a different cell. A range holding a table's anchor holds the
+        // table whole, as a deletion of it takes the table: over a table of one cell, from
+        // its anchor on, the range only meets that cell, and a select all of a text that is
+        // such a table copied its words and not the table, which the cut then removed.
+        let is_cross_cell = range_covers_table_anchor(&store, start, end) || {
             let mut first_cell: Option<Option<EntityId>> = None;
             let mut cross = false;
             for block in &blocks {
-                if block.document_position + block_char_length(block, &store) < start
-                    || block.document_position >= end
-                {
+                if !takes(block) {
                     continue;
                 }
                 let cell = block_to_cell.get(&block.id).map(|(cf, _, _)| *cf);
@@ -140,6 +197,7 @@ impl ExtractFragmentUseCase {
             // Single pass in document order so plain_texts stays ordered.
             let mut fragment_blocks: Vec<FragmentBlock> = Vec::new();
             let mut fragment_tables: Vec<FragmentTable> = Vec::new();
+            let mut quoting = FragmentQuoting::default();
             let mut plain_texts: Vec<String> = Vec::new();
             let mut processed_tables: HashSet<EntityId> = HashSet::new();
 
@@ -147,7 +205,7 @@ impl ExtractFragmentUseCase {
                 let block_start = block.document_position;
                 let block_end = block_start + block_char_length(block, &store);
 
-                if block_end < start || block_start >= end {
+                if !takes(block) {
                     continue;
                 }
 
@@ -177,6 +235,12 @@ impl ExtractFragmentUseCase {
                                 .get_frame_relationship(&cf_id, &FrameRelationshipField::Blocks)?;
                             let blk_opt = uow.get_block_multi(&blk_ids)?;
                             let mut blks: Vec<Block> = blk_opt.into_iter().flatten().collect();
+                            // In reading order, read off the rope: the stored field lags it
+                            // by whatever was typed since the last deletion, and a cell of
+                            // several paragraphs was copied with them out of order.
+                            common::database::rope_helpers::refresh_block_positions(
+                                &mut blks, &store,
+                            );
                             blks.sort_by_key(|b| b.document_position);
                             blks
                         } else {
@@ -222,6 +286,10 @@ impl ExtractFragmentUseCase {
                         fmt_alignment: table.fmt_alignment.clone(),
                         column_widths: table.column_widths.clone(),
                     });
+                    quoting.set_table(
+                        fragment_tables.len() - 1,
+                        table_quoted.get(tid).map_or(0, |quoted| quoted.depth),
+                    );
                 } else {
                     // Non-table block — extract with partial-block handling
                     let local_start = if start > block_start {
@@ -259,7 +327,7 @@ impl ExtractFragmentUseCase {
                         && (end > block_start + block_char_length(block, &store) || is_last_block);
 
                     plain_texts.push(extracted_text.clone());
-                    fragment_blocks.push(block_to_fragment_block(
+                    let fragment_block = block_to_fragment_block(
                         block,
                         extracted_elements,
                         extracted_text,
@@ -269,7 +337,14 @@ impl ExtractFragmentUseCase {
                         } else {
                             None
                         },
-                    ));
+                    );
+                    push_block(
+                        &mut fragment_blocks,
+                        &mut quoting,
+                        fragment_block,
+                        is_full_block,
+                        quoted_of_block.get(&block.id),
+                    );
                 }
             }
 
@@ -277,7 +352,7 @@ impl ExtractFragmentUseCase {
                 blocks: fragment_blocks,
                 tables: fragment_tables,
             };
-            let fragment_json = serde_json::to_string(&fragment_data)?;
+            let fragment_json = fragment_to_json(&fragment_data, &quoting)?;
             let plain_text = plain_texts.join("\n");
 
             uow.end_transaction()?;
@@ -289,13 +364,14 @@ impl ExtractFragmentUseCase {
 
         // ── Normal text extraction (no cross-cell) ────────────────
         let mut fragment_blocks: Vec<FragmentBlock> = Vec::new();
+        let mut quoting = FragmentQuoting::default();
         let mut plain_texts: Vec<String> = Vec::new();
 
         for block in &blocks {
             let block_start = block.document_position;
             let block_end = block_start + block_char_length(block, &store);
 
-            if block_end < start || block_start >= end {
+            if !takes(block) {
                 continue;
             }
 
@@ -332,7 +408,7 @@ impl ExtractFragmentUseCase {
                 && (end > block_start + block_char_length(block, &store) || is_last_block);
 
             plain_texts.push(extracted_text.clone());
-            fragment_blocks.push(block_to_fragment_block(
+            let fragment_block = block_to_fragment_block(
                 block,
                 extracted_elements,
                 extracted_text,
@@ -342,7 +418,14 @@ impl ExtractFragmentUseCase {
                 } else {
                     None
                 },
-            ));
+            );
+            push_block(
+                &mut fragment_blocks,
+                &mut quoting,
+                fragment_block,
+                is_full_block,
+                quoted_of_block.get(&block.id),
+            );
         }
 
         let fragment_data = FragmentData {
@@ -350,7 +433,7 @@ impl ExtractFragmentUseCase {
             tables: vec![],
         };
 
-        let fragment_json = serde_json::to_string(&fragment_data)?;
+        let fragment_json = fragment_to_json(&fragment_data, &quoting)?;
         let plain_text = plain_texts.join("\n");
 
         uow.end_transaction()?;
@@ -380,7 +463,9 @@ impl ExtractFragmentUseCase {
     }
 }
 
-/// Build a `FragmentBlock` from a block entity and its extracted elements.
+/// Build a `FragmentBlock` from a block entity and its extracted elements. A whole block
+/// carries its block formatting; a part of one carries none, and goes into the paragraph it
+/// is pasted into. The quotations a whole block stands in go beside it (see [`push_block`]).
 fn block_to_fragment_block(
     block: &Block,
     elements: Vec<FragmentElement>,
@@ -490,6 +575,21 @@ fn block_to_fragment_block(
     }
 }
 
+/// Add `block` to `blocks`, and the quotations it stands in to `quoting` when it is a whole
+/// block: a part of one goes into the paragraph it is pasted into, quoted or not.
+fn push_block(
+    blocks: &mut Vec<FragmentBlock>,
+    quoting: &mut FragmentQuoting,
+    block: FragmentBlock,
+    is_full_block: bool,
+    quoted: Option<&Quoted>,
+) {
+    if is_full_block && let Some(quoted) = quoted {
+        quoting.set_block(blocks.len(), quoted.depth, quoted.role.clone());
+    }
+    blocks.push(block);
+}
+
 /// Extract elements within a character range [local_start, local_end) of a block.
 /// Returns the extracted FragmentElements and the concatenated plain text.
 fn extract_elements_in_range(
@@ -559,50 +659,70 @@ fn extract_elements_in_range(
     (result_elements, result_text)
 }
 
-/// Recursively collect block IDs from a frame, traversing sub-frames
-/// (blockquotes) and table cell frames.
-fn collect_block_ids_recursive_ro(
+/// The quotations a block or a table stands in: how many, and the role of the innermost.
+#[derive(Debug, Clone, Default)]
+struct Quoted {
+    depth: u32,
+    role: Option<SemanticRole>,
+}
+
+/// Collect the blocks of the tree under `frame_id` in reading order, each with the
+/// quotations it stands in, traversing sub-frames (quotations) and table cell frames, and
+/// record the quotations each table stands in.
+fn collect_tree_blocks_ro(
     uow: &dyn ExtractFragmentUnitOfWorkTrait,
     frame_id: &EntityId,
-    out: &mut Vec<EntityId>,
+    quoted: Quoted,
+    out: &mut Vec<(EntityId, Quoted)>,
+    table_quoted: &mut HashMap<EntityId, Quoted>,
 ) -> Result<()> {
     let frame = match uow.get_frame(frame_id)? {
         Some(f) => f,
         None => return Ok(()),
     };
 
-    if !frame.child_order.is_empty() {
-        for &entry in &frame.child_order {
-            if entry > 0 {
-                out.push(entry as EntityId);
-            } else if entry < 0 {
-                let sub_frame_id = (-entry) as EntityId;
-                if let Some(sub_frame) = uow.get_frame(&sub_frame_id)? {
-                    if let Some(table_entity_id) = sub_frame.table {
-                        // Table anchor frame: expand cell frames
-                        let cell_ids = uow.get_table_relationship(
-                            &table_entity_id,
-                            &TableRelationshipField::Cells,
-                        )?;
-                        let cells_opt = uow.get_table_cell_multi(&cell_ids)?;
-                        let mut cells: Vec<_> = cells_opt.into_iter().flatten().collect();
-                        cells.sort_by(|a, b| a.row.cmp(&b.row).then(a.column.cmp(&b.column)));
-                        for c in cells {
-                            if let Some(cf_id) = c.cell_frame {
-                                collect_block_ids_recursive_ro(uow, &cf_id, out)?;
-                            }
-                        }
-                    } else {
-                        // Non-table sub-frame (blockquote): recurse
-                        collect_block_ids_recursive_ro(uow, &sub_frame_id, out)?;
-                    }
+    if frame.child_order.is_empty() {
+        let block_ids = uow.get_frame_relationship(frame_id, &FrameRelationshipField::Blocks)?;
+        out.extend(block_ids.into_iter().map(|id| (id, quoted.clone())));
+        return Ok(());
+    }
+    for &entry in &frame.child_order {
+        if entry > 0 {
+            out.push((entry as EntityId, quoted.clone()));
+            continue;
+        }
+        if entry == 0 {
+            continue;
+        }
+        let sub_frame_id = (-entry) as EntityId;
+        let Some(sub_frame) = uow.get_frame(&sub_frame_id)? else {
+            continue;
+        };
+        if let Some(table_entity_id) = sub_frame.table {
+            // Table anchor frame: expand cell frames
+            table_quoted.insert(table_entity_id, quoted.clone());
+            let cell_ids =
+                uow.get_table_relationship(&table_entity_id, &TableRelationshipField::Cells)?;
+            let cells_opt = uow.get_table_cell_multi(&cell_ids)?;
+            let mut cells: Vec<_> = cells_opt.into_iter().flatten().collect();
+            cells.sort_by(|a, b| a.row.cmp(&b.row).then(a.column.cmp(&b.column)));
+            for c in cells {
+                if let Some(cf_id) = c.cell_frame {
+                    collect_tree_blocks_ro(uow, &cf_id, Quoted::default(), out, table_quoted)?;
                 }
             }
+        } else {
+            // A quotation one deeper; any other sub-frame at the same depth.
+            let inner = if sub_frame.fmt_is_blockquote == Some(true) {
+                Quoted {
+                    depth: quoted.depth + 1,
+                    role: sub_frame.fmt_semantic_role.clone(),
+                }
+            } else {
+                quoted.clone()
+            };
+            collect_tree_blocks_ro(uow, &sub_frame_id, inner, out, table_quoted)?;
         }
-    } else {
-        let block_ids = uow.get_frame_relationship(frame_id, &FrameRelationshipField::Blocks)?;
-        out.extend(block_ids);
     }
-
     Ok(())
 }
