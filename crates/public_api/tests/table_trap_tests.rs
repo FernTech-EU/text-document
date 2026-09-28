@@ -1,7 +1,7 @@
 //! Tests for table-trap selection logic.
 //!
 //! When extending a selection across a table boundary, the cursor position
-//! snaps to the adjacent block outside the table so the entire table is
+//! snaps to the table's edge on the far side, so the entire table is
 //! enclosed ("trapped") by the selection range. This mirrors LibreOffice
 //! behaviour.
 
@@ -64,8 +64,12 @@ fn before_block_info(doc: &TextDocument) -> (usize, usize) {
 
 // ── Forward snap: anchor before table, position inside table ────
 
+/// Moved forward into a table, the position goes to the end of the table's last cell, the
+/// last position a removal of the selection takes. It went to the start of the block after
+/// the table, one position more than the removal takes, since the two paragraphs are not
+/// joined.
 #[test]
-fn trap_snap_forward_position_lands_at_after_block() {
+fn trap_snap_forward_position_lands_at_the_end_of_the_last_cell() {
     let doc = doc_with_table();
     let cell_pos = first_table_cell_position(&doc);
     let after_pos = after_block_position(&doc);
@@ -76,10 +80,16 @@ fn trap_snap_forward_position_lands_at_after_block() {
 
     assert_eq!(
         cursor.position(),
-        after_pos,
-        "position should snap to start of block after table"
+        after_pos - 1,
+        "position should snap to the end of the table's last cell"
     );
     assert_eq!(cursor.anchor(), 2, "anchor should not move");
+    let removed = cursor.remove_selected_text().unwrap();
+    assert_eq!(
+        doc.to_plain_text().unwrap(),
+        "Be\nAfter",
+        "removed {removed:?}"
+    );
 }
 
 #[test]
@@ -97,7 +107,7 @@ fn trap_snap_forward_selection_kind_is_mixed() {
             ..
         } => {
             assert!(text_before, "should have text before table");
-            assert!(text_after, "should have text after table");
+            assert!(!text_after, "should end with the table");
         }
         other => panic!("expected Mixed, got {:?}", other),
     }
@@ -218,13 +228,13 @@ fn move_position_keep_anchor_triggers_snap() {
     let cursor = doc.cursor_at(before_end);
 
     // Move right with KeepAnchor - the next position is inside the table,
-    // which should trigger the snap to the block after the table.
+    // which should trigger the snap to the end of the table.
     let after_pos = after_block_position(&doc);
     cursor.set_position(before_end + 1, MoveMode::KeepAnchor);
 
     assert_eq!(
         cursor.position(),
-        after_pos,
-        "shift-right from end of block before table should snap to start of block after"
+        after_pos - 1,
+        "shift-right from end of block before table should snap to the end of the table"
     );
 }

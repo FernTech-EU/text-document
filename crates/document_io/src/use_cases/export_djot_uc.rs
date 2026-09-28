@@ -1495,7 +1495,9 @@ fn djot_list_marker(
             // at 3 was read back as starting at 1, and the items after a table splitting a
             // list were read back numbered from its start again.
             let counter = match previous {
-                Some(open) if open.ordered.as_ref() == Some(&ordered) => open.counter + 1,
+                Some(open) if open.ordered.as_ref() == Some(&ordered) => {
+                    open.counter.saturating_add(1)
+                }
                 _ => number.unwrap_or_else(|| list.start.unwrap_or(1)),
             };
             let token = djot_ordered_token(&list.style, counter);

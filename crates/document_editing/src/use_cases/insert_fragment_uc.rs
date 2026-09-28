@@ -1417,6 +1417,68 @@ fn remove_replaced_paragraph(
     Ok(())
 }
 
+/// The list a paste's list items run on in when they are of its kind (see `ListGrouper`),
+/// the paste staying in the frame of `current_block`, the paragraph pasted into.
+///
+/// Items pasted after the start of that paragraph follow it, so they run on in its list.
+/// Items `replacing_its_head`, the paste starting at the paragraph's start, take the place
+/// of its first part: they run on in the list the paragraph is an item of, or else in the
+/// list of the paragraph right before it in its frame, which they then follow. Items pasted
+/// into a list, or right after one of its items, so join it, as a word processor numbers
+/// them and as a save reads them back: two lists of one kind side by side are one list in
+/// Djot and Markdown. Pasted into an empty item of the list, or at the start of one, they
+/// made a list of their own numbered as they were copied, and moving two items of a list
+/// starting at 3 down by cut and paste showed 3, 4, 4, 5, then 3, 4, 5, 6 after a reload.
+fn list_the_paste_runs_on_in(
+    uow: &dyn InsertFragmentUnitOfWorkTrait,
+    frame: &Frame,
+    current_block: &Block,
+    replacing_its_head: bool,
+) -> Result<Option<List>> {
+    let list_id = match current_block.list {
+        Some(list_id) => Some(list_id),
+        None if replacing_its_head => {
+            let before = frame
+                .child_order
+                .iter()
+                .position(|entry| *entry == current_block.id as i64)
+                .and_then(|at| at.checked_sub(1))
+                .and_then(|at| frame.child_order.get(at))
+                .and_then(|entry| EntityId::try_from(*entry).ok())
+                .filter(|block_id| *block_id > 0);
+            match before {
+                Some(block_id) => uow.get_block(&block_id)?.and_then(|block| block.list),
+                None => None,
+            }
+        }
+        None => None,
+    };
+    match list_id {
+        Some(list_id) => uow.get_list(&list_id),
+        None => Ok(None),
+    }
+}
+
+/// The list the one list item `frag_list` a paste puts in goes into: `runs_on_in`, the
+/// list the paste runs on in (see [`list_the_paste_runs_on_in`]), when it is of the same
+/// kind and level, or else a list of its own, starting at `start`.
+fn list_for_a_pasted_item(
+    uow: &mut Box<dyn InsertFragmentUnitOfWorkTrait>,
+    doc_id: EntityId,
+    frag_list: &common::parser_tools::fragment_schema::FragmentList,
+    runs_on_in: Option<&List>,
+    start: Option<i64>,
+) -> Result<EntityId> {
+    if let Some(list) = runs_on_in
+        && list.style == frag_list.style
+        && list.indent == frag_list.indent
+    {
+        return Ok(list.id);
+    }
+    let list = frag_list.to_entity_starting_at(start);
+    Ok(uow.create_list(&list, doc_id, -1)?.id)
+}
+
 /// Insert a table-only fragment at the cursor position.
 fn insert_table_fragment(
     uow: &mut Box<dyn InsertFragmentUnitOfWorkTrait>,
@@ -1923,16 +1985,48 @@ fn insert_mixed_fragment(
     // (see `attach_lists`).
     let mut new_list_ids: Vec<EntityId> = Vec::new();
 
+    // The items the paste starts with run on in the list of the paragraph they follow or
+    // replace the head of (see `list_the_paste_runs_on_in`), unless the head opens a
+    // quotation of its own. The head goes through the grouper too, so the items after it in
+    // its list stay in its list.
+    let mut list_grouper = ListGrouper::new();
+    let head_stays_in_the_frame =
+        !overwrite_head || first_item.is_none_or(|(index, _)| quoting.block_depth(index) == 0);
+    if head_stays_in_the_frame
+        && let Some(list_entity) =
+            list_the_paste_runs_on_in(&**uow, &frame, &current_block, overwrite_head)?
+    {
+        list_grouper.register(
+            list_entity.id,
+            list_entity.style.clone(),
+            list_entity.indent as u32,
+        );
+    }
+
     let mut updated_current = current_block.clone();
     if overwrite_head {
-        let fb = first_fb.unwrap();
+        // A head is overwritten only by the paste's first item, a paragraph.
+        let fb = first_fb.ok_or_else(|| anyhow!("The paste overwrites no head"))?;
         let head_list_id = if let Some(ref frag_list) = fb.list {
-            let list = frag_list
-                .to_entity_starting_at(first_item.and_then(|(index, _)| list_starts.get(index)));
-            let created_list = uow.create_orphan_list(&list)?;
-            new_list_ids.push(created_list.id);
-            Some(created_list.id)
+            if let Some(existing_id) =
+                list_grouper.try_reuse(&frag_list.style, frag_list.indent as u32)
+            {
+                Some(existing_id)
+            } else {
+                let list = frag_list.to_entity_starting_at(
+                    first_item.and_then(|(index, _)| list_starts.get(index)),
+                );
+                let created_list = uow.create_orphan_list(&list)?;
+                new_list_ids.push(created_list.id);
+                list_grouper.register(
+                    created_list.id,
+                    frag_list.style.clone(),
+                    frag_list.indent as u32,
+                );
+                Some(created_list.id)
+            }
         } else {
+            list_grouper.reset();
             None
         };
         updated_current.list = head_list_id;
@@ -2000,18 +2094,6 @@ fn insert_mixed_fragment(
     let skip_first = merge_first || overwrite_head;
     let skip_last = merge_last;
     let mut block_index = 0usize;
-
-    let mut list_grouper = ListGrouper::new();
-    if !overwrite_head
-        && let Some(list_id) = current_block.list
-        && let Ok(Some(list_entity)) = uow.get_list(&list_id)
-    {
-        list_grouper.register(
-            list_id,
-            list_entity.style.clone(),
-            list_entity.indent as u32,
-        );
-    }
 
     // What the paste adds after the head, in the order the frame lists it:
     // its paragraphs, each table's anchor followed by the table's cells in
@@ -2452,6 +2534,7 @@ fn execute_insert_fragment(
         data: mut fragment_data,
         quoting,
         replaces_text,
+        into_an_emptied_text,
         whole_text,
         list_starts,
         ..
@@ -2473,20 +2556,27 @@ fn execute_insert_fragment(
         .first()
         .ok_or_else(|| anyhow!("Root has no document"))?;
 
-    // A text replaces an empty one: pasted into a main text that is one empty paragraph, a
-    // fragment with a structure of its own (several paragraphs, a table, a quotation, or a
-    // paragraph of its own format) keeps its formatting, rather than going into that of the
-    // paragraph, which a removal leaves with the formatting of the first paragraph it took.
-    // It does so whatever made the text empty: a cut of everything, an undo back to it, a
-    // new document. The paste used to ask a mark the cursor held after a cut of
-    // everything, which no undo or redo gives back: cut everything, paste, undo and paste
-    // again, and the text came back inside the first paragraph's quotation. A phrase, one
-    // plain paragraph copied from the text or from a web page, goes into the paragraph as
-    // typing does, keeping its heading level, list, quotation or alignment: made plain
-    // first, a right-to-left scene came back left to right and a centred line uncentred.
-    // Only a whole text (a version put back) replaces a text as a phrase, when it is
-    // pasted over a selection that held the whole text.
-    let empty = if (replaces_text && whole_text) || !is_a_phrase(&fragment_data, &quoting) {
+    // Only a paste replacing the whole text replaces it: over a selection that held the whole
+    // text, or into the empty paragraph a removal of all of it left, which keeps the
+    // formatting of the first paragraph removed, not the pasted text's. And only a text
+    // replaces it: a whole text (a version put back), or a fragment with a structure of its
+    // own. A phrase, one plain paragraph copied from the text or from a web page, goes into
+    // the paragraph as typing does, keeping its heading level, list, quotation or alignment:
+    // made plain first, a right-to-left scene came back left to right and a centred line
+    // uncentred.
+    //
+    // The caller says which empty paragraph it is. Right after its cursor removed a selection
+    // holding the whole text, a whole text replaces it as a phrase too (see
+    // `replacing_the_text`). Into the paragraph a removal left, as it left it, whichever
+    // cursor removed the text and after an undo or a redo back to it, only a fragment of a
+    // structure of its own does (see `into_an_emptied_text`): cut everything, paste, undo and
+    // paste again, and the second paste went into the quotation the first paragraph cut stood
+    // in. An empty paragraph the writer formatted (a heading line, a list item, a quotation)
+    // and then pastes into keeps its formatting, as it does for typing, in an empty text as in
+    // a text holding other paragraphs: a scene opened with a quotation for an epigraph, then
+    // pasted into, is quoted.
+    let phrase = is_a_phrase(&fragment_data, &quoting);
+    let empty = if (replaces_text && (whole_text || !phrase)) || (into_an_emptied_text && !phrase) {
         empty_text_to_make_plain(&**uow, doc_id, dto.position)?
     } else {
         None
@@ -2796,13 +2886,16 @@ fn paste_fragment(
             },
         );
 
+        // The items the paste starts with run on in the list of the paragraph they follow
+        // or replace the head of (see `list_the_paste_runs_on_in`), unless the head opens a
+        // quotation of its own.
         let mut list_grouper = ListGrouper::new();
-        if !overwrite_head
-            && let Some(list_id) = current_block.list
-            && let Ok(Some(list_entity)) = uow.get_list(&list_id)
+        if (!overwrite_head || quoting.block_depth(0) == 0)
+            && let Some(list_entity) =
+                list_the_paste_runs_on_in(&**uow, &frame, &current_block, overwrite_head)?
         {
             list_grouper.register(
-                list_id,
+                list_entity.id,
                 list_entity.style.clone(),
                 list_entity.indent as u32,
             );
@@ -3150,14 +3243,24 @@ fn paste_fragment(
         let block_text_len = block_chars + inline_block_runs.object_count();
 
         let overwrite_head = text_before.is_empty();
+        // The list the item pasted runs on in, when it stays in the frame (see
+        // `list_the_paste_runs_on_in`).
+        let runs_on_in = if quoting.block_depth(0) == 0 {
+            list_the_paste_runs_on_in(&**uow, &frame, &current_block, overwrite_head)?
+        } else {
+            None
+        };
 
         if overwrite_head {
-            let list_id = if let Some(ref frag_list) = frag_block.list {
-                let list = frag_list.to_entity_starting_at(list_starts.get(0));
-                let created_list = uow.create_list(&list, doc_id, -1)?;
-                Some(created_list.id)
-            } else {
-                None
+            let list_id = match frag_block.list {
+                Some(ref frag_list) => Some(list_for_a_pasted_item(
+                    uow,
+                    doc_id,
+                    frag_list,
+                    runs_on_in.as_ref(),
+                    list_starts.get(0),
+                )?),
+                None => None,
             };
             let mut updated_current = current_block.clone();
             updated_current.list = list_id;
@@ -3322,12 +3425,15 @@ fn paste_fragment(
             let mut running_position =
                 current_block.document_position + block_char_length(&updated_current, &store) + 1;
 
-            let list_id = if let Some(ref frag_list) = frag_block.list {
-                let list = frag_list.to_entity_starting_at(list_starts.get(0));
-                let created_list = uow.create_list(&list, doc_id, -1)?;
-                Some(created_list.id)
-            } else {
-                None
+            let list_id = match frag_block.list {
+                Some(ref frag_list) => Some(list_for_a_pasted_item(
+                    uow,
+                    doc_id,
+                    frag_list,
+                    runs_on_in.as_ref(),
+                    list_starts.get(0),
+                )?),
+                None => None,
             };
 
             let new_block = Block {

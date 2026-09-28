@@ -677,3 +677,277 @@ fn a_copied_list_keeps_its_numbers() {
         .unwrap();
     assert_eq!(doc.to_djot().unwrap(), original, "put back as Markdown");
 }
+
+/// A list's start stays within what every format and every counter can hold: nine digits,
+/// the most a CommonMark list marker reads, which also fits the 32-bit counters of LaTeX
+/// and DOCX. The Djot and HTML readers took any start: a list starting at the largest
+/// 64-bit number overflowed the Djot writer's count at its second item, which aborts a save
+/// in a debug build and writes a wrong number in a release one, and a LaTeX export set a
+/// counter TeX refuses.
+#[test]
+fn a_list_start_stays_within_what_every_format_holds() {
+    let from_html = TextDocument::new();
+    from_html
+        .set_html("<ol start=\"9223372036854775807\"><li>a</li><li>b</li></ol>")
+        .unwrap()
+        .wait()
+        .unwrap();
+    for (name, doc) in [
+        (
+            "Djot",
+            djot("9223372036854775807. a\n9223372036854775807. b\n"),
+        ),
+        ("HTML", from_html),
+    ] {
+        let saved = doc.to_djot().unwrap();
+        assert_eq!(saved, "999999999. a\n\n1000000000. b", "{name}");
+        assert_eq!(djot(&saved).to_djot().unwrap(), saved, "{name} reloaded");
+        // An HTML list has no delimiter of its own.
+        assert_eq!(
+            first_marker(&doc).trim_end_matches('.'),
+            "999999999",
+            "{name}"
+        );
+        assert!(
+            doc.to_latex("article", false)
+                .unwrap()
+                .contains("\\setcounter{enumi}{999999998}"),
+            "{name}: {}",
+            doc.to_latex("article", false).unwrap()
+        );
+    }
+
+    // A copy of items numbered past the limit is pasted within it.
+    let doc = djot("999999999. a\n1000000000. b\n1000000001. c\n");
+    let text = doc.to_addressable_text().unwrap();
+    let at = |needle: &str| text[..text.find(needle).unwrap()].chars().count();
+    let cursor = doc.cursor();
+    cursor.set_position(at("c"), MoveMode::MoveAnchor);
+    cursor.set_position(at("c") + 1, MoveMode::KeepAnchor);
+    let copied = cursor.selection();
+    let other = djot("Other.\n");
+    other.cursor_at(6).insert_fragment(&copied).unwrap();
+    assert_eq!(other.to_djot().unwrap(), "Other.\n\n999999999. c");
+}
+
+/// A roman marker is written in digits past 3999, the largest number a numeral writes
+/// without a bar over it, as a letter marker is past z. A roman numeral grows by a letter for
+/// every thousand: a list starting at 999,999,999 made roman painted a marker of a million
+/// letters, rebuilt for each item on every snapshot.
+#[test]
+fn a_roman_marker_past_3999_is_written_in_digits() {
+    for (start, marker) in [
+        ("3999", "MMMCMXCIX."),
+        ("4000", "4000."),
+        ("999999999", "999999999."),
+    ] {
+        let doc = djot(&format!("{start}. a\n"));
+        let cursor = doc.cursor_at(0);
+        let list = cursor.current_list().unwrap();
+        cursor
+            .set_list_format(
+                list.id(),
+                &ListFormat {
+                    style: Some(ListStyle::UpperRoman),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(first_marker(&doc), marker, "a list starting at {start}");
+    }
+}
+
+/// An HTML list's `start` is read as a browser reads it: the digits after any white space
+/// and a sign, up to the first character that is not one. The whole value was parsed as a
+/// number, so a list a page showed from 5 was pasted numbered from 1.
+#[test]
+fn an_html_list_start_is_read_as_a_browser_reads_it() {
+    for (start, marker) in [
+        (" 5x", "5"),
+        ("+7", "7"),
+        ("12.5", "12"),
+        ("1e3", "1"),
+        ("-3", "1"),
+        ("x5", "1"),
+        ("", "1"),
+    ] {
+        let doc = TextDocument::new();
+        doc.set_html(&format!("<ol start=\"{start}\"><li>a</li></ol>"))
+            .unwrap()
+            .wait()
+            .unwrap();
+        assert_eq!(first_marker(&doc), marker, "<ol start={start:?}>");
+    }
+}
+
+/// Every item's marker in reading order, with its text.
+fn markers_in_order(doc: &TextDocument) -> Vec<String> {
+    doc.blocks()
+        .iter()
+        .map(|block| {
+            let marker = block
+                .list_item_index()
+                .zip(block.list())
+                .map(|(index, list)| list.item_marker(index))
+                .unwrap_or_default();
+            format!("{marker}{}", block.text())
+        })
+        .collect()
+}
+
+/// List items pasted into a list, or right after one of its items, join it: they are
+/// numbered on from the item before them, as a word processor numbers them, and as a save
+/// reads them back, since two lists of one kind side by side are one list in Djot and
+/// Markdown. Pasted into an empty item of the list, or at the start of one, they made a list
+/// of their own numbered as they were copied, so moving two items of a list starting at 3
+/// down by cut and paste showed 3, 4, 4, 5, and the next reload 3, 4, 5, 6.
+#[test]
+fn list_items_pasted_into_a_list_join_it() {
+    const TEXT: &str = "Intro.\n\n3. a\n4. b\n5. c\n6. d\n\nOutro.\n";
+    let at = |doc: &TextDocument, needle: &str| {
+        let text = doc.to_addressable_text().unwrap();
+        text[..text.find(needle).unwrap()].chars().count()
+    };
+    type Target = (
+        &'static str,
+        fn(&TextDocument, usize) -> text_document::TextCursor,
+    );
+    let targets: [Target; 4] = [
+        ("an empty item made after the last", |doc, d| {
+            let cursor = doc.cursor_at(d + 1);
+            cursor.insert_block().unwrap();
+            cursor
+        }),
+        ("the start of the last item", |doc, d| doc.cursor_at(d)),
+        ("the end of the last item", |doc, d| {
+            let cursor = doc.cursor_at(d + 1);
+            cursor.insert_block().unwrap();
+            cursor.insert_text("e").unwrap();
+            cursor.set_position(d + 1, text_document::MoveMode::MoveAnchor);
+            cursor
+        }),
+        ("the start of the paragraph after the list", |doc, d| {
+            doc.cursor_at(d + 2)
+        }),
+    ];
+    // Two items (b and c), and one whole item (c).
+    for (copy_name, from, to) in [("two items", "b", "d"), ("one item", "c", "d")] {
+        for (target_name, target) in targets {
+            let what = format!("{copy_name} cut and pasted into {target_name}");
+            let doc = djot(TEXT);
+            let cursor = doc.cursor();
+            cursor.set_position(at(&doc, from), MoveMode::MoveAnchor);
+            cursor.set_position(at(&doc, to), MoveMode::KeepAnchor);
+            let cut = cursor.selection();
+            cursor.remove_selected_text().unwrap();
+            let d = at(&doc, "d");
+            target(&doc, d).insert_fragment(&cut).unwrap();
+            let shown = markers_in_order(&doc);
+            let reloaded = markers_in_order(&djot(&doc.to_djot().unwrap()));
+            assert_eq!(
+                shown, reloaded,
+                "{what}: shown, and read back from its save"
+            );
+        }
+    }
+
+    // Items with a table after them, pasted into an empty item of the list: the paste
+    // splits the paragraph around the table, and every item it puts in joins the list.
+    let doc = djot("Intro.\n\n3. a\n4. b\n5. c\n\n| t |\n\nOutro.\n");
+    let cursor = doc.cursor();
+    cursor.set_position(at(&doc, "b"), MoveMode::MoveAnchor);
+    cursor.set_position(at(&doc, "Outro"), MoveMode::KeepAnchor);
+    let cut = cursor.selection();
+    cursor.remove_selected_text().unwrap();
+    let paste_at = doc.cursor_at(at(&doc, "a") + 1);
+    paste_at.insert_block().unwrap();
+    paste_at.insert_fragment(&cut).unwrap();
+    let shown = markers_in_order(&doc);
+    assert_eq!(
+        shown,
+        markers_in_order(&djot(&doc.to_djot().unwrap())),
+        "items and a table pasted into an empty item: shown, and read back from its save"
+    );
+    let items: Vec<&String> = shown
+        .iter()
+        .filter(|line| line.starts_with(|c: char| c.is_ascii_digit()))
+        .collect();
+    assert_eq!(items, ["3.a", "4.b", "5.c"], "{:?}", doc.to_djot().unwrap());
+}
+
+/// A run of a list resumed after a paragraph is written to ODT starting at the number its
+/// first item wears, as an editor shows it: every `<text:list>` of one list style starts at
+/// the style's start, so a list starting at 3, its second item taken out of it, read 3 and 3
+/// again in LibreOffice where the editor showed 3 and 4.
+#[test]
+fn a_resumed_run_of_a_list_keeps_its_number_in_odt() {
+    let doc = djot("3. a\n4. b\n5. c\n");
+    let text = doc.to_addressable_text().unwrap();
+    let b = text[..text.find('b').unwrap()].chars().count();
+    doc.cursor_at(b).remove_current_block_from_list().unwrap();
+    assert_eq!(markers_in_order(&doc), ["3.a", "b", "4.c"]);
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("list.odt");
+    doc.to_odt(path.to_str().unwrap()).unwrap().wait().unwrap();
+    let file = std::fs::File::open(&path).unwrap();
+    let mut archive = zip::ZipArchive::new(file).unwrap();
+    let mut content = String::new();
+    std::io::Read::read_to_string(&mut archive.by_name("content.xml").unwrap(), &mut content)
+        .unwrap();
+    let items: Vec<&str> = content
+        .match_indices("<text:list-item")
+        .map(|(at, _)| {
+            let end = content[at..]
+                .find('>')
+                .map_or(content.len(), |end| at + end + 1);
+            &content[at..end]
+        })
+        .collect();
+    assert_eq!(
+        items,
+        [
+            "<text:list-item>",
+            "<text:list-item text:start-value=\"4\">"
+        ],
+        "{content}"
+    );
+}
+
+/// A DOCX export gives each list a numbering of its own, under ids no other numbering of
+/// the file holds. docx-rs writes a default numbering with id 1 in front of those a document
+/// adds, and the first list's took id 1 too: two definitions under one id, the default's
+/// decimal numbering from 1 first, and which one Word or LibreOffice applies is the reader's
+/// guess. The first list of a text, starting at 3 or bulleted, could come out as 1., 2.
+#[test]
+fn every_list_s_numbering_has_an_id_of_its_own_in_docx() {
+    let doc = djot("- bullet\n\nText.\n\n3. three\n4. four\n");
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("lists.docx");
+    doc.to_docx(path.to_str().unwrap()).unwrap().wait().unwrap();
+    let file = std::fs::File::open(&path).unwrap();
+    let mut archive = zip::ZipArchive::new(file).unwrap();
+    let mut numbering = String::new();
+    std::io::Read::read_to_string(
+        &mut archive.by_name("word/numbering.xml").unwrap(),
+        &mut numbering,
+    )
+    .unwrap();
+    for element in ["<w:abstractNum w:abstractNumId=\"", "<w:num w:numId=\""] {
+        let mut ids: Vec<&str> = numbering
+            .match_indices(element)
+            .map(|(at, _)| {
+                let from = at + element.len();
+                &numbering[from..from + numbering[from..].find('"').unwrap_or(0)]
+            })
+            .collect();
+        let count = ids.len();
+        ids.sort_unstable();
+        ids.dedup();
+        assert_eq!(ids.len(), count, "{element}: {numbering}");
+    }
+    assert!(
+        numbering.contains("<w:start w:val=\"3\" />"),
+        "the numbered list starts at 3: {numbering}"
+    );
+}

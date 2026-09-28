@@ -167,6 +167,111 @@ pub(crate) struct TextDocumentInner {
     // Holds SubscriptionTokens for LongOperation event bridges. Dropping a
     // token unsubscribes the callback, so these must outlive the document.
     pub long_op_subscriptions: Vec<SubscriptionToken>,
+    /// The empty paragraph the last removal of all of the main text left, as it looked then
+    /// (see [`EmptiedText`]). A text of its own structure pasted into the main text while it
+    /// is that paragraph, looking the same, replaces it, by whichever cursor and after
+    /// whatever brought the text back to it.
+    pub emptied_text: Option<EmptiedText>,
+}
+
+/// The one empty paragraph the main text is: the block, the list it is an item of and the
+/// frames under the main frame, each without what names or dates it, as a removal of all of
+/// the text left them.
+///
+/// That paragraph keeps the formatting of the first paragraph removed, which is not the
+/// text a paste of what was cut brings back: a text of its own structure pasted into it
+/// replaces it (see `TextCursor::insert_fragment_with_origin`). The cursor that removed the
+/// text says so until the next edit, and nothing says so after an undo or a redo back to the
+/// empty paragraph: cut everything, paste, undo and paste again, and a scene opening with an
+/// epigraph came back quoted from end to end. The paragraph as it looked is kept here
+/// instead, beside the document: an undo gives the same paragraph back, looking the same,
+/// while a heading, a list item or a quotation the writer makes of it, or another text
+/// loaded, looks otherwise, and a paste goes into it as into any formatted line.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct EmptiedText {
+    block_id: EntityId,
+    block: common::entities::Block,
+    list: Option<common::entities::List>,
+    frames: Vec<common::entities::Frame>,
+}
+
+impl EmptiedText {
+    /// The main text as `store` holds it, when it is one paragraph holding nothing: no
+    /// character, no image, no second paragraph and no table.
+    pub(crate) fn of(store: &common::database::Store) -> Option<Self> {
+        use common::entities::{Block, Frame, List};
+        let main_frame = store
+            .documents
+            .read()
+            .values()
+            .next()
+            .and_then(|document| document.frames.first().copied())?;
+        let frames = store.frames.read();
+        // The frames under the main frame in reading order, and the one block they hold.
+        let mut sub_frames: Vec<Frame> = Vec::new();
+        let mut only_block: Option<EntityId> = None;
+        let mut pending: Vec<EntityId> = vec![main_frame];
+        let mut seen: std::collections::HashSet<EntityId> = std::collections::HashSet::new();
+        while let Some(frame_id) = pending.pop() {
+            if !seen.insert(frame_id) {
+                return None;
+            }
+            let frame = frames.get(&frame_id)?;
+            if frame.table.is_some() || frame.footnote_label.is_some() {
+                return None;
+            }
+            if frame_id != main_frame {
+                sub_frames.push(Frame {
+                    id: 0,
+                    created_at: Default::default(),
+                    updated_at: Default::default(),
+                    parent_frame: None,
+                    blocks: Vec::new(),
+                    child_order: Vec::new(),
+                    byte_range: (0, 0),
+                    ..frame.clone()
+                });
+            }
+            // In reverse, so that the first sub-frame is looked at first.
+            for entry in frame.child_order.iter().rev() {
+                if *entry > 0 {
+                    if only_block.is_some() {
+                        return None;
+                    }
+                    only_block = Some(*entry as EntityId);
+                } else if *entry < 0 {
+                    pending.push(entry.unsigned_abs() as EntityId);
+                }
+            }
+        }
+        drop(frames);
+        let block_id = only_block?;
+        let block = store.blocks.read().get(&block_id)?.clone();
+        if common::database::rope_helpers::block_char_length(&block, store) != 0 {
+            return None;
+        }
+        let list = block.list.and_then(|list_id| {
+            store.lists.read().get(&list_id).map(|list| List {
+                id: 0,
+                created_at: Default::default(),
+                updated_at: Default::default(),
+                ..list.clone()
+            })
+        });
+        Some(EmptiedText {
+            block_id,
+            block: Block {
+                id: 0,
+                created_at: Default::default(),
+                updated_at: Default::default(),
+                document_position: 0,
+                list: None,
+                ..block
+            },
+            list,
+            frames: sub_frames,
+        })
+    }
 }
 
 impl TextDocumentInner {
@@ -223,9 +328,20 @@ impl TextDocumentInner {
                 self.content_revision = self.content_revision.wrapping_add(1);
             }
             DocumentEvent::UndoRedoChanged { .. } => self.end_whole_text_selections(),
+            // A text loaded in place is not the one a removal emptied, however alike its
+            // empty paragraph looks.
+            DocumentEvent::DocumentReset => self.emptied_text = None,
             _ => {}
         }
         self.pending_events.push(event);
+    }
+
+    /// Whether the main text is the empty paragraph the last removal of all of it left,
+    /// looking as it did then (see [`EmptiedText`]).
+    pub(crate) fn is_the_emptied_text(&self) -> bool {
+        self.emptied_text.as_ref().is_some_and(|emptied| {
+            EmptiedText::of(self.ctx.db_context.get_store()).as_ref() == Some(emptied)
+        })
     }
 
     /// End every cursor's whole-text selection (see [`CursorData::whole_text_selected`]).
@@ -536,6 +652,7 @@ impl TextDocumentInner {
             backend: None,
             own_operations: std::collections::HashSet::new(),
             history_resets: HashMap::new(),
+            emptied_text: None,
         })
     }
 }
@@ -637,9 +754,9 @@ pub(crate) fn adjust_offset(offset: usize, edit_pos: usize, removed: usize, adde
 /// maintained by the editing use cases and is the authoritative source.
 pub(crate) fn refresh_block_positions(
     dtos: &mut [frontend::block::dtos::BlockDto],
-    store: &frontend::common::database::Store,
+    store: &common::database::Store,
 ) {
-    frontend::common::database::rope_helpers::refresh_positions_from_rope(
+    common::database::rope_helpers::refresh_positions_from_rope(
         store,
         dtos.iter_mut()
             .map(|dto| (dto.id, &mut dto.document_position)),
@@ -673,11 +790,8 @@ pub(crate) fn block_at_caret_dto(
         )
     };
     let store = ctx.db_context.get_store();
-    let past_anchor = frontend::common::database::rope_helpers::snap_off_table_anchor(
-        store,
-        position as i64,
-        true,
-    );
+    let past_anchor =
+        common::database::rope_helpers::snap_off_table_anchor(store, position as i64, true);
     if past_anchor != position as i64 {
         return Ok(at(past_anchor.max(0) as usize)?);
     }
@@ -691,7 +805,7 @@ pub(crate) fn block_at_caret_dto(
 /// Like [`refresh_block_positions`] but for a single DTO.
 pub(crate) fn refresh_block_position(
     dto: &mut frontend::block::dtos::BlockDto,
-    store: &frontend::common::database::Store,
+    store: &common::database::Store,
 ) {
     refresh_block_positions(std::slice::from_mut(dto), store);
 }

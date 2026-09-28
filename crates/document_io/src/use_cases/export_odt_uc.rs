@@ -217,6 +217,10 @@ struct WalkCtx<'a> {
     inside_note_body: bool,
     image_hrefs: &'a BTreeMap<String, String>,
     images: &'a ExportImages,
+    /// The number each list item wears (see [`crate::list_numbers::ListNumbers`]), for a
+    /// run of a list resumed after a table or a paragraph: its `<text:list>` restarts at the
+    /// list style's start otherwise.
+    list_numbers: &'a crate::list_numbers::ListNumbers,
     /// `draw:name` must be unique per frame in the document; the image's own `src` is not
     /// (the same picture can be embedded twice). A shared counter, not a map, because the
     /// value only needs to be unique, never looked up again.
@@ -998,6 +1002,7 @@ impl ExportOdtUseCase {
         // pre-rendered before the main walk even starts, over content
         // `to_addressable_text` never descends into, so a `DocumentComment`'s character offset
         // can never legitimately resolve inside one — see this module's own doc comment.
+        let list_numbers = crate::list_numbers::ListNumbers::new(&uow.store());
         let note_bodies: NoteBodies = {
             let mut built: NoteBodies = HashMap::new();
             for (_, label, frame_id) in notes.in_print_order() {
@@ -1012,6 +1017,7 @@ impl ExportOdtUseCase {
                     inside_note_body: true,
                     image_hrefs: &image_hrefs,
                     images: &self.dto.options.images,
+                    list_numbers: &list_numbers,
                     image_seq: Cell::new(0),
                 };
                 let mut body = String::new();
@@ -1041,6 +1047,7 @@ impl ExportOdtUseCase {
             inside_note_body: false,
             image_hrefs: &image_hrefs,
             images: &self.dto.options.images,
+            list_numbers: &list_numbers,
             image_seq: Cell::new(0),
         };
 
@@ -1274,8 +1281,9 @@ impl ExportOdtUseCase {
                 depth,
                 style_name,
                 inner,
+                restart_at,
             } => {
-                list_stack.push(out, list_id, depth, style_name, inner);
+                list_stack.push(out, list_id, depth, style_name, inner, restart_at);
             }
         }
         *counter += 1;
@@ -1441,11 +1449,28 @@ impl ExportOdtUseCase {
                     .map(|(state, window)| (*state, window)),
             );
             let item_body = format!("<text:p text:style-name=\"{para_style}\">{inner}</text:p>");
+            // The number the item wears, when a list opening with it would not show it: a run
+            // of the list resumed after a table or a paragraph (see `ListStack::push`).
+            let restart_at = ctx
+                .list_numbers
+                .of(block.id)
+                .filter(|number| *number != list_entity.start.unwrap_or(1))
+                .filter(|_| {
+                    matches!(
+                        list_entity.style,
+                        ListStyle::Decimal
+                            | ListStyle::LowerAlpha
+                            | ListStyle::UpperAlpha
+                            | ListStyle::LowerRoman
+                            | ListStyle::UpperRoman
+                    )
+                });
             return Ok(RenderedBlock::ListItem {
                 list_id: *list_id,
                 depth,
                 style_name: list_style_name,
                 inner: item_body,
+                restart_at,
             });
         }
 
@@ -1729,6 +1754,9 @@ enum RenderedBlock {
         depth: i64,
         style_name: String,
         inner: String,
+        /// The number the item wears when it is not the one a `<text:list>` opening with it
+        /// would show: the list's style starts every `<text:list>` of the list at its start.
+        restart_at: Option<i64>,
     },
 }
 
@@ -1888,11 +1916,29 @@ struct ListFrame {
     style_name: String,
     /// Already-closed `<text:list-item>…</text:list-item>` strings, in order.
     finished_items: Vec<String>,
+    /// The number the list's first item wears, when the list's style would number it
+    /// otherwise (see `RenderedBlock::ListItem::restart_at`).
+    restart_at: Option<i64>,
     /// The inner XML of the item currently being built. A deeper sub-list appends into this
     /// (via `ListStack::close_last`) *before* the item is finalized, which is what keeps a
     /// sub-list nested inside its parent item rather than becoming the parent's sibling.
     current_item_inner: String,
     has_open_item: bool,
+}
+
+impl ListFrame {
+    /// Close an item holding `inner`: the list's first says where the list restarts, when
+    /// it does (see `restart_at`).
+    fn finish_item(&mut self, inner: String) {
+        let restart = match self.restart_at {
+            Some(number) if self.finished_items.is_empty() => {
+                format!(" text:start-value=\"{number}\"")
+            }
+            _ => String::new(),
+        };
+        self.finished_items
+            .push(format!("<text:list-item{restart}>{inner}</text:list-item>"));
+    }
 }
 
 /// Turns a flat sequence of `(List entity, indent)`-tagged blocks into a properly nested
@@ -1909,6 +1955,11 @@ impl ListStack {
     /// closing (deeper frames, and a same-depth-but-different-list frame) and opens a new one.
     /// `item_body` is that item's own rendered content (a `<text:p>` or `<text:h>` — ODF permits
     /// either directly inside a `<text:list-item>`).
+    ///
+    /// A list opening with an item that wears another number than the list style's start (a
+    /// run of the list resumed after a table or a paragraph) says so on that item with
+    /// `text:start-value`: every `<text:list>` of one style starts at the style's start, so a
+    /// list starting at 3 and resumed after a table as 5 and 6 read 3 and 4 again.
     fn push(
         &mut self,
         out: &mut String,
@@ -1916,6 +1967,7 @@ impl ListStack {
         depth: i64,
         style_name: String,
         item_body: String,
+        restart_at: Option<i64>,
     ) {
         while self.frames.last().is_some_and(|f| f.depth > depth) {
             self.close_last(out);
@@ -1933,6 +1985,7 @@ impl ListStack {
                 depth,
                 style_name,
                 finished_items: Vec::new(),
+                restart_at,
                 current_item_inner: String::new(),
                 has_open_item: false,
             });
@@ -1943,8 +1996,7 @@ impl ListStack {
         if let Some(f) = self.frames.last_mut() {
             if continues && f.has_open_item {
                 let inner = std::mem::take(&mut f.current_item_inner);
-                f.finished_items
-                    .push(format!("<text:list-item>{inner}</text:list-item>"));
+                f.finish_item(inner);
             }
             f.current_item_inner.push_str(&item_body);
             f.has_open_item = true;
@@ -1961,9 +2013,7 @@ impl ListStack {
         };
         if frame.has_open_item {
             let inner = std::mem::take(&mut frame.current_item_inner);
-            frame
-                .finished_items
-                .push(format!("<text:list-item>{inner}</text:list-item>"));
+            frame.finish_item(inner);
         }
         let list_xml = format!(
             "<text:list text:style-name=\"{}\">{}</text:list>",

@@ -424,7 +424,7 @@ impl ExportMarkdownUseCase {
                     // CommonMark reads from that item, up to nine digits: written from 1, a
                     // list starting at 3 was read back as starting at 1.
                     let counter = match same_level {
-                        Some(open) if open.list_id == *list_id => open.counter + 1,
+                        Some(open) if open.list_id == *list_id => open.counter.saturating_add(1),
                         _ => self
                             .list_numbers
                             .of(block.id)

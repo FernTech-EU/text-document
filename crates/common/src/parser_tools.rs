@@ -10,6 +10,7 @@ pub mod image_options;
 pub mod latex_options;
 pub mod list_depth;
 pub mod list_grouper;
+pub mod list_start;
 pub mod mark_options;
 pub mod odt_options;
 pub mod pdf_options;

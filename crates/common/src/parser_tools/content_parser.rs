@@ -1522,6 +1522,33 @@ const HTML_READER_STACK: usize = 2 << 20;
 /// what a debug build spends on one.
 const HTML_STACK_PER_LEVEL: usize = 16 << 10;
 
+/// `value` read as HTML reads an integer attribute such as `<ol start>`: after any leading
+/// white space, an optional sign and the digits up to the first character that is not one.
+/// `None` when no digit follows. A number past what 64 bits hold reads as the largest they
+/// hold on its side of 0. A browser numbers `<ol start="5x">` from 5, where a strict parse
+/// of the whole value numbered it from 1.
+fn html_integer(value: &str) -> Option<i64> {
+    let value = value.trim_start_matches(|c: char| c.is_ascii_whitespace());
+    let (negative, digits) = match value.as_bytes().first() {
+        Some(b'-') => (true, &value[1..]),
+        Some(b'+') => (false, &value[1..]),
+        _ => (false, value),
+    };
+    let digits: &str = digits
+        .split(|c: char| !c.is_ascii_digit())
+        .next()
+        .unwrap_or("");
+    if digits.is_empty() {
+        return None;
+    }
+    let magnitude = digits.bytes().fold(0i64, |number, digit| {
+        number
+            .saturating_mul(10)
+            .saturating_add(i64::from(digit - b'0'))
+    });
+    Some(if negative { -magnitude } else { magnitude })
+}
+
 /// How many elements deep the deepest node of `tree` is. A loop over the tree's edges,
 /// never a recursion.
 fn html_tree_depth(tree: &ego_tree::Tree<Node>) -> usize {
@@ -1976,11 +2003,12 @@ fn read_html_tree(fragment: &scraper::Html, depth_limit: usize) -> Vec<ParsedEle
                     }
                     "ol" => {
                         // A list numbered from below 0 is kept from 1: no saved syntax
-                        // but HTML writes one.
+                        // but HTML writes one. A start past what every format holds is
+                        // read as the largest it holds (see `list_start`).
                         let start = el
                             .attr("start")
-                            .and_then(|start| start.trim().parse::<i64>().ok())
-                            .filter(|start| *start >= 0 && *start != 1);
+                            .and_then(html_integer)
+                            .and_then(crate::parser_tools::list_start::list_start);
                         new_list = (Some(ListStyle::Decimal), start);
                         new_list_depth = list_depth + 1;
                     }
@@ -2797,10 +2825,10 @@ fn block_attrs_to_style(attrs: &jotdown::Attributes, opts: &DjotImportOptions) -
 }
 
 /// The start a list keeps on its entity, from the number its first item is written with:
-/// `None` for 1, which every list starts at unless it says otherwise, and for a number past
-/// what the model holds.
+/// `None` for 1, which every list starts at unless it says otherwise, and a number past what
+/// every format holds read as the largest it holds (see `list_start`).
 fn list_start_of(start: u64) -> Option<i64> {
-    i64::try_from(start).ok().filter(|start| *start != 1)
+    crate::parser_tools::list_start::list_start_from_unsigned(start)
 }
 
 /// Push a finished block into `elements`, applying the djot block-level fields

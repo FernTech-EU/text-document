@@ -2530,10 +2530,9 @@ fn pasting_into_an_empty_formatted_line_keeps_its_format() {
 /// A cut of all of a text leaves its cursor standing for the whole of the empty text, so the
 /// paste that follows gives the text back as it was. Any edit made between the two ends
 /// that: a heading, a list item or a quotation the writer makes of the emptied line, by this
-/// cursor or another, or a text a load puts in, leaves the paste doing what it does in any
-/// text that is one empty formatted line: a phrase goes into the line and keeps its
-/// format, and a text of its own structure replaces it. The mark outlived every edit that
-/// moved no text, so the two differed.
+/// cursor or another, or a text a load puts in, is the line the paste goes into, as it is
+/// for a paste into any empty line the writer formatted. The mark outlived every edit that
+/// moved no text, and the paste took off the formatting the writer had just given the line.
 #[test]
 fn an_edit_after_a_cut_of_everything_is_kept_by_the_paste() {
     type Edit = fn(&TextDocument, &text_document::TextCursor);
@@ -2592,8 +2591,8 @@ fn an_edit_after_a_cut_of_everything_is_kept_by_the_paste() {
 /// went into the line the undo leaves, which keeps the formatting and the quotation of the
 /// first paragraph cut, and a scene opening with an epigraph came back quoted from end to
 /// end: the mark saying that line stands for the whole text was the cursor's, and ended with
-/// the first paste, where no undo or redo gives it back. A text pasted into a text that is
-/// one empty paragraph now keeps its own formatting whatever made the text empty.
+/// the first paste, where no undo or redo gives it back. The document now keeps that line as
+/// the cut left it, and a paste into the same line, looking the same, replaces the text.
 #[test]
 fn pasting_again_after_undoing_the_paste_of_a_cut_of_everything_changes_nothing() {
     let text = "> {semantic_role=epigraph}\n> The sea.\n\n# Title\n\nAlpha.\n";
@@ -2626,43 +2625,22 @@ fn pasting_again_after_undoing_the_paste_of_a_cut_of_everything_changes_nothing(
     );
 }
 
-/// A text of its own structure pasted into a text that is one empty paragraph keeps its own
-/// formatting, whatever made the text empty: a new document whose line the writer made a
-/// heading or a quotation, a removal of everything by another cursor than the one pasting,
-/// an undo back to an empty text. A phrase goes into the paragraph and keeps its format, as
-/// typing does. The text's first paragraph went into the empty line's heading, and all of
-/// it into the empty line's quotation, unless the cursor pasting had just cut everything.
+/// A text of its own structure pasted into a text a removal of everything left empty keeps
+/// its own formatting, whoever removed it and however the text came back to that empty
+/// paragraph: a removal by another cursor than the one pasting, or an undo back to it. The
+/// paragraph the removal leaves keeps the first removed paragraph's formatting, which is not
+/// the pasted text's. A phrase goes into the paragraph and keeps its format, as typing does.
+/// All of the text went into the empty line's quotation unless the cursor pasting had just
+/// cut everything: cut everything, paste, undo and paste again, and a scene opening with an
+/// epigraph came back quoted from end to end.
 #[test]
-fn a_text_pasted_into_an_empty_text_keeps_its_formatting_however_it_came_to_be_empty() {
+fn a_text_pasted_into_a_text_a_removal_emptied_keeps_its_formatting() {
     let text = load("Plain.\n\n> Quoted.\n");
     let copied = select(&text, 0, length(&text)).selection();
     let expected = text.to_djot().unwrap();
     /// What emptied the text, how to make that text, and the format its empty line keeps.
     type Emptied = (&'static str, fn() -> TextDocument, &'static str);
-    let emptied: [Emptied; 4] = [
-        (
-            "a new document with a heading line",
-            || {
-                let doc = TextDocument::new();
-                doc.cursor()
-                    .set_block_format(&text_document::BlockFormat {
-                        heading_level: Some(2),
-                        ..Default::default()
-                    })
-                    .unwrap();
-                doc
-            },
-            "## ",
-        ),
-        (
-            "a new document with a quotation line",
-            || {
-                let doc = TextDocument::new();
-                doc.cursor().insert_blockquote().unwrap();
-                doc
-            },
-            "> ",
-        ),
+    let emptied: [Emptied; 3] = [
         (
             "a text emptied by another cursor",
             || {
@@ -2687,6 +2665,20 @@ fn a_text_pasted_into_an_empty_text_keeps_its_formatting_however_it_came_to_be_e
             },
             "> ",
         ),
+        (
+            "a text emptied, typed into and emptied again by Backspace",
+            || {
+                let doc = load("> Title\n\nText.\n");
+                select(&doc, 0, length(&doc))
+                    .remove_selected_text()
+                    .unwrap();
+                let cursor = doc.cursor();
+                cursor.insert_text("x").unwrap();
+                cursor.delete_previous_char().unwrap();
+                doc
+            },
+            "> ",
+        ),
     ];
     for (name, make, format) in emptied {
         let doc = make();
@@ -2698,13 +2690,20 @@ fn a_text_pasted_into_an_empty_text_keeps_its_formatting_however_it_came_to_be_e
             "a text pasted into {name}"
         );
 
-        let doc = make();
-        doc.cursor().insert_djot("Phrase").unwrap();
-        assert_eq!(
-            doc.to_djot().unwrap(),
-            format!("{format}Phrase"),
-            "a phrase pasted into {name}"
-        );
+        type Insert = fn(&text_document::TextCursor) -> text_document::Result<()>;
+        let inserts: [(&str, Insert); 2] = [
+            ("HTML", |cursor| cursor.insert_html("<span>Phrase</span>")),
+            ("Djot", |cursor| cursor.insert_djot("Phrase")),
+        ];
+        for (syntax, insert) in inserts {
+            let doc = make();
+            insert(&doc.cursor()).unwrap();
+            assert_eq!(
+                doc.to_djot().unwrap(),
+                format!("{format}Phrase"),
+                "a phrase pasted as {syntax} into {name}"
+            );
+        }
 
         let doc = make();
         doc.cursor().insert_text("Typed").unwrap();
@@ -2713,6 +2712,86 @@ fn a_text_pasted_into_an_empty_text_keeps_its_formatting_however_it_came_to_be_e
             format!("{format}Typed"),
             "typing into {name}"
         );
+    }
+}
+
+/// A heading, a quotation or a list item the writer makes of the empty line of an empty
+/// text is the line a paste goes into, as it is in a text holding other paragraphs: a scene
+/// opened with a quotation for an epigraph, then pasted into, is quoted. A paste into an
+/// empty text made every text of its own structure plain first, whatever gave the line its
+/// format: the epigraph pasted from a web page came in unquoted, a list pasted into a new
+/// note's first item came in as plain paragraphs, and the same paste after a first
+/// paragraph kept them.
+#[test]
+fn a_line_the_writer_formatted_in_an_empty_text_is_kept_by_a_paste() {
+    type Format = (&'static str, fn(&text_document::TextCursor));
+    let formats: [Format; 3] = [
+        ("a quotation", |cursor| {
+            cursor.insert_blockquote().unwrap();
+        }),
+        ("a heading", |cursor| {
+            cursor
+                .set_block_format(&text_document::BlockFormat {
+                    heading_level: Some(2),
+                    ..Default::default()
+                })
+                .unwrap();
+        }),
+        ("a numbered list item", |cursor| {
+            cursor
+                .create_list(text_document::ListStyle::Decimal)
+                .unwrap();
+        }),
+    ];
+    let source = load("First line.\n\nSecond line.\n");
+    let fragments = [
+        (
+            "two paragraphs copied",
+            select(&source, 0, length(&source)).selection(),
+        ),
+        (
+            "two paragraphs pasted as HTML",
+            DocumentFragment::from_html("<p>First line.</p><p>Second line.</p>"),
+        ),
+        (
+            "two lines of plain text",
+            DocumentFragment::from_plain_text("First line.\nSecond line."),
+        ),
+    ];
+    for (format_name, format) in formats {
+        for (fragment_name, fragment) in &fragments {
+            // The same line after a first paragraph, and the paste into it.
+            let after_intro = load("Intro.\n");
+            let cursor = after_intro.cursor_at(6);
+            cursor.insert_block().unwrap();
+            format(&cursor);
+            cursor.insert_fragment(fragment).unwrap();
+            let expected = after_intro.to_djot().unwrap();
+            let expected = expected
+                .strip_prefix("Intro.\n\n")
+                .unwrap_or(&expected)
+                .to_string();
+
+            let what =
+                format!("{fragment_name} pasted into {format_name} made of a new text's line");
+            let doc = TextDocument::new();
+            let cursor = doc.cursor();
+            format(&cursor);
+            cursor.insert_fragment(fragment).unwrap();
+            assert_model(&doc, &what);
+            assert_eq!(doc.to_djot().unwrap(), expected, "{what}");
+
+            let what = format!(
+                "{fragment_name} pasted into {format_name} made of the line a cut of everything left"
+            );
+            let doc = load("Alpha.\n\nBeta.\n");
+            let cursor = select(&doc, 0, length(&doc));
+            cursor.remove_selected_text().unwrap();
+            format(&cursor);
+            cursor.insert_fragment(fragment).unwrap();
+            assert_model(&doc, &what);
+            assert_eq!(doc.to_djot().unwrap(), expected, "{what}");
+        }
     }
 }
 

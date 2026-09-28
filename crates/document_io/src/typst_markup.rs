@@ -327,10 +327,14 @@ impl TypstNotes {
 /// `render_blocks_html`'s own precedent (its list/code branches carry no `style_attr` either):
 /// only the "normal block" (heading/paragraph) branch does.
 ///
+/// `numbers` holds the number each list item wears (see `ListNumbers`), which a run of an
+/// ordered list starts at.
+///
 /// `contained` says whether the blocks are written inside a container, which decides how
 /// a page break is written (see [`page_break_in`]).
 pub fn render_blocks_typst(
     store: &Store,
+    numbers: &crate::list_numbers::ListNumbers,
     blocks: &[Block],
     options: &PdfExportOptions,
     notes: &TypstNotes,
@@ -406,10 +410,14 @@ pub fn render_blocks_typst(
             }
 
             let call = if is_ordered {
-                // Where the list starts, when it is not 1.
-                let start = list_entity
-                    .start
-                    .filter(|start| *start >= 0)
+                // Where the run starts, when it is not 1: the number its first item wears
+                // (see `ListNumbers`), the list's start or, for a run of the list resumed
+                // after a table or a paragraph, the number the editor shows there, where the
+                // run started from the list's start again.
+                let start = numbers
+                    .of(block.id)
+                    .or(list_entity.start)
+                    .filter(|start| *start >= 0 && *start != 1)
                     .map_or_else(String::new, |start| format!(", start: {start}"));
                 format!(
                     "#enum(numbering: \"{}\"{start})",

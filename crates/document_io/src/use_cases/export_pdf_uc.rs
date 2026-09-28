@@ -49,6 +49,10 @@ pub trait ExportPdfUnitOfWorkTrait: QueryUnitOfWork + Send + Sync {}
 pub struct ExportPdfUseCase {
     uow_factory: Box<dyn ExportPdfUnitOfWorkFactoryTrait>,
     dto: ExportPdfDto,
+    /// The number each list item wears, read at the top of `build_markup` for every run of
+    /// blocks the walk writes (see [`crate::list_numbers::ListNumbers`]). `RefCell` because
+    /// the walk only holds `&self`, as `ExportLatexUseCase::footnoted_labels` does.
+    list_numbers: std::cell::RefCell<crate::list_numbers::ListNumbers>,
 }
 
 impl ExportPdfUseCase {
@@ -56,6 +60,7 @@ impl ExportPdfUseCase {
         ExportPdfUseCase {
             uow_factory,
             dto: dto.clone(),
+            list_numbers: std::cell::RefCell::default(),
         }
     }
 }
@@ -209,6 +214,7 @@ impl ExportPdfUseCase {
         let mut body_parts: Vec<String> = Vec::new();
 
         let notes = crate::footnotes::Footnotes::build(&uow.store());
+        *self.list_numbers.borrow_mut() = crate::list_numbers::ListNumbers::new(&uow.store());
 
         // Each note's body as Typst markup, rendered before the prose that
         // cites it — `#footnote[…]` takes its text at the reference. Built with
@@ -236,6 +242,7 @@ impl ExportPdfUseCase {
                 }
                 let body = crate::typst_markup::render_blocks_typst(
                     &uow.store(),
+                    &self.list_numbers.borrow(),
                     &blocks,
                     &self.dto.options,
                     &empty,
@@ -358,6 +365,7 @@ impl ExportPdfUseCase {
 
         let typst = render_blocks_typst(
             &uow.store(),
+            &self.list_numbers.borrow(),
             &blocks,
             &self.dto.options,
             notes,
@@ -402,9 +410,17 @@ impl ExportPdfUseCase {
         }
         let attribution_block = blocks.pop().expect("checked non-empty above");
         // Both are written inside the epigraph's quotation.
-        let body = render_blocks_typst(&uow.store(), &blocks, &self.dto.options, notes, true);
+        let body = render_blocks_typst(
+            &uow.store(),
+            &self.list_numbers.borrow(),
+            &blocks,
+            &self.dto.options,
+            notes,
+            true,
+        );
         let attribution = render_blocks_typst(
             &uow.store(),
+            &self.list_numbers.borrow(),
             std::slice::from_ref(&attribution_block),
             &self.dto.options,
             notes,
@@ -443,6 +459,7 @@ impl ExportPdfUseCase {
                 if !pending_blocks.is_empty() {
                     let typst = render_blocks_typst(
                         &uow.store(),
+                        &self.list_numbers.borrow(),
                         &pending_blocks,
                         &self.dto.options,
                         notes,
@@ -535,6 +552,7 @@ impl ExportPdfUseCase {
         if !pending_blocks.is_empty() {
             let typst = render_blocks_typst(
                 &uow.store(),
+                &self.list_numbers.borrow(),
                 &pending_blocks,
                 &self.dto.options,
                 notes,
@@ -645,6 +663,63 @@ mod tests {
             .expect("build_markup");
         uow.end_transaction().expect("end_transaction");
         markup
+    }
+
+    /// A run of a list resumed after a paragraph starts at the number its first item wears,
+    /// as an editor shows it and every other writer writes it: the list's items are numbered
+    /// on across whatever separates them. Every run started from the list's start: a list
+    /// starting at 3, with its second item taken out of it, read 3, then 3 again.
+    #[test]
+    fn a_resumed_run_of_a_list_starts_at_the_number_it_wears() {
+        let (db, ev, _) = test_harness::setup().expect("setup");
+        document_io_controller::import_djot_sync(
+            &db,
+            &ev,
+            &ImportDjotDto {
+                djot_text: "3. a\n4. b\n5. c\n".to_string(),
+                options: Default::default(),
+            },
+        )
+        .expect("import_djot_sync");
+        // Item `b` taken out of the list, as an editor does it, which a load cannot do.
+        {
+            let store = db.get_store();
+            let mut blocks = store.blocks.write();
+            let mut listed: Vec<EntityId> = blocks
+                .values()
+                .filter(|block| block.list.is_some())
+                .map(|block| block.id)
+                .collect();
+            listed.sort_unstable();
+            if let Some(second) = listed.get(1)
+                && let Some(block) = blocks.get_mut(second)
+            {
+                block.list = None;
+            }
+        }
+        let dto = ExportPdfDto {
+            output_path: String::new(),
+            options: PdfExportOptions::default(),
+        };
+        let uc = ExportPdfUseCase::new(Box::new(ExportPdfUnitOfWorkFactory::new(&db)), &dto);
+        let uow = uc.uow_factory.create();
+        uow.begin_transaction().expect("begin_transaction");
+        let markup = uc
+            .build_markup(&*uow, &|_progress| {}, None)
+            .expect("build_markup");
+        uow.end_transaction().expect("end_transaction");
+        let starts: Vec<&str> = markup
+            .match_indices("#enum(")
+            .map(|(at, _)| &markup[at..markup[at..].find(')').map_or(markup.len(), |end| at + end)])
+            .collect();
+        assert_eq!(
+            starts,
+            [
+                "#enum(numbering: \"1.\", start: 3",
+                "#enum(numbering: \"1.\", start: 4"
+            ],
+            "{markup}"
+        );
     }
 
     /// Citing the same label twice must define exactly ONE `#footnote[…]`, carrying the note's

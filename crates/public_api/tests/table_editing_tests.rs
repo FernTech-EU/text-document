@@ -2284,3 +2284,149 @@ fn merging_cells_keeps_the_text_of_every_cell() {
         assert_eq!(doc.to_djot().unwrap(), loaded(text).to_djot().unwrap());
     }
 }
+
+/// What an editor's drag of a selection to a drop point in the same text does, as teksilo's
+/// rich-text editor does it: the selection's ends taken as the range `(lo, hi)`, the
+/// selection copied, then selected again by those two numbers and removed, and the copy
+/// inserted where the drop point stands once the removal is done, which the editor takes to
+/// be `hi - lo` positions back when the drop point was after the selection.
+fn drag_as_an_editor_does(cursor: &text_document::TextCursor, drop_at: usize) {
+    let (a, b) = (cursor.anchor(), cursor.position());
+    let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
+    let fragment = cursor.selection();
+    if (lo..=hi).contains(&drop_at) {
+        return;
+    }
+    cursor.set_position(lo, MoveMode::MoveAnchor);
+    cursor.set_position(hi, MoveMode::KeepAnchor);
+    cursor.remove_selected_text().unwrap();
+    let target = if drop_at > hi {
+        drop_at - (hi - lo)
+    } else {
+        drop_at
+    };
+    cursor.set_position(target, MoveMode::MoveAnchor);
+    cursor.insert_fragment(&fragment).unwrap();
+}
+
+/// A selection dragged into a table from the text beside it holds the table whole and ends
+/// at the table's edge, so the positions it spans are the positions its removal takes: an
+/// editor dragging it elsewhere by its two ends, and putting it back where the drop point
+/// stands once as many positions went, puts it where the writer dropped it. A selection
+/// entering a table from the paragraph before it ended at the start of the paragraph after
+/// it, one position its removal leaves, as the two paragraphs are not joined: the text went
+/// in one character before the drop point, splitting the word it was dropped after and
+/// leaving the full stop at the end of the text in a paragraph of its own.
+#[test]
+fn a_selection_dragged_over_a_table_goes_where_it_is_dropped() {
+    for text in [
+        "Before.\n\n| a1 | b1 |\n| c1 | d1 |\n\nAfter.\n\nLast words.\n",
+        "Before.\n\n> | a1 | b1 |\n> | c1 | d1 |\n\nAfter.\n\nLast words.\n",
+        "> Before.\n>\n> | a1 | b1 |\n> | c1 | d1 |\n>\n> After.\n\nLast words.\n",
+    ] {
+        dragged_over_a_table(text);
+    }
+}
+
+fn dragged_over_a_table(text: &str) {
+    let reference = loaded(text);
+    let end_of_text = reference.to_addressable_text().unwrap().chars().count();
+    for (from, into) in [
+        (
+            position_in(&reference, "ore."),
+            position_in(&reference, "c1") + 1,
+        ),
+        (
+            position_in(&reference, "ore."),
+            position_in(&reference, "a1"),
+        ),
+        (
+            position_in(&reference, "ter."),
+            position_in(&reference, "b1") + 1,
+        ),
+        (
+            position_in(&reference, "b1") + 1,
+            position_in(&reference, "ter."),
+        ),
+        (
+            position_in(&reference, "b1") + 1,
+            position_in(&reference, "ore."),
+        ),
+    ] {
+        for drop_at in [position_in(&reference, "words"), end_of_text, 0] {
+            let what =
+                format!("a selection from {from} into {into} dropped at {drop_at} in {text:?}");
+            // The move as the selection makes it: cut, then pasted where the drop point
+            // stands once the cut is done.
+            let expected = {
+                let doc = loaded(text);
+                let cursor = doc.cursor_at(from);
+                cursor.set_position(into, MoveMode::KeepAnchor);
+                let (lo, hi) = (cursor.selection_start(), cursor.selection_end());
+                let fragment = cursor.selection();
+                let before = doc.to_addressable_text().unwrap().chars().count();
+                cursor.remove_selected_text().unwrap();
+                let removed = before - doc.to_addressable_text().unwrap().chars().count();
+                assert_eq!(removed, hi - lo, "{what}: the selection shown is what goes");
+                let target = if drop_at > hi {
+                    drop_at - removed
+                } else {
+                    drop_at
+                };
+                cursor.set_position(target, MoveMode::MoveAnchor);
+                cursor.insert_fragment(&fragment).unwrap();
+                doc.to_djot().unwrap()
+            };
+            let doc = loaded(text);
+            let cursor = doc.cursor_at(from);
+            cursor.set_position(into, MoveMode::KeepAnchor);
+            drag_as_an_editor_does(&cursor, drop_at);
+            assert_eq!(doc.to_djot().unwrap(), expected, "{what}");
+        }
+    }
+}
+
+/// A selection holding a table whole gives it back when its moving end steps back toward
+/// where the selection started: the Left or the Up arrow from the end of a table the
+/// selection runs past, and the Right or the Down arrow from the start of a table it runs
+/// back over, take the moving end to the other side of the table. Every step back landed in
+/// the table and was snapped past it again: the selection could only grow.
+#[test]
+fn a_selection_holding_a_table_gives_it_back_one_step_back() {
+    use text_document::MoveOperation;
+    const TEXT: &str = "Before.\n\n| a1 | b1 |\n| c1 | d1 |\n\nAfter.\n";
+    let doc = loaded(TEXT);
+    let before_end = position_in(&doc, "Before.") + "Before.".len();
+    let after_start = position_in(&doc, "After.");
+
+    for back in [MoveOperation::Left, MoveOperation::Up] {
+        let cursor = doc.cursor_at(position_in(&doc, "ore."));
+        cursor.set_position(before_end, MoveMode::KeepAnchor);
+        cursor.move_position(MoveOperation::Right, MoveMode::KeepAnchor, 1);
+        assert!(
+            cursor.selection_end() > position_in(&doc, "d1"),
+            "{back:?}: the table is held"
+        );
+        cursor.move_position(back, MoveMode::KeepAnchor, 1);
+        assert_eq!(
+            (cursor.anchor(), cursor.position()),
+            (position_in(&doc, "ore."), before_end),
+            "{back:?} from the end of the table held"
+        );
+    }
+    for back in [MoveOperation::Right, MoveOperation::Down] {
+        let cursor = doc.cursor_at(position_in(&doc, "ter."));
+        cursor.set_position(after_start, MoveMode::KeepAnchor);
+        cursor.move_position(MoveOperation::Left, MoveMode::KeepAnchor, 1);
+        assert!(
+            cursor.selection_start() < position_in(&doc, "a1"),
+            "{back:?}: the table is held"
+        );
+        cursor.move_position(back, MoveMode::KeepAnchor, 1);
+        assert_eq!(
+            (cursor.anchor(), cursor.position()),
+            (position_in(&doc, "ter."), after_start),
+            "{back:?} from the start of the table held"
+        );
+    }
+}

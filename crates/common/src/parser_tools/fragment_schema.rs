@@ -229,7 +229,8 @@ impl FragmentList {
     }
 
     /// As [`to_entity`](Self::to_entity), the list's first item numbered `start` (`None`
-    /// for 1).
+    /// for 1), brought within what every format holds (see `list_start`): a fragment
+    /// carries the numbers its items wore, which a copy counts past the list's own start.
     pub fn to_entity_starting_at(&self, start: Option<i64>) -> List {
         List {
             id: 0,
@@ -239,7 +240,7 @@ impl FragmentList {
             indent: self.indent,
             prefix: self.prefix.clone(),
             suffix: self.suffix.clone(),
-            start: start.filter(|start| *start != 1),
+            start: start.and_then(crate::parser_tools::list_start::list_start),
         }
     }
 }
@@ -444,6 +445,9 @@ pub struct CarriedFragment {
     /// Whether the insertion replaces a selection its caller removed first, one that held
     /// the whole of a text (see [`replacing_the_text`]).
     pub replaces_text: bool,
+    /// Whether the insertion goes into the empty paragraph an earlier removal of all of a
+    /// text left, as that removal left it (see [`into_an_emptied_text`]).
+    pub into_an_emptied_text: bool,
     /// Whether the fragment is a whole text, written in a syntax a text is saved in (Djot,
     /// Markdown) or taken from a whole document, rather than a passage copied from a text
     /// or from another application (see [`whole_text_to_json`]).
@@ -457,6 +461,8 @@ pub struct CarriedFragment {
 struct CarriedRef<'a> {
     #[serde(skip_serializing_if = "is_false")]
     replaces_text: bool,
+    #[serde(skip_serializing_if = "is_false")]
+    into_an_emptied_text: bool,
     #[serde(skip_serializing_if = "is_false")]
     whole_text: bool,
     blocks: &'a [FragmentBlock],
@@ -474,6 +480,8 @@ struct CarriedRef<'a> {
 struct Carried {
     #[serde(default)]
     replaces_text: bool,
+    #[serde(default)]
+    into_an_emptied_text: bool,
     #[serde(default)]
     whole_text: bool,
     blocks: Vec<FragmentBlock>,
@@ -545,6 +553,7 @@ fn carried_to_json(
 ) -> serde_json::Result<String> {
     serde_json::to_string(&CarriedRef {
         replaces_text: false,
+        into_an_emptied_text: false,
         whole_text,
         blocks: &data.blocks,
         tables: &data.tables,
@@ -564,6 +573,7 @@ pub fn fragment_from_json(json: &str) -> serde_json::Result<CarriedFragment> {
         },
         quoting: carried.quoting,
         replaces_text: carried.replaces_text,
+        into_an_emptied_text: carried.into_an_emptied_text,
         whole_text: carried.whole_text,
         list_starts: carried.list_starts,
     })
@@ -575,6 +585,9 @@ const REPLACES_TEXT_MARK: &str = "\"replaces_text\":true";
 /// The mark [`as_a_whole_text`] puts in front of a fragment's keys, and
 /// [`whole_text_to_json`] writes.
 const WHOLE_TEXT_MARK: &str = "\"whole_text\":true";
+
+/// The mark [`into_an_emptied_text`] puts in front of a fragment's keys.
+const INTO_AN_EMPTIED_TEXT_MARK: &str = "\"into_an_emptied_text\":true";
 
 /// `json`, a fragment's JSON, marked as replacing a whole text: the caller removed a
 /// selection holding all of a text before inserting it. An insertion into the one empty
@@ -588,6 +601,18 @@ const WHOLE_TEXT_MARK: &str = "\"whole_text\":true";
 /// an object is returned as it is, for the insertion to refuse.
 pub fn replacing_the_text(json: &str) -> String {
     marked(json, REPLACES_TEXT_MARK)
+}
+
+/// `json`, a fragment's JSON, marked as going into the empty paragraph an earlier removal of
+/// all of a text left, the paragraph looking as that removal left it: whichever cursor
+/// removed the text, and after an undo or a redo back to it. That paragraph keeps the first
+/// removed paragraph's formatting, not the pasted text's, and an insertion into it gives it
+/// the fragment's own formatting when the fragment is more than a phrase (see
+/// [`replacing_the_text`]). Cut everything, paste, undo and paste again: the second paste went
+/// into the quotation the first paragraph cut stood in. Spliced in as [`replacing_the_text`]
+/// is.
+pub fn into_an_emptied_text(json: &str) -> String {
+    marked(json, INTO_AN_EMPTIED_TEXT_MARK)
 }
 
 /// `json`, a fragment's JSON, marked as a whole text, as [`whole_text_to_json`] writes it:
@@ -604,9 +629,13 @@ fn marked(json: &str, mark: &str) -> String {
     };
     // The marks lead the object, in whichever order they were put in.
     let mut leading = rest;
-    while let Some(present) = [REPLACES_TEXT_MARK, WHOLE_TEXT_MARK]
-        .into_iter()
-        .find(|present| leading.starts_with(present))
+    while let Some(present) = [
+        REPLACES_TEXT_MARK,
+        WHOLE_TEXT_MARK,
+        INTO_AN_EMPTIED_TEXT_MARK,
+    ]
+    .into_iter()
+    .find(|present| leading.starts_with(present))
     {
         if present == mark {
             return json.to_string();
@@ -740,5 +769,28 @@ mod tests {
         assert_eq!(as_a_whole_text(&replacing_first), replacing_first);
         assert_eq!(replacing_the_text(&replacing_first), replacing_first);
         assert_eq!(as_a_whole_text("not json"), "not json");
+    }
+
+    /// The mark of an insertion into a text a removal emptied reads back beside the others,
+    /// in whichever order they were put in, and leaves the blocks readable.
+    #[test]
+    fn the_mark_of_an_emptied_text_reads_back_beside_the_others() {
+        let plain = fragment_to_json(&data(), &FragmentQuoting::default()).unwrap();
+        assert!(!fragment_from_json(&plain).unwrap().into_an_emptied_text);
+        let emptied = into_an_emptied_text(&plain);
+        let back = fragment_from_json(&emptied).unwrap();
+        assert!(back.into_an_emptied_text && !back.replaces_text && !back.whole_text);
+        assert_eq!(into_an_emptied_text(&emptied), emptied);
+        for marked in [
+            as_a_whole_text(&emptied),
+            into_an_emptied_text(&as_a_whole_text(&plain)),
+        ] {
+            let back = fragment_from_json(&marked).unwrap();
+            assert!(back.into_an_emptied_text && back.whole_text, "{marked}");
+            assert_eq!(into_an_emptied_text(&marked), marked);
+            assert_eq!(as_a_whole_text(&marked), marked);
+            let alone: FragmentData = serde_json::from_str(&marked).unwrap();
+            assert_eq!(alone.blocks.len(), 3);
+        }
     }
 }

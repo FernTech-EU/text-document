@@ -1759,50 +1759,6 @@ fn extent_of(store: &Store, table_id: EntityId) -> Option<TableExtent> {
     })
 }
 
-/// Where the paragraph right beside `table_id` in the frame holding the table stands, when
-/// the entry there is a paragraph: the end of its text for the one `before` the table, the
-/// start of it for the one after. `None` when the table opens or closes its frame, or a
-/// quotation or another table stands beside it, or the rope is not the position space.
-pub fn position_beside_table(store: &Store, table_id: EntityId, before: bool) -> Option<i64> {
-    if !rope_positions_match_flow(store) {
-        return None;
-    }
-    let neighbour = {
-        let frames = store.frames.read();
-        let anchor_frame = frames
-            .iter()
-            .find(|(_, frame)| frame.table == Some(table_id))
-            .map(|(id, _)| -(*id as i64))?;
-        let holder = frames
-            .values()
-            .find(|frame| frame.child_order.contains(&anchor_frame))?;
-        let at = holder
-            .child_order
-            .iter()
-            .position(|entry| *entry == anchor_frame)?;
-        let entry = if before {
-            *holder.child_order.get(at.checked_sub(1)?)?
-        } else {
-            *holder.child_order.get(at + 1)?
-        };
-        EntityId::try_from(entry).ok().filter(|id| *id > 0)?
-    };
-    let offsets = store.block_offsets.read();
-    let (start, end, has_successor) =
-        offsets.range_with_successor(OffsetMarker::Block(neighbour))?;
-    let rope = store.rope.read();
-    let byte = if before {
-        if has_successor && end > start {
-            end - 1
-        } else {
-            end
-        }
-    } else {
-        start
-    };
-    Some(rope.byte_to_char(byte as usize) as i64)
-}
-
 /// The range `[start, end)` widened to hold whole every table it has one end in and the
 /// other end outside of: a start in a table's cells with an end past the table moves back to
 /// the table's anchor, and an end in a table's cells with a start before the table moves on

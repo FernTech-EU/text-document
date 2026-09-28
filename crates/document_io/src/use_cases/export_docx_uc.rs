@@ -879,8 +879,11 @@ impl NumberingBuilder {
         if let Some(&id) = self.map.get(&list_id) {
             return id;
         }
-        // Numbering ids are 1-based; `map.len()` is the count assigned so far.
-        let id = self.map.len() + 1;
+        // Numbering ids are 1-based; `map.len()` is the count assigned so far. They start at
+        // 2: docx-rs writes a default abstract numbering and numbering, both with id 1, in
+        // front of the ones a document adds, and the first list's took id 1 as well, two
+        // definitions under one id, the default's decimal numbering from 1 first.
+        let id = self.map.len() + 2;
         let abstract_num = build_abstract_numbering(id, list);
         let numbering = docx_rs::Numbering::new(id, id);
         self.defs.push((abstract_num, numbering));

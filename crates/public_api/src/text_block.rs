@@ -1116,9 +1116,15 @@ fn compute_list_item_index(inner: &TextDocumentInner, list_id: EntityId, block_i
         .unwrap_or(0)
 }
 
+/// The largest number a roman list marker is written in numerals for, the largest a numeral
+/// writes without a bar over it. A numeral grows by a letter for every thousand, so a list
+/// starting at 999,999,999 made roman painted a marker of a million letters for each of its
+/// items on every snapshot.
+const MAX_ROMAN_MARKER: usize = 3999;
+
 /// Format a list marker for the given item index: the list's start (1 unless it says
 /// otherwise) plus the index. A number no letter or numeral stands for is written in
-/// digits.
+/// digits: past z, and past [`MAX_ROMAN_MARKER`].
 pub(crate) fn format_list_marker(
     list_dto: &frontend::list::dtos::ListDto,
     item_index: usize,
@@ -1130,7 +1136,7 @@ pub(crate) fn format_list_marker(
         _ => format!("{number}"),
     };
     let numeral = |to_roman: fn(usize) -> String| match usize::try_from(number) {
-        Ok(n) if n >= 1 => to_roman(n),
+        Ok(n @ 1..=MAX_ROMAN_MARKER) => to_roman(n),
         _ => format!("{number}"),
     };
     let marker_body = match list_dto.style {
