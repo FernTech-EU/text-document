@@ -24,7 +24,9 @@ pub type EventCallback = Box<dyn Fn(Event) + Send>;
 struct Subscriber {
     callback: Mutex<EventCallback>,
     /// Cleared when the token drops, so a callback removed while an event is being
-    /// delivered is skipped if the pump has not reached it yet.
+    /// delivered is skipped if the pump has not reached it yet. The pump reads it
+    /// just before the call, not under any lock the drop takes, so a drop landing
+    /// between that read and the call does not stop that one call.
     active: AtomicBool,
 }
 
@@ -146,9 +148,14 @@ impl EventHubClient {
 /// removed entirely when its last subscriber goes away.
 ///
 /// The pump calls callbacks without holding the map, so a drop no longer waits
-/// for a delivery in progress: a callback the pump had already started can run
-/// to its end after its token dropped, and one it had not reached yet is
-/// skipped. A callback therefore has to tolerate running once while its
+/// for a delivery in progress. Once the drop returns, the callback is never
+/// called for an event sent after that, and it is skipped for the event being
+/// delivered if the pump has not reached it yet. It can still be called once,
+/// for that event: the call may already be running, and it may also begin just
+/// after the drop returns, when the pump checked the subscription an instant
+/// before the drop cleared it. The callback and what it captured are released
+/// by whichever of the token and the pump lets go of them last, which can be
+/// the pump thread. A callback therefore has to tolerate running once while its
 /// subscriber is going away, as one holding a weak reference does.
 pub struct SubscriptionToken {
     subscribers: Arc<Mutex<HashMap<Origin, SubscriberList>>>,
@@ -322,5 +329,53 @@ mod tests {
             "subscribing while holding a lock a running callback waits on did not \
              return within {LIMIT:?}: the pump holds the subscriber map across the call"
         );
+    }
+
+    /// A subscription dropped while an event is being delivered, before the pump
+    /// reached it, is not called for that event, nor for any event sent after.
+    ///
+    /// The pump delivers from a copy of the subscriber list taken before the drop,
+    /// so the copy still names the subscription. Only the flag the drop clears
+    /// keeps the pump from calling back a subscriber that has already let go,
+    /// whether the drop came from another thread or from an earlier callback of
+    /// the same event. Nothing else fails without it.
+    #[test]
+    fn a_subscription_dropped_before_the_pump_reaches_it_is_skipped() {
+        let hub = EventHub::new();
+        let (client, _shutdown) = pumped(&hub);
+
+        // Holds the pump inside the first callback of each event until released.
+        let (entered_tx, entered_rx) = flume::unbounded();
+        let (release_tx, release_rx) = flume::unbounded::<()>();
+        let first = client.subscribe(progress(), move |_| {
+            let _ = entered_tx.send(());
+            let _ = release_rx.recv_timeout(LIMIT);
+        });
+        let (called_tx, called_rx) = flume::unbounded();
+        let second = client.subscribe(progress(), move |_| {
+            let _ = called_tx.send(());
+        });
+
+        hub.send_event(event(progress()));
+        assert!(
+            entered_rx.recv_timeout(LIMIT).is_ok(),
+            "the first event did not reach the first subscriber within {LIMIT:?}"
+        );
+        // The pump is inside `first`, with a copy of the list that names `second`.
+        drop(second);
+        hub.send_event(event(progress()));
+        let _ = release_tx.send(());
+        let _ = release_tx.send(());
+        // `first` is entered for the second event only once the pump is done with
+        // every subscriber of the first one, `second` included.
+        assert!(
+            entered_rx.recv_timeout(LIMIT).is_ok(),
+            "the second event did not reach the first subscriber within {LIMIT:?}"
+        );
+        assert!(
+            called_rx.try_recv().is_err(),
+            "a subscription dropped before the pump reached it was still called"
+        );
+        drop(first);
     }
 }
