@@ -290,23 +290,24 @@ fn a_copied_cell_keeps_its_paragraphs_in_the_order_they_are_read() {
              </table>",
         )
         .unwrap();
+    // The table replaces the text, with no empty paragraph in front of it.
     assert_eq!(
         doc.to_addressable_text().unwrap(),
-        "\n\u{FFFC}\nTitle\n\none\ntwo"
+        "\u{FFFC}\nTitle\n\none\ntwo"
     );
-    select(&doc, 9, 17).insert_text("over").unwrap();
-    doc.cursor_at(7)
+    select(&doc, 8, 16).insert_text("over").unwrap();
+    doc.cursor_at(6)
         .insert_html("<pre>verse one\n  verse two\n\nverse three</pre>")
         .unwrap();
-    doc.cursor_at(14).insert_table(2, 2).unwrap();
+    doc.cursor_at(13).insert_table(2, 2).unwrap();
     // A copy of part of the text pasted over another part of it, which stores new
     // positions for some of the blocks and leaves the others' behind.
-    let copied = select(&doc, 7, 49).selection();
-    let _ = select(&doc, 18, 42).insert_fragment(&copied);
+    let copied = select(&doc, 6, 48).selection();
+    let _ = select(&doc, 17, 41).insert_fragment(&copied);
     let before = doc.to_addressable_text().unwrap();
     assert_eq!(
         before,
-        "\n\u{FFFC}\nTitlverse one\n  verse two\n\nverse threee\nover\n\n\n\u{FFFC}\n\n\n\n"
+        "\u{FFFC}\nTitlverse one\n  verse two\n\nverse threee\nover\n\n\n\u{FFFC}\n\n\n\n"
     );
 
     let cursor = select_all(&doc);

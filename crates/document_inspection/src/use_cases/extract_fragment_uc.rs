@@ -13,8 +13,8 @@ use common::entities::{Block, Frame, List, Root, SemanticRole, Table, TableCell}
 use common::format_runs::{InlineContent, InlineSegment};
 use common::format_runs_query::inline_segments_for_block;
 use common::parser_tools::fragment_schema::{
-    FragmentBlock, FragmentData, FragmentElement, FragmentList, FragmentQuoting, FragmentTable,
-    FragmentTableCell, fragment_to_json,
+    FragmentBlock, FragmentData, FragmentElement, FragmentList, FragmentListStarts,
+    FragmentQuoting, FragmentTable, FragmentTableCell, fragment_with_list_starts_to_json,
 };
 use common::types::{EntityId, ROOT_ENTITY_ID};
 use std::collections::{HashMap, HashSet};
@@ -147,12 +147,18 @@ impl ExtractFragmentUseCase {
             .find(|block| block.document_position + block_char_length(block, &store) >= start)
             .and_then(|block| tree_of_block.get(&block.id).copied());
         blocks.retain(|block| tree_of_block.get(&block.id).copied() == starting_tree);
+        let mut numbering = ListNumbering::new(&blocks);
 
         // Whether the range takes anything of `block`. An empty paragraph closing the tree
-        // stands where a range reaching the tree's end ends, and is taken with it: left out,
+        // stands where a range holding the whole tree ends, and is taken with it: left out,
         // a cut of all of a text and its paste dropped the empty code block or heading the
-        // text ended with, which a save keeps.
+        // text ended with, which a save keeps. A range starting further in leaves it, as its
+        // removal does: copied, a cut of a table and what followed it to the end of the text
+        // was pasted back with a second empty paragraph.
         let last_block_id = blocks.last().map(|block| block.id);
+        let holds_the_whole_tree = blocks
+            .first()
+            .is_some_and(|first| start <= first.document_position);
         let takes = |block: &Block| {
             let block_start = block.document_position;
             let length = block_char_length(block, &store);
@@ -163,6 +169,7 @@ impl ExtractFragmentUseCase {
                 || (block_start == end
                     && length == 0
                     && start < end
+                    && holds_the_whole_tree
                     && Some(block.id) == last_block_id)
         };
 
@@ -199,6 +206,7 @@ impl ExtractFragmentUseCase {
             let mut fragment_blocks: Vec<FragmentBlock> = Vec::new();
             let mut fragment_tables: Vec<FragmentTable> = Vec::new();
             let mut quoting = FragmentQuoting::default();
+            let mut trail = QuoteTrail::default();
             let mut plain_texts: Vec<String> = Vec::new();
             let mut processed_tables: HashSet<EntityId> = HashSet::new();
 
@@ -275,6 +283,7 @@ impl ExtractFragmentUseCase {
                         });
                     }
 
+                    numbering.table();
                     fragment_tables.push(FragmentTable {
                         rows: table.rows as usize,
                         columns: table.columns as usize,
@@ -287,10 +296,17 @@ impl ExtractFragmentUseCase {
                         fmt_alignment: table.fmt_alignment.clone(),
                         column_widths: table.column_widths.clone(),
                     });
-                    quoting.set_table(
-                        fragment_tables.len() - 1,
-                        table_quoted.get(tid).map_or(0, |quoted| quoted.depth),
-                    );
+                    let table_index = fragment_tables.len() - 1;
+                    match table_quoted.get(tid) {
+                        Some(quoted) if quoted.depth > 0 => {
+                            quoting.set_table(table_index, quoted.depth);
+                            let opens = trail.opens(quoted);
+                            if opens > 0 {
+                                quoting.set_table_opens(table_index, opens);
+                            }
+                        }
+                        _ => trail.leave(),
+                    }
                 } else {
                     // Non-table block — extract with partial-block handling
                     let local_start = if start > block_start {
@@ -339,9 +355,16 @@ impl ExtractFragmentUseCase {
                             None
                         },
                     );
+                    numbering.item(
+                        fragment_blocks.len(),
+                        block,
+                        list.as_ref().filter(|_| is_full_block),
+                        quoted_of_block.get(&block.id),
+                    );
                     push_block(
                         &mut fragment_blocks,
                         &mut quoting,
+                        &mut trail,
                         fragment_block,
                         is_full_block,
                         quoted_of_block.get(&block.id),
@@ -353,7 +376,12 @@ impl ExtractFragmentUseCase {
                 blocks: fragment_blocks,
                 tables: fragment_tables,
             };
-            let fragment_json = fragment_to_json(&fragment_data, &quoting)?;
+            let fragment_json = fragment_with_list_starts_to_json(
+                &fragment_data,
+                &quoting,
+                &numbering.starts,
+                false,
+            )?;
             let plain_text = plain_texts.join("\n");
 
             uow.end_transaction()?;
@@ -366,6 +394,7 @@ impl ExtractFragmentUseCase {
         // ── Normal text extraction (no cross-cell) ────────────────
         let mut fragment_blocks: Vec<FragmentBlock> = Vec::new();
         let mut quoting = FragmentQuoting::default();
+        let mut trail = QuoteTrail::default();
         let mut plain_texts: Vec<String> = Vec::new();
 
         for block in &blocks {
@@ -420,9 +449,16 @@ impl ExtractFragmentUseCase {
                     None
                 },
             );
+            numbering.item(
+                fragment_blocks.len(),
+                block,
+                list.as_ref().filter(|_| is_full_block),
+                quoted_of_block.get(&block.id),
+            );
             push_block(
                 &mut fragment_blocks,
                 &mut quoting,
+                &mut trail,
                 fragment_block,
                 is_full_block,
                 quoted_of_block.get(&block.id),
@@ -434,7 +470,8 @@ impl ExtractFragmentUseCase {
             tables: vec![],
         };
 
-        let fragment_json = fragment_to_json(&fragment_data, &quoting)?;
+        let fragment_json =
+            fragment_with_list_starts_to_json(&fragment_data, &quoting, &numbering.starts, false)?;
         let plain_text = plain_texts.join("\n");
 
         uow.end_transaction()?;
@@ -578,17 +615,124 @@ fn block_to_fragment_block(
 
 /// Add `block` to `blocks`, and the quotations it stands in to `quoting` when it is a whole
 /// block: a part of one goes into the paragraph it is pasted into, quoted or not.
+/// The numbers the lists a fragment holds start at (see [`FragmentListStarts`]). A list
+/// item copied with its list begins a run of that list's items in the fragment when the
+/// block before it in the fragment is not an item of the same list in the same quotations
+/// (an insertion starts a list anew at a quotation's edge); the run starts at the number
+/// the item wore. A copy of a list starting at 3, or of the fourth item on of a list, was
+/// pasted numbered from 1.
+struct ListNumbering {
+    /// Each list's items, in the order the text reads them.
+    items: HashMap<EntityId, Vec<EntityId>>,
+    /// The list of the item copied last, and the quotations it stands in, while the
+    /// fragment's blocks go on in it.
+    previous: Option<(EntityId, Vec<EntityId>)>,
+    starts: FragmentListStarts,
+}
+
+impl ListNumbering {
+    /// For the blocks of the text a copy is made from, in reading order.
+    fn new(blocks: &[Block]) -> Self {
+        let mut items: HashMap<EntityId, Vec<EntityId>> = HashMap::new();
+        for block in blocks {
+            if let Some(list_id) = block.list {
+                items.entry(list_id).or_default().push(block.id);
+            }
+        }
+        ListNumbering {
+            items,
+            previous: None,
+            starts: FragmentListStarts::default(),
+        }
+    }
+
+    /// `block`, copied as the fragment's block at `index`, as an item of `list` when it is
+    /// copied with its list, standing in the quotations `quoted` names.
+    fn item(&mut self, index: usize, block: &Block, list: Option<&List>, quoted: Option<&Quoted>) {
+        let Some(list) = list else {
+            self.previous = None;
+            return;
+        };
+        let run = (
+            list.id,
+            quoted
+                .map(|quoted| quoted.frames.clone())
+                .unwrap_or_default(),
+        );
+        if self.previous.as_ref() != Some(&run) {
+            let position = self
+                .items
+                .get(&list.id)
+                .and_then(|items| items.iter().position(|item| *item == block.id))
+                .unwrap_or(0);
+            let position = i64::try_from(position).unwrap_or(i64::MAX);
+            self.starts
+                .set(index, list.start.unwrap_or(1).saturating_add(position));
+        }
+        self.previous = Some(run);
+    }
+
+    /// A table copied next: the lists around it are apart.
+    fn table(&mut self) {
+        self.previous = None;
+    }
+}
+
 fn push_block(
     blocks: &mut Vec<FragmentBlock>,
     quoting: &mut FragmentQuoting,
+    trail: &mut QuoteTrail,
     block: FragmentBlock,
     is_full_block: bool,
     quoted: Option<&Quoted>,
 ) {
-    if is_full_block && let Some(quoted) = quoted {
-        quoting.set_block(blocks.len(), quoted.depth, quoted.role.clone());
+    match quoted.filter(|_| is_full_block) {
+        Some(quoted) => {
+            quoting.set_block(blocks.len(), quoted.depth, quoted.role.clone());
+            let opens = trail.opens(quoted);
+            if opens > 0 {
+                quoting.set_block_opens(blocks.len(), opens);
+            }
+        }
+        // A piece of a paragraph goes into the paragraph it is pasted into, in no
+        // quotation of its own.
+        None => trail.leave(),
     }
     blocks.push(block);
+}
+
+/// The quotations the block or table copied last stands in, to tell the quotations the
+/// next one stands in apart from them (see [`FragmentQuoting::set_block_opens`]): two
+/// quotations one after the other were copied as one.
+#[derive(Default)]
+struct QuoteTrail {
+    previous: Vec<EntityId>,
+}
+
+impl QuoteTrail {
+    /// How many of the quotations `quoted` names, the innermost, are not the ones the entry
+    /// copied before it stands in; `quoted` is then the entry copied last. Nothing opens
+    /// after an entry standing in no quotation: every quotation there is a new one anyway.
+    fn opens(&mut self, quoted: &Quoted) -> u32 {
+        let shared = quoted
+            .frames
+            .iter()
+            .zip(&self.previous)
+            .take_while(|(frame, previous)| frame == previous)
+            .count();
+        let opens = if self.previous.is_empty() {
+            0
+        } else {
+            (quoted.frames.len() - shared) as u32
+        };
+        self.previous.clone_from(&quoted.frames);
+        opens
+    }
+
+    /// An entry standing in no quotation was copied.
+    fn leave(&mut self) {
+        self.previous.clear();
+    }
 }
 
 /// Extract elements within a character range [local_start, local_end) of a block.
@@ -660,11 +804,13 @@ fn extract_elements_in_range(
     (result_elements, result_text)
 }
 
-/// The quotations a block or a table stands in: how many, and the role of the innermost.
+/// The quotations a block or a table stands in: how many, the role of the innermost, and
+/// which they are, outermost first.
 #[derive(Debug, Clone, Default)]
 struct Quoted {
     depth: u32,
     role: Option<SemanticRole>,
+    frames: Vec<EntityId>,
 }
 
 /// Collect the blocks of the tree under `frame_id` in reading order, each with the
@@ -715,9 +861,12 @@ fn collect_tree_blocks_ro(
         } else {
             // A quotation one deeper; any other sub-frame at the same depth.
             let inner = if sub_frame.fmt_is_blockquote == Some(true) {
+                let mut frames = quoted.frames.clone();
+                frames.push(sub_frame_id);
                 Quoted {
                     depth: quoted.depth + 1,
                     role: sub_frame.fmt_semantic_role.clone(),
+                    frames,
                 }
             } else {
                 quoted.clone()

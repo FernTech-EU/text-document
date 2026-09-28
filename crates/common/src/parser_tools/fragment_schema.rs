@@ -221,7 +221,16 @@ impl FragmentList {
         }
     }
 
+    /// The list entity this fragment list stands for, numbered from 1. A list starting past
+    /// 1 takes its start from the [`FragmentListStarts`] the fragment carries (see
+    /// [`to_entity_starting_at`](Self::to_entity_starting_at)).
     pub fn to_entity(&self) -> List {
+        self.to_entity_starting_at(None)
+    }
+
+    /// As [`to_entity`](Self::to_entity), the list's first item numbered `start` (`None`
+    /// for 1).
+    pub fn to_entity_starting_at(&self, start: Option<i64>) -> List {
         List {
             id: 0,
             created_at: chrono::Utc::now(),
@@ -230,7 +239,61 @@ impl FragmentList {
             indent: self.indent,
             prefix: self.prefix.clone(),
             suffix: self.suffix.clone(),
+            start: start.filter(|start| *start != 1),
         }
+    }
+}
+
+/// The number the ordered lists of a fragment start at, where it is not 1, by the index in
+/// [`FragmentData::blocks`] of an item of the list: a copy records at the first item it
+/// holds of a list the number that item wore, and a fragment parsed from Djot, Markdown or
+/// HTML records at every item the start its list was written with. An insertion reads it
+/// at the item it makes a new list for, and a writer at the item a list opens with. A copy
+/// of a list starting at 3, or of its items from the fourth on, keeps its numbers, and a
+/// text put back keeps its lists' starts: both were numbered from 1.
+///
+/// It travels beside [`FragmentData`] in the JSON an insertion takes, as [`FragmentQuoting`]
+/// does and for the same reason: [`FragmentList`] is built field by field by earlier releases
+/// of the other text-document crates, which a field added to it would stop compiling. A
+/// reader that does not know it ignores it, and numbers the lists from 1.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct FragmentListStarts {
+    /// `(block index, start)`, in increasing order of the index.
+    entries: Vec<(usize, i64)>,
+}
+
+impl FragmentListStarts {
+    /// Whether every list of the fragment starts at 1.
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// Record that a list begins with the block at `index`, numbered `start`. A start of 1
+    /// records nothing, and takes back what was recorded for that block.
+    pub fn set(&mut self, index: usize, start: i64) {
+        let at = self.entries.partition_point(|(entry, _)| *entry < index);
+        let replaces = self
+            .entries
+            .get(at)
+            .is_some_and(|(entry, _)| *entry == index);
+        match (start == 1, replaces) {
+            (true, true) => {
+                self.entries.remove(at);
+            }
+            (true, false) => {}
+            (false, true) => self.entries[at] = (index, start),
+            (false, false) => self.entries.insert(at, (index, start)),
+        }
+    }
+
+    /// The number a list beginning with the block at `index` starts at, when it is not 1.
+    pub fn get(&self, index: usize) -> Option<i64> {
+        self.entries
+            .binary_search_by_key(&index, |(entry, _)| *entry)
+            .ok()
+            .and_then(|at| self.entries.get(at))
+            .map(|(_, start)| *start)
     }
 }
 
@@ -265,6 +328,14 @@ struct QuotedEntry {
     depth: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     role: Option<SemanticRole>,
+    /// How many of its quotations, the innermost, open at it (see
+    /// [`FragmentQuoting::set_block_opens`]).
+    #[serde(default, skip_serializing_if = "is_zero")]
+    opens: u32,
+}
+
+fn is_zero(value: &u32) -> bool {
+    *value == 0
 }
 
 impl FragmentQuoting {
@@ -299,6 +370,38 @@ impl FragmentQuoting {
     pub fn table_depth(&self, index: usize) -> u32 {
         find_entry(&self.tables, index).map_or(0, |entry| entry.depth)
     }
+
+    /// Record that the innermost `opens` of the quotations the block at `index` stands in
+    /// (see [`set_block`](Self::set_block), which comes first) open at it: they are not the
+    /// quotations of the block or table before it, however deep those stand. Two quotations
+    /// one after the other were pasted as one, since the depth alone does not tell them
+    /// apart.
+    pub fn set_block_opens(&mut self, index: usize, opens: u32) {
+        set_opens(&mut self.blocks, index, opens);
+    }
+
+    /// As [`set_block_opens`](Self::set_block_opens), for the table at `index`.
+    pub fn set_table_opens(&mut self, index: usize, opens: u32) {
+        set_opens(&mut self.tables, index, opens);
+    }
+
+    /// How many of the quotations the block at `index` stands in open at it.
+    pub fn block_opens(&self, index: usize) -> u32 {
+        find_entry(&self.blocks, index).map_or(0, |entry| entry.opens)
+    }
+
+    /// How many of the quotations the table at `index` stands in open at it.
+    pub fn table_opens(&self, index: usize) -> u32 {
+        find_entry(&self.tables, index).map_or(0, |entry| entry.opens)
+    }
+}
+
+fn set_opens(entries: &mut [QuotedEntry], index: usize, opens: u32) {
+    if let Ok(at) = entries.binary_search_by_key(&index, |entry| entry.index)
+        && let Some(entry) = entries.get_mut(at)
+    {
+        entry.opens = opens.min(entry.depth);
+    }
 }
 
 fn set_entry(entries: &mut Vec<QuotedEntry>, index: usize, depth: u32, role: Option<SemanticRole>) {
@@ -310,7 +413,12 @@ fn set_entry(entries: &mut Vec<QuotedEntry>, index: usize, depth: u32, role: Opt
         }
         return;
     }
-    let entry = QuotedEntry { index, depth, role };
+    let entry = QuotedEntry {
+        index,
+        depth,
+        role,
+        opens: 0,
+    };
     if replaces {
         entries[at] = entry;
     } else {
@@ -340,6 +448,8 @@ pub struct CarriedFragment {
     /// Markdown) or taken from a whole document, rather than a passage copied from a text
     /// or from another application (see [`whole_text_to_json`]).
     pub whole_text: bool,
+    /// The numbers its ordered lists start at.
+    pub list_starts: FragmentListStarts,
 }
 
 /// The JSON a fragment is written as for an insertion.
@@ -354,6 +464,8 @@ struct CarriedRef<'a> {
     tables: &'a [FragmentTable],
     #[serde(skip_serializing_if = "no_quoting")]
     quoting: &'a FragmentQuoting,
+    #[serde(skip_serializing_if = "no_list_starts")]
+    list_starts: &'a FragmentListStarts,
 }
 
 /// The JSON a fragment is read from for an insertion. Every key but `blocks` may be absent,
@@ -369,6 +481,8 @@ struct Carried {
     tables: Vec<FragmentTable>,
     #[serde(default)]
     quoting: FragmentQuoting,
+    #[serde(default)]
+    list_starts: FragmentListStarts,
 }
 
 fn is_false(value: &bool) -> bool {
@@ -383,13 +497,28 @@ fn no_quoting(quoting: &&FragmentQuoting) -> bool {
     quoting.is_empty()
 }
 
+fn no_list_starts(list_starts: &&FragmentListStarts) -> bool {
+    list_starts.is_empty()
+}
+
 /// Write `data` and its `quoting` as the JSON an insertion takes. With nothing quoted it is
 /// exactly the JSON of `data` alone, and every reader of [`FragmentData`] reads it.
 pub fn fragment_to_json(
     data: &FragmentData,
     quoting: &FragmentQuoting,
 ) -> serde_json::Result<String> {
-    carried_to_json(data, quoting, false)
+    carried_to_json(data, quoting, &FragmentListStarts::default(), false)
+}
+
+/// As [`fragment_to_json`], or [`whole_text_to_json`] when `whole_text`, with the numbers the
+/// fragment's ordered lists start at.
+pub fn fragment_with_list_starts_to_json(
+    data: &FragmentData,
+    quoting: &FragmentQuoting,
+    list_starts: &FragmentListStarts,
+    whole_text: bool,
+) -> serde_json::Result<String> {
+    carried_to_json(data, quoting, list_starts, whole_text)
 }
 
 /// As [`fragment_to_json`], for a fragment that is a whole text: parsed from a syntax a text
@@ -405,12 +534,13 @@ pub fn whole_text_to_json(
     data: &FragmentData,
     quoting: &FragmentQuoting,
 ) -> serde_json::Result<String> {
-    carried_to_json(data, quoting, true)
+    carried_to_json(data, quoting, &FragmentListStarts::default(), true)
 }
 
 fn carried_to_json(
     data: &FragmentData,
     quoting: &FragmentQuoting,
+    list_starts: &FragmentListStarts,
     whole_text: bool,
 ) -> serde_json::Result<String> {
     serde_json::to_string(&CarriedRef {
@@ -419,6 +549,7 @@ fn carried_to_json(
         blocks: &data.blocks,
         tables: &data.tables,
         quoting,
+        list_starts,
     })
 }
 
@@ -434,6 +565,7 @@ pub fn fragment_from_json(json: &str) -> serde_json::Result<CarriedFragment> {
         quoting: carried.quoting,
         replaces_text: carried.replaces_text,
         whole_text: carried.whole_text,
+        list_starts: carried.list_starts,
     })
 }
 

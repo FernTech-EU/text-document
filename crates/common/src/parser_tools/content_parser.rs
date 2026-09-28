@@ -61,6 +61,9 @@ pub struct ParsedTable {
     /// Blockquote nesting depth at the point the table appeared
     /// (0 = not inside a blockquote), mirroring `ParsedBlock::blockquote_depth`.
     pub blockquote_depth: u32,
+    /// How many of those quotations open at the table, mirroring
+    /// `ParsedBlock::blockquote_opens`.
+    pub blockquote_opens: u32,
 }
 
 impl ParsedTable {
@@ -119,6 +122,28 @@ fn push_table(elements: &mut Vec<ParsedElement>, table: ParsedTable, own_cells: 
     );
 }
 
+/// Record that a quotation opened at the first block or table of `elements` from `first`
+/// on: the quotation that began where `elements` stood at `first` and closes now. Nothing
+/// when the quotation holds none.
+fn mark_quotation_opened(elements: &mut [ParsedElement], first: usize) {
+    let Some(rest) = elements.get_mut(first..) else {
+        return;
+    };
+    for element in rest {
+        match element {
+            ParsedElement::Block(block) => {
+                block.blockquote_opens += 1;
+                return;
+            }
+            ParsedElement::Table(table) => {
+                table.blockquote_opens += 1;
+                return;
+            }
+            ParsedElement::FootnoteDefinition { .. } => {}
+        }
+    }
+}
+
 /// The cells a table's rows hold, for [`push_table`].
 fn cells_in_rows(rows: &[Vec<ParsedTableCell>]) -> usize {
     rows.iter().map(Vec::len).sum()
@@ -164,10 +189,12 @@ impl ParsedElement {
                                 list_indent: 0,
                                 list_prefix: String::new(),
                                 list_suffix: String::new(),
+                                list_start: None,
                                 marker: None,
                                 is_code_block: false,
                                 code_language: None,
                                 blockquote_depth: t.blockquote_depth,
+                                blockquote_opens: 0,
                                 line_height: None,
                                 non_breakable_lines: None,
                                 page_break_before: None,
@@ -194,10 +221,12 @@ impl ParsedElement {
                 list_indent: 0,
                 list_prefix: String::new(),
                 list_suffix: String::new(),
+                list_start: None,
                 marker: None,
                 is_code_block: false,
                 code_language: None,
                 blockquote_depth: 0,
+                blockquote_opens: 0,
                 line_height: None,
                 non_breakable_lines: None,
                 page_break_before: None,
@@ -231,12 +260,23 @@ pub struct ParsedBlock {
     /// Ordered-list delimiter suffix (`"."` for `1.`, `")"` for `1)`/`(1)`;
     /// empty for unordered lists).
     pub list_suffix: String,
+    /// The number the first item of the list this item belongs to wears, when it is not 1
+    /// (Djot and Markdown `3.`, HTML `<ol start="3">`). Every item of a list carries it.
+    /// Stored on the `List` entity.
+    pub list_start: Option<i64>,
     /// Task-list checkbox marker (djot `- [ ]` / `- [x]`). Maps to
     /// `Block.fmt_marker`. `None` for non-task blocks.
     pub marker: Option<MarkerType>,
     pub is_code_block: bool,
     pub code_language: Option<String>,
     pub blockquote_depth: u32,
+    /// How many of the quotations the block stands in open at it, the innermost ones:
+    /// quotations as deep as the element's before it but not the same ones. `0` when the
+    /// block goes on in the quotations the element before it stands in, as deep as it
+    /// stands. Two quotations one after the other (Djot and Markdown `> a` and `> b` with a
+    /// blank line between, HTML `<blockquote>` twice) were read as one, since the depth
+    /// alone does not tell them apart.
+    pub blockquote_opens: u32,
     pub line_height: Option<i64>,
     pub non_breakable_lines: Option<bool>,
     /// Start this block on a new page (djot `{page_break_before=true}`). Maps to
@@ -346,6 +386,13 @@ fn dangling_footnote_labels(
     referenced.difference(&defined).cloned().collect()
 }
 
+/// Read `markdown` into blocks and tables.
+///
+/// The parser reads nested containers without recursing, whatever their depth. The
+/// quotations the text holds are kept within
+/// [`MAX_QUOTE_LEVELS`](crate::parser_tools::quote_depth::MAX_QUOTE_LEVELS) (see
+/// `quote_depth`): the writers walk one call deeper for each, and a text nested 500
+/// quotations deep loaded, then aborted the process at its first save.
 pub fn parse_markdown(markdown: &str) -> Vec<ParsedElement> {
     use pulldown_cmark::{Event, Options, Parser, Tag, TagEnd};
 
@@ -391,9 +438,12 @@ pub fn parse_markdown(markdown: &str) -> Vec<ParsedElement> {
     let mut current_spans: Vec<ParsedSpan> = Vec::new();
     let mut current_heading: Option<i64> = None;
     let mut current_list_style: Option<ListStyle> = None;
+    let mut current_list_start: Option<i64> = None;
     let mut is_code_block = false;
     let mut code_language: Option<String> = None;
     let mut blockquote_depth: u32 = 0;
+    // Where `elements` stood as each open quotation began (see `mark_quotation_opened`).
+    let mut quotations_open: Vec<usize> = Vec::new();
     let mut in_block = false;
 
     // Formatting state stack
@@ -412,8 +462,10 @@ pub fn parse_markdown(markdown: &str) -> Vec<ParsedElement> {
     // footnote definitions cannot nest, so one slot suffices.
     let mut footnote_open: Option<(String, usize)> = None;
 
-    // List style stack for nested lists (also tracks nesting depth)
+    // List style stack for nested lists (also tracks nesting depth), and the start of each
+    // of those lists beside it.
     let mut list_stack: Vec<Option<ListStyle>> = Vec::new();
+    let mut list_start_stack: Vec<Option<i64>> = Vec::new();
     let mut current_list_indent: u32 = 0;
 
     // Table tracking state
@@ -440,10 +492,12 @@ pub fn parse_markdown(markdown: &str) -> Vec<ParsedElement> {
                         list_indent: current_list_indent,
                         list_prefix: String::new(),
                         list_suffix: String::new(),
+                        list_start: current_list_start,
                         marker: None,
                         is_code_block: false,
                         code_language: None,
                         blockquote_depth,
+                        blockquote_opens: 0,
                         line_height: None,
                         non_breakable_lines: None,
                         page_break_before: None,
@@ -457,6 +511,7 @@ pub fn parse_markdown(markdown: &str) -> Vec<ParsedElement> {
                 }
                 in_block = false;
                 current_list_style = None;
+                current_list_start = None;
             }
             Event::Start(Tag::Heading { level, .. }) => {
                 in_block = true;
@@ -471,10 +526,12 @@ pub fn parse_markdown(markdown: &str) -> Vec<ParsedElement> {
                     list_indent: 0,
                     list_prefix: String::new(),
                     list_suffix: String::new(),
+                    list_start: None,
                     marker: None,
                     is_code_block: false,
                     code_language: None,
                     blockquote_depth,
+                    blockquote_opens: 0,
                     line_height: None,
                     non_breakable_lines: None,
                     page_break_before: None,
@@ -494,9 +551,11 @@ pub fn parse_markdown(markdown: &str) -> Vec<ParsedElement> {
                     Some(ListStyle::Disc)
                 };
                 list_stack.push(style);
+                list_start_stack.push(ordered.and_then(list_start_of));
             }
             Event::End(TagEnd::List(_)) => {
                 list_stack.pop();
+                list_start_stack.pop();
             }
             Event::Start(Tag::Item) => {
                 // Flush any accumulated spans from the parent item before
@@ -509,10 +568,12 @@ pub fn parse_markdown(markdown: &str) -> Vec<ParsedElement> {
                         list_indent: current_list_indent,
                         list_prefix: String::new(),
                         list_suffix: String::new(),
+                        list_start: current_list_start,
                         marker: None,
                         is_code_block: false,
                         code_language: None,
                         blockquote_depth,
+                        blockquote_opens: 0,
                         line_height: None,
                         non_breakable_lines: None,
                         page_break_before: None,
@@ -526,6 +587,7 @@ pub fn parse_markdown(markdown: &str) -> Vec<ParsedElement> {
                 }
                 in_block = true;
                 current_list_style = list_stack.last().cloned().flatten();
+                current_list_start = list_start_stack.last().copied().flatten();
                 current_list_indent = if list_stack.is_empty() {
                     0
                 } else {
@@ -543,10 +605,12 @@ pub fn parse_markdown(markdown: &str) -> Vec<ParsedElement> {
                         list_indent: current_list_indent,
                         list_prefix: String::new(),
                         list_suffix: String::new(),
+                        list_start: current_list_start,
                         marker: None,
                         is_code_block: false,
                         code_language: None,
                         blockquote_depth,
+                        blockquote_opens: 0,
                         line_height: None,
                         non_breakable_lines: None,
                         page_break_before: None,
@@ -560,6 +624,7 @@ pub fn parse_markdown(markdown: &str) -> Vec<ParsedElement> {
                 }
                 in_block = false;
                 current_list_style = None;
+                current_list_start = None;
             }
             Event::Start(Tag::CodeBlock(kind)) => {
                 in_block = true;
@@ -585,10 +650,12 @@ pub fn parse_markdown(markdown: &str) -> Vec<ParsedElement> {
                     list_indent: 0,
                     list_prefix: String::new(),
                     list_suffix: String::new(),
+                    list_start: None,
                     marker: None,
                     is_code_block: true,
                     code_language: code_language.take(),
                     blockquote_depth,
+                    blockquote_opens: 0,
                     line_height: None,
                     non_breakable_lines: None,
                     page_break_before: None,
@@ -619,6 +686,7 @@ pub fn parse_markdown(markdown: &str) -> Vec<ParsedElement> {
                         header_rows: table_header_rows,
                         rows: std::mem::take(&mut table_rows),
                         blockquote_depth,
+                        blockquote_opens: 0,
                     },
                     own_cells,
                 );
@@ -792,10 +860,12 @@ pub fn parse_markdown(markdown: &str) -> Vec<ParsedElement> {
                     list_indent: current_list_indent,
                     list_prefix: String::new(),
                     list_suffix: String::new(),
+                    list_start: current_list_start,
                     marker: None,
                     is_code_block,
                     code_language: code_language.clone(),
                     blockquote_depth,
+                    blockquote_opens: 0,
                     line_height: None,
                     non_breakable_lines: None,
                     page_break_before: None,
@@ -809,9 +879,13 @@ pub fn parse_markdown(markdown: &str) -> Vec<ParsedElement> {
             }
             Event::Start(Tag::BlockQuote(_)) => {
                 blockquote_depth += 1;
+                quotations_open.push(elements.len());
             }
             Event::End(TagEnd::BlockQuote(_)) => {
                 blockquote_depth = blockquote_depth.saturating_sub(1);
+                if let Some(first) = quotations_open.pop() {
+                    mark_quotation_opened(&mut elements, first);
+                }
             }
             // ── Footnote definitions ──
             //
@@ -832,10 +906,12 @@ pub fn parse_markdown(markdown: &str) -> Vec<ParsedElement> {
                         list_indent: current_list_indent,
                         list_prefix: String::new(),
                         list_suffix: String::new(),
+                        list_start: current_list_start,
                         marker: None,
                         is_code_block: false,
                         code_language: None,
                         blockquote_depth,
+                        blockquote_opens: 0,
                         line_height: None,
                         non_breakable_lines: None,
                         page_break_before: None,
@@ -858,10 +934,12 @@ pub fn parse_markdown(markdown: &str) -> Vec<ParsedElement> {
                         list_indent: current_list_indent,
                         list_prefix: String::new(),
                         list_suffix: String::new(),
+                        list_start: current_list_start,
                         marker: None,
                         is_code_block: false,
                         code_language: None,
                         blockquote_depth,
+                        blockquote_opens: 0,
                         line_height: None,
                         non_breakable_lines: None,
                         page_break_before: None,
@@ -927,10 +1005,12 @@ pub fn parse_markdown(markdown: &str) -> Vec<ParsedElement> {
             list_indent: current_list_indent,
             list_prefix: String::new(),
             list_suffix: String::new(),
+            list_start: current_list_start,
             marker: None,
             is_code_block,
             code_language: code_language.take(),
             blockquote_depth,
+            blockquote_opens: 0,
             line_height: None,
             non_breakable_lines: None,
             page_break_before: None,
@@ -967,10 +1047,12 @@ pub fn parse_markdown(markdown: &str) -> Vec<ParsedElement> {
             list_indent: 0,
             list_prefix: String::new(),
             list_suffix: String::new(),
+            list_start: None,
             marker: None,
             is_code_block: false,
             code_language: None,
             blockquote_depth: 0,
+            blockquote_opens: 0,
             line_height: None,
             non_breakable_lines: None,
             page_break_before: None,
@@ -983,6 +1065,9 @@ pub fn parse_markdown(markdown: &str) -> Vec<ParsedElement> {
         }));
     }
 
+    // Quotations past the ceiling a document holds are flattened into the deepest kept
+    // (see `quote_depth`): the writers walk one call deeper for each.
+    crate::parser_tools::quote_depth::clamp_quote_depths(&mut elements);
     elements
 }
 
@@ -1219,6 +1304,7 @@ pub fn split_block_at_line_breaks(mut block: ParsedBlock) -> Vec<ParsedBlock> {
     }
     let later_line = ParsedBlock {
         page_break_before: None,
+        blockquote_opens: 0,
         ..block.clone()
     };
     let mut first_line = Some(block);
@@ -1419,11 +1505,86 @@ fn flatten_deep_html_lists(tree: &mut ego_tree::Tree<Node>) {
     }
 }
 
+/// How deep a walk of an HTML tree may go on the caller's own stack: a debug build spends
+/// between 5 and 8 KiB of stack on each element level it follows, so this is at most some
+/// 256 KiB, what any thread a host reads on has to spare.
+const HTML_DEPTH_ON_THE_CALLERS_STACK: usize = 32;
+
+/// The deepest an HTML reader follows elements: a subtree nested deeper is read as its
+/// text, without recursing (see `read_html_tree`).
+const MAX_HTML_READ_DEPTH: usize = 256;
+
+/// The stack a reader of a deeper tree gets on a thread of its own, before what each level
+/// adds: a spawned thread's.
+const HTML_READER_STACK: usize = 2 << 20;
+
+/// The stack each element level of a deeper tree adds for its reader: two to three times
+/// what a debug build spends on one.
+const HTML_STACK_PER_LEVEL: usize = 16 << 10;
+
+/// How many elements deep the deepest node of `tree` is. A loop over the tree's edges,
+/// never a recursion.
+fn html_tree_depth(tree: &ego_tree::Tree<Node>) -> usize {
+    use ego_tree::iter::Edge;
+    let mut depth = 0usize;
+    let mut deepest = 0usize;
+    for edge in tree.root().traverse() {
+        match edge {
+            Edge::Open(node) if node.value().is_element() => {
+                depth += 1;
+                deepest = deepest.max(depth);
+            }
+            Edge::Close(node) if node.value().is_element() => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+    }
+    deepest
+}
+
+/// Read `html` into blocks and tables.
+///
+/// The reader recurses once per element level it follows, up to `MAX_HTML_READ_DEPTH`,
+/// and a stack overflow aborts the process: a debug build ran out of a spawned thread's
+/// stack on a paste nested some 200 elements deep, and a host reading on a smaller thread
+/// sooner. A tree nested deeper than a caller's stack is sure to hold is read on a thread
+/// of its own, with a stack sized for its depth; when no thread can be started, it is read
+/// on the caller's stack to `HTML_DEPTH_ON_THE_CALLERS_STACK` levels, each subtree
+/// deeper than that read as its text. The quotations it holds are kept within
+/// [`MAX_QUOTE_LEVELS`](crate::parser_tools::quote_depth::MAX_QUOTE_LEVELS) (see
+/// `quote_depth`).
 pub fn parse_html_elements(html: &str) -> Vec<ParsedElement> {
     use scraper::Html;
 
+    let read = |depth_limit: usize, html: &str| {
+        let mut fragment = Html::parse_fragment(html);
+        flatten_deep_html_lists(&mut fragment.tree);
+        let mut elements = read_html_tree(&fragment, depth_limit);
+        crate::parser_tools::quote_depth::clamp_quote_depths(&mut elements);
+        elements
+    };
     let mut fragment = Html::parse_fragment(html);
     flatten_deep_html_lists(&mut fragment.tree);
+    let depth = html_tree_depth(&fragment.tree);
+    if depth <= HTML_DEPTH_ON_THE_CALLERS_STACK {
+        let mut elements = read_html_tree(&fragment, MAX_HTML_READ_DEPTH);
+        crate::parser_tools::quote_depth::clamp_quote_depths(&mut elements);
+        return elements;
+    }
+    drop(fragment);
+    let stack = HTML_READER_STACK + depth.min(MAX_HTML_READ_DEPTH + 1) * HTML_STACK_PER_LEVEL;
+    let owned = html.to_owned();
+    let on_its_own_thread = std::thread::Builder::new()
+        .stack_size(stack)
+        .spawn(move || read(MAX_HTML_READ_DEPTH, &owned))
+        .ok()
+        .and_then(|reader| reader.join().ok());
+    on_its_own_thread.unwrap_or_else(|| read(HTML_DEPTH_ON_THE_CALLERS_STACK, html))
+}
+
+/// Read `fragment`, following its elements `depth_limit` deep at most: a subtree nested
+/// deeper is read as its text (see `subtree_text`). The walk recurses once per element
+/// level it follows.
+fn read_html_tree(fragment: &scraper::Html, depth_limit: usize) -> Vec<ParsedElement> {
     let mut elements: Vec<ParsedElement> = Vec::new();
 
     // Walk the DOM tree starting from the root
@@ -1441,7 +1602,9 @@ pub fn parse_html_elements(html: &str) -> Vec<ParsedElement> {
         link_href: Option<String>,
     }
 
-    const MAX_RECURSION_DEPTH: usize = 256;
+    /// The list an element stands in: its style, and the number its first item wears when
+    /// it is not 1 (`<ol start="3">`).
+    type HtmlList = (Option<ListStyle>, Option<i64>);
 
     /// Elements whose text content is machinery, not prose.
     ///
@@ -1468,7 +1631,7 @@ pub fn parse_html_elements(html: &str) -> Vec<ParsedElement> {
     }
 
     /// The text of everything under `node`, for a subtree nested deeper than
-    /// the reader follows ([`MAX_RECURSION_DEPTH`]): read without recursing,
+    /// the reader follows (see [`MAX_HTML_READ_DEPTH`]): read without recursing,
     /// with a space where a block ends so that words do not run together, and
     /// without what [`is_metadata_tag`] names.
     ///
@@ -1526,8 +1689,9 @@ pub fn parse_html_elements(html: &str) -> Vec<ParsedElement> {
         state: &FmtState,
         spans: &mut Vec<ParsedSpan>,
         depth: usize,
+        limit: usize,
     ) {
-        if depth > MAX_RECURSION_DEPTH {
+        if depth > limit {
             let text = subtree_text(node);
             if !text.is_empty() {
                 spans.push(text_span(text, state));
@@ -1604,7 +1768,7 @@ pub fn parse_html_elements(html: &str) -> Vec<ParsedElement> {
                         }
                         _ => {}
                     }
-                    collect_cell_spans(child, &new_state, spans, depth + 1);
+                    collect_cell_spans(child, &new_state, spans, depth + 1, limit);
                 }
                 _ => {}
             }
@@ -1616,26 +1780,46 @@ pub fn parse_html_elements(html: &str) -> Vec<ParsedElement> {
     const MAX_HTML_COLSPAN: usize = 1000;
 
     /// Parse a `<table>` element into a ParsedTable, with the number of `<td>` and `<th>`
-    /// cells it has (see `push_table`).
-    fn parse_table_element(table_node: ego_tree::NodeRef<Node>) -> (ParsedTable, usize) {
+    /// cells it has (see `push_table`). `depth` is how deep the walk stands at the table,
+    /// and `limit` how deep it goes.
+    fn parse_table_element(
+        table_node: ego_tree::NodeRef<Node>,
+        depth: usize,
+        limit: usize,
+    ) -> (ParsedTable, usize) {
         let mut rows: Vec<Vec<ParsedTableCell>> = Vec::new();
         let mut header_rows: usize = 0;
         let mut own_cells: usize = 0;
 
+        /// `walk` is how deep the walk stands at `node` and how deep it goes.
         fn collect_rows(
             node: ego_tree::NodeRef<Node>,
             rows: &mut Vec<Vec<ParsedTableCell>>,
             header_rows: &mut usize,
             own_cells: &mut usize,
             in_thead: bool,
+            walk: (usize, usize),
         ) {
+            let (depth, limit) = walk;
             for child in node.children() {
                 if let Node::Element(el) = child.value() {
                     match el.name() {
-                        "thead" => collect_rows(child, rows, header_rows, own_cells, true),
-                        "tbody" | "tfoot" => {
-                            collect_rows(child, rows, header_rows, own_cells, false)
-                        }
+                        "thead" => collect_rows(
+                            child,
+                            rows,
+                            header_rows,
+                            own_cells,
+                            true,
+                            (depth + 1, limit),
+                        ),
+                        "tbody" | "tfoot" => collect_rows(
+                            child,
+                            rows,
+                            header_rows,
+                            own_cells,
+                            false,
+                            (depth + 1, limit),
+                        ),
                         "tr" => {
                             let mut cells: Vec<ParsedTableCell> = Vec::new();
                             // The cells of the row up to its last `<td>` or `<th>`: the
@@ -1647,7 +1831,7 @@ pub fn parse_html_elements(html: &str) -> Vec<ParsedElement> {
                                 {
                                     let mut spans = Vec::new();
                                     let state = FmtState::default();
-                                    collect_cell_spans(td, &state, &mut spans, 0);
+                                    collect_cell_spans(td, &state, &mut spans, depth + 2, limit);
                                     collapse_inline_whitespace(&mut spans);
                                     if spans.is_empty() {
                                         spans.push(ParsedSpan::default());
@@ -1697,6 +1881,7 @@ pub fn parse_html_elements(html: &str) -> Vec<ParsedElement> {
             &mut header_rows,
             &mut own_cells,
             false,
+            (depth, limit),
         );
 
         // Tables without explicit <thead> but with <th> cells: treat first row as header
@@ -1711,21 +1896,24 @@ pub fn parse_html_elements(html: &str) -> Vec<ParsedElement> {
                 // The caller (`walk_node`) sets the real depth: this helper has
                 // no visibility into the surrounding blockquote nesting.
                 blockquote_depth: 0,
+                blockquote_opens: 0,
             },
             own_cells,
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn walk_node(
         node: ego_tree::NodeRef<Node>,
         state: &FmtState,
         elements: &mut Vec<ParsedElement>,
-        current_list_style: &Option<ListStyle>,
+        current_list: &HtmlList,
         blockquote_depth: u32,
         list_depth: u32,
         depth: usize,
+        limit: usize,
     ) {
-        if depth > MAX_RECURSION_DEPTH {
+        if depth > limit {
             let text = subtree_text(node);
             if !text.trim().is_empty() {
                 let mut spans = vec![text_span(text, state)];
@@ -1733,6 +1921,7 @@ pub fn parse_html_elements(html: &str) -> Vec<ParsedElement> {
                 elements.push(ParsedElement::Block(ParsedBlock {
                     spans,
                     blockquote_depth,
+                    blockquote_opens: 0,
                     ..ParsedBlock::default()
                 }));
             }
@@ -1745,7 +1934,7 @@ pub fn parse_html_elements(html: &str) -> Vec<ParsedElement> {
                     return;
                 }
                 let mut new_state = state.clone();
-                let mut new_list_style = current_list_style.clone();
+                let mut new_list = current_list.clone();
                 let mut bq_depth = blockquote_depth;
                 let mut new_list_depth = list_depth;
 
@@ -1782,11 +1971,17 @@ pub fn parse_html_elements(html: &str) -> Vec<ParsedElement> {
                         }
                     }
                     "ul" => {
-                        new_list_style = Some(ListStyle::Disc);
+                        new_list = (Some(ListStyle::Disc), None);
                         new_list_depth = list_depth + 1;
                     }
                     "ol" => {
-                        new_list_style = Some(ListStyle::Decimal);
+                        // A list numbered from below 0 is kept from 1: no saved syntax
+                        // but HTML writes one.
+                        let start = el
+                            .attr("start")
+                            .and_then(|start| start.trim().parse::<i64>().ok())
+                            .filter(|start| *start >= 0 && *start != 1);
+                        new_list = (Some(ListStyle::Decimal), start);
                         new_list_depth = list_depth + 1;
                     }
                     "blockquote" => {
@@ -1835,7 +2030,7 @@ pub fn parse_html_elements(html: &str) -> Vec<ParsedElement> {
 
                 if tag == "table" {
                     // Parse table structure into a ParsedTable
-                    let (mut parsed_table, own_cells) = parse_table_element(node);
+                    let (mut parsed_table, own_cells) = parse_table_element(node, depth, limit);
                     if !parsed_table.rows.is_empty() {
                         parsed_table.blockquote_depth = bq_depth;
                         push_table(elements, parsed_table, own_cells);
@@ -1855,10 +2050,12 @@ pub fn parse_html_elements(html: &str) -> Vec<ParsedElement> {
                         list_indent: 0,
                         list_prefix: String::new(),
                         list_suffix: String::new(),
+                        list_start: None,
                         marker: None,
                         is_code_block: false,
                         code_language: None,
                         blockquote_depth: bq_depth,
+                        blockquote_opens: 0,
                         line_height: None,
                         non_breakable_lines: None,
                         page_break_before: None,
@@ -1874,17 +2071,20 @@ pub fn parse_html_elements(html: &str) -> Vec<ParsedElement> {
 
                 if tag == "blockquote" {
                     // Blockquote is a container — recurse into children with increased depth
+                    let first = elements.len();
                     for child in node.children() {
                         walk_node(
                             child,
                             &new_state,
                             elements,
-                            &new_list_style,
+                            &new_list,
                             bq_depth,
                             new_list_depth,
                             depth + 1,
+                            limit,
                         );
                     }
+                    mark_quotation_opened(elements, first);
                 } else if is_block_tag && tag != "br" {
                     // Start collecting spans for a new block.
                     // Use a temporary buffer so that nested block-level
@@ -1896,17 +2096,18 @@ pub fn parse_html_elements(html: &str) -> Vec<ParsedElement> {
                         node,
                         &new_state,
                         &mut spans,
-                        &new_list_style,
+                        &new_list,
                         &mut nested_elements,
                         bq_depth,
                         new_list_depth,
                         depth + 1,
+                        limit,
                     );
 
-                    let list_style_for_block = if tag == "li" {
-                        new_list_style.clone()
+                    let (list_style_for_block, list_start_for_block) = if tag == "li" {
+                        new_list.clone()
                     } else {
-                        None
+                        (None, None)
                     };
 
                     let list_indent_for_block = if tag == "li" {
@@ -1944,10 +2145,12 @@ pub fn parse_html_elements(html: &str) -> Vec<ParsedElement> {
                             list_indent: list_indent_for_block,
                             list_prefix: String::new(),
                             list_suffix: String::new(),
+                            list_start: list_start_for_block,
                             marker: None,
                             is_code_block,
                             code_language: code_language.filter(|_| is_code_block),
                             blockquote_depth: bq_depth,
+                            blockquote_opens: 0,
                             line_height: css.line_height,
                             non_breakable_lines: css.non_breakable_lines,
                             page_break_before: css.page_break_before,
@@ -1980,10 +2183,11 @@ pub fn parse_html_elements(html: &str) -> Vec<ParsedElement> {
                             child,
                             &new_state,
                             elements,
-                            &new_list_style,
+                            &new_list,
                             bq_depth,
                             new_list_depth,
                             depth + 1,
+                            limit,
                         );
                     }
                 } else {
@@ -1993,10 +2197,11 @@ pub fn parse_html_elements(html: &str) -> Vec<ParsedElement> {
                             child,
                             &new_state,
                             elements,
-                            current_list_style,
+                            current_list,
                             bq_depth,
                             list_depth,
                             depth + 1,
+                            limit,
                         );
                     }
                 }
@@ -2025,10 +2230,12 @@ pub fn parse_html_elements(html: &str) -> Vec<ParsedElement> {
                         list_indent: 0,
                         list_prefix: String::new(),
                         list_suffix: String::new(),
+                        list_start: None,
                         marker: None,
                         is_code_block: false,
                         code_language: None,
                         blockquote_depth,
+                        blockquote_opens: 0,
                         line_height: None,
                         non_breakable_lines: None,
                         page_break_before: None,
@@ -2048,10 +2255,11 @@ pub fn parse_html_elements(html: &str) -> Vec<ParsedElement> {
                         child,
                         state,
                         elements,
-                        current_list_style,
+                        current_list,
                         blockquote_depth,
                         list_depth,
                         depth + 1,
+                        limit,
                     );
                 }
             }
@@ -2066,13 +2274,14 @@ pub fn parse_html_elements(html: &str) -> Vec<ParsedElement> {
         node: ego_tree::NodeRef<Node>,
         state: &FmtState,
         spans: &mut Vec<ParsedSpan>,
-        current_list_style: &Option<ListStyle>,
+        current_list: &HtmlList,
         elements: &mut Vec<ParsedElement>,
         blockquote_depth: u32,
         list_depth: u32,
         depth: usize,
+        limit: usize,
     ) {
-        if depth > MAX_RECURSION_DEPTH {
+        if depth > limit {
             let text = subtree_text(node);
             if !text.is_empty() {
                 spans.push(text_span(text, state));
@@ -2168,10 +2377,11 @@ pub fn parse_html_elements(html: &str) -> Vec<ParsedElement> {
                             child,
                             &new_state,
                             elements,
-                            current_list_style,
+                            current_list,
                             blockquote_depth,
                             list_depth,
                             depth + 1,
+                            limit,
                         );
                     } else {
                         // Inline element: recurse
@@ -2179,11 +2389,12 @@ pub fn parse_html_elements(html: &str) -> Vec<ParsedElement> {
                             child,
                             &new_state,
                             spans,
-                            current_list_style,
+                            current_list,
                             elements,
                             blockquote_depth,
                             list_depth,
                             depth + 1,
+                            limit,
                         );
                     }
                 }
@@ -2201,11 +2412,12 @@ pub fn parse_html_elements(html: &str) -> Vec<ParsedElement> {
         *root,
         &initial_state,
         &mut root_spans,
-        &None,
+        &(None, None),
         &mut elements,
         0,
         0,
         0,
+        depth_limit,
     );
     collapse_inline_whitespace(&mut root_spans);
     // Only when something survived: the root's direct text children are the
@@ -2218,10 +2430,12 @@ pub fn parse_html_elements(html: &str) -> Vec<ParsedElement> {
             list_indent: 0,
             list_prefix: String::new(),
             list_suffix: String::new(),
+            list_start: None,
             marker: None,
             is_code_block: false,
             code_language: None,
             blockquote_depth: 0,
+            blockquote_opens: 0,
             line_height: None,
             non_breakable_lines: None,
             page_break_before: None,
@@ -2246,10 +2460,12 @@ pub fn parse_html_elements(html: &str) -> Vec<ParsedElement> {
             list_indent: 0,
             list_prefix: String::new(),
             list_suffix: String::new(),
+            list_start: None,
             marker: None,
             is_code_block: false,
             code_language: None,
             blockquote_depth: 0,
+            blockquote_opens: 0,
             line_height: None,
             non_breakable_lines: None,
             page_break_before: None,
@@ -2580,6 +2796,13 @@ fn block_attrs_to_style(attrs: &jotdown::Attributes, opts: &DjotImportOptions) -
     style
 }
 
+/// The start a list keeps on its entity, from the number its first item is written with:
+/// `None` for 1, which every list starts at unless it says otherwise, and for a number past
+/// what the model holds.
+fn list_start_of(start: u64) -> Option<i64> {
+    i64::try_from(start).ok().filter(|start| *start != 1)
+}
+
 /// Push a finished block into `elements`, applying the djot block-level fields
 /// plus any round-tripped block-style attributes carried in `style`.
 #[allow(clippy::too_many_arguments)]
@@ -2591,6 +2814,7 @@ fn djot_push_block(
     list_indent: u32,
     list_prefix: String,
     list_suffix: String,
+    list_start: Option<i64>,
     marker: Option<MarkerType>,
     is_code_block: bool,
     code_language: Option<String>,
@@ -2604,10 +2828,12 @@ fn djot_push_block(
         list_indent,
         list_prefix,
         list_suffix,
+        list_start,
         marker,
         is_code_block,
         code_language,
         blockquote_depth,
+        blockquote_opens: 0,
         line_height: style.line_height,
         non_breakable_lines: style.non_breakable_lines,
         page_break_before: style.page_break_before,
@@ -2667,7 +2893,7 @@ fn djot_source_lines(djot: &str) -> Vec<ParsedElement> {
 /// code blocks and table cells normalise their block styling away.
 ///
 /// Known model limitations (normalised, not preserved on round-trip):
-/// ordered-list start number, table column alignment, and list tight/loose.
+/// table column alignment, and list tight/loose.
 pub fn parse_djot(djot: &str, options: &DjotImportOptions) -> Vec<ParsedElement> {
     use jotdown::{Container as C, Event as E, ListKind};
 
@@ -2707,6 +2933,8 @@ pub fn parse_djot(djot: &str, options: &DjotImportOptions) -> Vec<ParsedElement>
     let mut is_code_block = false;
     let mut code_language: Option<String> = None;
     let mut blockquote_depth: u32 = 0;
+    // Where `elements` stood as each open quotation began (see `mark_quotation_opened`).
+    let mut quotations_open: Vec<usize> = Vec::new();
     // Block-style attributes captured from a standalone paragraph/heading's djot
     // `{…}` block attributes, consumed when that block is flushed.
     let mut pending_style = DjotBlockStyle::default();
@@ -2724,12 +2952,13 @@ pub fn parse_djot(djot: &str, options: &DjotImportOptions) -> Vec<ParsedElement>
     // `Str` events in between, so it has to be captured rather than emitted.
     let mut pending_image: Option<ParsedImage> = None;
 
-    // List nesting: each entry is (style, prefix, suffix); depth = indent + 1.
-    let mut list_stack: Vec<(ListStyle, String, String)> = Vec::new();
+    // List nesting: each entry is (style, prefix, suffix, start); depth = indent + 1.
+    let mut list_stack: Vec<(ListStyle, String, String, Option<i64>)> = Vec::new();
     // Context applied to the next flushed block while inside a list item.
     let mut cur_list_style: Option<ListStyle> = None;
     let mut cur_list_prefix = String::new();
     let mut cur_list_suffix = String::new();
+    let mut cur_list_start: Option<i64> = None;
     let mut cur_list_indent: u32 = 0;
     let mut cur_marker: Option<MarkerType> = None;
 
@@ -2823,6 +3052,7 @@ pub fn parse_djot(djot: &str, options: &DjotImportOptions) -> Vec<ParsedElement>
                     cur_list_indent,
                     cur_list_prefix.clone(),
                     cur_list_suffix.clone(),
+                    cur_list_start,
                     cur_marker.clone(),
                     false,
                     None,
@@ -2830,14 +3060,16 @@ pub fn parse_djot(djot: &str, options: &DjotImportOptions) -> Vec<ParsedElement>
                     DjotBlockStyle::default(),
                 );
             }
-            let (style, prefix, suffix) = list_stack.last().cloned().unwrap_or((
+            let (style, prefix, suffix, start) = list_stack.last().cloned().unwrap_or((
                 ListStyle::Disc,
                 String::new(),
                 String::new(),
+                None,
             ));
             cur_list_style = Some(style);
             cur_list_prefix = prefix;
             cur_list_suffix = suffix;
+            cur_list_start = start;
             cur_list_indent = list_stack.len().saturating_sub(1) as u32;
             cur_marker = $marker;
         }};
@@ -2867,6 +3099,7 @@ pub fn parse_djot(djot: &str, options: &DjotImportOptions) -> Vec<ParsedElement>
                     String::new(),
                     String::new(),
                     None,
+                    None,
                     false,
                     None,
                     blockquote_depth,
@@ -2884,6 +3117,7 @@ pub fn parse_djot(djot: &str, options: &DjotImportOptions) -> Vec<ParsedElement>
                     cur_list_indent,
                     cur_list_prefix.clone(),
                     cur_list_suffix.clone(),
+                    cur_list_start,
                     cur_marker.clone(),
                     is_code_block,
                     code_language.clone(),
@@ -2919,27 +3153,38 @@ pub fn parse_djot(djot: &str, options: &DjotImportOptions) -> Vec<ParsedElement>
             E::Start(C::Div { .. }, _) | E::End(C::Div { .. }) => {}
 
             // ── Blockquote ──
-            E::Start(C::Blockquote, _) => blockquote_depth += 1,
-            E::End(C::Blockquote) => blockquote_depth = blockquote_depth.saturating_sub(1),
+            E::Start(C::Blockquote, _) => {
+                blockquote_depth += 1;
+                quotations_open.push(elements.len());
+            }
+            E::End(C::Blockquote) => {
+                blockquote_depth = blockquote_depth.saturating_sub(1);
+                if let Some(first) = quotations_open.pop() {
+                    mark_quotation_opened(&mut elements, first);
+                }
+            }
 
             // ── Lists ──
             E::Start(C::List { kind, .. }, _) => {
-                let (style, prefix, suffix) = match kind {
+                let (style, prefix, suffix, start) = match kind {
                     ListKind::Unordered(b) | ListKind::Task(b) => {
-                        (djot_bullet_style(b), String::new(), String::new())
+                        (djot_bullet_style(b), String::new(), String::new(), None)
                     }
                     ListKind::Ordered {
-                        numbering, style, ..
+                        numbering,
+                        style,
+                        start,
                     } => {
                         let (p, s) = djot_ordered_affixes(style);
-                        (djot_ordered_style(numbering), p, s)
+                        (djot_ordered_style(numbering), p, s, list_start_of(start))
                     }
                 };
-                list_stack.push((style, prefix, suffix));
+                list_stack.push((style, prefix, suffix, start));
             }
             E::End(C::List { .. }) => {
                 list_stack.pop();
                 cur_list_style = None;
+                cur_list_start = None;
                 cur_marker = None;
             }
             E::Start(C::ListItem, _) => enter_item!(None),
@@ -2959,6 +3204,7 @@ pub fn parse_djot(djot: &str, options: &DjotImportOptions) -> Vec<ParsedElement>
                         cur_list_indent,
                         cur_list_prefix.clone(),
                         cur_list_suffix.clone(),
+                        cur_list_start,
                         cur_marker.clone(),
                         false,
                         None,
@@ -2967,6 +3213,7 @@ pub fn parse_djot(djot: &str, options: &DjotImportOptions) -> Vec<ParsedElement>
                     );
                 }
                 cur_list_style = None;
+                cur_list_start = None;
                 cur_marker = None;
             }
 
@@ -2986,6 +3233,7 @@ pub fn parse_djot(djot: &str, options: &DjotImportOptions) -> Vec<ParsedElement>
                     0,
                     String::new(),
                     String::new(),
+                    None,
                     None,
                     false,
                     None,
@@ -3014,6 +3262,7 @@ pub fn parse_djot(djot: &str, options: &DjotImportOptions) -> Vec<ParsedElement>
                         cur_list_indent,
                         cur_list_prefix.clone(),
                         cur_list_suffix.clone(),
+                        cur_list_start,
                         cur_marker.clone(),
                         false,
                         None,
@@ -3022,6 +3271,7 @@ pub fn parse_djot(djot: &str, options: &DjotImportOptions) -> Vec<ParsedElement>
                     );
                 }
                 cur_list_style = None;
+                cur_list_start = None;
                 cur_marker = None;
             }
             E::Start(C::CodeBlock { language }, _) => {
@@ -3048,6 +3298,7 @@ pub fn parse_djot(djot: &str, options: &DjotImportOptions) -> Vec<ParsedElement>
                     String::new(),
                     String::new(),
                     None,
+                    None,
                     true,
                     code_language.take(),
                     blockquote_depth,
@@ -3071,6 +3322,7 @@ pub fn parse_djot(djot: &str, options: &DjotImportOptions) -> Vec<ParsedElement>
                         header_rows: table_header_rows,
                         rows: std::mem::take(&mut table_rows),
                         blockquote_depth,
+                        blockquote_opens: 0,
                     },
                     own_cells,
                 );
@@ -3162,6 +3414,7 @@ pub fn parse_djot(djot: &str, options: &DjotImportOptions) -> Vec<ParsedElement>
                         cur_list_indent,
                         cur_list_prefix.clone(),
                         cur_list_suffix.clone(),
+                        cur_list_start,
                         cur_marker.clone(),
                         false,
                         None,
@@ -3181,6 +3434,7 @@ pub fn parse_djot(djot: &str, options: &DjotImportOptions) -> Vec<ParsedElement>
                         cur_list_indent,
                         cur_list_prefix.clone(),
                         cur_list_suffix.clone(),
+                        cur_list_start,
                         cur_marker.clone(),
                         false,
                         None,
@@ -3295,6 +3549,7 @@ pub fn parse_djot(djot: &str, options: &DjotImportOptions) -> Vec<ParsedElement>
             cur_list_indent,
             cur_list_prefix.clone(),
             cur_list_suffix.clone(),
+            cur_list_start,
             cur_marker.clone(),
             is_code_block,
             code_language.take(),
@@ -3317,6 +3572,7 @@ pub fn parse_djot(djot: &str, options: &DjotImportOptions) -> Vec<ParsedElement>
             0,
             String::new(),
             String::new(),
+            None,
             None,
             false,
             None,

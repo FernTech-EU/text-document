@@ -469,3 +469,65 @@ fn wrapping_in_a_quotation_takes_the_caret_s_paragraph() {
     cursor.toggle_blockquote().unwrap();
     assert_eq!(doc.to_djot().unwrap(), "Quoted para.\n\nPlain after.");
 }
+
+/// How many quotations the main text holds at its top level.
+fn top_level_quotations(doc: &TextDocument) -> usize {
+    doc.snapshot_flow()
+        .elements
+        .iter()
+        .filter(|element| matches!(element, text_document::FlowElementSnapshot::Frame(_)))
+        .count()
+}
+
+/// Two quotations one after the other stay two through a load, a save and a reload, in
+/// Djot, Markdown and HTML, and through a copy and a paste, or a text put back. The readers
+/// kept only each paragraph's quotation depth, so the two were one quotation from the first
+/// reload on, and a quotation of two paragraphs written to Markdown came back as two.
+#[test]
+fn two_quotations_one_after_the_other_stay_two() {
+    for (djot, quotations) in [
+        ("> a\n\n> b", 2),
+        ("> a\n>\n> b", 1),
+        ("> a\n\n> b\n\n> c", 3),
+        ("> > a\n>\n> > b", 1),
+        ("> > a\n\n> > b", 2),
+        ("> | t1 |\n> |---|\n\n> after", 2),
+    ] {
+        let doc = TextDocument::new();
+        doc.set_djot_sync(djot).unwrap();
+        assert_eq!(top_level_quotations(&doc), quotations, "{djot:?} loaded");
+        assert_eq!(doc.to_djot().unwrap(), djot, "{djot:?} saved");
+
+        let markdown = doc.to_markdown().unwrap();
+        let reloaded = new_doc_with_markdown(&markdown);
+        assert_eq!(
+            reloaded.to_djot().unwrap(),
+            djot,
+            "{djot:?} through {markdown:?}"
+        );
+
+        let html = TextDocument::new();
+        html.set_html(&doc.to_html().unwrap())
+            .unwrap()
+            .wait()
+            .unwrap();
+        assert_eq!(html.to_djot().unwrap(), djot, "{djot:?} through HTML");
+
+        let cursor = doc.cursor();
+        cursor.select(text_document::SelectionType::Document);
+        let copied = cursor.selection();
+        let pasted = TextDocument::new();
+        pasted.cursor().insert_fragment(&copied).unwrap();
+        assert_eq!(
+            pasted.to_djot().unwrap(),
+            djot,
+            "{djot:?} copied and pasted"
+        );
+
+        let restored = new_doc_with_markdown("Something else.");
+        let cursor = restored.cursor();
+        cursor.select(text_document::SelectionType::Document);
+        cursor.insert_djot(djot).unwrap();
+        assert_eq!(restored.to_djot().unwrap(), djot, "{djot:?} put back");
+    }
+}

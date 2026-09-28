@@ -1094,6 +1094,23 @@ fn execute_delete(
         let new_position = if roots.len() > 1 {
             tree_end_after_removal(uow.as_ref(), &blocks, &root_of_block, start_root)
                 .map_or(new_position, |tree_end| new_position.min(tree_end))
+        } else if common::database::rope_helpers::rope_positions_match_flow(&store) {
+            // Nor past the end of the text: a range from a table's anchor to the end of the
+            // text takes the table and all after it, and the anchor's position is then past
+            // the end of what is left.
+            new_position.min(store.rope.read().len_chars() as i64)
+        } else {
+            new_position
+        };
+        // A range that took a table from its anchor leaves the caret where the table stood.
+        // When what now stands there is another table's anchor (the range ran up to it), the
+        // caret goes to the end of the paragraph before: on the anchor it reads as in that
+        // table's first cell, and the paste of what was cut went into that cell.
+        let took_the_start_table = block_to_cell_frame
+            .get(&start_block.id)
+            .is_some_and(|cell_frame| swept.frames.contains(cell_frame));
+        let new_position = if took_the_start_table {
+            snap_off_table_anchor(&store, new_position, false)
         } else {
             new_position
         };
@@ -1108,6 +1125,35 @@ fn execute_delete(
             && total_chars_removed == 0;
         if took_nothing {
             return Err(NothingToDelete { new_position }.into());
+        }
+        // A range from inside one paragraph to inside another, holding whole the tables
+        // between them, joins the two, as a range of text does: the paste of what it took,
+        // which splits the paragraph at the caret and puts the pieces around the tables,
+        // gives the text back. Left apart, the rest of the second paragraph followed the
+        // pasted piece of it as a paragraph of its own. A range ending at the start of the
+        // second paragraph leaves it as it is, and one ending in a cell has no second
+        // paragraph to join.
+        let end_block_kept_in_part = end_offset > 0
+            && end_offset
+                < end_of.get(&end_block.id).copied().unwrap_or(0) - end_block.document_position;
+        let joins_its_ends = start_offset > 0
+            && end_block_kept_in_part
+            && start_block.id != end_block.id
+            && !block_to_cell_frame.contains_key(&start_block.id)
+            && !block_to_cell_frame.contains_key(&end_block.id)
+            && !ends_in_different_roots
+            && !joins_objects_into_a_code_block
+            && follows_in_the_rope(&store, start_block.id, end_block.id);
+        if joins_its_ends {
+            let join = DeleteTextDto {
+                position: new_position,
+                anchor: new_position + 1,
+            };
+            match execute_delete(uow, &join) {
+                Ok(_) => {}
+                Err(error) if error.downcast_ref::<NothingToDelete>().is_some() => {}
+                Err(error) => return Err(error),
+            }
         }
         // In the order the text read, one line for each block it came from.
         taken.sort_by_key(|(start, _)| *start);
@@ -1452,6 +1498,16 @@ fn execute_delete(
             snapshot,
         ))
     }
+}
+
+/// Whether the entry right after block `first` in the rope is block `second`: nothing (a
+/// table, a note's body) stands between them.
+fn follows_in_the_rope(store: &common::database::Store, first: EntityId, second: EntityId) -> bool {
+    let offsets = store.block_offsets.read();
+    offsets
+        .position_of(OffsetMarker::Block(first))
+        .and_then(|at| offsets.entries.get(at + 1))
+        .is_some_and(|(marker, _)| *marker == OffsetMarker::Block(second))
 }
 
 /// Delete a char range inside a single block (used by cross-cell partial-

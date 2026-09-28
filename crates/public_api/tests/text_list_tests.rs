@@ -528,3 +528,152 @@ fn remove_list_item_out_of_range_errors() {
     let cursor = doc.cursor();
     assert!(cursor.remove_list_item(list.id(), 99).is_err());
 }
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// The number an ordered list starts at
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+fn djot(text: &str) -> TextDocument {
+    let doc = TextDocument::new();
+    doc.set_djot_sync(text).unwrap();
+    doc
+}
+
+fn first_marker(doc: &TextDocument) -> String {
+    doc.blocks()
+        .iter()
+        .find_map(|block| block.list().map(|list| list.item_marker(0)))
+        .expect("a list")
+}
+
+/// A list written to start past 1 keeps its start through a load, the markers an editor
+/// shows and every save, in Djot, Markdown and HTML. The model had nowhere to keep it: a
+/// list starting at 3 came back numbered from 1 after a save and a reload.
+#[test]
+fn an_ordered_list_keeps_its_start_through_a_save_and_a_reload() {
+    for (text, marker, saved) in [
+        ("3. three\n4. four\n", "3.", "3. three\n\n4. four"),
+        ("b. two\nc. three\n", "b.", "b. two\n\nc. three"),
+        ("iii) three\niv) four\n", "iii)", "iii) three\n\niv) four"),
+        ("0. zero\n1. one\n", "0.", "0. zero\n\n1. one"),
+        (
+            "1. a\n\n   3. x\n   4. y\n\n2. b\n",
+            "1.",
+            "1. a\n\n  3. x\n\n  4. y\n\n2. b",
+        ),
+    ] {
+        let doc = djot(text);
+        assert_eq!(first_marker(&doc), marker, "the marker of {text:?}");
+        let saved_djot = doc.to_djot().unwrap();
+        assert_eq!(saved_djot, saved, "{text:?} saved");
+        assert_eq!(
+            djot(&saved_djot).to_djot().unwrap(),
+            saved,
+            "{text:?} reloaded"
+        );
+    }
+
+    let doc = djot("Before.\n\n3. three\n4. four\n");
+    let items: Vec<String> = doc
+        .blocks()
+        .iter()
+        .filter_map(|block| block.list_item_index().zip(block.list()))
+        .map(|(index, list)| list.item_marker(index))
+        .collect();
+    assert_eq!(items, ["3.", "4."]);
+
+    let markdown = TextDocument::new();
+    markdown
+        .set_markdown("7. seven\n8. eight\n")
+        .unwrap()
+        .wait()
+        .unwrap();
+    assert_eq!(markdown.to_markdown().unwrap(), "7. seven\n8. eight");
+    assert!(markdown.to_djot().unwrap().starts_with("7. seven"));
+    assert!(markdown.to_html().unwrap().contains("<ol start=\"7\">"));
+
+    let html = TextDocument::new();
+    html.set_html("<ol start=\"5\"><li>five</li><li>six</li></ol><p>p</p><ol><li>one</li></ol>")
+        .unwrap()
+        .wait()
+        .unwrap();
+    assert_eq!(html.to_djot().unwrap(), "5. five\n\n6. six\n\np\n\n1. one");
+    assert!(
+        html.to_html()
+            .unwrap()
+            .contains("<ol start=\"5\"><li>five</li><li>six</li></ol>")
+    );
+    let reloaded = TextDocument::new();
+    reloaded
+        .set_html(&html.to_html().unwrap())
+        .unwrap()
+        .wait()
+        .unwrap();
+    assert_eq!(reloaded.to_djot().unwrap(), html.to_djot().unwrap());
+}
+
+/// A copied list keeps its numbers wherever it is pasted, and a text cut and pasted back,
+/// or put back as a version, keeps its lists' starts. The fragment carried no start: every
+/// pasted list was numbered from 1.
+#[test]
+fn a_copied_list_keeps_its_numbers() {
+    let source = djot("Intro.\n\n3. three\n4. four\n5. five\n\nOutro.\n");
+    let original = source.to_djot().unwrap();
+    let length = source.to_addressable_text().unwrap().chars().count();
+
+    let whole = {
+        let cursor = source.cursor();
+        cursor.set_position(0, MoveMode::MoveAnchor);
+        cursor.set_position(length, MoveMode::KeepAnchor);
+        cursor.selection()
+    };
+    let pasted = TextDocument::new();
+    pasted.cursor().insert_fragment(&whole).unwrap();
+    assert_eq!(
+        pasted.to_djot().unwrap(),
+        original,
+        "pasted into a new text"
+    );
+    assert!(whole.to_markdown().contains("3. three\n4. four"));
+    assert!(whole.to_html().contains("<ol start=\"3\">"));
+
+    // The items from the second on, numbered as they were.
+    let from_four = {
+        let text = source.to_addressable_text().unwrap();
+        let at = |needle: &str| text[..text.find(needle).unwrap()].chars().count();
+        let cursor = source.cursor();
+        cursor.set_position(at("four"), MoveMode::MoveAnchor);
+        cursor.set_position(at("Outro"), MoveMode::KeepAnchor);
+        cursor.selection()
+    };
+    let doc = djot("Other.\n");
+    doc.cursor_at(6).insert_fragment(&from_four).unwrap();
+    assert!(
+        doc.to_djot().unwrap().contains("4. four\n\n5. five"),
+        "{:?}",
+        doc.to_djot().unwrap()
+    );
+
+    // Cut everything and paste it back, and a version put back.
+    let doc = djot(&original);
+    let cursor = doc.cursor();
+    cursor.select(text_document::SelectionType::Document);
+    let cut = cursor.selection();
+    cursor.remove_selected_text().unwrap();
+    cursor.insert_fragment(&cut).unwrap();
+    assert_eq!(doc.to_djot().unwrap(), original, "cut and pasted back");
+
+    let doc = djot("Something else.\n");
+    let cursor = doc.cursor();
+    cursor.select(text_document::SelectionType::Document);
+    cursor.insert_djot(&original).unwrap();
+    assert_eq!(doc.to_djot().unwrap(), original, "put back as a version");
+
+    let doc = djot("Something else.\n");
+    let cursor = doc.cursor();
+    cursor.select(text_document::SelectionType::Document);
+    cursor
+        .insert_markdown("Intro.\n\n3. three\n4. four\n5. five\n\nOutro.\n")
+        .unwrap();
+    assert_eq!(doc.to_djot().unwrap(), original, "put back as Markdown");
+}

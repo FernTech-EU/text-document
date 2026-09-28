@@ -224,6 +224,11 @@ pub struct List {
     pub indent: i64,
     pub prefix: String,
     pub suffix: String,
+    /// The number an ordered list's first item wears, when it is not 1: `3` for a list
+    /// written `3.`, `c.` or `iii.`. `None` for a list numbered from 1, and for every
+    /// unordered list. A Djot, Markdown or HTML list starting past 1 came back numbered
+    /// from 1 after a save and a reload, as the model had nowhere to keep its start.
+    pub start: Option<i64>,
 }
 
 impl HasId for List {

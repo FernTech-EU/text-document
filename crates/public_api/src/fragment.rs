@@ -5,8 +5,9 @@ use frontend::common::parser_tools::content_parser::{
     ParsedBlock, ParsedElement, ParsedSpan, split_block_at_line_breaks,
 };
 use frontend::common::parser_tools::fragment_schema::{
-    FragmentBlock, FragmentData, FragmentElement, FragmentQuoting, FragmentTable,
-    FragmentTableCell, as_a_whole_text, fragment_to_json, whole_text_to_json,
+    FragmentBlock, FragmentData, FragmentElement, FragmentListStarts, FragmentQuoting,
+    FragmentTable, FragmentTableCell, as_a_whole_text, fragment_from_json,
+    fragment_with_list_starts_to_json,
 };
 
 /// A piece of rich text that can be inserted into a [`TextDocument`](crate::TextDocument).
@@ -161,8 +162,8 @@ impl DocumentFragment {
             return String::from("<html><head><meta charset=\"utf-8\"></head><body></body></html>");
         }
 
-        let fragment_data: FragmentData = match serde_json::from_str(&self.data) {
-            Ok(d) => d,
+        let (fragment_data, list_starts) = match fragment_from_json(&self.data) {
+            Ok(carried) => (carried.data, carried.list_starts),
             Err(_) => {
                 return String::from(
                     "<html><head><meta charset=\"utf-8\"></head><body></body></html>",
@@ -205,6 +206,10 @@ impl DocumentFragment {
                 let list_tag = if is_ordered { "ol" } else { "ul" };
                 body.push('<');
                 body.push_str(list_tag);
+                // Where the list starts, when it is not 1.
+                if let Some(start) = list_starts.get(i).filter(|_| is_ordered) {
+                    body.push_str(&format!(" start=\"{start}\""));
+                }
                 body.push('>');
 
                 while i < blocks.len() {
@@ -261,8 +266,8 @@ impl DocumentFragment {
             return String::new();
         }
 
-        let fragment_data: FragmentData = match serde_json::from_str(&self.data) {
-            Ok(d) => d,
+        let (fragment_data, list_starts) = match fragment_from_json(&self.data) {
+            Ok(carried) => (carried.data, carried.list_starts),
             Err(_) => return String::new(),
         };
 
@@ -304,7 +309,11 @@ impl DocumentFragment {
             } else if let Some(ref list) = block.list {
                 let is_ordered = is_ordered_list_style(&list.style);
                 if !prev_was_list {
-                    list_counter = 0;
+                    // From where the list starts, when it is not 1.
+                    list_counter = list_starts
+                        .get(blk_idx)
+                        .and_then(|start| u32::try_from(start.saturating_sub(1)).ok())
+                        .unwrap_or(0);
                 }
                 if is_ordered {
                     list_counter += 1;
@@ -849,6 +858,9 @@ fn parsed_elements_to_fragment(parsed: Vec<ParsedElement>, from: ParsedFrom) -> 
     let mut tables: Vec<FragmentTable> = Vec::new();
     // The quotations each block and table stands in, carried beside them.
     let mut quoting = FragmentQuoting::default();
+    // The number each list starts at, carried beside its items: every item of a list
+    // starting past 1 names it, and an insertion reads it where it makes the list.
+    let mut list_starts = FragmentListStarts::default();
 
     for elem in parsed {
         match elem {
@@ -865,6 +877,8 @@ fn parsed_elements_to_fragment(parsed: Vec<ParsedElement>, from: ParsedFrom) -> 
             // markers spelled.
             ParsedElement::Block(pb) => {
                 let depth = pb.blockquote_depth;
+                // The quotations opening at the block open at its first line.
+                let mut opens = pb.blockquote_opens;
                 // The quotation's role rides on its first block, as the parsers put it.
                 let mut role = pb.semantic_role.clone();
                 let keep_code_block = pb.is_code_block && from == ParsedFrom::SavedSyntax;
@@ -874,9 +888,13 @@ fn parsed_elements_to_fragment(parsed: Vec<ParsedElement>, from: ParsedFrom) -> 
                     split_block_at_line_breaks(pb)
                 };
                 for pb in lines {
+                    if let Some(start) = pb.list_start.filter(|_| pb.list_style.is_some()) {
+                        list_starts.set(blocks.len(), start);
+                    }
                     blocks.push(parsed_block_to_fragment_block(pb, keep_code_block));
                     if depth > 0 {
                         quoting.set_block(blocks.len() - 1, depth, role.take());
+                        quoting.set_block_opens(blocks.len() - 1, std::mem::take(&mut opens));
                     }
                 }
             }
@@ -948,6 +966,7 @@ fn parsed_elements_to_fragment(parsed: Vec<ParsedElement>, from: ParsedFrom) -> 
                     column_widths: vec![],
                 });
                 quoting.set_table(tables.len() - 1, pt.blockquote_depth);
+                quoting.set_table_opens(tables.len() - 1, pt.blockquote_opens);
             }
         }
     }
@@ -960,10 +979,12 @@ fn parsed_elements_to_fragment(parsed: Vec<ParsedElement>, from: ParsedFrom) -> 
         .collect::<Vec<_>>()
         .join("\n");
     let data = FragmentData { blocks, tables };
-    let data = match from {
-        ParsedFrom::SavedSyntax => whole_text_to_json(&data, &quoting),
-        ParsedFrom::Html => fragment_to_json(&data, &quoting),
-    }
+    let data = fragment_with_list_starts_to_json(
+        &data,
+        &quoting,
+        &list_starts,
+        from == ParsedFrom::SavedSyntax,
+    )
     .expect("fragment serialization should not fail");
 
     DocumentFragment { data, plain_text }

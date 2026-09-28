@@ -186,3 +186,172 @@ fn a_deep_list_pasted_into_a_quotation_lands_in_it_at_the_deepest_level() {
     }
     assert!(!is_too_deep(&doc.to_djot().unwrap()));
 }
+
+// ── Quotations and lists nested deeply in Markdown and HTML ─────────────────────────────
+
+/// The stack `std::thread::spawn` gives a thread by default, which a load reads on.
+const SPAWNED_THREAD_STACK: usize = 2 << 20;
+
+/// A smaller stack, as a host's worker thread may have, which a paste reads on.
+const SMALL_THREAD_STACK: usize = 512 << 10;
+
+/// Run `f` on a thread with `stack` bytes of stack, and hand back what it returns. A stack
+/// overflow is not a panic: it aborts the test binary, which is the signal.
+fn on_a_thread<T: Send + 'static>(stack: usize, f: impl FnOnce() -> T + Send + 'static) -> T {
+    std::thread::Builder::new()
+        .stack_size(stack)
+        .spawn(f)
+        .expect("spawn the thread")
+        .join()
+        .expect("the thread must not unwind")
+}
+
+/// Texts nested far past what an editor builds: quotations and lists 500 deep, in
+/// Markdown and in HTML, with the word each ends on.
+fn deeply_nested_texts() -> Vec<(&'static str, String)> {
+    const LEVELS: usize = 500;
+    vec![
+        ("markdown", format!("{} deepest\n", ">".repeat(LEVELS))),
+        (
+            "markdown",
+            (0..LEVELS)
+                .map(|level| format!("{}line {level}\n\n", "> ".repeat(level + 1)))
+                .chain(std::iter::once("deepest\n".to_string()))
+                .collect(),
+        ),
+        (
+            "markdown",
+            (0..LEVELS)
+                .map(|level| format!("{}- item {level}\n", "  ".repeat(level)))
+                .chain(std::iter::once("\ndeepest\n".to_string()))
+                .collect(),
+        ),
+        (
+            "html",
+            format!(
+                "{}deepest{}",
+                "<blockquote>".repeat(LEVELS),
+                "</blockquote>".repeat(LEVELS)
+            ),
+        ),
+        (
+            "html",
+            format!(
+                "{}<p>deepest</p>{}",
+                (0..LEVELS)
+                    .map(|level| format!("<blockquote><p>line {level}</p>"))
+                    .collect::<String>(),
+                "</blockquote>".repeat(LEVELS)
+            ),
+        ),
+        (
+            "html",
+            format!(
+                "{}deepest{}",
+                "<ul><li>".repeat(LEVELS),
+                "</li></ul>".repeat(LEVELS)
+            ),
+        ),
+        (
+            "html",
+            format!(
+                "{}deepest{}",
+                "<div>".repeat(LEVELS),
+                "</div>".repeat(LEVELS)
+            ),
+        ),
+    ]
+}
+
+/// How many quotations the most deeply quoted block of `doc` stands in.
+fn deepest_quotation(doc: &TextDocument) -> usize {
+    let cursor = doc.cursor();
+    doc.blocks()
+        .iter()
+        .map(|block| {
+            cursor.set_position(block.position(), text_document::MoveMode::MoveAnchor);
+            cursor.blockquote_depth_at_cursor()
+        })
+        .max()
+        .unwrap_or(0)
+}
+
+/// A Markdown or HTML text nested 500 quotations or list levels deep loads, saves in every
+/// format, copies and reloads on the stack a spawned thread gets, with every word, its
+/// quotations held to the 64 levels an editor builds. The Markdown and HTML readers kept
+/// every level: the load went through, and the first save, export or copy of the document
+/// aborted the process, which a host cannot catch.
+#[test]
+fn a_deeply_nested_markdown_or_html_text_loads_saves_and_copies() {
+    use common::parser_tools::quote_depth::MAX_QUOTE_LEVELS;
+    for (syntax, text) in deeply_nested_texts() {
+        let what = format!(
+            "{syntax} {:?}...",
+            text.chars().take(24).collect::<String>()
+        );
+        let (quoted, words) = on_a_thread(SPAWNED_THREAD_STACK, move || {
+            let doc = TextDocument::new();
+            match syntax {
+                "markdown" => doc
+                    .set_markdown(&text)
+                    .and_then(|load| load.wait())
+                    .map(drop),
+                _ => doc.set_html(&text).and_then(|load| load.wait()).map(drop),
+            }
+            .expect("load the text");
+            let djot = doc.to_djot().expect("save as Djot");
+            doc.to_markdown().expect("save as Markdown");
+            doc.to_html().expect("save as HTML");
+            let _ = doc.snapshot_flow();
+            let cursor = doc.cursor();
+            cursor.select(text_document::SelectionType::Document);
+            let copied = cursor.selection();
+            let pasted = TextDocument::new();
+            pasted
+                .cursor()
+                .insert_fragment(&copied)
+                .expect("paste the copy");
+            let reloaded = TextDocument::new();
+            reloaded.set_djot_sync(&djot).expect("reload the Djot");
+            let words = |doc: &TextDocument| {
+                doc.to_plain_text()
+                    .unwrap_or_default()
+                    .split_whitespace()
+                    .count()
+            };
+            (
+                deepest_quotation(&doc),
+                [words(&doc), words(&pasted), words(&reloaded)],
+            )
+        });
+        assert!(
+            quoted <= MAX_QUOTE_LEVELS as usize,
+            "{what}: a block stands in {quoted} quotations"
+        );
+        assert!(words[0] > 0, "{what}: the text is gone");
+        assert_eq!(words[1], words[0], "{what}: the copy pasted");
+        assert_eq!(words[2], words[0], "{what}: the Djot reloaded");
+    }
+}
+
+/// The same texts pasted, as Markdown or HTML a clipboard carries, on a thread smaller than
+/// a spawned one, as a host's worker may be: the paste reads them on the caller's stack.
+/// The HTML reader recursed once per element level, 256 deep at most, which a debug build
+/// could not hold in 1 MiB.
+#[test]
+fn a_deeply_nested_markdown_or_html_paste_reads_on_a_small_stack() {
+    for (syntax, text) in deeply_nested_texts() {
+        let what = format!(
+            "{syntax} {:?}...",
+            text.chars().take(24).collect::<String>()
+        );
+        let words = on_a_thread(SMALL_THREAD_STACK, move || {
+            let fragment = match syntax {
+                "markdown" => text_document::DocumentFragment::from_markdown(&text),
+                _ => text_document::DocumentFragment::from_html(&text),
+            };
+            fragment.to_plain_text().split_whitespace().count()
+        });
+        assert!(words > 0, "{what}: the paste holds no word");
+    }
+}

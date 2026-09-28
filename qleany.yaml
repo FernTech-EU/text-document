@@ -306,6 +306,9 @@ entities:
         type: string
       - name: suffix
         type: string
+      - name: start
+        type: integer
+        optional: true
 
   # ── Resource (binary/text resource referenced by name) ─
   #    Document owns all resources. `ImageAnchor.name`

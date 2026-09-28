@@ -80,11 +80,22 @@ fn max_cursor_position_of(inner: &TextDocumentInner) -> Option<usize> {
 /// between its ends. Reporting the selection's length for those moved every
 /// other cursor on the document back by characters that were still there, and
 /// told listeners about a change that never happened.
+///
+/// A `selection` is removed as it is copied: with one end in a table and the
+/// other outside it, it takes the whole table (see [`whole_tables_selected`]).
+/// Backspace and Delete of one character are not selections: at a table's edge
+/// they take nothing.
 fn measured_delete(
     inner: &TextDocumentInner,
     pos: usize,
     anchor: usize,
+    selection: bool,
 ) -> Result<(frontend::document_editing::DeleteTextResultDto, usize)> {
+    let (pos, anchor) = if selection {
+        whole_tables_selected(inner, pos, anchor)
+    } else {
+        (pos, anchor)
+    };
     let before = max_cursor_position_of(inner);
     let dto = frontend::document_editing::DeleteTextDto {
         position: to_i64(pos),
@@ -118,6 +129,21 @@ fn measured_delete(
     Ok((result, removed))
 }
 
+/// `[pos, anchor)` (either order), from its start to its end, as a copy or a removal of a
+/// selection takes it: holding whole every table it has one end in and the other end
+/// outside of (see `rope_helpers::take_whole_tables`). The table trap of
+/// [`TextCursor::set_position`] leaves every selection a writer drags or extends so already;
+/// one another cursor's edit moved into a table, or a range a caller hands to
+/// [`TextCursor::replace`], is read the same way.
+fn whole_tables_selected(inner: &TextDocumentInner, pos: usize, anchor: usize) -> (usize, usize) {
+    let (start, end) = common::database::rope_helpers::take_whole_tables(
+        inner.ctx.db_context.get_store(),
+        to_i64(pos.min(anchor)),
+        to_i64(pos.max(anchor)),
+    );
+    (to_usize(start), to_usize(end))
+}
+
 /// Delete `[pos, anchor)` (either order), then run `insert` where the
 /// deletion left the caret, as one undo entry. Returns what `insert` returned,
 /// how many positions the deletion took (see [`measured_delete`]) and where
@@ -137,7 +163,7 @@ fn delete_then<R>(
     insert: impl FnOnce(usize) -> Result<R>,
 ) -> Result<(R, usize, usize)> {
     undo_redo_commands::begin_composite(&inner.ctx, Some(inner.stack_id));
-    let outcome = measured_delete(inner, pos, anchor).and_then(|(deleted, removed)| {
+    let outcome = measured_delete(inner, pos, anchor, true).and_then(|(deleted, removed)| {
         let at = to_usize(deleted.new_position);
         insert(at).map(|value| (value, removed, at))
     });
@@ -212,9 +238,14 @@ pub struct TextCursor {
 
 impl Clone for TextCursor {
     fn clone(&self) -> Self {
-        let (position, anchor, content_locale) = {
+        let (position, anchor, content_locale, anchor_in_table) = {
             let d = self.data.lock();
-            (d.position, d.anchor, d.content_locale.clone())
+            (
+                d.position,
+                d.anchor,
+                d.content_locale.clone(),
+                d.anchor_in_table,
+            )
         };
         let data = {
             let mut inner = self.doc.lock();
@@ -225,6 +256,8 @@ impl Clone for TextCursor {
                 // A clone reads the same text as its original, so it inherits the language.
                 content_locale,
                 whole_text_selected: false,
+                // The same selection, started where the original's was.
+                anchor_in_table,
             }));
             inner.cursors.push(Arc::downgrade(&data));
             data
@@ -346,6 +379,7 @@ impl TextCursor {
             d.position = new_pos;
             d.anchor = new_pos;
             d.whole_text_selected = false;
+            d.anchor_in_table = None;
         }
         inner.modified = true;
         inner.invalidate_text_cache();
@@ -519,6 +553,7 @@ impl TextCursor {
         let mut d = self.data.lock();
         d.anchor = d.position;
         d.whole_text_selected = false;
+        d.anchor_in_table = None;
     }
 
     // ── Boundary queries ─────────────────────────────────────
@@ -586,15 +621,32 @@ impl TextCursor {
 
     /// Set the cursor to an absolute position.
     ///
-    /// When extending a selection (`KeepAnchor`) across a table boundary,
-    /// the position is snapped to the adjacent block outside the table so
-    /// the entire table is "trapped" inside the selection range. This
-    /// mirrors LibreOffice's behaviour: partial table selections from
-    /// outside are not allowed; the table is always fully enclosed.
+    /// When extending a selection (`KeepAnchor`) across a table's edge, the
+    /// selection takes the whole table, as LibreOffice and Word take a table a
+    /// selection runs into or out of: partial table selections from outside a
+    /// table are not allowed.
     ///
-    /// The snap is skipped when:
-    /// - `mode` is `MoveAnchor` (plain click / move without selection)
-    /// - No adjacent block exists (table is first or last in the document)
+    /// - Moved into a table from outside it, the position snaps past the
+    ///   table: moving forward, to the start of the paragraph after it in the
+    ///   table's own frame (or to the end of the table's last cell when a
+    ///   quotation, another table or nothing stands there); moving back, to the
+    ///   table's anchor, its start.
+    /// - Moved out of the table the selection started in, the anchor goes to
+    ///   the table's edge on the far side, so the selection holds the table
+    ///   whole, from its anchor or to the end of its last cell. The cell it
+    ///   started in is remembered: moved back into that table, the selection
+    ///   starts there again.
+    ///
+    /// The selection this leaves is what [`selection`](Self::selection)
+    /// copies and what [`remove_selected_text`](Self::remove_selected_text),
+    /// typing and pasting over it remove: the anchor stayed in the cell, so an
+    /// editor showed the table's cells up to it selected while the copy held
+    /// the whole table, the removal emptied the cells it met, and a cut pasted
+    /// back put the table in twice. The position was moved instead, to the
+    /// other side of the table: a selection from a cell to the end of the
+    /// text removed the table and kept the paragraphs after it.
+    ///
+    /// Nothing snaps when `mode` is `MoveAnchor` (a plain click or move).
     pub fn set_position(&self, position: usize, mode: MoveMode) {
         // Clamp to max document position (includes block separators)
         let end = {
@@ -603,38 +655,67 @@ impl TextCursor {
         };
         let mut pos = position.min(end);
 
-        // Table-trap snap: when extending a selection, if one endpoint is
-        // inside a table and the other is outside, relocate the inside
-        // endpoint to the boundary of the adjacent block.
+        let mut kept_anchor: Option<(usize, Option<usize>)> = None;
         if mode == MoveMode::KeepAnchor {
-            let anchor = self.data.lock().anchor;
+            // The end the selection was started at, before any table it started in moved
+            // the anchor out to its edge.
+            let fixed = {
+                let d = self.data.lock();
+                d.anchor_in_table.unwrap_or(d.anchor)
+            };
             let pos_cell = self.table_cell_at(pos);
-            let anchor_cell = self.selection_anchor_cell(anchor, pos_cell.as_ref());
-            match (&pos_cell, &anchor_cell) {
-                (Some(tc), None) => {
-                    // Position is inside a table, anchor is outside.
-                    let before = anchor < pos;
-                    if let Some(boundary) = self.table_boundary_position(tc.table.id(), !before) {
-                        pos = boundary;
-                    }
-                }
-                (None, Some(tc)) => {
-                    // Anchor is inside a table, position is outside.
-                    // Snap the position so the table is enclosed.
-                    let before = pos < anchor;
-                    if let Some(boundary) = self.table_boundary_position(tc.table.id(), !before) {
-                        pos = boundary;
-                    }
-                }
-                _ => {}
+            let fixed_cell = self.selection_anchor_cell(fixed, pos_cell.as_ref());
+            let same_table = |one: &TableCellRef, other: &Option<TableCellRef>| {
+                other
+                    .as_ref()
+                    .is_some_and(|other| other.table.id() == one.table.id())
+            };
+            // The position in a table the selection did not start in: past the table, on the
+            // side away from where it started. Going forward, to the start of the paragraph
+            // after the table; going back, to the table's anchor, so the selection holds the
+            // table and none of the paragraph before it, which a removal would then join to
+            // what is left of the one it started in.
+            if let Some(moving) = &pos_cell
+                && !same_table(moving, &fixed_cell)
+            {
+                let forward = fixed < pos;
+                let table_id = moving.table.id();
+                let beside = if forward {
+                    self.position_beside_table(table_id, false)
+                } else {
+                    None
+                };
+                pos = beside
+                    .or_else(|| self.table_edge(table_id, forward))
+                    .unwrap_or(pos);
             }
+            // The selection started in a table the position is not in: the anchor at the
+            // table's edge, on the side away from the position.
+            let anchor = match &fixed_cell {
+                Some(started_in) if !same_table(started_in, &pos_cell) => {
+                    let table_id = started_in.table.id();
+                    match self.table_edge(table_id, pos < fixed) {
+                        Some(edge) => (edge, Some(fixed)),
+                        None => (fixed, None),
+                    }
+                }
+                _ => (fixed, None),
+            };
+            kept_anchor = Some(anchor);
         }
 
         {
             let mut d = self.data.lock();
             d.position = pos;
-            if mode == MoveMode::MoveAnchor {
-                d.anchor = pos;
+            match kept_anchor {
+                Some((anchor, anchor_in_table)) => {
+                    d.anchor = anchor;
+                    d.anchor_in_table = anchor_in_table;
+                }
+                None => {
+                    d.anchor = pos;
+                    d.anchor_in_table = None;
+                }
             }
             d.cell_selection_override = None;
             d.whole_text_selected = false;
@@ -644,6 +725,18 @@ impl TextCursor {
         // from a hit-test or a plain-text search) never leaves the
         // cursor inside a multi-scalar grapheme cluster.
         self.snap_position_to_grapheme_boundary();
+    }
+
+    /// Where the table `table_id` ends, `at_end`, or starts, with its anchor, when the rope
+    /// is the document's position space: the edges a selection holding the table whole runs
+    /// from or to.
+    fn table_edge(&self, table_id: usize, at_end: bool) -> Option<usize> {
+        let inner = self.doc.lock();
+        let extent = common::database::rope_helpers::table_extent(
+            inner.ctx.db_context.get_store(),
+            table_id as common::types::EntityId,
+        )?;
+        Some(to_usize(if at_end { extent.end } else { extent.anchor }))
     }
 
     /// Move the cursor by a semantic operation.
@@ -692,6 +785,7 @@ impl TextCursor {
                 d.position = end;
                 d.cell_selection_override = None;
                 d.whole_text_selected = true;
+                d.anchor_in_table = None;
             }
             SelectionType::BlockUnderCursor | SelectionType::LineUnderCursor => {
                 let pos = self.position();
@@ -706,6 +800,7 @@ impl TextCursor {
                     d.position = end;
                     d.cell_selection_override = None;
                     d.whole_text_selected = false;
+                    d.anchor_in_table = None;
                 }
             }
             SelectionType::WordUnderCursor => {
@@ -716,6 +811,7 @@ impl TextCursor {
                 d.position = word_end;
                 d.cell_selection_override = None;
                 d.whole_text_selected = false;
+                d.anchor_in_table = None;
             }
             SelectionType::SentenceUnderCursor => {
                 let pos = self.position();
@@ -727,6 +823,7 @@ impl TextCursor {
                     d.position = end;
                     d.cell_selection_override = None;
                     d.whole_text_selected = false;
+                    d.anchor_in_table = None;
                 }
             }
         }
@@ -1097,23 +1194,25 @@ impl TextCursor {
     /// less deep than the caret already is (one pasted into a quotation is not
     /// quoted twice); in a table cell or a footnote's body, which hold paragraphs,
     /// it goes in as its paragraphs, and in a table cell a code block goes in as a
-    /// paragraph (a table cell is written as one line of text). Inserted over a
-    /// selection holding the whole text (from its start to its end, or
-    /// [`select(SelectionType::Document)`](Self::select), even of an empty text, or at
-    /// the caret the removal of such a selection left), a
-    /// whole text (a fragment [`from_djot`](DocumentFragment::from_djot),
+    /// paragraph (a table cell is written as one line of text).
+    ///
+    /// Inserted into a main text that is one empty paragraph, a fragment with a structure
+    /// of its own (several paragraphs, a table, a quotation, or a paragraph of its own
+    /// format) keeps its own formatting rather than taking that paragraph's, whatever made
+    /// the text empty: the removal of a selection holding the whole text, which leaves the
+    /// first removed paragraph's formatting, an undo back to an empty text, or a new
+    /// document. The text reads as the fragment loaded. So does a whole text (a fragment
+    /// [`from_djot`](DocumentFragment::from_djot),
     /// [`from_markdown`](DocumentFragment::from_markdown) or
     /// [`from_document`](DocumentFragment::from_document), and so what
     /// [`insert_djot`](Self::insert_djot) and [`insert_markdown`](Self::insert_markdown)
-    /// insert) keeps its own formatting rather than taking that of the empty paragraph the
-    /// removal leaves, which is the first removed paragraph's: the text reads as the
-    /// fragment loaded. So does any other fragment with a structure of its own: several
-    /// paragraphs, a table, a quotation, or a paragraph of its own format. A phrase, one
-    /// plain paragraph copied from a text or pasted as HTML, goes into that empty paragraph
-    /// as typed text does and keeps its formatting: its direction, alignment, heading
-    /// level and quotation. Inserted at a caret in an empty paragraph, a
-    /// fragment of one plain paragraph takes the paragraph's formatting, as typed
-    /// text does: a heading line stays a heading. The bodies of footnote definitions
+    /// insert) of one plain paragraph, inserted over a selection holding the whole text
+    /// (from its start to its end, or [`select(SelectionType::Document)`](Self::select),
+    /// even of an empty text, or at the caret the removal of such a selection left). A
+    /// phrase, one plain paragraph copied from a text or pasted as HTML, goes into the
+    /// paragraph at the caret as typed text does and keeps its formatting: its direction,
+    /// alignment, heading level and quotation; a heading line stays a heading. The bodies
+    /// of footnote definitions
     /// the document holds stay where they are, as
     /// [`remove_selected_text`](Self::remove_selected_text) says. A paste that
     /// would put an image or a footnote reference into a code block is refused, the
@@ -1227,9 +1326,10 @@ impl TextCursor {
     /// The fragment holds the text the selection starts in: the main text, with the
     /// quotations its whole paragraphs stand in, or the one footnote body it starts in.
     /// A note's reference travels; its body stays where it is defined. Each paragraph is
-    /// held once, in reading order. A table the selection holds the anchor of, or runs
-    /// into from the text beside it, is held whole, in a quotation as anywhere else, as a
-    /// removal of the same selection takes it. An empty paragraph closing the text is held
+    /// held once, in reading order. A table the selection holds the anchor of, runs into
+    /// from the text beside it, or runs out of into the text beside it, is held whole, in a
+    /// quotation as anywhere else, as a removal of the same selection takes it. An ordered
+    /// list keeps the numbers its items wore. An empty paragraph closing the text is held
     /// when the selection reaches the text's end.
     pub fn selection(&self) -> DocumentFragment {
         let (pos, anchor) = self.read_cursor();
@@ -1396,6 +1496,7 @@ impl TextCursor {
                 d.position = new_pos;
                 d.anchor = new_pos;
                 d.whole_text_selected = false;
+                d.anchor_in_table = None;
             }
             inner.modified = true;
             inner.invalidate_text_cache();
@@ -2421,45 +2522,21 @@ impl TextCursor {
         ))
     }
 
-    /// Find the document position at the boundary of the block adjacent to a
-    /// table. Used by the table-trap logic in [`set_position`](Self::set_position).
-    ///
-    /// - `before == true`: returns the last position of the block immediately
-    ///   before the table (i.e. `block.position() + block.length()`).
-    /// - `before == false`: returns the first position of the block immediately
-    ///   after the table.
-    ///
-    /// Returns `None` when no adjacent block exists (table is first or last
-    /// element in the flow).
-    fn table_boundary_position(&self, table_id: usize, before: bool) -> Option<usize> {
+    /// Where the paragraph beside the table `table_id` in its own frame stands (see
+    /// `rope_helpers::position_beside_table`): the end of the one `before` it, or the start
+    /// of the one after it. The table trap moves a selection's end entering a table from
+    /// before it to the start of the paragraph after it, so the selection holds the table
+    /// whole. It went to the nearest paragraph in reading order, which could be inside a
+    /// quotation, or past another table: the selection then ran into the quotation, or held
+    /// that table too.
+    fn position_beside_table(&self, table_id: usize, before: bool) -> Option<usize> {
         let inner = self.doc.lock();
-        let main_frame_id = get_main_frame_id(&inner);
-        // A table in a quotation is found too, and the paragraph beside it is the one next
-        // to it in reading order, inside the quotation or out of it.
-        let flow = crate::text_frame::flow_in_reading_order(&inner, &self.doc, main_frame_id);
-        drop(inner);
-
-        // Find the table in the flow and peek at the adjacent element.
-        let idx = flow
-            .iter()
-            .position(|e| matches!(e, FlowElement::Table(t) if t.id() == table_id))?;
-
-        if before {
-            // Walk backwards to find the nearest Block.
-            for i in (0..idx).rev() {
-                if let FlowElement::Block(b) = &flow[i] {
-                    return Some(b.position() + b.length());
-                }
-            }
-        } else {
-            // Walk forwards to find the nearest Block.
-            for item in flow.iter().skip(idx + 1) {
-                if let FlowElement::Block(b) = item {
-                    return Some(b.position());
-                }
-            }
-        }
-        None
+        common::database::rope_helpers::position_beside_table(
+            inner.ctx.db_context.get_store(),
+            table_id as common::types::EntityId,
+            before,
+        )
+        .map(to_usize)
     }
 
     /// Find the first table whose cell blocks fall within the range `(start, end)`.
@@ -2579,6 +2656,12 @@ impl TextCursor {
     /// all of a text pasted back is the text as it was. Typed text keeps the formatting of
     /// the empty paragraph, which is the first removed paragraph's.
     ///
+    /// A selection with one end in a table and the other outside it takes the whole table,
+    /// as [`selection`](Self::selection) copies it (see
+    /// [`set_position`](Self::set_position)). A selection from inside one paragraph to
+    /// inside another, holding whole the tables between them, joins the two paragraphs, as
+    /// a selection of text does.
+    ///
     /// Backspace and Delete across a paragraph that would bring an image or a footnote
     /// reference into a code block join nothing, and a selection across one takes its text
     /// and joins nothing.
@@ -2589,7 +2672,7 @@ impl TextCursor {
         }
         let queued = {
             let mut inner = self.doc.lock();
-            let (result, removed) = measured_delete(&inner, pos, anchor)?;
+            let (result, removed) = measured_delete(&inner, pos, anchor, true)?;
             let stands_for_the_empty_text = self.finish_delete(
                 &mut inner,
                 pos.min(anchor),
@@ -3056,7 +3139,7 @@ impl TextCursor {
     fn do_delete(&self, pos: usize, anchor: usize, selection: bool) -> Result<()> {
         let queued = {
             let mut inner = self.doc.lock();
-            let (result, removed) = measured_delete(&inner, pos, anchor)?;
+            let (result, removed) = measured_delete(&inner, pos, anchor, selection)?;
             let stands_for_the_empty_text = self.finish_delete(
                 &mut inner,
                 pos.min(anchor),
@@ -3112,6 +3195,7 @@ impl TextCursor {
             d.position = new_pos;
             d.anchor = new_pos;
             d.whole_text_selected = false;
+            d.anchor_in_table = None;
         }
         if removed > 0 {
             inner.modified = true;

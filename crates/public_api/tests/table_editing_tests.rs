@@ -1924,47 +1924,261 @@ fn a_selection_ending_on_a_tables_anchor_cuts_what_it_copies() {
 }
 
 /// A selection started in a table cell and dragged out of the table, into the paragraph
-/// before or after it, is a mixed selection: its copy holds the whole table, as Word selects
-/// every cell of a table a selection runs out of. Its removal does not: the table trap cannot
-/// move the fixed end out of the cell, so the range the removal takes runs from inside the
-/// cell, which empties the cells it meets and keeps the grid. Cut and pasted back, the table
-/// is in the text twice, the second time with the words of the emptied cells. Every table
-/// was reached so before this release; a table in a quotation is now too, since the trap
-/// finds it.
+/// before or after it, holds the whole table, as Word and LibreOffice take a table a
+/// selection runs out of: what an editor shows selected (the cursor's anchor and position),
+/// what a copy holds and what a cut removes are the same. The anchor stayed in the cell and
+/// the table trap moved the position to the other side of the table: an editor showed part
+/// of the table selected, the copy held all of it and none of the text the selection was
+/// dragged to, and the cut emptied the cells it met and kept the grid. Cut and pasted back,
+/// the table was in the text twice, and the text dragged over was left behind.
 #[test]
-#[ignore = "a mixed selection's removal takes less than its copy; making the removal take the \
-            whole table changes what Delete and typing over such a selection remove, a design \
-            decision beyond a patch release"]
 fn a_selection_dragged_out_of_a_table_cuts_what_it_copies() {
     for text in [
         "Before.\n\n| a1 | b1 |\n| c1 | d1 |\n\nAfter.\n",
         "Before.\n\n> | a1 | b1 |\n> | c1 | d1 |\n\nAfter.\n",
+        "Before.\n\n| a1 | b1 |\n| c1 | d1 |\n\nAfter.\n\nLast.\n",
     ] {
         let reference = loaded(text);
-        let in_a_cell = position_in(&reference, "b1") + 1;
-        for outside in [
-            position_in(&reference, "After.") + 3,
-            position_in(&reference, "Before.") + 3,
+        let table_start = position_in(&reference, "\u{FFFC}");
+        let table_end = position_in(&reference, "d1") + 2;
+        let end_of_text = reference.to_addressable_text().unwrap().chars().count();
+        for inside in [
+            position_in(&reference, "b1") + 1,
+            position_in(&reference, "a1"),
+            table_end,
+        ] {
+            for outside in [
+                position_in(&reference, "After.") + 3,
+                position_in(&reference, "After."),
+                position_in(&reference, "Before.") + 3,
+                position_in(&reference, "Before.") + "Before.".len(),
+                0,
+                end_of_text,
+            ] {
+                let what = format!("a selection from {inside} to {outside} in {text:?}");
+                let doc = loaded(text);
+                let original = doc.to_djot().unwrap();
+                let original_text = doc.to_addressable_text().unwrap();
+                let cursor = doc.cursor_at(inside);
+                cursor.set_position(outside, MoveMode::KeepAnchor);
+                assert_eq!(
+                    cursor.position(),
+                    outside,
+                    "{what}: the position stays where it was dragged"
+                );
+                assert!(
+                    cursor.selection_start() <= table_start && cursor.selection_end() >= table_end,
+                    "{what}: the selection {}..{} holds the table, {table_start}..{table_end}",
+                    cursor.selection_start(),
+                    cursor.selection_end()
+                );
+                let shown: String = original_text
+                    .chars()
+                    .skip(cursor.selection_start())
+                    .take(cursor.selection_end() - cursor.selection_start())
+                    .collect();
+                let copied = cursor.selection();
+                cursor.remove_selected_text().unwrap();
+                let mut kept_and_cut = sorted_characters(&doc.to_plain_text().unwrap());
+                kept_and_cut.extend(sorted_characters(copied.to_plain_text()));
+                kept_and_cut.sort_unstable();
+                assert_eq!(
+                    kept_and_cut,
+                    sorted_characters(&reference.to_plain_text().unwrap()),
+                    "{what}: the cut left {:?} and copied {:?}",
+                    doc.to_djot().unwrap(),
+                    copied.to_plain_text()
+                );
+                assert_eq!(
+                    sorted_characters(copied.to_plain_text()),
+                    sorted_characters(&shown),
+                    "{what}: the copy holds what the selection shows"
+                );
+                cursor.insert_fragment(&copied).unwrap();
+                assert_eq!(
+                    doc.to_djot().unwrap(),
+                    original,
+                    "{what}: cut and pasted back"
+                );
+                assert_eq!(
+                    doc.to_addressable_text().unwrap(),
+                    original_text,
+                    "{what}: cut and pasted back, the live text"
+                );
+            }
+        }
+    }
+}
+
+/// Dragged back into the table it started in, a selection starts again where it did: the
+/// anchor moved to the table's edge while the selection held the table stands for the cell
+/// it was started in.
+#[test]
+fn a_selection_dragged_out_of_a_table_and_back_starts_where_it_did() {
+    let doc = loaded("Before.\n\n| a1 | b1 |\n| c1 | d1 |\n\nAfter.\n");
+    let in_b1 = position_in(&doc, "b1") + 1;
+    let in_d1 = position_in(&doc, "d1") + 1;
+    let in_after = position_in(&doc, "After.") + 3;
+    let cursor = doc.cursor_at(in_b1);
+    cursor.set_position(in_after, MoveMode::KeepAnchor);
+    assert_ne!(
+        cursor.anchor(),
+        in_b1,
+        "out of the table, the table is held whole"
+    );
+    cursor.set_position(in_b1 + 1, MoveMode::KeepAnchor);
+    assert_eq!(
+        (cursor.anchor(), cursor.position()),
+        (in_b1, in_b1 + 1),
+        "back in the cell"
+    );
+    cursor.set_position(in_after, MoveMode::KeepAnchor);
+    cursor.set_position(in_d1, MoveMode::KeepAnchor);
+    assert_eq!(cursor.anchor(), in_b1, "back in another cell of the table");
+    assert!(
+        cursor.is_cell_selection(),
+        "a selection of the cells between"
+    );
+}
+
+/// A selection from the end of a table's last cell to the end of the text holds the table
+/// and the paragraphs after it: its removal takes them all. The table trap moved the moving
+/// end back before the table, so the removal took the table and kept every paragraph after
+/// it, which the writer had selected. Delete at the end of the last cell, and Backspace at
+/// the start of the paragraph after the table, still take nothing.
+#[test]
+fn deleting_from_the_end_of_a_tables_last_cell_to_the_end_of_the_text_takes_all_of_it() {
+    use text_document::MoveOperation;
+    const TEXT: &str = "Before.\n\n| a1 | b1 |\n| c1 | d1 |\n\nAfter.\n\nLast.\n";
+    let doc = loaded(TEXT);
+    let cursor = doc.cursor_at(position_in(&doc, "d1") + 2);
+    cursor.move_position(MoveOperation::End, MoveMode::KeepAnchor, 1);
+    let removed = cursor.remove_selected_text().unwrap();
+    assert_eq!(doc.to_djot().unwrap(), "Before.", "removed {removed:?}");
+
+    let doc = loaded(TEXT);
+    let original = doc.to_djot().unwrap();
+    doc.cursor_at(position_in(&doc, "d1") + 2)
+        .delete_char()
+        .unwrap();
+    doc.cursor_at(position_in(&doc, "After."))
+        .delete_previous_char()
+        .unwrap();
+    assert_eq!(
+        doc.to_djot().unwrap(),
+        original,
+        "Delete and Backspace by the table"
+    );
+    assert!(!doc.can_undo(), "nothing to undo");
+}
+
+/// A copy from inside a table to a paragraph past it holds everything up to where the
+/// selection ends. The table trap moved the moving end back before the table, and the copy
+/// held the table and nothing after it.
+#[test]
+fn a_copy_from_a_table_to_past_it_holds_the_text_after_the_table() {
+    let doc = loaded("Before.\n\n| a1 | b1 |\n\nAfter.\n\nLast.\n");
+    let cursor = doc.cursor_at(position_in(&doc, "b1") + 1);
+    cursor.set_position(position_in(&doc, "Last.") + 2, MoveMode::KeepAnchor);
+    let copied = cursor.selection().to_plain_text().to_string();
+    assert_eq!(copied, "a1\nb1\nAfter.\nLa");
+}
+
+/// Typing or pasting over a selection that runs out of a table, and moving it elsewhere as
+/// an editor's drag does (select it again by its ends, remove it, insert it at the drop),
+/// take the whole table and the text selected beside it, and nothing else.
+#[test]
+fn typing_pasting_or_dragging_over_a_selection_out_of_a_table_takes_the_table_whole() {
+    const TEXT: &str = "Before.\n\n| a1 | b1 |\n| c1 | d1 |\n\nAfter.\n\nLast.\n";
+    let selected = |doc: &TextDocument| {
+        let cursor = doc.cursor_at(position_in(doc, "b1") + 1);
+        cursor.set_position(position_in(doc, "After.") + 3, MoveMode::KeepAnchor);
+        cursor
+    };
+
+    let doc = loaded(TEXT);
+    selected(&doc).insert_text("typed").unwrap();
+    assert_eq!(doc.to_djot().unwrap(), "Before.\n\ntypeder.\n\nLast.");
+
+    let doc = loaded(TEXT);
+    selected(&doc).insert_djot("pasted").unwrap();
+    assert_eq!(doc.to_djot().unwrap(), "Before.\n\npasteder.\n\nLast.");
+
+    // An editor's drag of the selection to the end of the text.
+    let doc = loaded(TEXT);
+    let cursor = selected(&doc);
+    let (lo, hi) = (cursor.selection_start(), cursor.selection_end());
+    let fragment = cursor.selection();
+    let drop_at = doc.to_addressable_text().unwrap().chars().count();
+    cursor.set_position(lo, MoveMode::MoveAnchor);
+    cursor.set_position(hi, MoveMode::KeepAnchor);
+    cursor.remove_selected_text().unwrap();
+    cursor.set_position(drop_at - (hi - lo), MoveMode::MoveAnchor);
+    cursor.insert_fragment(&fragment).unwrap();
+    let mut before = sorted_characters(&loaded(TEXT).to_plain_text().unwrap());
+    let mut after = sorted_characters(&doc.to_plain_text().unwrap());
+    before.sort_unstable();
+    after.sort_unstable();
+    assert_eq!(after, before, "dragged: {:?}", doc.to_djot().unwrap());
+    assert!(
+        doc.to_djot()
+            .unwrap()
+            .starts_with("Before.\n\ner.\n\nLast."),
+        "the text left: {:?}",
+        doc.to_djot().unwrap()
+    );
+}
+
+/// A selection from inside one paragraph to inside another, over a table, holds the table
+/// whole; cut and pasted back it gives the text back. The cut left the two pieces of the
+/// paragraphs apart, and the paste, which splits the paragraph at the caret, put the piece
+/// of the second one it held in a paragraph of its own before the rest of it.
+#[test]
+fn a_selection_over_a_table_from_paragraph_to_paragraph_cuts_and_pastes_back() {
+    for text in [
+        "Before.\n\n| a1 | b1 |\n| c1 | d1 |\n\nAfter.\n",
+        "Before.\n\n> | a1 | b1 |\n\nAfter.\n",
+        "> Before.\n>\n> | a1 | b1 |\n>\n> After.\n",
+        "Before.\n\n| a1 |\n\nMiddle.\n\n| a2 |\n\nAfter.\n",
+    ] {
+        let reference = loaded(text);
+        for (from, to) in [
+            (
+                position_in(&reference, "ore."),
+                position_in(&reference, "er."),
+            ),
+            (
+                position_in(&reference, ".\n"),
+                position_in(&reference, "er."),
+            ),
+            (
+                position_in(&reference, "ore."),
+                position_in(&reference, "After."),
+            ),
+            (
+                position_in(&reference, ".\n"),
+                position_in(&reference, "After."),
+            ),
+            (0, position_in(&reference, "er.")),
         ] {
             let doc = loaded(text);
             let original = doc.to_djot().unwrap();
-            let cursor = doc.cursor_at(in_a_cell);
-            cursor.set_position(outside, MoveMode::KeepAnchor);
+            let original_text = doc.to_addressable_text().unwrap();
+            let cursor = doc.cursor_at(from);
+            cursor.set_position(to, MoveMode::KeepAnchor);
             let copied = cursor.selection();
             cursor.remove_selected_text().unwrap();
-            let mut kept_and_cut = sorted_characters(&doc.to_plain_text().unwrap());
-            kept_and_cut.extend(sorted_characters(copied.to_plain_text()));
-            kept_and_cut.sort_unstable();
-            assert_eq!(
-                kept_and_cut,
-                sorted_characters(&reference.to_plain_text().unwrap()),
-                "a selection from inside a cell to {outside} in {text:?}: the cut left {:?} \
-                 and copied {:?}",
-                doc.to_djot().unwrap(),
-                copied.to_plain_text()
-            );
             cursor.insert_fragment(&copied).unwrap();
-            assert_eq!(doc.to_djot().unwrap(), original, "cut and pasted back");
+            assert_eq!(
+                doc.to_djot().unwrap(),
+                original,
+                "{from}..{to} of {text:?}, cut and pasted back"
+            );
+            assert_eq!(
+                doc.to_addressable_text().unwrap(),
+                original_text,
+                "{from}..{to} of {text:?}, cut and pasted back, the live text"
+            );
         }
     }
 }
@@ -1995,15 +2209,15 @@ fn merging_cells_from_the_end_of_a_cell_s_text_merges_that_cell() {
 }
 
 /// Merging cells keeps the words of every cell merged, as a word processor merging cells
-/// does. The merge removes every cell but the top left one with its paragraphs: merging `aa`
-/// and `bb` leaves `aa` alone, and `bb` is gone from the text and from every save. 1.12.2
-/// does the same.
+/// does: the merged cell holds each cell's paragraphs, in reading order, and an empty cell
+/// adds nothing. The merge removed every cell but the top left one with its paragraphs:
+/// merging `aa` and `bb` left `aa` alone, and `bb` was gone from the text and from every
+/// save. An undo gives the cells back as they were.
 #[test]
-#[ignore = "a merge drops the text of every cell but the first; keeping it means moving each \
-            merged cell's paragraphs into the surviving one, a change to the merge beyond a \
-            patch release"]
 fn merging_cells_keeps_the_text_of_every_cell() {
     let doc = loaded("| aa | bb | cc |\n");
+    let original = doc.to_djot().unwrap();
+    let original_text = doc.to_addressable_text().unwrap();
     let cursor = doc.cursor_at(position_in(&doc, "aa") + 1);
     cursor.set_position(position_in(&doc, "bb") + 1, MoveMode::KeepAnchor);
     cursor.merge_selected_cells().unwrap();
@@ -2012,4 +2226,61 @@ fn merging_cells_keeps_the_text_of_every_cell() {
         text.contains("bb"),
         "the merged cell's text is gone: {text:?}"
     );
+    let table = doc
+        .cursor_at(position_in(&doc, "aa"))
+        .current_table()
+        .unwrap();
+    let merged: Vec<String> = table
+        .cell(0, 0)
+        .unwrap()
+        .blocks()
+        .iter()
+        .map(|block| block.text())
+        .collect();
+    assert_eq!(merged, ["aa", "bb"]);
+    doc.undo().unwrap();
+    assert_eq!(doc.to_djot().unwrap(), original, "undone");
+    assert_eq!(doc.to_addressable_text().unwrap(), original_text, "undone");
+    doc.redo().unwrap();
+    assert!(doc.to_plain_text().unwrap().contains("bb"), "redone");
+
+    // Across rows, the merged cell reads the cells row by row, and the cells between keep
+    // their places; an empty cell adds nothing, an empty top-left cell included.
+    for (text, range, expected, rest) in [
+        (
+            "| a1 | b1 |\n| c1 | d1 |\n",
+            (0, 0, 1, 0),
+            vec!["a1", "c1"],
+            "b1\nd1",
+        ),
+        ("|  | b1 |\n| c1 |  |\n", (0, 0, 1, 1), vec!["b1", "c1"], ""),
+        ("|  |  |\n", (0, 0, 0, 1), vec![""], ""),
+    ] {
+        let doc = loaded(text);
+        let table = doc.cursor_at(1).current_table().unwrap();
+        let (start_row, start_column, end_row, end_column) = range;
+        doc.cursor()
+            .merge_table_cells(table.id(), start_row, start_column, end_row, end_column)
+            .unwrap();
+        let merged: Vec<String> = table
+            .cell(0, 0)
+            .unwrap()
+            .blocks()
+            .iter()
+            .map(|block| block.text())
+            .collect();
+        assert_eq!(merged, expected, "merging {range:?} of {text:?}");
+        let addressable = doc.to_addressable_text().unwrap();
+        let after_merged = addressable
+            .split('\n')
+            .skip(1 + expected.len())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(
+            after_merged, rest,
+            "the rope after the merged cell of {text:?}"
+        );
+        doc.undo().unwrap();
+        assert_eq!(doc.to_djot().unwrap(), loaded(text).to_djot().unwrap());
+    }
 }

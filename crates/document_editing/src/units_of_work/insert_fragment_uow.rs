@@ -110,6 +110,7 @@ impl CommandUnitOfWork for InsertFragmentUnitOfWork {
 #[macros::uow_action(entity = "List", action = "Get")]
 #[macros::uow_action(entity = "List", action = "Create")]
 #[macros::uow_action(entity = "List", action = "CreateOrphan")]
+#[macros::uow_action(entity = "List", action = "Remove")]
 #[macros::uow_action(entity = "Frame", action = "Create")]
 #[macros::uow_action(entity = "Frame", action = "CreateOrphan")]
 #[macros::uow_action(entity = "Frame", action = "RemoveMulti")]

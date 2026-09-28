@@ -117,8 +117,12 @@ fn trap_snap_forward_selected_cells_covers_all() {
 
 // ── Reverse snap: anchor after table, position inside table ─────
 
+/// Moved back into a table, the position goes to the table's anchor, its start, so the
+/// selection holds the table and none of the paragraph before it. It went to the end of that
+/// paragraph, and a removal of the selection joined the paragraph to what was left of the one
+/// the selection started in.
 #[test]
-fn trap_snap_reverse_position_lands_at_before_block_end() {
+fn trap_snap_reverse_position_lands_at_the_tables_anchor() {
     let doc = doc_with_table();
     let cell_pos = first_table_cell_position(&doc);
     let (before_pos, before_len) = before_block_info(&doc);
@@ -131,9 +135,11 @@ fn trap_snap_reverse_position_lands_at_before_block_end() {
 
     assert_eq!(
         cursor.position(),
-        before_end,
-        "position should snap to end of block before table"
+        before_end + 1,
+        "position should snap to the table's anchor"
     );
+    cursor.remove_selected_text().unwrap();
+    assert_eq!(doc.to_plain_text().unwrap(), "Before\ner");
 }
 
 #[test]

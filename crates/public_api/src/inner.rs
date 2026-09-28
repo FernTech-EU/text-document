@@ -60,6 +60,13 @@ pub(crate) struct CursorData {
     /// it still replaces the text, as a paste over any whole-text selection does (see
     /// `TextCursor::insert_fragment_with_origin`).
     pub whole_text_selected: bool,
+    /// Where the selection was started, in a table's cell, while its moving end is outside
+    /// that table. The table trap (see `TextCursor::set_position`) then sets `anchor` at
+    /// the table's edge, so the selection shown, copied and removed holds the whole table;
+    /// this is the end it came from, which the selection gets back when its moving end
+    /// returns into the table. `None` whenever the anchor is where the selection started,
+    /// and set back to `None` by every move of the anchor and every edit by this cursor.
+    pub anchor_in_table: Option<usize>,
 }
 
 /// Callback entry for document event subscriptions.
@@ -179,6 +186,9 @@ impl TextDocumentInner {
                 let mut data = cursor.lock();
                 data.position = adjust_offset(data.position, edit_pos, removed, added);
                 data.anchor = adjust_offset(data.anchor, edit_pos, removed, added);
+                data.anchor_in_table = data
+                    .anchor_in_table
+                    .map(|origin| adjust_offset(origin, edit_pos, removed, added));
                 // Cell selection override references table coordinates that may be
                 // invalidated by the edit, so always clear it.
                 data.cell_selection_override = None;
@@ -197,6 +207,7 @@ impl TextDocumentInner {
             content_locale: None,
             cell_selection_override: None,
             whole_text_selected: false,
+            anchor_in_table: None,
         }));
         self.cursors.push(Arc::downgrade(&data));
         data

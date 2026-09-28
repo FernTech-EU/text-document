@@ -757,6 +757,11 @@ fn corpus() -> Vec<(&'static str, String)> {
         .to_string();
     // Rows of differing length, from Djot and from an HTML heading spanning two columns.
     let ragged = "Before.\n\n| a |\n| b | c |\n| d | e | f |\n\nAfter.\n".to_string();
+    // Ordered lists starting past 1, in each numbering, quotations side by side, and tables
+    // between paragraphs a selection runs out of.
+    let starts = "Intro.\n\n3. three\n4. four\n\nMid.\n\nb) bee\nc) sea\n\n> a\n\n> b\n\n\
+                  | t1 | t2 |\n| t3 | t4 |\n\niii. third\niv. fourth\n\n| solo |\n\nEnd.\n"
+        .to_string();
     vec![
         ("prose", plain),
         ("lists", lists),
@@ -768,6 +773,7 @@ fn corpus() -> Vec<(&'static str, String)> {
         ("code", code),
         ("quotations", quotations),
         ("ragged", ragged),
+        ("list starts", starts),
     ]
 }
 
@@ -859,6 +865,14 @@ fn fragments() -> Vec<(&'static str, String)> {
                 .into(),
         ),
         ("djot", ragged_table(65, 64)),
+        // Lists starting past 1, and quotations side by side.
+        ("djot", "7. seven\n8. eight\n".into()),
+        ("markdown", "5. five\n6. six\n\nafter\n".into()),
+        (
+            "html",
+            "<ol start=\"4\"><li>four</li><li>five</li></ol><p>p</p>".into(),
+        ),
+        ("djot", "> one\n\n> two\n".into()),
     ]
 }
 
@@ -1577,18 +1591,17 @@ fn random_edit(doc: &TextDocument, rng: &mut Rng, fragments: &[(&str, String)]) 
         }
         37 => {
             // Select all, cut and paste back at the same caret, as one edit: the text is as
-            // it was, and so is the text a save of it reads back as. A copy held a quoted
-            // paragraph once for each quotation around it, one of a text opening with a
-            // quoted table held nothing, and the paste put every paragraph into the
-            // quotation the first one stood in. Two quotations side by side are one after a
-            // reload, as after this paste, so the saved text is compared as a reload reads
-            // it; and an empty paragraph, which no save keeps, can be left before a table the
-            // text opens with or dropped at its end, so the text is compared line by line,
-            // every line that holds anything once and in its place.
+            // it was, and so is the text a save writes. A copy held a quoted paragraph once
+            // for each quotation around it, one of a text opening with a quoted table held
+            // nothing, and the paste put every paragraph into the quotation the first one
+            // stood in; two quotations side by side came back as one, an ordered list
+            // numbered from 1, and a text opening with a table with an empty paragraph
+            // before it.
             let edit = "cut everything and paste it back".to_string();
             let Ok((djot, text)) = seen(doc) else {
                 return edit;
             };
+            let hidden_list_items = holds_list_items_written_otherwise(doc);
             let cursor = doc.cursor();
             cursor.select(SelectionType::Document);
             let cut = cursor.selection();
@@ -1605,26 +1618,288 @@ fn random_edit(doc: &TextDocument, rng: &mut Rng, fragments: &[(&str, String)]) 
             }
             let (djot_after, text_after) =
                 seen(doc).unwrap_or_else(|error| panic!("{edit}: {error}"));
-            let lines = |text: &str| -> Vec<String> {
-                text.split('\n')
-                    .filter(|line| !line.is_empty())
-                    .map(str::to_string)
-                    .collect()
-            };
-            assert_eq!(lines(&text_after), lines(&text), "{edit}: the text changed");
-            let reloaded = |djot: &str| load(djot).to_djot().unwrap_or_default();
-            assert_eq!(
-                reloaded(&djot_after),
-                reloaded(&djot),
-                "{edit}: the saved text changed, from {djot:?} to {djot_after:?}"
-            );
+            assert_eq!(text_after, text, "{edit}: the text changed");
+            // A list item the save writes as a heading or a code block leaves no marker, and
+            // the paste groups the items around it into lists by their style, as a reload
+            // groups written items: the items after it can then count from another number.
+            // Every other list keeps its numbers.
+            if hidden_list_items {
+                assert_eq!(
+                    without_list_numbers(&djot_after),
+                    without_list_numbers(&djot),
+                    "{edit}: the saved text changed"
+                );
+            } else {
+                assert_eq!(djot_after, djot, "{edit}: the saved text changed");
+            }
             edit
         }
+        38 | 39 => table_edge_selection(doc, rng),
         _ => {
             let _ = doc.undo();
             "undo".into()
         }
     }
+}
+
+/// Whether `doc` holds a list item its Djot writes as a heading or a code block, with no
+/// marker: an editor's heading or code-block format over a list item.
+fn holds_list_items_written_otherwise(doc: &TextDocument) -> bool {
+    doc.rope_store_for_test()
+        .blocks
+        .read()
+        .values()
+        .any(|block| {
+            block.list.is_some()
+                && (block.fmt_heading_level.is_some() || block.fmt_is_code_block == Some(true))
+        })
+}
+
+/// `djot` with the number of every ordered list item's marker left out.
+fn without_list_numbers(djot: &str) -> String {
+    djot.lines()
+        .map(|line| {
+            let body = line.trim_start_matches(['>', ' ']);
+            let lead = &line[..line.len() - body.len()];
+            let digits = body.chars().take_while(char::is_ascii_digit).count();
+            match body[digits..].chars().next() {
+                Some('.' | ')') if digits > 0 => format!("{lead}#{}", &body[digits..]),
+                _ => line.to_string(),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// The characters of `text` a selection or a removal accounts for, sorted: its words, without
+/// the whitespace and the anchors a removal joins or a copy leaves out.
+fn counted_characters(text: &str) -> Vec<char> {
+    let mut characters: Vec<char> = text
+        .chars()
+        .filter(|c| !c.is_whitespace() && *c != SENTINEL)
+        .collect();
+    characters.sort_unstable();
+    characters
+}
+
+/// A paragraph's text, as the positions it starts and ends at.
+type Span = (usize, usize);
+
+/// The text of the paragraphs right before and right after the table `table_id` in the frame
+/// that holds it, when the entry beside the table is a paragraph.
+fn paragraphs_beside_table(doc: &TextDocument, table_id: u64) -> (Option<Span>, Option<Span>) {
+    let store = doc.rope_store_for_test();
+    let frames: HashMap<u64, Frame> = copied(store.frames.read().iter());
+    let Some(anchor_frame) = frames
+        .iter()
+        .find(|(_, frame)| frame.table == Some(table_id))
+        .map(|(id, _)| *id)
+    else {
+        return (None, None);
+    };
+    let Some(holder) = frames
+        .values()
+        .find(|frame| frame.child_order.contains(&-(anchor_frame as i64)))
+    else {
+        return (None, None);
+    };
+    let Some(at) = holder
+        .child_order
+        .iter()
+        .position(|entry| *entry == -(anchor_frame as i64))
+    else {
+        return (None, None);
+    };
+    let rope = store.rope.read();
+    let offsets = store.block_offsets.read();
+    let total = rope.len_chars();
+    let extent = |entry: Option<&i64>| -> Option<Span> {
+        let block = u64::try_from(*entry?).ok().filter(|id| *id > 0)?;
+        let index = offsets.position_of(OffsetMarker::Block(block))?;
+        let start = rope.byte_to_char(offsets.entries.get(index)?.1 as usize);
+        let end = offsets
+            .entries
+            .get(index + 1)
+            .map_or(total, |(_, next)| rope.byte_to_char(*next as usize) - 1);
+        Some((start, end))
+    };
+    (
+        at.checked_sub(1)
+            .and_then(|before| extent(holder.child_order.get(before))),
+        extent(holder.child_order.get(at + 1)),
+    )
+}
+
+/// A selection with one end in a table's cells and the other outside the table, made as a
+/// drag or Shift and the arrows make it, from either end: it shows the whole table selected,
+/// and a copy, a cut, typing over it and a drag of it elsewhere all take that, the table
+/// whole with the text beside it. Cut and pasted back when its outer end stands in a
+/// paragraph beside the table, it gives the text back exactly; anywhere else, a removal
+/// takes exactly what the copy holds, and a drag moves it without a word lost.
+fn table_edge_selection(doc: &TextDocument, rng: &mut Rng) -> String {
+    let store = doc.rope_store_for_test();
+    let extents = common::database::rope_helpers::table_extents(&store);
+    drop(store);
+    if extents.is_empty() {
+        return "no table to select from".into();
+    }
+    let extent = extents[rng.below(extents.len())];
+    let (anchor, end) = (extent.anchor as usize, extent.end as usize);
+    let first_cell = anchor + 2;
+    if first_cell > end {
+        return "a table with no cell".into();
+    }
+    let n = length(doc);
+    let inside = first_cell + rng.below(end - first_cell + 1);
+    // Where the outer end may stand for the cut pasted back to give the text back exactly:
+    // in the paragraph before the table past its start, or in the one after it before its
+    // end. From the start of the paragraph before, or to the end of the one after, the
+    // paragraph goes whole, and the paste puts its text into the paragraph at the caret,
+    // with that paragraph's format, as a paste of a plain paragraph does.
+    let (before, after) = paragraphs_beside_table(doc, extent.table_id);
+    let beside: Vec<Span> = before
+        .filter(|(start, end)| start < end)
+        .map(|(start, end)| (start + 1, end))
+        .into_iter()
+        .chain(after.map(|(start, end)| (start, end.saturating_sub(1).max(start))))
+        .collect();
+    let outside = if !beside.is_empty() && rng.below(2) == 0 {
+        let (start, stop) = beside[rng.below(beside.len())];
+        Some((start + rng.below(stop - start + 1), true))
+    } else {
+        // Anywhere before the table's anchor or past its last cell.
+        let candidates = anchor + n.saturating_sub(end);
+        (candidates > 0).then(|| {
+            let pick = rng.below(candidates);
+            (
+                if pick < anchor {
+                    pick
+                } else {
+                    end + 1 + (pick - anchor)
+                },
+                false,
+            )
+        })
+    };
+    let Some((outside, beside_the_table)) = outside else {
+        return "nothing outside the table".into();
+    };
+    let outside = outside.min(n);
+    let (from, to) = if rng.below(2) == 0 {
+        (inside, outside)
+    } else {
+        (outside, inside)
+    };
+    let cursor = doc.cursor_at(from);
+    cursor.set_position(to, MoveMode::KeepAnchor);
+    let (lo, hi) = (cursor.selection_start(), cursor.selection_end());
+    let what = format!("a selection from {from} to {to} across the table at {anchor}..{end}");
+    assert!(
+        lo <= anchor && hi >= end,
+        "{what}: the selection {lo}..{hi} does not hold the whole table"
+    );
+    let before_text = doc.to_addressable_text().unwrap_or_default();
+    let (djot, _) = seen(doc).unwrap_or_default();
+    let copied = cursor.selection();
+    let copied_characters = counted_characters(copied.to_plain_text());
+    let all_characters = counted_characters(&before_text);
+    let edit = match rng.below(4) {
+        0 => {
+            cursor.begin_edit_block();
+            let done = cursor
+                .remove_selected_text()
+                .and_then(|_| cursor.insert_fragment(&copied));
+            cursor.end_edit_block();
+            if let Err(error) = done {
+                panic!("{what}, cut and pasted back: {error}");
+            }
+            if beside_the_table {
+                let (djot_after, text_after) = seen(doc).unwrap_or_default();
+                assert_eq!(text_after, before_text, "{what}, cut and pasted back");
+                assert_eq!(
+                    djot_after, djot,
+                    "{what}, cut and pasted back: the saved text"
+                );
+            }
+            "cut and pasted back"
+        }
+        1 => {
+            cursor.remove_selected_text().unwrap_or_default();
+            let mut kept_and_cut =
+                counted_characters(&doc.to_addressable_text().unwrap_or_default());
+            kept_and_cut.extend(&copied_characters);
+            kept_and_cut.sort_unstable();
+            assert_eq!(
+                kept_and_cut,
+                all_characters,
+                "{what}, removed: the removal took other than the copy holds, copied {:?}",
+                copied.to_plain_text()
+            );
+            "removed"
+        }
+        2 => {
+            if cursor.insert_text("typed").is_ok() {
+                let mut kept = counted_characters(&doc.to_addressable_text().unwrap_or_default());
+                kept.extend(&copied_characters);
+                kept.sort_unstable();
+                let mut expected = all_characters.clone();
+                expected.extend("typed".chars());
+                expected.sort_unstable();
+                assert_eq!(kept, expected, "{what}, typed over");
+            }
+            "typed over"
+        }
+        _ => {
+            // An editor's drag of the selection: selected again by its ends, removed, and
+            // put in where it is dropped, outside every table. It is selected again as it was
+            // made, from its anchor: from its start to its end instead, an end standing on the
+            // anchor of the next table is a moving end that takes that table in (as Shift and
+            // the Right arrow onto it do), which the copy dragged does not hold.
+            let store = doc.rope_store_for_test();
+            let tables = common::database::rope_helpers::table_extents(&store);
+            drop(store);
+            let drops: Vec<usize> = (0..=n)
+                .filter(|at| *at < lo || *at > hi)
+                .filter(|at| {
+                    tables
+                        .iter()
+                        .all(|t| (*at as i64) < t.anchor || (*at as i64) > t.end + 1)
+                })
+                .collect();
+            if drops.is_empty() {
+                return format!("{what}: nowhere to drop it");
+            }
+            let drop_at = drops[rng.below(drops.len())];
+            // One edit, as an editor makes a drag one step of its history.
+            let (anchor_end, moving_end) = (cursor.anchor(), cursor.position());
+            cursor.begin_edit_block();
+            cursor.set_position(anchor_end, MoveMode::MoveAnchor);
+            cursor.set_position(moving_end, MoveMode::KeepAnchor);
+            assert_eq!(
+                (cursor.selection_start(), cursor.selection_end()),
+                (lo, hi),
+                "{what}: selected again"
+            );
+            let _ = cursor.remove_selected_text();
+            let target = if drop_at > hi {
+                drop_at - (hi - lo)
+            } else {
+                drop_at
+            };
+            cursor.set_position(target.min(length(doc)), MoveMode::MoveAnchor);
+            let dropped = cursor.insert_fragment(&copied);
+            cursor.end_edit_block();
+            if dropped.is_ok() {
+                assert_eq!(
+                    counted_characters(&doc.to_addressable_text().unwrap_or_default()),
+                    all_characters,
+                    "{what}, dragged to {drop_at}"
+                );
+            }
+            "dragged"
+        }
+    };
+    format!("{what}, {edit}")
 }
 
 /// Move the list item at `at` one level in or out, as an editor's Tab and Shift+Tab do: take
@@ -2255,9 +2530,10 @@ fn pasting_into_an_empty_formatted_line_keeps_its_format() {
 /// A cut of all of a text leaves its cursor standing for the whole of the empty text, so the
 /// paste that follows gives the text back as it was. Any edit made between the two ends
 /// that: a heading, a list item or a quotation the writer makes of the emptied line, by this
-/// cursor or another, or a text a load puts in, is the line the paste goes into, as it is
-/// for a paste into any empty formatted line. The mark outlived every edit that moved no
-/// text, and the paste took off the formatting the writer had just given the line.
+/// cursor or another, or a text a load puts in, leaves the paste doing what it does in any
+/// text that is one empty formatted line: a phrase goes into the line and keeps its
+/// format, and a text of its own structure replaces it. The mark outlived every edit that
+/// moved no text, so the two differed.
 #[test]
 fn an_edit_after_a_cut_of_everything_is_kept_by_the_paste() {
     type Edit = fn(&TextDocument, &text_document::TextCursor);
@@ -2311,15 +2587,14 @@ fn an_edit_after_a_cut_of_everything_is_kept_by_the_paste() {
     }
 }
 
-/// Cut everything, paste it back, undo the paste and paste again: the second paste should
-/// give the text back as the first did. It goes into the line the undo leaves, which keeps
-/// the formatting and the quotation of the first paragraph cut, and a scene opening with an
-/// epigraph comes back quoted from end to end. The mark saying that line stands for the whole
-/// text is the cursor's, and ends with the first paste; an undo or a redo back to the empty
-/// text cannot give it back, since the history does not say what that line is.
+/// Cut everything, paste it back, undo the paste and paste again: the second paste gives
+/// the text back as the first did, and so does a paste after the cut undone and redone. It
+/// went into the line the undo leaves, which keeps the formatting and the quotation of the
+/// first paragraph cut, and a scene opening with an epigraph came back quoted from end to
+/// end: the mark saying that line stands for the whole text was the cursor's, and ended with
+/// the first paste, where no undo or redo gives it back. A text pasted into a text that is
+/// one empty paragraph now keeps its own formatting whatever made the text empty.
 #[test]
-#[ignore = "the cut's whole-text mark does not survive an undo or a redo; restoring it needs \
-            the history to carry it, a design change beyond a patch release"]
 fn pasting_again_after_undoing_the_paste_of_a_cut_of_everything_changes_nothing() {
     let text = "> {semantic_role=epigraph}\n> The sea.\n\n# Title\n\nAlpha.\n";
     let doc = load(text);
@@ -2349,6 +2624,96 @@ fn pasting_again_after_undoing_the_paste_of_a_cut_of_everything_changes_nothing(
         original,
         "a paste after the cut undone and redone"
     );
+}
+
+/// A text of its own structure pasted into a text that is one empty paragraph keeps its own
+/// formatting, whatever made the text empty: a new document whose line the writer made a
+/// heading or a quotation, a removal of everything by another cursor than the one pasting,
+/// an undo back to an empty text. A phrase goes into the paragraph and keeps its format, as
+/// typing does. The text's first paragraph went into the empty line's heading, and all of
+/// it into the empty line's quotation, unless the cursor pasting had just cut everything.
+#[test]
+fn a_text_pasted_into_an_empty_text_keeps_its_formatting_however_it_came_to_be_empty() {
+    let text = load("Plain.\n\n> Quoted.\n");
+    let copied = select(&text, 0, length(&text)).selection();
+    let expected = text.to_djot().unwrap();
+    /// What emptied the text, how to make that text, and the format its empty line keeps.
+    type Emptied = (&'static str, fn() -> TextDocument, &'static str);
+    let emptied: [Emptied; 4] = [
+        (
+            "a new document with a heading line",
+            || {
+                let doc = TextDocument::new();
+                doc.cursor()
+                    .set_block_format(&text_document::BlockFormat {
+                        heading_level: Some(2),
+                        ..Default::default()
+                    })
+                    .unwrap();
+                doc
+            },
+            "## ",
+        ),
+        (
+            "a new document with a quotation line",
+            || {
+                let doc = TextDocument::new();
+                doc.cursor().insert_blockquote().unwrap();
+                doc
+            },
+            "> ",
+        ),
+        (
+            "a text emptied by another cursor",
+            || {
+                let doc = load("## Title\n\nText.\n");
+                select(&doc, 0, length(&doc))
+                    .remove_selected_text()
+                    .unwrap();
+                doc
+            },
+            "## ",
+        ),
+        (
+            "an undo back to an empty text",
+            || {
+                let doc = load("> Title\n\nText.\n");
+                select(&doc, 0, length(&doc))
+                    .remove_selected_text()
+                    .unwrap();
+                doc.cursor().insert_text("x").unwrap();
+                doc.undo().unwrap();
+                doc
+            },
+            "> ",
+        ),
+    ];
+    for (name, make, format) in emptied {
+        let doc = make();
+        doc.cursor().insert_fragment(&copied).unwrap();
+        assert_model(&doc, name);
+        assert_eq!(
+            doc.to_djot().unwrap(),
+            expected,
+            "a text pasted into {name}"
+        );
+
+        let doc = make();
+        doc.cursor().insert_djot("Phrase").unwrap();
+        assert_eq!(
+            doc.to_djot().unwrap(),
+            format!("{format}Phrase"),
+            "a phrase pasted into {name}"
+        );
+
+        let doc = make();
+        doc.cursor().insert_text("Typed").unwrap();
+        assert_eq!(
+            doc.to_djot().unwrap(),
+            format!("{format}Typed"),
+            "typing into {name}"
+        );
+    }
 }
 
 /// Selecting all of a text and pasting a phrase over it, a few words copied from the text or
@@ -2489,6 +2854,81 @@ fn a_pasted_quotation_stays_a_quotation_where_one_can_stand() {
         .insert_djot("x\n\n> q\n\ny")
         .unwrap();
     assert_model(&doc, "the paste into a note");
+}
+
+/// A paragraph of its own format (a quoted paragraph, a heading, a code block) pasted at
+/// the end of a paragraph goes in after it, and nothing follows it: the paste left an empty
+/// paragraph after it, which a paste of several paragraphs never did, and a save dropped.
+/// The caret stands at the end of what was pasted.
+#[test]
+fn a_formatted_paragraph_pasted_at_the_end_of_a_paragraph_leaves_no_empty_one_after_it() {
+    for (fragment, words) in [
+        ("> Quoted.", "Quoted."),
+        ("# Title", "Title"),
+        ("```\ncode\n```", "code"),
+    ] {
+        for (text, rest) in [("Some text.\n", ""), ("Some text.\n\nMore.\n", "\n\nMore.")] {
+            let doc = load(text);
+            let cursor = doc.cursor_at("Some text.".len());
+            cursor.insert_djot(fragment).unwrap();
+            assert_model(&doc, &format!("{fragment:?} pasted at the end of {text:?}"));
+            let blocks: Vec<String> = doc.blocks().iter().map(|block| block.text()).collect();
+            assert!(
+                !blocks.iter().any(String::is_empty),
+                "{fragment:?} pasted at the end of {text:?}: an empty paragraph in {blocks:?}"
+            );
+            assert_eq!(
+                doc.to_djot().unwrap(),
+                format!("Some text.\n\n{fragment}{rest}"),
+                "{fragment:?} into {text:?}"
+            );
+            assert_caret_after(&doc, &cursor, words);
+        }
+    }
+    // The same passage copied from a text.
+    let source = load("> Quoted.\n\nPlain.\n");
+    let copied = select(&source, 0, position_of(&source, "Plain.")).selection();
+    let doc = load("Some text.\n");
+    doc.cursor_at("Some text.".len())
+        .insert_fragment(&copied)
+        .unwrap();
+    assert_eq!(doc.to_djot().unwrap(), "Some text.\n\n> Quoted.");
+    assert_eq!(doc.blocks().len(), 2);
+}
+
+/// A paste opening with a paragraph of its own format, at the start of a paragraph, puts
+/// that paragraph in the first one's place, and the paragraph's own text after the paste
+/// keeps its format: its heading level, list, quotation or alignment. It was made a plain
+/// paragraph: a heading cut with the table after it and pasted back at the start of the
+/// next heading lost that heading's level. (The structural differential's seed 29.)
+#[test]
+fn the_rest_of_a_paragraph_a_formatted_paste_goes_into_keeps_its_format() {
+    let text = "## One\n\n| c1 | c2 |\n|---|---|\n\n## Two\n";
+    let doc = load(text);
+    let original = doc.to_djot().unwrap();
+    let cursor = doc.cursor_at(position_of(&doc, "c1"));
+    cursor.set_position(position_of(&doc, "One"), MoveMode::KeepAnchor);
+    let cut = cursor.selection();
+    cursor.remove_selected_text().unwrap();
+    assert_eq!(doc.to_djot().unwrap(), "## Two");
+    cursor.insert_fragment(&cut).unwrap();
+    assert_model(&doc, "cut and pasted back");
+    assert_eq!(doc.to_djot().unwrap(), original, "cut and pasted back");
+
+    for (into, expected) in [
+        ("## Title\n", "# Pasted\n\n| t |\n|---|\n\n## Title"),
+        ("- item\n", "# Pasted\n\n| t |\n|---|\n\n- item"),
+        ("> quoted\n", "> # Pasted\n>\n> | t |\n> |---|\n>\n> quoted"),
+    ] {
+        let doc = load(into);
+        doc.cursor_at(0).insert_djot("# Pasted\n\n| t |\n").unwrap();
+        assert_model(&doc, into);
+        assert_eq!(
+            doc.to_djot().unwrap(),
+            expected,
+            "pasted at the start of {into:?}"
+        );
+    }
 }
 
 /// A selection across a quotation copies each of its paragraphs once. Every frame of the
@@ -3238,6 +3678,92 @@ fn pasting_a_table_alone_mid_document_keeps_the_rope_in_flow_order() {
     }
 }
 
+/// A text opening with a table, pasted over everything, put back as a version, cut and
+/// pasted back, or pasted into an empty document, reads as the text loaded: the table first.
+/// The paste split the empty paragraph at the caret and put the table after its empty first
+/// half, so the live text opened with an empty paragraph no save keeps, and a caret or a
+/// search counted a line the text does not have.
+#[test]
+fn a_text_opening_with_a_table_replaces_everything_with_nothing_before_the_table() {
+    for text in [
+        "| a | b |\n| c | d |\n\nAfter.\n",
+        "| a | b |\n",
+        "| a |\n\n| b |\n\nEnd.\n",
+        "> | q1 | q2 |\n\nAfter.\n",
+        "| a | b |\n\n- one\n- two\n",
+    ] {
+        let source = load(text);
+        let expected = source.to_addressable_text().unwrap();
+        let expected_djot = source.to_djot().unwrap();
+        let whole = select(&source, 0, length(&source)).selection();
+        let check = |doc: &TextDocument, what: &str| {
+            assert_model(doc, &format!("{what} of {text:?}"));
+            assert_eq!(
+                doc.to_addressable_text().unwrap(),
+                expected,
+                "{what} of {text:?}"
+            );
+            assert_eq!(doc.to_djot().unwrap(), expected_djot, "{what} of {text:?}");
+        };
+
+        let doc = load("Some.\n\nText.\n");
+        let cursor = doc.cursor();
+        cursor.select(SelectionType::Document);
+        cursor.insert_fragment(&whole).unwrap();
+        check(&doc, "select all and paste");
+
+        let doc = load("# A heading\n\nText.\n");
+        restore(&doc, text);
+        check(&doc, "a version put back");
+
+        let doc = load(text);
+        let cursor = doc.cursor();
+        cursor.select(SelectionType::Document);
+        let cut = cursor.selection();
+        cursor.remove_selected_text().unwrap();
+        cursor.insert_fragment(&cut).unwrap();
+        check(&doc, "cut everything and paste it back");
+
+        let doc = TextDocument::new();
+        doc.cursor().insert_fragment(&whole).unwrap();
+        check(&doc, "a paste into an empty document");
+    }
+}
+
+/// A table pasted with the caret at the start of a paragraph goes in front of the paragraph,
+/// which keeps its text and format; an empty paragraph stays after it. It went in after the
+/// paragraph wherever the caret stood in it.
+#[test]
+fn a_table_pasted_at_the_start_of_a_paragraph_goes_in_front_of_it() {
+    for (fragment, expected) in [
+        ("| x | y |\n", "one\n\u{FFFC}\nx\ny\ntwo\nthree"),
+        ("| x | y |\n\nmore", "one\n\u{FFFC}\nx\ny\nmoretwo\nthree"),
+    ] {
+        let doc = load("one\n\n## two\n\nthree\n");
+        paste(&doc.cursor_at(position_of(&doc, "two")), "djot", fragment);
+        assert_model(&doc, &format!("{fragment:?} pasted"));
+        assert_eq!(doc.to_addressable_text().unwrap(), expected, "{fragment:?}");
+        assert!(
+            doc.to_djot().unwrap().contains("## "),
+            "{fragment:?}: the heading keeps its level: {:?}",
+            doc.to_djot().unwrap()
+        );
+    }
+
+    // An empty line stays after a table pasted on it, as in a word processor.
+    let doc = load("one\n\nthree\n");
+    doc.cursor_at(3).insert_block().unwrap();
+    assert_eq!(doc.to_addressable_text().unwrap(), "one\n\nthree");
+    paste(&doc.cursor_at(4), "djot", "| x | y |\n");
+    assert_model(&doc, "a table pasted into an empty paragraph");
+    assert_eq!(
+        doc.to_addressable_text().unwrap(),
+        "one\n\u{FFFC}\nx\ny\n\nthree"
+    );
+    doc.undo().unwrap();
+    assert_eq!(doc.to_addressable_text().unwrap(), "one\n\nthree");
+}
+
 /// A selection over a whole table of one cell, from the end of the paragraph before it to
 /// the start of the paragraph after it, takes text from that one cell only. It went through
 /// the join, which removed the cell's blocks and left the table itself behind: an anchor in
@@ -3974,13 +4500,14 @@ fn a_frame_inserted_after_a_paragraph_follows_it_in_the_rope() {
     assert_eq!(doc.to_addressable_text().unwrap(), "");
 }
 
-/// A range from the start of a table's first cell to past the table empties the cells and
-/// keeps the table: it does not hold the table's start. When a cell held two paragraphs, the
-/// deletion removed the second one before it looked at the tables; the rope, still holding
-/// it, was then no longer the position space, so the table's anchor had no position and the
-/// table was taken to start at its first cell. The table went, anchor and all.
+/// A range from the start of a table's first cell to past the table takes the whole table,
+/// as a selection with one end in a table and the other outside it does. When a cell held two
+/// paragraphs, the deletion removed the second one before it looked at the tables; the rope,
+/// still holding it, was then no longer the position space, so the table's anchor had no
+/// position and the table was taken to start at its first cell. That removal is what the
+/// range asks for now, and the model has to come out of it whole.
 #[test]
-fn a_range_from_the_first_cell_on_keeps_the_table_when_a_cell_holds_two_paragraphs() {
+fn a_range_from_the_first_cell_on_takes_the_table_when_a_cell_holds_two_paragraphs() {
     let doc = load("Intro.\n\n| x | y |\n| 1 | 2 |\n\nAfter words.\n");
     doc.cursor_at(position_of(&doc, "2\n"))
         .insert_block()
@@ -3995,10 +4522,7 @@ fn a_range_from_the_first_cell_on_keeps_the_table_when_a_cell_holds_two_paragrap
         .replace(from, to, "X", Default::default())
         .unwrap();
     assert_model(&doc, "replacing from the first cell to past the table");
-    assert_eq!(
-        doc.to_addressable_text().unwrap(),
-        "Intro.\n\u{FFFC}\nX\n\n\n\nwords."
-    );
+    assert_eq!(doc.to_addressable_text().unwrap(), "Intro.\nXwords.");
 }
 
 // ── Lists in quotations, table cells and notes ───────────────────────────────

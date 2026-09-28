@@ -283,9 +283,13 @@ fn execute_content_insert(
         let mut updated_current = current_block.clone();
         let (head_plain, head_runs, head_images) = if overwrite_head {
             let head_list_id = if let Some(ref list_style) = first_parsed.list_style {
-                if let Some(existing_id) =
-                    list_grouper.try_reuse(list_style, first_parsed.list_indent)
-                {
+                if let Some(existing_id) = list_grouper.try_reuse_list(
+                    list_style,
+                    first_parsed.list_indent,
+                    "",
+                    "",
+                    first_parsed.list_start,
+                ) {
                     Some(existing_id)
                 } else {
                     let list = List {
@@ -296,12 +300,16 @@ fn execute_content_insert(
                         indent: first_parsed.list_indent as i64,
                         prefix: String::new(),
                         suffix: String::new(),
+                        start: first_parsed.list_start,
                     };
                     let created_list = uow.create_list(&list, doc_id, -1)?;
-                    list_grouper.register(
+                    list_grouper.register_list(
                         created_list.id,
                         list_style.clone(),
                         first_parsed.list_indent,
+                        String::new(),
+                        String::new(),
+                        first_parsed.list_start,
                     );
                     Some(created_list.id)
                 }
@@ -400,7 +408,13 @@ fn execute_content_insert(
             let block_text_len = block_plain.chars().count() as i64;
 
             let list_id = if let Some(ref list_style) = parsed.list_style {
-                if let Some(existing_id) = list_grouper.try_reuse(list_style, parsed.list_indent) {
+                if let Some(existing_id) = list_grouper.try_reuse_list(
+                    list_style,
+                    parsed.list_indent,
+                    "",
+                    "",
+                    parsed.list_start,
+                ) {
                     Some(existing_id)
                 } else {
                     let list = List {
@@ -411,9 +425,17 @@ fn execute_content_insert(
                         indent: parsed.list_indent as i64,
                         prefix: String::new(),
                         suffix: String::new(),
+                        start: parsed.list_start,
                     };
                     let created_list = uow.create_list(&list, doc_id, -1)?;
-                    list_grouper.register(created_list.id, list_style.clone(), parsed.list_indent);
+                    list_grouper.register_list(
+                        created_list.id,
+                        list_style.clone(),
+                        parsed.list_indent,
+                        String::new(),
+                        String::new(),
+                        parsed.list_start,
+                    );
                     Some(created_list.id)
                 }
             } else {
@@ -703,6 +725,7 @@ fn execute_content_insert(
                     indent: parsed.list_indent as i64,
                     prefix: String::new(),
                     suffix: String::new(),
+                    start: parsed.list_start,
                 };
                 let created_list = uow.create_list(&list, doc_id, -1)?;
                 Some(created_list.id)
@@ -869,6 +892,7 @@ fn execute_content_insert(
                     indent: parsed.list_indent as i64,
                     prefix: String::new(),
                     suffix: String::new(),
+                    start: parsed.list_start,
                 };
                 let created_list = uow.create_list(&list, doc_id, -1)?;
                 Some(created_list.id)

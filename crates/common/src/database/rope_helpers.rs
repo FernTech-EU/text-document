@@ -771,6 +771,49 @@ pub fn rope_insert_run_after(
     true
 }
 
+/// Insert `run` into the rope right in front of the entry `before`, in order: whatever
+/// preceded `before` precedes the run, and `before` follows it. Returns `false`, leaving the
+/// rope alone, when `before` is not in the index.
+///
+/// This is how a paste opening with a table at the start of a paragraph lays the table out
+/// in front of that paragraph rather than after it (see `insert_fragment_uc`).
+pub fn rope_insert_run_before(
+    store: &Store,
+    before: OffsetMarker,
+    run: &[(OffsetMarker, &str)],
+) -> bool {
+    let previous = {
+        let offsets = store.block_offsets.read();
+        let Some(position) = offsets.position_of(before) else {
+            return false;
+        };
+        position
+            .checked_sub(1)
+            .and_then(|at| offsets.entries.get(at))
+            .map(|(marker, _)| *marker)
+    };
+    if let Some(previous) = previous {
+        return rope_insert_run_after(store, previous, run);
+    }
+    if run.is_empty() {
+        return true;
+    }
+    // `before` opens the rope: each marker of the run is its text followed by a boundary,
+    // and everything already there moves up by the whole run.
+    let mut inserted = String::new();
+    let mut entries = Vec::with_capacity(run.len());
+    for (marker, text) in run {
+        entries.push((*marker, inserted.len() as u32));
+        inserted.push_str(text);
+        inserted.push('\n');
+    }
+    store.rope.write().insert(0, &inserted);
+    let mut offsets = store.block_offsets.write();
+    offsets.shift_after(0, inserted.len() as i32);
+    offsets.insert_run_at(0, &entries);
+    true
+}
+
 /// Insert a run of new markers at `byte_pos`, each a `\n` boundary
 /// followed by its text, and register them in the offset index at
 /// `vec_pos`, `vec_pos + 1`, …. Every entry strictly past `byte_pos`
@@ -1636,6 +1679,171 @@ pub fn range_holds_a_whole_table(store: &Store, start: i64, end: i64) -> bool {
         || holds_a_table_from_its_anchor(store, start, snapped_start, snapped_end)
 }
 
+/// Where a table lies in the rope's position space: the position of its anchor, and where
+/// the text of the last entry it holds ends (its last cell's last paragraph, or a table
+/// nested there).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TableExtent {
+    pub table_id: EntityId,
+    pub anchor: i64,
+    pub end: i64,
+}
+
+impl TableExtent {
+    /// Whether a range starting at `start` starts in the table: in one of its cells, or on
+    /// the boundary right after its anchor, which stands for its first cell. A start on the
+    /// anchor itself is the table's start (see [`holds_a_table_from_its_anchor`]).
+    fn holds_start(&self, start: i64) -> bool {
+        self.anchor < start && start <= self.end
+    }
+
+    /// Whether a range ending at `end` ends in the table: in one of its cells. An end on the
+    /// anchor, or on the boundary after it, ends before the table (see
+    /// [`snap_off_table_anchor`]).
+    fn holds_end(&self, store: &Store, end: i64) -> bool {
+        let end = snap_off_table_anchor(store, end, false);
+        self.anchor < end && end <= self.end
+    }
+}
+
+/// Every table's [`TableExtent`], in reading order, when the rope is the document's position
+/// space. Empty otherwise, and for a document holding no table.
+pub fn table_extents(store: &Store) -> Vec<TableExtent> {
+    if !rope_positions_match_flow(store) {
+        return Vec::new();
+    }
+    let table_ids: Vec<EntityId> = store.tables.read().keys().copied().collect();
+    let mut extents: Vec<TableExtent> = table_ids
+        .into_iter()
+        .filter_map(|table_id| extent_of(store, table_id))
+        .collect();
+    // In reading order, whatever order the store keeps the tables in.
+    extents.sort_unstable_by_key(|extent| extent.anchor);
+    extents
+}
+
+/// The [`TableExtent`] of `table_id`, when the rope is the document's position space and
+/// holds its anchor.
+pub fn table_extent(store: &Store, table_id: EntityId) -> Option<TableExtent> {
+    if !rope_positions_match_flow(store) {
+        return None;
+    }
+    extent_of(store, table_id)
+}
+
+fn extent_of(store: &Store, table_id: EntityId) -> Option<TableExtent> {
+    let blocks = table_block_ids(store, table_id);
+    let offsets = store.block_offsets.read();
+    let anchor_index = offsets.position_of(OffsetMarker::TableAnchor(table_id))?;
+    let last_index = blocks
+        .iter()
+        .filter_map(|block_id| offsets.position_of(OffsetMarker::Block(*block_id)))
+        .max()
+        .unwrap_or(anchor_index)
+        .max(anchor_index);
+    let rope = store.rope.read();
+    let char_of = |byte: u32| rope.byte_to_char(byte as usize) as i64;
+    let (_, anchor_byte) = offsets.entries.get(anchor_index)?;
+    // The text of the last entry ends at the boundary before whatever follows it, or at the
+    // end of the rope.
+    let end = offsets
+        .entries
+        .get(last_index + 1)
+        .map_or(rope.len_chars() as i64, |(_, next)| {
+            char_of(next.saturating_sub(1))
+        });
+    Some(TableExtent {
+        table_id,
+        anchor: char_of(*anchor_byte),
+        end,
+    })
+}
+
+/// Where the paragraph right beside `table_id` in the frame holding the table stands, when
+/// the entry there is a paragraph: the end of its text for the one `before` the table, the
+/// start of it for the one after. `None` when the table opens or closes its frame, or a
+/// quotation or another table stands beside it, or the rope is not the position space.
+pub fn position_beside_table(store: &Store, table_id: EntityId, before: bool) -> Option<i64> {
+    if !rope_positions_match_flow(store) {
+        return None;
+    }
+    let neighbour = {
+        let frames = store.frames.read();
+        let anchor_frame = frames
+            .iter()
+            .find(|(_, frame)| frame.table == Some(table_id))
+            .map(|(id, _)| -(*id as i64))?;
+        let holder = frames
+            .values()
+            .find(|frame| frame.child_order.contains(&anchor_frame))?;
+        let at = holder
+            .child_order
+            .iter()
+            .position(|entry| *entry == anchor_frame)?;
+        let entry = if before {
+            *holder.child_order.get(at.checked_sub(1)?)?
+        } else {
+            *holder.child_order.get(at + 1)?
+        };
+        EntityId::try_from(entry).ok().filter(|id| *id > 0)?
+    };
+    let offsets = store.block_offsets.read();
+    let (start, end, has_successor) =
+        offsets.range_with_successor(OffsetMarker::Block(neighbour))?;
+    let rope = store.rope.read();
+    let byte = if before {
+        if has_successor && end > start {
+            end - 1
+        } else {
+            end
+        }
+    } else {
+        start
+    };
+    Some(rope.byte_to_char(byte as usize) as i64)
+}
+
+/// The range `[start, end)` widened to hold whole every table it has one end in and the
+/// other end outside of: a start in a table's cells with an end past the table moves back to
+/// the table's anchor, and an end in a table's cells with a start before the table moves on
+/// to the end of the table's last cell. The same is done for the tables around those, so a
+/// range from a table nested in a cell to past the outer table holds the outer one whole.
+///
+/// This is the one rule a copy and a removal share for a range crossing a table's edge, as
+/// a range holding a table's anchor already is (see [`range_holds_a_whole_table`]): the
+/// whole table goes with the text beside it, as Word and LibreOffice take a table a
+/// selection runs out of. A copy of such a range held the whole table while the removal
+/// emptied the cells it met and kept the grid, so a cut pasted back put the table in twice;
+/// and a removal from a table's last cell to the end of the text kept the paragraph after
+/// the table. A range with both ends in one table, or both outside every table, is left as
+/// it is.
+pub fn take_whole_tables(store: &Store, start: i64, end: i64) -> (i64, i64) {
+    if start >= end || store.tables.read().is_empty() {
+        return (start, end);
+    }
+    let extents = table_extents(store);
+    let (mut start, mut end) = (start, end);
+    // Each widening moves an end out to a table's edge, never back: at most one pass per
+    // table, and one more to see nothing moves.
+    for _ in 0..=extents.len() {
+        let mut moved = false;
+        for extent in &extents {
+            if extent.holds_start(start) && end > extent.end {
+                start = extent.anchor;
+                moved = true;
+            }
+            if start < extent.anchor && extent.holds_end(store, end) && end < extent.end {
+                end = extent.end;
+                moved = true;
+            }
+        }
+        if !moved {
+            break;
+        }
+    }
+    (start, end)
+}
+
 /// Remove a registered block from the rope: drops its content bytes
 /// plus one boundary `\n` (the one after, if the block has a
 /// successor; the one before, if it's the last entry), removes the
@@ -1653,11 +1861,9 @@ pub fn rope_remove_block(store: &Store, block_id: EntityId) {
         let Some((start, end)) = offsets.range_of(block_marker) else {
             return;
         };
-        let idx = offsets
-            .entries
-            .iter()
-            .position(|(m, _)| *m == block_marker)
-            .unwrap();
+        let Some(idx) = offsets.position_of(block_marker) else {
+            return;
+        };
         let is_last = idx + 1 == offsets.entries.len();
         let has_pred = idx > 0;
         (start, end, idx, is_last, has_pred)

@@ -15,6 +15,7 @@ pub struct ListDto {
     pub indent: i64,
     pub prefix: String,
     pub suffix: String,
+    pub start: Option<i64>,
 }
 
 impl From<ListDto> for List {
@@ -27,6 +28,7 @@ impl From<ListDto> for List {
             indent: dto.indent,
             prefix: dto.prefix,
             suffix: dto.suffix,
+            start: dto.start,
         }
     }
 }
@@ -41,6 +43,7 @@ impl From<&ListDto> for List {
             indent: dto.indent,
             prefix: dto.prefix.clone(),
             suffix: dto.suffix.clone(),
+            start: dto.start,
         }
     }
 }
@@ -55,6 +58,7 @@ impl From<List> for ListDto {
             indent: entity.indent,
             prefix: entity.prefix,
             suffix: entity.suffix,
+            start: entity.start,
         }
     }
 }
@@ -67,6 +71,7 @@ pub struct CreateListDto {
     pub indent: i64,
     pub prefix: String,
     pub suffix: String,
+    pub start: Option<i64>,
 }
 
 impl From<CreateListDto> for List {
@@ -79,6 +84,7 @@ impl From<CreateListDto> for List {
             indent: dto.indent,
             prefix: dto.prefix,
             suffix: dto.suffix,
+            start: dto.start,
         }
     }
 }
@@ -93,6 +99,7 @@ impl From<&CreateListDto> for List {
             indent: dto.indent,
             prefix: dto.prefix.clone(),
             suffix: dto.suffix.clone(),
+            start: dto.start,
         }
     }
 }
@@ -106,6 +113,7 @@ impl From<List> for CreateListDto {
             indent: entity.indent,
             prefix: entity.prefix,
             suffix: entity.suffix,
+            start: entity.start,
         }
     }
 }
@@ -119,6 +127,7 @@ pub struct UpdateListDto {
     pub indent: i64,
     pub prefix: String,
     pub suffix: String,
+    pub start: Option<i64>,
 }
 
 impl From<UpdateListDto> for List {
@@ -131,6 +140,7 @@ impl From<UpdateListDto> for List {
             indent: dto.indent,
             prefix: dto.prefix,
             suffix: dto.suffix,
+            start: dto.start,
         }
     }
 }
@@ -145,6 +155,7 @@ impl From<&UpdateListDto> for List {
             indent: dto.indent,
             prefix: dto.prefix.clone(),
             suffix: dto.suffix.clone(),
+            start: dto.start,
         }
     }
 }
@@ -159,6 +170,7 @@ impl From<List> for UpdateListDto {
             indent: entity.indent,
             prefix: entity.prefix,
             suffix: entity.suffix,
+            start: entity.start,
         }
     }
 }
@@ -173,6 +185,7 @@ impl From<ListDto> for UpdateListDto {
             indent: dto.indent,
             prefix: dto.prefix,
             suffix: dto.suffix,
+            start: dto.start,
         }
     }
 }

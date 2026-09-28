@@ -13,6 +13,7 @@ pub mod list_grouper;
 pub mod mark_options;
 pub mod odt_options;
 pub mod pdf_options;
+pub mod quote_depth;
 pub mod sentence;
 pub mod text_options;
 pub mod word_count;

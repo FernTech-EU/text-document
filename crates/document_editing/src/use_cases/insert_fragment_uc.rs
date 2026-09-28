@@ -10,8 +10,8 @@ use common::database::block_offset_index::OffsetMarker;
 use common::database::rope_helpers::{
     block_char_length, block_document_position, outermost_table_around, refresh_block_positions,
     rope_append_block, rope_delete_in_block, rope_insert_block_boundary, rope_insert_in_block,
-    rope_insert_run_after, rope_remove_markers, rope_replace_block_content, rope_split_block,
-    rope_split_block_into,
+    rope_insert_run_after, rope_insert_run_before, rope_remove_markers, rope_replace_block_content,
+    rope_split_block, rope_split_block_into,
 };
 use common::direct_access::document::document_repository::DocumentRelationshipField;
 use common::direct_access::frame::frame_repository::FrameRelationshipField;
@@ -28,8 +28,8 @@ use common::format_runs::{
 
 use common::parser_tools::TABLE_ANCHOR;
 use common::parser_tools::fragment_schema::{
-    CarriedFragment, FragmentBlock, FragmentData, FragmentQuoting, FragmentTable,
-    FragmentTableCell, fragment_from_json,
+    CarriedFragment, FragmentBlock, FragmentData, FragmentListStarts, FragmentQuoting,
+    FragmentTable, FragmentTableCell, fragment_from_json,
 };
 use common::parser_tools::list_depth::clamp_fragment_list_indents;
 use common::parser_tools::list_grouper::ListGrouper;
@@ -67,6 +67,7 @@ pub trait InsertFragmentUnitOfWorkFactoryTrait: Send + Sync {
 #[macros::uow_action(entity = "List", action = "Get")]
 #[macros::uow_action(entity = "List", action = "Create")]
 #[macros::uow_action(entity = "List", action = "CreateOrphan")]
+#[macros::uow_action(entity = "List", action = "Remove")]
 #[macros::uow_action(entity = "Frame", action = "Create")]
 #[macros::uow_action(entity = "Frame", action = "CreateOrphan")]
 #[macros::uow_action(entity = "Frame", action = "RemoveMulti")]
@@ -703,6 +704,8 @@ fn objects_into_a_code_block() -> anyhow::Error {
 struct Quote {
     depth: u32,
     role: Option<SemanticRole>,
+    /// How many of those quotations, the innermost, open at the block.
+    opens: u32,
 }
 
 impl Quote {
@@ -711,6 +714,7 @@ impl Quote {
         Quote {
             depth: quoting.block_depth(index),
             role: quoting.block_role(index).cloned(),
+            opens: quoting.block_opens(index),
         }
     }
 }
@@ -741,6 +745,9 @@ struct PastedEntry {
     entry: i64,
     depth: u32,
     role: Option<SemanticRole>,
+    /// How many of its quotations, the innermost, open at it: two quotations one after the
+    /// other stay two.
+    opens: u32,
 }
 
 impl PastedEntry {
@@ -749,6 +756,7 @@ impl PastedEntry {
             entry: block_id as i64,
             depth: quote.depth,
             role: quote.role,
+            opens: quote.opens,
         }
     }
 }
@@ -790,8 +798,9 @@ fn quote_depth_of_frame(
 /// `pasted` are consecutive in the frame's `child_order`, in order. Each goes as deep as its
 /// fragment block (or table) stood, counted from the text it came from, and never less deep
 /// than the frame it was pasted into already is: consecutive entries asking for the same
-/// depth share a quotation, as a load reads them, and a deeper one opens a quotation nested
-/// in it. Quotations are frames, not text, so the rope, which holds the pasted text in
+/// depth share a quotation, as a load reads them, unless the later one opens quotations of
+/// its own (two quotations one after the other stay two), and a deeper one opens a
+/// quotation nested in it. Quotations are frames, not text, so the rope, which holds the pasted text in
 /// order already, is left as it is. The pasted blocks went into the caret's frame whatever
 /// the fragment said, so a quotation pasted, or a version of a text put back, came out as
 /// plain paragraphs.
@@ -871,7 +880,9 @@ fn nest_in_quotations(
     let mut moved: std::collections::HashSet<EntityId> = std::collections::HashSet::new();
     for entry in pasted {
         let wanted = entry.depth.saturating_sub(base) as usize;
-        while stack.len() > wanted {
+        // The quotations opening at the entry close those as deep that are open.
+        let kept = wanted.saturating_sub(entry.opens as usize);
+        while stack.len() > kept {
             if let Some(open) = stack.pop() {
                 close(uow, open, &mut stack, &mut top, now)?;
             }
@@ -1066,15 +1077,27 @@ fn caret_in_table(
 /// text, and the Djot writer, which only reads a cell's own paragraphs, left
 /// the nested table out of the save, so the pasted text was visible until the
 /// document was reloaded and then gone.
-fn tables_as_paragraphs(fragment_data: &FragmentData) -> FragmentData {
+///
+/// The numbers the fragment's lists start at follow their blocks to where they now stand.
+fn tables_as_paragraphs(
+    fragment_data: &FragmentData,
+    list_starts: &mut FragmentListStarts,
+) -> FragmentData {
     let mut tables: Vec<&FragmentTable> = fragment_data.tables.iter().collect();
     tables.sort_by_key(|table| table.block_insert_index);
     let mut blocks: Vec<FragmentBlock> = Vec::new();
+    let mut moved_starts = FragmentListStarts::default();
     let mut next = 0;
+    let mut keep = |blocks: &mut Vec<FragmentBlock>, next: usize| {
+        if let Some(start) = list_starts.get(next) {
+            moved_starts.set(blocks.len(), start);
+        }
+        blocks.push(fragment_data.blocks[next].clone());
+    };
     for table in tables {
         let index = table.block_insert_index.min(fragment_data.blocks.len());
         while next < index {
-            blocks.push(fragment_data.blocks[next].clone());
+            keep(&mut blocks, next);
             next += 1;
         }
         let mut cells: Vec<_> = table.cells.iter().collect();
@@ -1088,11 +1111,10 @@ fn tables_as_paragraphs(fragment_data: &FragmentData) -> FragmentData {
             );
         }
     }
-    blocks.extend(
-        fragment_data.blocks[next.min(fragment_data.blocks.len())..]
-            .iter()
-            .cloned(),
-    );
+    for rest in next..fragment_data.blocks.len() {
+        keep(&mut blocks, rest);
+    }
+    *list_starts = moved_starts;
     FragmentData {
         blocks,
         tables: Vec::new(),
@@ -1274,6 +1296,127 @@ fn try_replace_table_cells(
     )))
 }
 
+/// Where a paste opening with a table puts it, beside the paragraph at the caret.
+///
+/// A paste splits the paragraph at the caret and puts what it holds between the two halves.
+/// With the caret at the start of the paragraph the first half is empty, and a table opening
+/// the paste went in after it: an empty paragraph stood before the table that no save keeps,
+/// so a text opening with a table pasted over everything, put back as a version, or cut and
+/// pasted back, showed a line the loaded text does not have, and a table cut from the start
+/// of a paragraph and pasted back went in after that paragraph.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TablesGo {
+    /// After the paragraph: the caret stands in its text or at its end, and the paragraph
+    /// keeps what is before the caret.
+    After,
+    /// In front of the paragraph, which keeps its text after the paste: the caret stands at
+    /// its start. An empty paragraph stays after the paste, as a word processor leaves the
+    /// line a table is pasted on.
+    InFront,
+    /// In place of the paragraph, which is the whole main text and empty: the paste is the
+    /// text, as the same text loaded is.
+    Replacing,
+}
+
+impl TablesGo {
+    /// Where a table goes beside `block`, the caret standing `offset` characters into it.
+    fn beside(
+        uow: &dyn InsertFragmentUnitOfWorkTrait,
+        doc_id: EntityId,
+        block: &Block,
+        offset: i64,
+    ) -> Result<Self> {
+        Ok(if offset > 0 {
+            TablesGo::After
+        } else if is_the_empty_main_text(uow, doc_id, block)? {
+            TablesGo::Replacing
+        } else {
+            TablesGo::InFront
+        })
+    }
+}
+
+/// Whether `block` is empty and all the main text holds: its one paragraph, in quotations
+/// holding nothing else at most.
+fn is_the_empty_main_text(
+    uow: &dyn InsertFragmentUnitOfWorkTrait,
+    doc_id: EntityId,
+    block: &Block,
+) -> Result<bool> {
+    if block_char_length(block, &uow.store()) != 0 {
+        return Ok(false);
+    }
+    let frame_ids = uow.get_document_relationship(&doc_id, &DocumentRelationshipField::Frames)?;
+    let Some(&main_frame_id) = frame_ids.first() else {
+        return Ok(false);
+    };
+    let mut pending = vec![main_frame_id];
+    let mut seen: std::collections::HashSet<EntityId> = std::collections::HashSet::new();
+    while let Some(frame_id) = pending.pop() {
+        if !seen.insert(frame_id) {
+            return Ok(false);
+        }
+        let Some(frame) = uow.get_frame(&frame_id)? else {
+            return Ok(false);
+        };
+        if frame.table.is_some() {
+            return Ok(false);
+        }
+        for entry in &frame.child_order {
+            if *entry > 0 {
+                if *entry as EntityId != block.id {
+                    return Ok(false);
+                }
+            } else if *entry < 0 {
+                pending.push(entry.unsigned_abs() as EntityId);
+            }
+        }
+    }
+    Ok(true)
+}
+
+/// Take out the empty paragraph `block` a paste replaced with what it holds (see
+/// [`TablesGo::Replacing`]): its entity, its entry in `frame_id` and in the rope, and its
+/// list when no other paragraph is an item of it.
+fn remove_replaced_paragraph(
+    uow: &mut Box<dyn InsertFragmentUnitOfWorkTrait>,
+    doc_id: EntityId,
+    frame_id: EntityId,
+    block: &Block,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<()> {
+    clear_block_state(uow, block.id);
+    common::database::rope_helpers::rope_remove_block(&uow.store(), block.id);
+    uow.remove_block(&block.id)?;
+    let frame = uow
+        .get_frame(&frame_id)?
+        .ok_or_else(|| anyhow!("Frame not found"))?;
+    let mut updated_frame = frame.clone();
+    updated_frame
+        .child_order
+        .retain(|entry| *entry != block.id as i64);
+    updated_frame.blocks =
+        uow.get_frame_relationship(&frame_id, &FrameRelationshipField::Blocks)?;
+    updated_frame.updated_at = now;
+    uow.update_frame(&updated_frame)?;
+    if let Some(list_id) = block.list {
+        let still_listed = uow
+            .store()
+            .blocks
+            .read()
+            .values()
+            .any(|other| other.list == Some(list_id));
+        if !still_listed {
+            let lists =
+                uow.get_document_relationship(&doc_id, &DocumentRelationshipField::Lists)?;
+            if lists.contains(&list_id) {
+                uow.remove_list(&list_id)?;
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Insert a table-only fragment at the cursor position.
 fn insert_table_fragment(
     uow: &mut Box<dyn InsertFragmentUnitOfWorkTrait>,
@@ -1312,11 +1455,14 @@ fn insert_table_fragment(
 
     // The frame that receives the table anchor: the owning frame of the
     // block at the cursor position (root frame when the document is empty),
-    // and the block the tables follow, in the frame and in the rope.
-    let (frame_id, child_order_insert_idx, target_block_id) = if blocks.is_empty() {
+    // and the block the tables go beside, in the frame and in the rope.
+    //
+    // The tables follow that block, unless the caret stands at its start:
+    // then they go in front of it (see `TablesGo`).
+    let (frame_id, child_order_insert_idx, target) = if blocks.is_empty() {
         (root_frame_id, 0usize, None)
     } else {
-        let (target_block, _, _) = find_block_at_position(&blocks, insert_pos, &uow.store())?;
+        let (target_block, _, offset) = find_block_at_position(&blocks, insert_pos, &uow.store())?;
         let owning_frame_id = block_to_frame
             .get(&target_block.id)
             .copied()
@@ -1324,16 +1470,18 @@ fn insert_table_fragment(
         let owning_frame = uow
             .get_frame(&owning_frame_id)?
             .ok_or_else(|| anyhow!("Owning frame not found"))?;
-        // Insert after the target block's entry in the owning frame's
-        // child_order (positive entries are block ids; negative entries
-        // are sub-frames and must be skipped by the id match).
+        let goes = TablesGo::beside(&**uow, doc_id, &target_block, offset)?;
+        // The target block's entry in the owning frame's child_order
+        // (positive entries are block ids; negative entries are sub-frames and
+        // must be skipped by the id match): the tables go after it, or where it
+        // stands when they go in front of it.
         let idx = owning_frame
             .child_order
             .iter()
             .position(|&e| e > 0 && e as EntityId == target_block.id)
-            .map(|i| i + 1)
+            .map(|i| if goes == TablesGo::After { i + 1 } else { i })
             .unwrap_or(owning_frame.child_order.len());
-        (owning_frame_id, idx, Some(target_block.id))
+        (owning_frame_id, idx, Some((target_block, goes)))
     };
 
     let mut total_blocks_added: i64 = 0;
@@ -1491,6 +1639,7 @@ fn insert_table_fragment(
             entry: -(created_anchor.id as i64),
             depth: quoting.table_depth(table_index),
             role: None,
+            opens: quoting.table_opens(table_index),
         });
     }
 
@@ -1510,25 +1659,40 @@ fn insert_table_fragment(
     nest_in_quotations(uow, doc_id, frame_id, &pasted, now)?;
 
     // ── Rope mirror (insert_table_fragment) ──
-    // The tables follow the target block in the frame, so they follow it in
-    // the rope: each anchor, then that table's cells, in reading order. The
-    // cells used to go to the end of the enclosing top-level frame, which is
-    // where they belong only when the table is the last thing in it: pasted
-    // anywhere else, the cells and everything after them were out of flow
-    // order, and every position past the paste was wrong.
-    if let Some(target_block_id) = target_block_id {
+    // The tables stand beside the target block in the frame, so they stand
+    // beside it in the rope: each anchor, then that table's cells, in reading
+    // order. The cells used to go to the end of the enclosing top-level
+    // frame, which is where they belong only when the table is the last thing
+    // in it: pasted anywhere else, the cells and everything after them were
+    // out of flow order, and every position past the paste was wrong.
+    let mut replaced_block = false;
+    if let Some((target_block, goes)) = &target {
         let run: Vec<(OffsetMarker, &str)> = rope_run
             .iter()
             .map(|(marker, text)| (*marker, text.as_str()))
             .collect();
-        rope_insert_run_after(&uow.store(), OffsetMarker::Block(target_block_id), &run);
+        let target_marker = OffsetMarker::Block(target_block.id);
+        if *goes == TablesGo::After {
+            rope_insert_run_after(&uow.store(), target_marker, &run);
+        } else {
+            rope_insert_run_before(&uow.store(), target_marker, &run);
+        }
+        if *goes == TablesGo::Replacing && !new_anchor_entries.is_empty() {
+            remove_replaced_paragraph(uow, doc_id, frame_id, target_block, now)?;
+            replaced_block = true;
+        }
     }
 
-    let pos_shift = current_pos - insert_pos;
+    // The empty paragraph a table replaced took one position, its boundary.
+    let pos_shift = current_pos - insert_pos - i64::from(replaced_block);
     if pos_shift > 0 {
         let mut shifted: Vec<Block> = Vec::new();
+        let replaced_id = target
+            .as_ref()
+            .filter(|_| replaced_block)
+            .map(|(block, _)| block.id);
         for block in &blocks {
-            if block.document_position >= insert_pos {
+            if block.document_position >= insert_pos && Some(block.id) != replaced_id {
                 let mut ub = block.clone();
                 ub.document_position += pos_shift;
                 ub.updated_at = now;
@@ -1541,7 +1705,7 @@ fn insert_table_fragment(
     }
 
     let mut updated_doc = document.clone();
-    updated_doc.block_count += total_blocks_added;
+    updated_doc.block_count += total_blocks_added - i64::from(replaced_block);
     updated_doc.character_count += total_chars_added;
     updated_doc.updated_at = now;
     uow.update_document(&updated_doc)?;
@@ -1613,6 +1777,7 @@ fn insert_mixed_fragment(
     dto: &InsertFragmentDto,
     fragment_data: &FragmentData,
     quoting: &FragmentQuoting,
+    list_starts: &FragmentListStarts,
 ) -> Result<(InsertFragmentResultDto, EntityTreeSnapshot)> {
     let now = chrono::Utc::now();
 
@@ -1712,15 +1877,25 @@ fn insert_mixed_fragment(
 
     let merges = |item: Option<&FragItem>| matches!(item, Some(FragItem::Block(index, _)) if merges_inline(fragment_data, quoting, *index));
     let merge_first = merges(items.first());
-    let merge_last = fragment_data.blocks.len() >= 2 && merges(items.last());
+    // The last item joins the text after the caret when it is a paragraph that merges, and
+    // is not the one item, which the head takes. It had to be the second of two paragraphs
+    // or more, so a table followed by a phrase (a table cut with the start of the paragraph
+    // after it) put the phrase in a paragraph of its own before the rest of it.
+    let merge_last = items.len() >= 2 && merges(items.last());
     let overwrite_head = text_before.is_empty()
         && !merge_first
         && matches!(items.first(), Some(FragItem::Block(..)));
+    // A table opening a paste at the start of a paragraph goes in front of it: the head,
+    // empty, is taken out once the paste is in, and the tail keeps the paragraph's text and
+    // formatting (see `TablesGo`).
+    let goes_in_front = text_before.is_empty()
+        && left_image_count == 0
+        && matches!(items.first(), Some(FragItem::Table(..)));
     // As on the block-only path: nothing holding an object merges into a code block.
     if current_block.fmt_is_code_block == Some(true) {
         let merges_objects = |item: Option<&FragItem>| matches!(item, Some(FragItem::Block(_, block)) if holds_objects(block));
         if (merge_first && merges_objects(items.first()))
-            || (merge_last && !overwrite_head && merges_objects(items.last()))
+            || (merge_last && merges_objects(items.last()))
         {
             return Err(objects_into_a_code_block());
         }
@@ -1752,7 +1927,8 @@ fn insert_mixed_fragment(
     if overwrite_head {
         let fb = first_fb.unwrap();
         let head_list_id = if let Some(ref frag_list) = fb.list {
-            let list = frag_list.to_entity();
+            let list = frag_list
+                .to_entity_starting_at(first_item.and_then(|(index, _)| list_starts.get(index)));
             let created_list = uow.create_orphan_list(&list)?;
             new_list_ids.push(created_list.id);
             Some(created_list.id)
@@ -1887,7 +2063,9 @@ fn insert_mixed_fragment(
                 let block_text_len = inline_runs.logical_len(&frag_block.plain_text);
 
                 let quote = Quote::of_block(quoting, *fragment_index);
-                if quote.depth != previous_depth {
+                // A list runs on inside one quotation only: a new depth, or a new quotation
+                // as deep as the last, ends it.
+                if quote.depth != previous_depth || quote.opens > 0 {
                     list_grouper.reset();
                     previous_depth = quote.depth;
                 }
@@ -1897,7 +2075,8 @@ fn insert_mixed_fragment(
                     {
                         Some(existing_id)
                     } else {
-                        let list = frag_list.to_entity();
+                        let list =
+                            frag_list.to_entity_starting_at(list_starts.get(*fragment_index));
                         let created_list = uow.create_orphan_list(&list)?;
                         new_list_ids.push(created_list.id);
                         list_grouper.register(
@@ -2094,6 +2273,7 @@ fn insert_mixed_fragment(
                     entry: -(created_anchor.id as i64),
                     depth: quoting.table_depth(*table_index),
                     role: None,
+                    opens: quoting.table_opens(*table_index),
                 });
                 // A table always ends a list.
                 list_grouper.reset();
@@ -2113,115 +2293,53 @@ fn insert_mixed_fragment(
     let (tail_plain, tail_inline) = build_tail_state(&text_after, &right, last_frag);
     let tail_text_length = tail_inline.logical_len(&tail_plain);
 
-    let skip_tail_block = tail_plain.is_empty() && last_frag.is_none() && right_image_count == 0;
+    // An empty paragraph a table opening the paste goes in front of stays after the paste,
+    // unless it is the whole main text, which the paste then is.
+    let keeps_the_empty_paragraph =
+        goes_in_front && !is_the_empty_main_text(&**uow, doc_id, &current_block)?;
+    let skip_tail_block = tail_plain.is_empty()
+        && last_frag.is_none()
+        && right_image_count == 0
+        && !keeps_the_empty_paragraph;
 
     #[allow(unused_assignments)]
     let mut tail_text_len: i64 = 0;
 
     if !skip_tail_block {
+        // The rest of the paragraph pasted into keeps the paragraph's formatting and list,
+        // whatever the paste put in its first half: a paragraph of its own format pasted at
+        // the start of a heading made the heading's text a plain paragraph.
         let tail_block = Block {
             id: 0,
             created_at: now,
             updated_at: now,
-            list: if overwrite_head {
-                None
-            } else {
-                current_block.list
-            },
+            list: current_block.list,
             document_position: running_position,
-            fmt_alignment: if overwrite_head {
-                None
-            } else {
-                current_block.fmt_alignment.clone()
-            },
-            fmt_top_margin: if overwrite_head {
-                None
-            } else {
-                current_block.fmt_top_margin
-            },
-            fmt_bottom_margin: if overwrite_head {
-                None
-            } else {
-                current_block.fmt_bottom_margin
-            },
-            fmt_left_margin: if overwrite_head {
-                None
-            } else {
-                current_block.fmt_left_margin
-            },
-            fmt_right_margin: if overwrite_head {
-                None
-            } else {
-                current_block.fmt_right_margin
-            },
-            fmt_heading_level: if overwrite_head {
-                None
-            } else {
-                current_block.fmt_heading_level
-            },
-            fmt_indent: if overwrite_head {
-                None
-            } else {
-                current_block.fmt_indent
-            },
-            fmt_text_indent: if overwrite_head {
-                None
-            } else {
-                current_block.fmt_text_indent
-            },
-            fmt_marker: if overwrite_head {
-                None
-            } else {
-                current_block.fmt_marker.clone()
-            },
-            fmt_tab_positions: if overwrite_head {
-                vec![]
-            } else {
-                current_block.fmt_tab_positions.clone()
-            },
-            fmt_line_height: if overwrite_head {
-                None
-            } else {
-                current_block.fmt_line_height
-            },
-            fmt_non_breakable_lines: if overwrite_head {
-                None
-            } else {
-                current_block.fmt_non_breakable_lines
-            },
+            fmt_alignment: current_block.fmt_alignment.clone(),
+            fmt_top_margin: current_block.fmt_top_margin,
+            fmt_bottom_margin: current_block.fmt_bottom_margin,
+            fmt_left_margin: current_block.fmt_left_margin,
+            fmt_right_margin: current_block.fmt_right_margin,
+            fmt_heading_level: current_block.fmt_heading_level,
+            fmt_indent: current_block.fmt_indent,
+            fmt_text_indent: current_block.fmt_text_indent,
+            fmt_marker: current_block.fmt_marker.clone(),
+            fmt_tab_positions: current_block.fmt_tab_positions.clone(),
+            fmt_line_height: current_block.fmt_line_height,
+            fmt_non_breakable_lines: current_block.fmt_non_breakable_lines,
             // A split tail starts no page: the head kept the break, and inheriting it here
-            // would turn one page boundary into two.
-            fmt_page_break_before: None,
-            fmt_direction: if overwrite_head {
-                None
+            // would turn one page boundary into two. A head taken out leaves it to the tail.
+            fmt_page_break_before: if goes_in_front {
+                current_block.fmt_page_break_before
             } else {
-                current_block.fmt_direction.clone()
-            },
-            fmt_background_color: if overwrite_head {
                 None
-            } else {
-                current_block.fmt_background_color.clone()
             },
-            fmt_is_code_block: if overwrite_head {
-                None
-            } else {
-                current_block.fmt_is_code_block
-            },
-            fmt_code_language: if overwrite_head {
-                None
-            } else {
-                current_block.fmt_code_language.clone()
-            },
-            fmt_hyphenate: if overwrite_head {
-                None
-            } else {
-                current_block.fmt_hyphenate
-            },
-            fmt_language: if overwrite_head {
-                None
-            } else {
-                current_block.fmt_language.clone()
-            },
+            fmt_direction: current_block.fmt_direction.clone(),
+            fmt_background_color: current_block.fmt_background_color.clone(),
+            fmt_is_code_block: current_block.fmt_is_code_block,
+            fmt_code_language: current_block.fmt_code_language.clone(),
+            fmt_hyphenate: current_block.fmt_hyphenate,
+            fmt_language: current_block.fmt_language.clone(),
         };
 
         let created_tail = uow.create_orphan_block(&tail_block)?;
@@ -2264,6 +2382,14 @@ fn insert_mixed_fragment(
         uow.get_frame_relationship(&frame_id, &FrameRelationshipField::Blocks)?;
     uow.update_frame(&updated_frame)?;
     nest_in_quotations(uow, doc_id, frame_id, &pasted, now)?;
+    // The empty head in front of the table, out: one position, its boundary.
+    let head_taken_out = if goes_in_front {
+        remove_replaced_paragraph(uow, doc_id, frame_id, &current_block, now)?;
+        total_blocks_added -= 1;
+        1
+    } else {
+        0
+    };
 
     // `original_current_char_length` was captured at the top of the
     // function — the rope has since been overwritten by the head update.
@@ -2272,7 +2398,7 @@ fn insert_mixed_fragment(
         running_position
     } else {
         running_position + tail_text_len + 1
-    };
+    } - head_taken_out;
     let pos_shift = new_next_pos - original_next_pos;
 
     let mut blocks_to_update: Vec<Block> = Vec::new();
@@ -2298,7 +2424,7 @@ fn insert_mixed_fragment(
         running_position + last_chars
     } else {
         running_position
-    };
+    } - head_taken_out;
 
     Ok((
         InsertFragmentResultDto {
@@ -2327,6 +2453,7 @@ fn execute_insert_fragment(
         quoting,
         replaces_text,
         whole_text,
+        list_starts,
         ..
     } = fragment_from_json(&dto.fragment_data)
         .map_err(|e| anyhow!("Invalid fragment_data JSON: {}", e))?;
@@ -2346,28 +2473,32 @@ fn execute_insert_fragment(
         .first()
         .ok_or_else(|| anyhow!("Root has no document"))?;
 
-    // Only a paste over a selection that held the whole text replaces the text: the one
-    // empty paragraph the removal left keeps the formatting of the first paragraph removed,
-    // which is not the pasted text's. An empty paragraph the writer formatted (a heading
-    // line, a list item, a quotation) and then pastes into keeps its formatting, as it does
-    // for typing. And only a text replaces it: a whole text (a version put back), or a
-    // fragment with a structure of its own. A phrase copied from the text, or from a web
-    // page, pasted over everything goes into the paragraph the removal left, as typing over
-    // everything does: made plain first, a right-to-left scene came back left to right, a
-    // quoted letter unquoted and a centred line uncentred.
-    let empty = if replaces_text && (whole_text || !is_a_phrase(&fragment_data, &quoting)) {
+    // A text replaces an empty one: pasted into a main text that is one empty paragraph, a
+    // fragment with a structure of its own (several paragraphs, a table, a quotation, or a
+    // paragraph of its own format) keeps its formatting, rather than going into that of the
+    // paragraph, which a removal leaves with the formatting of the first paragraph it took.
+    // It does so whatever made the text empty: a cut of everything, an undo back to it, a
+    // new document. The paste used to ask a mark the cursor held after a cut of
+    // everything, which no undo or redo gives back: cut everything, paste, undo and paste
+    // again, and the text came back inside the first paragraph's quotation. A phrase, one
+    // plain paragraph copied from the text or from a web page, goes into the paragraph as
+    // typing does, keeping its heading level, list, quotation or alignment: made plain
+    // first, a right-to-left scene came back left to right and a centred line uncentred.
+    // Only a whole text (a version put back) replaces a text as a phrase, when it is
+    // pasted over a selection that held the whole text.
+    let empty = if (replaces_text && whole_text) || !is_a_phrase(&fragment_data, &quoting) {
         empty_text_to_make_plain(&**uow, doc_id, dto.position)?
     } else {
         None
     };
     let Some(empty) = empty else {
-        return paste_fragment(uow, dto, fragment_data, quoting, doc_id);
+        return paste_fragment(uow, dto, fragment_data, quoting, list_starts, doc_id);
     };
     // The document as it stands, for an undo: every path below takes its own snapshot,
     // after the empty text was made plain.
     let before = uow.snapshot_document(&[doc_id])?;
     make_the_empty_text_plain(uow, empty, chrono::Utc::now())?;
-    let (result, _) = paste_fragment(uow, dto, fragment_data, quoting, doc_id)?;
+    let (result, _) = paste_fragment(uow, dto, fragment_data, quoting, list_starts, doc_id)?;
     Ok((result, before))
 }
 
@@ -2378,6 +2509,7 @@ fn paste_fragment(
     dto: &InsertFragmentDto,
     mut fragment_data: FragmentData,
     mut quoting: FragmentQuoting,
+    mut list_starts: FragmentListStarts,
     doc_id: EntityId,
 ) -> Result<(InsertFragmentResultDto, EntityTreeSnapshot)> {
     // Where the caret stands, when what the fragment holds depends on it.
@@ -2420,19 +2552,21 @@ fn paste_fragment(
                 {
                     return Ok(result);
                 }
-                fragment_data = tables_as_paragraphs(&fragment_data);
+                fragment_data = tables_as_paragraphs(&fragment_data, &mut list_starts);
             }
             // A footnote's body holds paragraphs: the Djot reader keeps
             // nothing else of a definition, so a table pasted into a body was
             // in the saved text and gone after the next load. It goes in as
             // paragraphs, as it does in a table cell.
             Some(caret) if caret.in_note => {
-                fragment_data = tables_as_paragraphs(&fragment_data);
+                fragment_data = tables_as_paragraphs(&fragment_data, &mut list_starts);
             }
             _ if fragment_data.blocks.is_empty() => {
                 return insert_table_fragment(uow, dto, &fragment_data, &quoting);
             }
-            _ => return insert_mixed_fragment(uow, dto, &fragment_data, &quoting),
+            _ => {
+                return insert_mixed_fragment(uow, dto, &fragment_data, &quoting, &list_starts);
+            }
         }
     }
 
@@ -2642,10 +2776,10 @@ fn paste_fragment(
         let first_chars = first_frag.plain_text.chars().count() as i64;
         let overwrite_head = text_before.is_empty() && !merge_first;
         // The first block merges into the code block's head, the last into its tail,
-        // which stays a code block unless the head was overwritten.
+        // which stays a code block whatever the paste put in the head.
         if into_a_code_block
             && ((merge_first && holds_objects(first_frag))
-                || (merge_last && !overwrite_head && holds_objects(last_frag)))
+                || (merge_last && holds_objects(last_frag)))
         {
             return Err(objects_into_a_code_block());
         }
@@ -2685,7 +2819,7 @@ fn paste_fragment(
                 {
                     Some(existing_id)
                 } else {
-                    let list = frag_list.to_entity();
+                    let list = frag_list.to_entity_starting_at(list_starts.get(0));
                     let created_list = uow.create_orphan_list(&list)?;
                     new_list_ids.push(created_list.id);
                     list_grouper.register(
@@ -2770,7 +2904,7 @@ fn paste_fragment(
             let block_text_len = block_chars + inline_runs.object_count();
 
             let depth = quoting.block_depth(middle_start + offset);
-            if depth != previous_depth {
+            if depth != previous_depth || quoting.block_opens(middle_start + offset) > 0 {
                 list_grouper.reset();
                 previous_depth = depth;
             }
@@ -2780,7 +2914,8 @@ fn paste_fragment(
                 {
                     Some(existing_id)
                 } else {
-                    let list = frag_list.to_entity();
+                    let list =
+                        frag_list.to_entity_starting_at(list_starts.get(middle_start + offset));
                     let created_list = uow.create_orphan_list(&list)?;
                     new_list_ids.push(created_list.id);
                     list_grouper.register(
@@ -2849,109 +2984,34 @@ fn paste_fragment(
         let mut tail_text_len: i64 = 0;
 
         if !skip_tail {
+            // The rest of the paragraph keeps its formatting and list (see the mixed path).
             let tail_block = Block {
                 id: 0,
                 created_at: now,
                 updated_at: now,
-                list: if overwrite_head {
-                    None
-                } else {
-                    current_block.list
-                },
+                list: current_block.list,
                 document_position: running_position,
-                fmt_alignment: if overwrite_head {
-                    None
-                } else {
-                    current_block.fmt_alignment.clone()
-                },
-                fmt_top_margin: if overwrite_head {
-                    None
-                } else {
-                    current_block.fmt_top_margin
-                },
-                fmt_bottom_margin: if overwrite_head {
-                    None
-                } else {
-                    current_block.fmt_bottom_margin
-                },
-                fmt_left_margin: if overwrite_head {
-                    None
-                } else {
-                    current_block.fmt_left_margin
-                },
-                fmt_right_margin: if overwrite_head {
-                    None
-                } else {
-                    current_block.fmt_right_margin
-                },
-                fmt_heading_level: if overwrite_head {
-                    None
-                } else {
-                    current_block.fmt_heading_level
-                },
-                fmt_indent: if overwrite_head {
-                    None
-                } else {
-                    current_block.fmt_indent
-                },
-                fmt_text_indent: if overwrite_head {
-                    None
-                } else {
-                    current_block.fmt_text_indent
-                },
-                fmt_marker: if overwrite_head {
-                    None
-                } else {
-                    current_block.fmt_marker.clone()
-                },
-                fmt_tab_positions: if overwrite_head {
-                    vec![]
-                } else {
-                    current_block.fmt_tab_positions.clone()
-                },
-                fmt_line_height: if overwrite_head {
-                    None
-                } else {
-                    current_block.fmt_line_height
-                },
-                fmt_non_breakable_lines: if overwrite_head {
-                    None
-                } else {
-                    current_block.fmt_non_breakable_lines
-                },
+                fmt_alignment: current_block.fmt_alignment.clone(),
+                fmt_top_margin: current_block.fmt_top_margin,
+                fmt_bottom_margin: current_block.fmt_bottom_margin,
+                fmt_left_margin: current_block.fmt_left_margin,
+                fmt_right_margin: current_block.fmt_right_margin,
+                fmt_heading_level: current_block.fmt_heading_level,
+                fmt_indent: current_block.fmt_indent,
+                fmt_text_indent: current_block.fmt_text_indent,
+                fmt_marker: current_block.fmt_marker.clone(),
+                fmt_tab_positions: current_block.fmt_tab_positions.clone(),
+                fmt_line_height: current_block.fmt_line_height,
+                fmt_non_breakable_lines: current_block.fmt_non_breakable_lines,
                 // A split tail starts no page: the head kept the break, and inheriting it here
                 // would turn one page boundary into two.
                 fmt_page_break_before: None,
-                fmt_direction: if overwrite_head {
-                    None
-                } else {
-                    current_block.fmt_direction.clone()
-                },
-                fmt_background_color: if overwrite_head {
-                    None
-                } else {
-                    current_block.fmt_background_color.clone()
-                },
-                fmt_is_code_block: if overwrite_head {
-                    None
-                } else {
-                    current_block.fmt_is_code_block
-                },
-                fmt_code_language: if overwrite_head {
-                    None
-                } else {
-                    current_block.fmt_code_language.clone()
-                },
-                fmt_hyphenate: if overwrite_head {
-                    None
-                } else {
-                    current_block.fmt_hyphenate
-                },
-                fmt_language: if overwrite_head {
-                    None
-                } else {
-                    current_block.fmt_language.clone()
-                },
+                fmt_direction: current_block.fmt_direction.clone(),
+                fmt_background_color: current_block.fmt_background_color.clone(),
+                fmt_is_code_block: current_block.fmt_is_code_block,
+                fmt_code_language: current_block.fmt_code_language.clone(),
+                fmt_hyphenate: current_block.fmt_hyphenate,
+                fmt_language: current_block.fmt_language.clone(),
             };
 
             let created_tail = uow.create_orphan_block(&tail_block)?;
@@ -3093,7 +3153,7 @@ fn paste_fragment(
 
         if overwrite_head {
             let list_id = if let Some(ref frag_list) = frag_block.list {
-                let list = frag_list.to_entity();
+                let list = frag_list.to_entity_starting_at(list_starts.get(0));
                 let created_list = uow.create_list(&list, doc_id, -1)?;
                 Some(created_list.id)
             } else {
@@ -3263,7 +3323,7 @@ fn paste_fragment(
                 current_block.document_position + block_char_length(&updated_current, &store) + 1;
 
             let list_id = if let Some(ref frag_list) = frag_block.list {
-                let list = frag_list.to_entity();
+                let list = frag_list.to_entity_starting_at(list_starts.get(0));
                 let created_list = uow.create_list(&list, doc_id, -1)?;
                 Some(created_list.id)
             } else {
@@ -3302,6 +3362,11 @@ fn paste_fragment(
 
             running_position += block_text_len + 1;
 
+            // The rest of the paragraph after the caret, when there is any: pasted at the end
+            // of a paragraph, the block goes in after it and nothing follows it. An empty
+            // paragraph used to follow a quoted paragraph pasted there, which a paste of
+            // several paragraphs never left.
+            let skip_tail = text_after.is_empty() && right_image_count == 0;
             let tail_text_length = text_after_chars + right_image_count;
             let tail_block = Block {
                 id: 0,
@@ -3332,12 +3397,19 @@ fn paste_fragment(
                 fmt_language: current_block.fmt_language.clone(),
             };
 
-            let created_tail =
-                uow.create_block(&tail_block, frame_id, (blocks_insert_pos + 1) as i32)?;
-            write_block_state(uow, created_tail.id, right.clone());
+            let created_tail = if skip_tail {
+                None
+            } else {
+                let created =
+                    uow.create_block(&tail_block, frame_id, (blocks_insert_pos + 1) as i32)?;
+                write_block_state(uow, created.id, right.clone());
+                Some(created)
+            };
 
             let mut updated_frame = frame.clone();
-            let new_child_ids = [created_block.id as i64, created_tail.id as i64];
+            let new_child_ids: Vec<i64> = std::iter::once(created_block.id as i64)
+                .chain(created_tail.as_ref().map(|tail| tail.id as i64))
+                .collect();
             for (i, id) in new_child_ids.iter().enumerate() {
                 updated_frame
                     .child_order
@@ -3349,18 +3421,19 @@ fn paste_fragment(
             uow.update_frame(&updated_frame)?;
             // The pasted block goes into the quotations it stood in, between the two halves
             // of the paragraph it was pasted into.
-            nest_in_quotations(
-                uow,
-                doc_id,
-                frame_id,
-                &[
-                    PastedEntry::block(created_block.id, Quote::of_block(&quoting, 0)),
-                    PastedEntry::block(created_tail.id, Quote::default()),
-                ],
-                now,
-            )?;
+            let pasted: Vec<PastedEntry> = std::iter::once(PastedEntry::block(
+                created_block.id,
+                Quote::of_block(&quoting, 0),
+            ))
+            .chain(
+                created_tail
+                    .as_ref()
+                    .map(|tail| PastedEntry::block(tail.id, Quote::default())),
+            )
+            .collect();
+            nest_in_quotations(uow, doc_id, frame_id, &pasted, now)?;
 
-            let blocks_added: i64 = 2;
+            let blocks_added = new_child_ids.len() as i64;
             // Use pre-mutation length captured at top of function — the
             // rope content for current_block is unchanged in this
             // "Normal path" branch (only text_after was split off), but
@@ -3369,7 +3442,11 @@ fn paste_fragment(
             // length is what `pos_shift` math expects.
             let original_next_pos =
                 current_block.document_position + original_current_char_length + 1;
-            let new_next_pos = running_position + tail_text_length + 1;
+            let new_next_pos = if skip_tail {
+                running_position
+            } else {
+                running_position + tail_text_length + 1
+            };
             let pos_shift = new_next_pos - original_next_pos;
 
             let mut blocks_to_update: Vec<Block> = Vec::new();
@@ -3413,20 +3490,29 @@ fn paste_fragment(
                 if !frag_block.plain_text.is_empty() {
                     rope_insert_in_block(&store, created_block.id, 0, &frag_block.plain_text);
                 }
-                rope_split_block(
-                    &store,
-                    created_block.id,
-                    frag_block.plain_text.len() as u32,
-                    created_tail.id,
-                );
-                if !text_after.is_empty() {
-                    rope_insert_in_block(&store, created_tail.id, 0, &text_after);
+                if let Some(created_tail) = &created_tail {
+                    rope_split_block(
+                        &store,
+                        created_block.id,
+                        frag_block.plain_text.len() as u32,
+                        created_tail.id,
+                    );
+                    if !text_after.is_empty() {
+                        rope_insert_in_block(&store, created_tail.id, 0, &text_after);
+                    }
                 }
             }
 
+            // After the pasted block: at the start of the rest of the paragraph, or at the
+            // end of the block when nothing follows it.
+            let new_position = if skip_tail {
+                running_position - 1
+            } else {
+                running_position
+            };
             Ok((
                 InsertFragmentResultDto {
-                    new_position: running_position,
+                    new_position,
                     blocks_added: 1,
                 },
                 snapshot,

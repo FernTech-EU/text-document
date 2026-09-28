@@ -2282,9 +2282,14 @@ fn build_level(level: usize, list: &List) -> docx_rs::Level {
     };
 
     let left = INDENT_STEP_TWIPS * (level as i32 + 1);
+    // Where the list starts: its own number definition carries it (see `NumberingBuilder`).
+    let start = list
+        .start
+        .and_then(|start| usize::try_from(start).ok())
+        .unwrap_or(1);
     Level::new(
         level,
-        Start::new(1),
+        Start::new(start),
         NumberFormat::new(format),
         LevelText::new(text),
         LevelJc::new("left"),

@@ -1851,6 +1851,13 @@ fn odt_list_style_xml(name: &str, list: &List) -> String {
     } else {
         list.suffix.as_str()
     };
+    // Where the list starts, when it is not 1: the style is this list's own.
+    let start_value = list
+        .start
+        .filter(|start| *start >= 0)
+        .map_or_else(String::new, |start| {
+            format!(" text:start-value=\"{start}\"")
+        });
 
     let mut levels = String::new();
     for level in 1..=9i64 {
@@ -1861,7 +1868,7 @@ fn odt_list_style_xml(name: &str, list: &List) -> String {
         match &marker {
             Marker::Number { format } => levels.push_str(&format!(
                 "<text:list-level-style-number text:level=\"{level}\" style:num-format=\"{format}\" \
-                 style:num-prefix=\"{prefix}\" style:num-suffix=\"{suffix}\">{props}</text:list-level-style-number>",
+                 style:num-prefix=\"{prefix}\" style:num-suffix=\"{suffix}\"{start_value}>{props}</text:list-level-style-number>",
                 prefix = odt_render::xml_escape(&list.prefix),
                 suffix = odt_render::xml_escape(suffix),
             )),

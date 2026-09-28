@@ -126,6 +126,7 @@ fn execute_insert_list(
         indent: 0,
         prefix: String::new(),
         suffix: String::new(),
+        start: None,
     };
     let created_list = uow.create_list(&list, doc_id, -1)?;
 

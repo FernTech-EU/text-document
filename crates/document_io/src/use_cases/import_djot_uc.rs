@@ -142,10 +142,14 @@ fn transition_bq_depth(
     frame_stack: &mut Vec<FrameState>,
     current_bq_depth: &mut u32,
     target_depth: u32,
+    opens: u32,
     list_grouper: &mut ListGrouper,
 ) -> Result<()> {
-    // Close blockquote frames if depth decreased
-    while *current_bq_depth > target_depth && frame_stack.len() > 1 {
+    // Close blockquote frames if depth decreased, and the innermost `opens` of those still
+    // open when as many quotations open at the next element: two quotations one after the
+    // other are two frames, not one.
+    let kept_depth = target_depth.saturating_sub(opens);
+    while *current_bq_depth > kept_depth && frame_stack.len() > 1 {
         let finished = frame_stack.pop().unwrap();
         attach_blocks(uow, finished.frame_id, &finished.blocks)?;
         let mut frame_entity = uow
@@ -203,11 +207,12 @@ fn assign_list(
         list_grouper.reset();
         return Ok(());
     };
-    let list_id = match list_grouper.try_reuse_delim(
+    let list_id = match list_grouper.try_reuse_list(
         list_style,
         parsed.list_indent,
         &parsed.list_prefix,
         &parsed.list_suffix,
+        parsed.list_start,
     ) {
         Some(existing_id) => existing_id,
         None => {
@@ -216,16 +221,18 @@ fn assign_list(
                 indent: parsed.list_indent as i64,
                 prefix: parsed.list_prefix.clone(),
                 suffix: parsed.list_suffix.clone(),
+                start: parsed.list_start,
                 ..List::default()
             };
             let created_list = uow.create_orphan_list(&list)?;
             orphans.lists.push(created_list.id);
-            list_grouper.register_delim(
+            list_grouper.register_list(
                 created_list.id,
                 list_style.clone(),
                 parsed.list_indent,
                 parsed.list_prefix.clone(),
                 parsed.list_suffix.clone(),
+                parsed.list_start,
             );
             created_list.id
         }
@@ -340,6 +347,7 @@ fn import_parsed_elements(
                     &mut frame_stack,
                     &mut current_bq_depth,
                     parsed_block.blockquote_depth,
+                    parsed_block.blockquote_opens,
                     &mut list_grouper,
                 )?;
 
@@ -461,6 +469,7 @@ fn import_parsed_elements(
                     &mut frame_stack,
                     &mut current_bq_depth,
                     parsed_table.blockquote_depth,
+                    parsed_table.blockquote_opens,
                     &mut list_grouper,
                 )?;
 

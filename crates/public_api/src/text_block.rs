@@ -1116,33 +1116,32 @@ fn compute_list_item_index(inner: &TextDocumentInner, list_id: EntityId, block_i
         .unwrap_or(0)
 }
 
-/// Format a list marker for the given item index.
+/// Format a list marker for the given item index: the list's start (1 unless it says
+/// otherwise) plus the index. A number no letter or numeral stands for is written in
+/// digits.
 pub(crate) fn format_list_marker(
     list_dto: &frontend::list::dtos::ListDto,
     item_index: usize,
 ) -> String {
-    let number = item_index + 1; // 1-based for display
+    let index = i64::try_from(item_index).unwrap_or(i64::MAX);
+    let number = list_dto.start.unwrap_or(1).saturating_add(index);
+    let letter = |first: u8| match u8::try_from(number) {
+        Ok(n @ 1..=26) => ((first + (n - 1)) as char).to_string(),
+        _ => format!("{number}"),
+    };
+    let numeral = |to_roman: fn(usize) -> String| match usize::try_from(number) {
+        Ok(n) if n >= 1 => to_roman(n),
+        _ => format!("{number}"),
+    };
     let marker_body = match list_dto.style {
         ListStyle::Disc => "\u{2022}".to_string(),   // •
         ListStyle::Circle => "\u{25E6}".to_string(), // ◦
         ListStyle::Square => "\u{25AA}".to_string(), // ▪
         ListStyle::Decimal => format!("{number}"),
-        ListStyle::LowerAlpha => {
-            if number <= 26 {
-                ((b'a' + (number as u8 - 1)) as char).to_string()
-            } else {
-                format!("{number}")
-            }
-        }
-        ListStyle::UpperAlpha => {
-            if number <= 26 {
-                ((b'A' + (number as u8 - 1)) as char).to_string()
-            } else {
-                format!("{number}")
-            }
-        }
-        ListStyle::LowerRoman => to_roman_lower(number),
-        ListStyle::UpperRoman => to_roman_upper(number),
+        ListStyle::LowerAlpha => letter(b'a'),
+        ListStyle::UpperAlpha => letter(b'A'),
+        ListStyle::LowerRoman => numeral(to_roman_lower),
+        ListStyle::UpperRoman => numeral(to_roman_upper),
     };
     format!("{}{marker_body}{}", list_dto.prefix, list_dto.suffix)
 }

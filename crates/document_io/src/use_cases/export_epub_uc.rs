@@ -215,6 +215,7 @@ impl ExportEpubUseCase {
         let image_policy = html_render::HtmlImagePolicy::Rewrite(&image_hrefs);
 
         let notes = crate::footnotes::Footnotes::build(&uow.store());
+        let numbers = crate::list_numbers::ListNumbers::new(&uow.store());
 
         let mut units: Vec<RenderUnit> = Vec::new();
 
@@ -248,6 +249,7 @@ impl ExportEpubUseCase {
                 frame_id,
                 &cell_frame_ids,
                 &notes,
+                &numbers,
                 image_policy,
                 &mut units,
             )?;
@@ -299,6 +301,7 @@ impl ExportEpubUseCase {
                         frame_id,
                         &cell_frame_ids,
                         &notes,
+                        &numbers,
                         image_policy,
                         &mut inner,
                     )?;
@@ -334,12 +337,14 @@ impl ExportEpubUseCase {
     /// Render a frame's content into [`RenderUnit`]s, walking its `child_order` to interleave
     /// blocks and sub-frames (blockquotes/tables). Falls back to sorted blocks when
     /// `child_order` is empty. Mirrors `export_html_uc::render_frame_html`.
+    #[allow(clippy::too_many_arguments)]
     fn render_frame_units(
         &self,
         uow: &dyn ExportEpubUnitOfWorkTrait,
         frame_id: &EntityId,
         cell_frame_ids: &HashSet<EntityId>,
         notes: &crate::footnotes::Footnotes,
+        numbers: &crate::list_numbers::ListNumbers,
         image_policy: html_render::HtmlImagePolicy<'_>,
         out: &mut Vec<RenderUnit>,
     ) -> Result<()> {
@@ -365,6 +370,7 @@ impl ExportEpubUseCase {
                 &frame,
                 cell_frame_ids,
                 notes,
+                numbers,
                 image_policy,
                 out,
             );
@@ -387,18 +393,20 @@ impl ExportEpubUseCase {
         common::database::rope_helpers::refresh_block_positions(&mut blocks, &uow.store());
         blocks.sort_by_key(|b| b.document_position);
 
-        push_block_run_units(&uow.store(), &blocks, image_policy, notes, out);
+        push_block_run_units(&uow.store(), &blocks, image_policy, notes, numbers, out);
         Ok(())
     }
 
     /// Walk `child_order` entries: positive values are block IDs, negative values are negated
     /// sub-frame IDs. Mirrors `export_html_uc::render_frame_by_child_order`.
+    #[allow(clippy::too_many_arguments)]
     fn render_frame_units_by_child_order(
         &self,
         uow: &dyn ExportEpubUnitOfWorkTrait,
         frame: &Frame,
         cell_frame_ids: &HashSet<EntityId>,
         notes: &crate::footnotes::Footnotes,
+        numbers: &crate::list_numbers::ListNumbers,
         image_policy: html_render::HtmlImagePolicy<'_>,
         out: &mut Vec<RenderUnit>,
     ) -> Result<()> {
@@ -416,7 +424,14 @@ impl ExportEpubUseCase {
                 // Negative: negated sub-frame ID
                 // First, flush any accumulated blocks
                 if !pending_blocks.is_empty() {
-                    push_block_run_units(&uow.store(), &pending_blocks, image_policy, notes, out);
+                    push_block_run_units(
+                        &uow.store(),
+                        &pending_blocks,
+                        image_policy,
+                        notes,
+                        numbers,
+                        out,
+                    );
                     pending_blocks.clear();
                 }
 
@@ -439,6 +454,7 @@ impl ExportEpubUseCase {
                             &sub_frame_id,
                             cell_frame_ids,
                             notes,
+                            numbers,
                             image_policy,
                             &mut inner,
                         )?;
@@ -469,6 +485,7 @@ impl ExportEpubUseCase {
                             &sub_frame_id,
                             cell_frame_ids,
                             notes,
+                            numbers,
                             image_policy,
                             out,
                         )?;
@@ -479,7 +496,14 @@ impl ExportEpubUseCase {
 
         // Flush remaining blocks
         if !pending_blocks.is_empty() {
-            push_block_run_units(&uow.store(), &pending_blocks, image_policy, notes, out);
+            push_block_run_units(
+                &uow.store(),
+                &pending_blocks,
+                image_policy,
+                notes,
+                numbers,
+                out,
+            );
         }
 
         Ok(())
@@ -622,6 +646,7 @@ fn push_block_run_units(
     blocks: &[Block],
     image_policy: html_render::HtmlImagePolicy<'_>,
     notes: &crate::footnotes::Footnotes,
+    numbers: &crate::list_numbers::ListNumbers,
     out: &mut Vec<RenderUnit>,
 ) {
     let mut i = 0;
@@ -632,6 +657,7 @@ fn push_block_run_units(
                 std::slice::from_ref(&blocks[i]),
                 image_policy,
                 notes,
+                numbers,
             );
             let text = html_render::block_plain_text(store, &blocks[i]);
             let footnote_labels =
@@ -650,7 +676,8 @@ fn push_block_run_units(
         while i < blocks.len() && heading_level_for_split(store, &blocks[i]).is_none() {
             i += 1;
         }
-        let html = html_render::render_blocks_html(store, &blocks[start..i], image_policy, notes);
+        let html =
+            html_render::render_blocks_html(store, &blocks[start..i], image_policy, notes, numbers);
         if !html.is_empty() {
             let footnote_labels = footnote_labels_in_blocks(store, &blocks[start..i]);
             out.push(RenderUnit::content_with_labels(html, footnote_labels));

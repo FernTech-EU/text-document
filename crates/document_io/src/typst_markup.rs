@@ -406,8 +406,13 @@ pub fn render_blocks_typst(
             }
 
             let call = if is_ordered {
+                // Where the list starts, when it is not 1.
+                let start = list_entity
+                    .start
+                    .filter(|start| *start >= 0)
+                    .map_or_else(String::new, |start| format!(", start: {start}"));
                 format!(
-                    "#enum(numbering: \"{}\")",
+                    "#enum(numbering: \"{}\"{start})",
                     numbering_pattern(&list_entity.style)
                 )
             } else {

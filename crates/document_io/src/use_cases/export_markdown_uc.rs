@@ -32,6 +32,9 @@ pub trait ExportMarkdownUnitOfWorkTrait: QueryUnitOfWork {}
 /// One list level open after the block just written: the last item written
 /// at that level. Its index in the stack is its level.
 ///
+/// The largest number CommonMark reads as an ordered list item's: nine digits.
+const MAX_MARKDOWN_LIST_NUMBER: i64 = 999_999_999;
+
 /// A nested item is written from the column where its parent's text starts,
 /// which is what CommonMark reads as nesting: two spaces under `- a`, three
 /// under `1. a`. A fixed two spaces per level put an ordered sub-list under
@@ -56,6 +59,9 @@ pub struct ExportMarkdownUseCase {
     /// and the block. Mirrors `ExportLatexUseCase::note_bodies`, which holds
     /// its own footnote state as a field for the identical reason.
     notes: crate::footnotes::Footnotes,
+    /// The number each list item wears, read at the top of `execute` for the same reason
+    /// (see [`crate::list_numbers::ListNumbers`]).
+    list_numbers: crate::list_numbers::ListNumbers,
 }
 
 impl ExportMarkdownUseCase {
@@ -67,12 +73,14 @@ impl ExportMarkdownUseCase {
             uow_factory,
             options,
             notes: crate::footnotes::Footnotes::default(),
+            list_numbers: crate::list_numbers::ListNumbers::default(),
         }
     }
 
     pub fn execute(&mut self) -> Result<ExportMarkdownDto> {
         let uow = self.uow_factory.create();
         uow.begin_transaction()?;
+        self.list_numbers = crate::list_numbers::ListNumbers::new(&uow.store());
 
         // Step 1: Get Root and Document
         let root = uow
@@ -216,6 +224,13 @@ impl ExportMarkdownUseCase {
         quote_prefix: &str,
     ) -> Result<String> {
         let mut result = String::new();
+        // Between two blocks of a quotation, a line of its markers alone: a blank line
+        // there ends the quotation, and its next paragraph was read back as another one.
+        let separator = if quote_prefix.is_empty() {
+            "\n\n".to_string()
+        } else {
+            format!("\n{}\n", quote_prefix.trim_end())
+        };
         let mut prev_was_list = false;
         // The list levels open after the block just written; see `MdOpenLevel`.
         let mut open_levels: Vec<MdOpenLevel> = Vec::new();
@@ -236,7 +251,7 @@ impl ExportMarkdownUseCase {
                             if is_list_item && prev_was_list {
                                 result.push('\n');
                             } else {
-                                result.push_str("\n\n");
+                                result.push_str(&separator);
                             }
                         }
                         result.push_str(&line);
@@ -259,7 +274,7 @@ impl ExportMarkdownUseCase {
                                 table_md
                             };
                             if !result.is_empty() {
-                                result.push_str("\n\n");
+                                result.push_str(&separator);
                             }
                             result.push_str(&prefixed);
                             prev_was_list = false;
@@ -278,7 +293,7 @@ impl ExportMarkdownUseCase {
                             self.render_frame_content(uow, sf, cell_frame_ids, &sub_prefix)?;
                         if !sub_text.is_empty() {
                             if !result.is_empty() {
-                                result.push_str("\n\n");
+                                result.push_str(&separator);
                             }
                             result.push_str(&sub_text);
                         }
@@ -312,7 +327,7 @@ impl ExportMarkdownUseCase {
                     if is_list_item && prev_was_list {
                         result.push('\n');
                     } else {
-                        result.push_str("\n\n");
+                        result.push_str(&separator);
                     }
                 }
                 result.push_str(&line);
@@ -405,10 +420,17 @@ impl ExportMarkdownUseCase {
                 | ListStyle::UpperAlpha
                 | ListStyle::LowerRoman
                 | ListStyle::UpperRoman => {
+                    // A run of a list opens at the number its first item wears, which
+                    // CommonMark reads from that item, up to nine digits: written from 1, a
+                    // list starting at 3 was read back as starting at 1.
                     let counter = match same_level {
                         Some(open) if open.list_id == *list_id => open.counter + 1,
-                        _ => 1,
-                    };
+                        _ => self
+                            .list_numbers
+                            .of(block.id)
+                            .unwrap_or_else(|| list_entity.start.unwrap_or(1)),
+                    }
+                    .clamp(0, MAX_MARKDOWN_LIST_NUMBER);
                     (format!("{counter}. "), counter)
                 }
                 _ => ("- ".to_string(), 0),

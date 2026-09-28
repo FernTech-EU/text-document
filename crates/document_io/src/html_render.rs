@@ -85,8 +85,8 @@ fn list_tag(style: &ListStyle) -> &'static str {
 }
 
 /// Close the innermost open list: its last item, then the list itself.
-fn close_list_level(html: &mut String, open: &mut Vec<&'static str>) {
-    if let Some(tag) = open.pop() {
+fn close_list_level(html: &mut String, open: &mut Vec<(&'static str, EntityId)>) {
+    if let Some((tag, _)) = open.pop() {
         html.push_str("</li></");
         html.push_str(tag);
         html.push('>');
@@ -103,6 +103,7 @@ pub fn render_blocks_html(
     blocks: &[Block],
     images: HtmlImagePolicy<'_>,
     notes: &crate::footnotes::Footnotes,
+    numbers: &crate::list_numbers::ListNumbers,
 ) -> String {
     let mut parts: Vec<String> = Vec::new();
     let mut i = 0;
@@ -147,7 +148,7 @@ pub fn render_blocks_html(
             // the top level, and a bulleted list after a numbered one came back
             // numbered.
             let mut html = String::new();
-            let mut open: Vec<&'static str> = Vec::new();
+            let mut open: Vec<(&'static str, EntityId)> = Vec::new();
 
             while i < blocks.len() {
                 let b = &blocks[i];
@@ -162,8 +163,16 @@ pub fn render_blocks_html(
                 while open.len() > level + 1 {
                     close_list_level(&mut html, &mut open);
                 }
+                // The number the item wears (see `ListNumbers`): a run of an ordered list
+                // not numbered from 1 opens its own `<ol>`, which says where it starts, even
+                // after a list of the same kind.
+                let number = numbers
+                    .of(b.id)
+                    .unwrap_or_else(|| list_entity.start.unwrap_or(1));
+                let starts_its_own = tag == "ol" && number != 1;
                 if open.len() == level + 1 {
-                    if open[level] == tag {
+                    let (open_tag, open_list) = open[level];
+                    if open_tag == tag && !(starts_its_own && open_list != list_entity.id) {
                         html.push_str("</li>");
                     } else {
                         close_list_level(&mut html, &mut open);
@@ -172,8 +181,11 @@ pub fn render_blocks_html(
                 if open.len() == level {
                     html.push('<');
                     html.push_str(tag);
+                    if starts_its_own {
+                        html.push_str(&format!(" start=\"{number}\""));
+                    }
                     html.push('>');
-                    open.push(tag);
+                    open.push((tag, list_entity.id));
                 }
                 html.push_str("<li>");
                 html.push_str(&render_inline_html(store, b, images, notes));

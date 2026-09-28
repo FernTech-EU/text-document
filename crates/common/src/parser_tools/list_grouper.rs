@@ -8,13 +8,18 @@ use crate::types::EntityId;
 /// entries are truncated so that outer lists resume correctly.
 #[derive(Default)]
 pub struct ListGrouper {
-    /// Index = indent level. Each entry: (entity_id, style, prefix, suffix).
+    /// Index = indent level. Each entry: (entity_id, style, prefix, suffix, start).
     /// `prefix`/`suffix` are the ordered-list delimiter affixes (e.g. `"."`,
     /// `")"`, `"("`) so that two adjacent ordered lists with the same numbering
     /// but a different delimiter (djot `1.` vs `1)`) are kept as separate lists.
     /// They are always empty for Markdown/HTML, which don't model delimiters.
-    active: Vec<Option<(EntityId, ListStyle, String, String)>>,
+    /// `start` is the number the list's first item wears when it is not 1: every
+    /// item of a parsed list carries its list's start, so two lists the parser
+    /// read apart that start at different numbers stay apart.
+    active: Vec<Option<ActiveList>>,
 }
+
+type ActiveList = (EntityId, ListStyle, String, String, Option<i64>);
 
 impl ListGrouper {
     pub fn new() -> Self {
@@ -38,14 +43,28 @@ impl ListGrouper {
         prefix: &str,
         suffix: &str,
     ) -> Option<EntityId> {
+        self.try_reuse_list(style, indent, prefix, suffix, None)
+    }
+
+    /// Like [`try_reuse_delim`](Self::try_reuse_delim) but also requires the list's
+    /// start (see [`register_list`](Self::register_list)) to match.
+    pub fn try_reuse_list(
+        &mut self,
+        style: &ListStyle,
+        indent: u32,
+        prefix: &str,
+        suffix: &str,
+        start: Option<i64>,
+    ) -> Option<EntityId> {
         let idx = indent as usize;
         // Truncate deeper levels - we returned to a shallower depth
         self.active.truncate(idx + 1);
-        if let Some(Some((id, existing_style, existing_prefix, existing_suffix))) =
+        if let Some(Some((id, existing_style, existing_prefix, existing_suffix, existing_start))) =
             self.active.get(idx)
             && existing_style == style
             && existing_prefix == prefix
             && existing_suffix == suffix
+            && *existing_start == start
         {
             return Some(*id);
         }
@@ -68,11 +87,27 @@ impl ListGrouper {
         prefix: String,
         suffix: String,
     ) {
+        self.register_list(id, style, indent, prefix, suffix, None);
+    }
+
+    /// Like [`register_delim`](Self::register_delim) but also records the number the
+    /// list's first item wears when it is not 1, so that
+    /// [`try_reuse_list`](Self::try_reuse_list) keeps apart two lists starting at
+    /// different numbers.
+    pub fn register_list(
+        &mut self,
+        id: EntityId,
+        style: ListStyle,
+        indent: u32,
+        prefix: String,
+        suffix: String,
+        start: Option<i64>,
+    ) {
         let idx = indent as usize;
         while self.active.len() <= idx {
             self.active.push(None);
         }
-        self.active[idx] = Some((id, style, prefix, suffix));
+        self.active[idx] = Some((id, style, prefix, suffix, start));
     }
 
     /// Clear all tracking. Call on non-list blocks, tables, or frame boundaries.

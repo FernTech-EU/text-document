@@ -175,10 +175,11 @@ fn an_item_nested_under_no_item_is_written_at_the_level_it_reloads_at() {
 }
 
 /// Two ordered lists the model keeps apart, side by side at one level with one marker,
-/// are one list to the parser, so the second continues the first's numbering.
+/// are one list to the parser, so the second continues the first's numbering, from where
+/// the first starts (0, here).
 #[test]
 fn adjacent_ordered_lists_are_numbered_as_the_one_list_they_reload_as() {
-    assert_eq!(fixpoint("1. 0. A\n\n2. aa"), "1. A\n\n2. aa");
+    assert_eq!(fixpoint("1. 0. A\n\n2. aa"), "0. A\n\n1. aa");
 }
 
 /// The parser resumes a list once a sub-list nested in it closes, so the item after

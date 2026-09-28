@@ -5,7 +5,9 @@ use crate::MergeTableCellsDto;
 use crate::MergeTableCellsResultDto;
 use anyhow::{Result, anyhow};
 use common::database::CommandUnitOfWork;
-use common::database::rope_helpers::rope_remove_block;
+use common::database::rope_helpers::{
+    block_char_length, rope_remove_block, rope_restore_table_reading_order,
+};
 use common::direct_access::document::document_repository::DocumentRelationshipField;
 use common::direct_access::frame::frame_repository::FrameRelationshipField;
 use common::direct_access::root::root_repository::RootRelationshipField;
@@ -30,8 +32,11 @@ pub trait MergeTableCellsUnitOfWorkFactoryTrait: Send + Sync {
 #[macros::uow_action(entity = "Frame", action = "Get")]
 #[macros::uow_action(entity = "Frame", action = "Remove")]
 #[macros::uow_action(entity = "Frame", action = "GetRelationship")]
+#[macros::uow_action(entity = "Frame", action = "Update")]
+#[macros::uow_action(entity = "Frame", action = "SetRelationship")]
 #[macros::uow_action(entity = "Block", action = "GetMulti")]
 #[macros::uow_action(entity = "Block", action = "UpdateMulti")]
+#[macros::uow_action(entity = "Block", action = "RemoveMulti")]
 #[macros::uow_action(entity = "Table", action = "Get")]
 #[macros::uow_action(entity = "Table", action = "GetRelationship")]
 #[macros::uow_action(entity = "TableCell", action = "GetMulti")]
@@ -154,34 +159,114 @@ fn execute_merge_table_cells(
         .copied()
         .collect();
 
-    let removed_cell_count = cells_to_remove.len() as i64;
-
     // Find base_pos from existing cell blocks BEFORE any mutation
     let existing_cell_frame_ids: Vec<EntityId> =
         cells.iter().filter_map(|c| c.cell_frame).collect();
     let base_pos = compute_table_base_pos(&*uow, &existing_cell_frame_ids)?;
 
-    // Remove the other cells' frames (cascade removes blocks/elements) and the cell entities.
-    // Before removal, collect the block IDs owned by those cell frames so we
-    // can strip their entries from the global rope.
+    // What the merged cell holds: the paragraphs of every cell merged, in reading order
+    // (the top-left cell's first), as a word processor merging cells keeps them. A cell
+    // holding nothing but empty paragraphs adds nothing; when every cell is so, the merged
+    // cell keeps the top-left one's. The merge used to remove every other cell with its
+    // paragraphs, and their words were gone from the text and from every save.
+    let mut in_reading_order: Vec<&TableCell> = cells_in_range.clone();
+    in_reading_order.sort_by_key(|c| (c.row, c.column));
+    let store = uow.store();
+    let mut kept_entries: Vec<i64> = Vec::new();
+    let mut dropped_blocks: Vec<EntityId> = Vec::new();
+    let mut moved_frames: Vec<EntityId> = Vec::new();
+    let mut surviving_entries: Vec<i64> = Vec::new();
+    for cell in &in_reading_order {
+        let Some(frame_id) = cell.cell_frame else {
+            continue;
+        };
+        let Some(frame) = uow.get_frame(&frame_id)? else {
+            continue;
+        };
+        let block_ids = uow.get_frame_relationship(&frame_id, &FrameRelationshipField::Blocks)?;
+        // The frame's own order, or its block list when it keeps none.
+        let entries: Vec<i64> = if frame.child_order.is_empty() {
+            block_ids.iter().map(|id| *id as i64).collect()
+        } else {
+            frame.child_order.clone()
+        };
+        let blocks: Vec<Block> = uow
+            .get_block_multi(&block_ids)?
+            .into_iter()
+            .flatten()
+            .collect();
+        let holds_something = entries.iter().any(|entry| *entry < 0)
+            || blocks
+                .iter()
+                .any(|block| block_char_length(block, &store) > 0);
+        if cell.id == surviving_cell_id {
+            surviving_entries = entries.clone();
+        }
+        if holds_something {
+            kept_entries.extend(entries.iter().copied());
+            if cell.id != surviving_cell_id {
+                moved_frames.extend(entries.iter().filter(|e| **e < 0).map(|e| e.unsigned_abs()));
+            }
+        } else if cell.id != surviving_cell_id {
+            dropped_blocks.extend(block_ids);
+        }
+    }
+    let surviving_frame_id = surviving_cell
+        .cell_frame
+        .ok_or_else(|| anyhow!("The merged cell has no frame"))?;
+    if kept_entries.is_empty() {
+        kept_entries = surviving_entries.clone();
+    } else {
+        // The top-left cell's empty paragraphs go when another cell holds something.
+        let kept: std::collections::HashSet<i64> = kept_entries.iter().copied().collect();
+        dropped_blocks.extend(
+            surviving_entries
+                .iter()
+                .filter(|entry| **entry > 0 && !kept.contains(entry))
+                .map(|entry| *entry as EntityId),
+        );
+    }
+    let kept_blocks: Vec<EntityId> = kept_entries
+        .iter()
+        .filter(|entry| **entry > 0)
+        .map(|entry| *entry as EntityId)
+        .collect();
+
+    // The other cells' frames lose their paragraphs to the merged cell first, so removing
+    // the frames removes none of them; then the paragraphs of empty cells go, from the rope
+    // too.
     let remove_frame_ids: Vec<EntityId> = cells_to_remove
         .iter()
         .filter_map(|c| c.cell_frame)
         .collect();
-    let mut removed_cell_block_ids: Vec<EntityId> = Vec::new();
     for fid in &remove_frame_ids {
-        let bids = uow.get_frame_relationship(fid, &FrameRelationshipField::Blocks)?;
-        removed_cell_block_ids.extend(bids);
+        uow.set_frame_relationship(fid, &FrameRelationshipField::Blocks, &[])?;
+    }
+    uow.set_frame_relationship(
+        &surviving_frame_id,
+        &FrameRelationshipField::Blocks,
+        &kept_blocks,
+    )?;
+    if let Some(mut surviving_frame) = uow.get_frame(&surviving_frame_id)? {
+        surviving_frame.child_order = kept_entries;
+        surviving_frame.updated_at = now;
+        uow.update_frame(&surviving_frame)?;
+    }
+    for frame_id in &moved_frames {
+        if let Some(mut moved) = uow.get_frame(frame_id)? {
+            moved.parent_frame = Some(surviving_frame_id);
+            moved.updated_at = now;
+            uow.update_frame(&moved)?;
+        }
     }
     for fid in &remove_frame_ids {
         uow.remove_frame(fid)?;
     }
-    // Mirror the cell removal into the global rope.
-    {
-        let store = uow.store();
-        for bid in &removed_cell_block_ids {
-            rope_remove_block(&store, *bid);
-        }
+    for bid in &dropped_blocks {
+        rope_remove_block(&store, *bid);
+    }
+    if !dropped_blocks.is_empty() {
+        uow.remove_block_multi(&dropped_blocks)?;
     }
 
     let remove_cell_ids: Vec<EntityId> = cells_to_remove.iter().map(|c| c.id).collect();
@@ -214,8 +299,12 @@ fn execute_merge_table_cells(
     if !cell_blocks_to_update.is_empty() {
         uow.update_block_multi(&cell_blocks_to_update)?;
     }
+    // The paragraphs moved into the merged cell stand in the rope where their cells did: in
+    // a merge across rows, before the cells of the rows between. The rope follows the new
+    // reading order.
+    rope_restore_table_reading_order(&store, table_id);
 
-    // Shift non-table blocks after the table (reduce by number of removed cells)
+    // Shift non-table blocks after the table (reduce by the empty paragraphs removed)
     let frame_ids = uow.get_document_relationship(&doc_id, &DocumentRelationshipField::Frames)?;
     let cell_frame_set: std::collections::HashSet<EntityId> =
         remaining_frame_ids.into_iter().collect();
@@ -232,7 +321,7 @@ fn execute_merge_table_cells(
         for block in blocks_opt.into_iter().flatten() {
             if block.document_position >= base_pos {
                 let mut shifted = block;
-                shifted.document_position -= removed_cell_count;
+                shifted.document_position -= dropped_blocks.len() as i64;
                 shifted.updated_at = now;
                 shifted_blocks.push(shifted);
             }
@@ -244,7 +333,7 @@ fn execute_merge_table_cells(
 
     // Update Document.block_count
     let mut updated_doc = document.clone();
-    updated_doc.block_count -= removed_cell_count;
+    updated_doc.block_count -= dropped_blocks.len() as i64;
     updated_doc.updated_at = now;
     uow.update_document(&updated_doc)?;
 

@@ -690,8 +690,14 @@ mod tests {
     #[test]
     fn a_quotation_past_the_nesting_typst_lays_out_is_written_beside_it() {
         let depth = 20;
+        // Each level in the one before it: the line between two levels stays in the
+        // shallower quotation. A blank line there ends every quotation, and the next level
+        // opens quotations of its own.
         let djot: String = (1..=depth)
-            .map(|d| format!("{}level {d}\n\n", "> ".repeat(d)))
+            .map(|d| {
+                let markers = "> ".repeat(d);
+                format!("{markers}level {d}\n{}\n", markers.trim_end())
+            })
             .collect();
         let markup = markup_from_djot(&djot);
         // Each level sits in the one before it, so one `#quote` a level up to the limit

@@ -54,6 +54,9 @@ pub struct ExportLatexUseCase {
     /// second, LaTeX-auto-numbered, duplicated-body footnote. `RefCell`
     /// because `render_inline_latex` only holds `&self`.
     footnoted_labels: std::cell::RefCell<std::collections::HashSet<String>>,
+    /// The number each list item wears, read at the top of `execute` (see
+    /// [`crate::list_numbers::ListNumbers`]).
+    list_numbers: crate::list_numbers::ListNumbers,
 }
 
 impl ExportLatexUseCase {
@@ -63,6 +66,7 @@ impl ExportLatexUseCase {
             omit_images: false,
             note_bodies: std::collections::HashMap::new(),
             footnoted_labels: std::cell::RefCell::new(std::collections::HashSet::new()),
+            list_numbers: crate::list_numbers::ListNumbers::default(),
         }
     }
 
@@ -70,6 +74,7 @@ impl ExportLatexUseCase {
         self.omit_images = dto.options.omit_images;
         let uow = self.uow_factory.create();
         uow.begin_transaction()?;
+        self.list_numbers = crate::list_numbers::ListNumbers::new(&uow.store());
 
         // Step 1: Get Root and Document
         let root = uow
@@ -362,9 +367,22 @@ impl ExportLatexUseCase {
                     }
                 }
 
+                // Where an ordered run starts, when it is not 1 (the list's start, or the
+                // number its first item wears after a table split the list): its counter is
+                // set to the number before it, which `\item` then steps.
+                let first = self
+                    .list_numbers
+                    .of(block.id)
+                    .unwrap_or_else(|| list_entity.start.unwrap_or(1));
+                let counter = if is_ordered && first != 1 {
+                    format!("\n\\setcounter{{enumi}}{{{}}}", first.saturating_sub(1))
+                } else {
+                    String::new()
+                };
                 parts.push(format!(
-                    "\\begin{{{}}}\n{}\n\\end{{{}}}",
+                    "\\begin{{{}}}{}\n{}\n\\end{{{}}}",
                     env,
+                    counter,
                     items.join("\n"),
                     env
                 ));

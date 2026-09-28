@@ -98,6 +98,7 @@ impl ExportHtmlUseCase {
         }
 
         let notes = crate::footnotes::Footnotes::build(&uow.store());
+        let numbers = crate::list_numbers::ListNumbers::new(&uow.store());
 
         let mut body_parts: Vec<String> = Vec::new();
 
@@ -122,7 +123,8 @@ impl ExportHtmlUseCase {
                 continue;
             }
 
-            let frame_html = self.render_frame_html(&*uow, frame_id, &cell_frame_ids, &notes)?;
+            let frame_html =
+                self.render_frame_html(&*uow, frame_id, &cell_frame_ids, &notes, &numbers)?;
             if !frame_html.is_empty() {
                 body_parts.push(frame_html);
             }
@@ -132,7 +134,8 @@ impl ExportHtmlUseCase {
         // is what a reading system turns into a pop-up; the back-link is what
         // lets a reader who followed the marker get back to the sentence.
         for (number, label, frame_id) in notes.in_print_order() {
-            let body = self.render_frame_html(&*uow, &frame_id, &cell_frame_ids, &notes)?;
+            let body =
+                self.render_frame_html(&*uow, &frame_id, &cell_frame_ids, &notes, &numbers)?;
             let id = crate::html_render::escape_html(&label);
             body_parts.push(format!(
                 "<aside epub:type=\"footnote\" role=\"doc-footnote\" id=\"fn-{id}\">\
@@ -159,6 +162,7 @@ impl ExportHtmlUseCase {
         frame_id: &EntityId,
         cell_frame_ids: &HashSet<EntityId>,
         notes: &crate::footnotes::Footnotes,
+        numbers: &crate::list_numbers::ListNumbers,
     ) -> Result<String> {
         let image_policy = self.image_policy();
         let frame = uow
@@ -172,7 +176,7 @@ impl ExportHtmlUseCase {
 
         // If child_order is populated, use it to interleave blocks and sub-frames
         if !frame.child_order.is_empty() {
-            return self.render_frame_by_child_order(uow, &frame, cell_frame_ids, notes);
+            return self.render_frame_by_child_order(uow, &frame, cell_frame_ids, notes, numbers);
         }
 
         // Fallback: render all blocks in document_position order (original behaviour)
@@ -197,6 +201,7 @@ impl ExportHtmlUseCase {
             &blocks,
             image_policy,
             notes,
+            numbers,
         ))
     }
 
@@ -208,6 +213,7 @@ impl ExportHtmlUseCase {
         frame: &Frame,
         cell_frame_ids: &HashSet<EntityId>,
         notes: &crate::footnotes::Footnotes,
+        numbers: &crate::list_numbers::ListNumbers,
     ) -> Result<String> {
         let image_policy = self.image_policy();
         let mut parts: Vec<String> = Vec::new();
@@ -230,6 +236,7 @@ impl ExportHtmlUseCase {
                         &pending_blocks,
                         image_policy,
                         notes,
+                        numbers,
                     );
                     if !html.is_empty() {
                         parts.push(html);
@@ -248,8 +255,13 @@ impl ExportHtmlUseCase {
                 if let Some(ref sf) = sub_frame {
                     if sf.fmt_is_blockquote == Some(true) {
                         // Recursively render the blockquote frame content
-                        let inner =
-                            self.render_frame_html(uow, &sub_frame_id, cell_frame_ids, notes)?;
+                        let inner = self.render_frame_html(
+                            uow,
+                            &sub_frame_id,
+                            cell_frame_ids,
+                            notes,
+                            numbers,
+                        )?;
                         if !inner.is_empty() {
                             // A blockquote standing in for something a format can name
                             // gets said so. `epub:type` is the EPUB Structural Semantics
@@ -266,8 +278,13 @@ impl ExportHtmlUseCase {
                         }
                     } else {
                         // Non-blockquote sub-frame: render normally
-                        let inner =
-                            self.render_frame_html(uow, &sub_frame_id, cell_frame_ids, notes)?;
+                        let inner = self.render_frame_html(
+                            uow,
+                            &sub_frame_id,
+                            cell_frame_ids,
+                            notes,
+                            numbers,
+                        )?;
                         if !inner.is_empty() {
                             parts.push(inner);
                         }
@@ -278,8 +295,13 @@ impl ExportHtmlUseCase {
 
         // Flush remaining blocks
         if !pending_blocks.is_empty() {
-            let html =
-                html_render::render_blocks_html(&uow.store(), &pending_blocks, image_policy, notes);
+            let html = html_render::render_blocks_html(
+                &uow.store(),
+                &pending_blocks,
+                image_policy,
+                notes,
+                numbers,
+            );
             if !html.is_empty() {
                 parts.push(html);
             }
