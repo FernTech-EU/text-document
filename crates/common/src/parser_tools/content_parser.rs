@@ -1101,6 +1101,89 @@ fn collapse_inline_whitespace(spans: &mut [ParsedSpan]) {
     }
 }
 
+/// `block` as one block per line of its text.
+///
+/// The model has no line break inside a block: a new line is a new block, which is
+/// what the Djot reader makes of a hard break and what a plain-text paste makes of a
+/// line break. Text that kept its source's line breaks (`<pre>`, `white-space: pre`)
+/// held them inside one block, where the editor showed them as lines and the Djot
+/// writer had nothing to write them as. Written raw, a blank line ended the paragraph
+/// and the lines after it were read back as the lists, headings and quotations their
+/// markers spelled, however deep.
+///
+/// Each line keeps the block's own formatting and its spans' formatting, but for the
+/// page break, which stays with the first line: it is where the block starts, and on
+/// every line it put each on a page of its own. An empty line is an empty block. The
+/// line break that ends the last line starts no line of its own, as a browser shows it.
+/// A block without a line break is returned as it is.
+///
+/// Every line is built from copies of the block and of the span it comes from that
+/// hold no text, so the split costs in proportion to the text: built from whole copies,
+/// each line copied the whole text again, and a paste of 64,000 preformatted lines
+/// took seconds.
+pub fn split_block_at_line_breaks(mut block: ParsedBlock) -> Vec<ParsedBlock> {
+    let breaks = |span: &ParsedSpan| span.image.is_none() && span.text.contains('\n');
+    if !block.spans.iter().any(breaks) {
+        return vec![block];
+    }
+    let mut lines: Vec<Vec<ParsedSpan>> = vec![Vec::new()];
+    for mut span in std::mem::take(&mut block.spans) {
+        if !breaks(&span) {
+            push_to_last_line(&mut lines, span);
+            continue;
+        }
+        let text = std::mem::take(&mut span.text);
+        for (i, piece) in text.split('\n').enumerate() {
+            if i > 0 {
+                lines.push(Vec::new());
+            }
+            if !piece.is_empty() {
+                push_to_last_line(
+                    &mut lines,
+                    ParsedSpan {
+                        text: piece.to_string(),
+                        ..span.clone()
+                    },
+                );
+            }
+        }
+    }
+    if lines.len() > 1 && lines.last().is_some_and(Vec::is_empty) {
+        lines.pop();
+    }
+    let later_line = ParsedBlock {
+        page_break_before: None,
+        ..block.clone()
+    };
+    let mut first_line = Some(block);
+    lines
+        .into_iter()
+        .map(|spans| {
+            let spans = if spans.is_empty() {
+                vec![ParsedSpan::default()]
+            } else {
+                spans
+            };
+            match first_line.take() {
+                Some(first) => ParsedBlock { spans, ..first },
+                None => ParsedBlock {
+                    spans,
+                    ..later_line.clone()
+                },
+            }
+        })
+        .collect()
+}
+
+/// Append `span` to the last of `lines`, which [`split_block_at_line_breaks`] keeps
+/// non-empty.
+fn push_to_last_line(lines: &mut Vec<Vec<ParsedSpan>>, span: ParsedSpan) {
+    match lines.last_mut() {
+        Some(line) => line.push(span),
+        None => lines.push(vec![span]),
+    }
+}
+
 pub fn parse_html(html: &str) -> Vec<ParsedBlock> {
     ParsedElement::flatten_to_blocks(parse_html_elements(html))
 }
@@ -1737,7 +1820,7 @@ pub fn parse_html_elements(html: &str) -> Vec<ParsedElement> {
                         spans_carry_content(&spans) || nested_elements.is_empty();
 
                     if (!spans.is_empty() && own_run_is_content) || heading_level.is_some() {
-                        elements.push(ParsedElement::Block(ParsedBlock {
+                        let block = ParsedBlock {
                             spans,
                             heading_level,
                             list_style: list_style_for_block,
@@ -1757,7 +1840,19 @@ pub fn parse_html_elements(html: &str) -> Vec<ParsedElement> {
                             top_margin: None,
                             text_indent: None,
                             semantic_role: None,
-                        }));
+                        };
+                        // Kept whitespace keeps its line breaks, and a line break in
+                        // prose is a new block to the model. Only a code block holds
+                        // its lines in one block.
+                        if is_code_block {
+                            elements.push(ParsedElement::Block(block));
+                        } else {
+                            elements.extend(
+                                split_block_at_line_breaks(block)
+                                    .into_iter()
+                                    .map(ParsedElement::Block),
+                            );
+                        }
                     }
                     // Append nested block elements after the parent block
                     elements.append(&mut nested_elements);
@@ -2416,9 +2511,10 @@ fn djot_push_block(
 /// escapes whatever a paragraph opens with and whatever in it would read as markup, so
 /// the saved text reads back as these same paragraphs. Shown as one paragraph, the
 /// source kept its line breaks through a save, read back as the same document the parser
-/// could not take, and every save escaped its backslashes once more. Blank lines and a
-/// line's outer whitespace are left out for the same reason: the parser drops both when
-/// it reads the saved paragraphs back.
+/// could not take, and every save escaped its backslashes once more. Blank lines are left
+/// out because the reader keeps no block for an empty paragraph, and a line's outer
+/// whitespace because it is the source's indentation, which the parser does not read as
+/// text in a line it can take either.
 fn djot_source_lines(djot: &str) -> Vec<ParsedElement> {
     djot.lines()
         .map(|line| line.trim_matches(|c: char| c.is_ascii_whitespace()))
@@ -2627,6 +2723,58 @@ pub fn parse_djot(djot: &str, options: &DjotImportOptions) -> Vec<ParsedElement>
             cur_list_suffix = suffix;
             cur_list_indent = list_stack.len().saturating_sub(1) as u32;
             cur_marker = $marker;
+        }};
+    }
+
+    // A line break inside a block: a new block, which is what the model means by one,
+    // with the list, quotation, heading and block style the line was in. A table cell
+    // is one line, so there it is a space.
+    //
+    // The page break is the one style that stays with the first line: it is where the
+    // block starts, and copied to every line it put each on a page of its own.
+    macro_rules! line_break {
+        () => {{
+            if in_table_cell {
+                push_text!(" ");
+            } else if !current_spans.is_empty() && current_heading.is_some() {
+                // The line before a hard break in a heading is a line of that
+                // heading, as the line after it is when the heading ends. Read as
+                // a paragraph, a heading written over two lines came back as a
+                // paragraph and a heading.
+                djot_push_block(
+                    &mut elements,
+                    std::mem::take(&mut current_spans),
+                    current_heading,
+                    None,
+                    0,
+                    String::new(),
+                    String::new(),
+                    None,
+                    false,
+                    None,
+                    blockquote_depth,
+                    pending_style.clone(),
+                );
+                pending_style.page_break_before = None;
+            } else if !current_spans.is_empty() {
+                // Mirrors the Markdown importer: a hard break splits the
+                // paragraph into a new block.
+                djot_push_block(
+                    &mut elements,
+                    std::mem::take(&mut current_spans),
+                    None,
+                    cur_list_style.clone(),
+                    cur_list_indent,
+                    cur_list_prefix.clone(),
+                    cur_list_suffix.clone(),
+                    cur_marker.clone(),
+                    is_code_block,
+                    code_language.clone(),
+                    blockquote_depth,
+                    pending_style.clone(),
+                );
+                pending_style.page_break_before = None;
+            }
         }};
     }
 
@@ -2860,7 +3008,9 @@ pub fn parse_djot(djot: &str, options: &DjotImportOptions) -> Vec<ParsedElement>
                         .unwrap_or(0)
                 };
                 pending_image = Some(ParsedImage {
-                    src: src.to_string(),
+                    // The writer percent-encodes what the lexer would act on in a
+                    // source; the source is a name, so it is decoded back.
+                    src: crate::parser_tools::djot_escape::decode_djot_image_source(&src),
                     alt: String::new(),
                     width: attr_num("width"),
                     height: attr_num("height"),
@@ -2945,6 +3095,26 @@ pub fn parse_djot(djot: &str, options: &DjotImportOptions) -> Vec<ParsedElement>
             ) => skip_depth = 1,
 
             // ── Text + atoms ──
+            // A line ending inside a code span is kept by the parser as a line
+            // break in the span's text, the one a paragraph's text can hold. It is
+            // read as a hard break is, a new block with the list, quotation or
+            // heading the line was in, so the model holds no line break inside a
+            // block. Kept inside the span, the Djot writer saved the code run's
+            // lines as blocks of their own, which reloaded as two blocks: a document
+            // that did not settle into the Djot it saves as. Such a span is what an
+            // older version wrote for a code run holding a line break, a pasted
+            // `<pre><code>` passage above all, and reading its lines as blocks is how
+            // that passage reads in the editor.
+            E::Str(s) if code && !is_code_block && pending_image.is_none() && s.contains('\n') => {
+                for (i, piece) in s.split('\n').enumerate() {
+                    if i > 0 {
+                        line_break!();
+                    }
+                    if !piece.is_empty() {
+                        push_text!(piece);
+                    }
+                }
+            }
             E::Str(s) => push_text!(s.as_ref()),
             E::Softbreak => push_text!(" "),
             E::LeftSingleQuote => push_text!("\u{2018}"),
@@ -2955,28 +3125,7 @@ pub fn parse_djot(djot: &str, options: &DjotImportOptions) -> Vec<ParsedElement>
             E::EnDash => push_text!("\u{2013}"),
             E::EmDash => push_text!("\u{2014}"),
             E::NonBreakingSpace => push_text!("\u{00A0}"),
-            E::Hardbreak => {
-                if in_table_cell {
-                    push_text!(" ");
-                } else if !current_spans.is_empty() {
-                    // Mirrors the Markdown importer: a hard break splits the
-                    // paragraph into a new block.
-                    djot_push_block(
-                        &mut elements,
-                        std::mem::take(&mut current_spans),
-                        None,
-                        cur_list_style.clone(),
-                        cur_list_indent,
-                        cur_list_prefix.clone(),
-                        cur_list_suffix.clone(),
-                        cur_marker.clone(),
-                        is_code_block,
-                        code_language.clone(),
-                        blockquote_depth,
-                        pending_style.clone(),
-                    );
-                }
-            }
+            E::Hardbreak => line_break!(),
             // A footnote reference. jotdown emits this purely syntactically —
             // it never checks that a matching `[^label]:` exists anywhere — so a
             // reference whose definition lives outside this document (the normal
@@ -3404,9 +3553,14 @@ mod tests {
         let text: String = blocks[0].spans.iter().map(|s| s.text.as_str()).collect();
         assert_eq!(text, "fn main() {\n    let x = 1;\n}");
 
+        // Outside a code block a line break is a new block, and each line keeps its
+        // spaces.
         let styled = parse_html("<p style=\"white-space: pre-wrap\">a\n  b</p>");
-        let text: String = styled[0].spans.iter().map(|s| s.text.as_str()).collect();
-        assert_eq!(text, "a\n  b");
+        let texts: Vec<String> = styled
+            .iter()
+            .map(|b| b.spans.iter().map(|s| s.text.as_str()).collect())
+            .collect();
+        assert_eq!(texts, ["a", "  b"]);
 
         let nowrap = parse_html("<p style=\"white-space: nowrap\">a\n  b</p>");
         let text: String = nowrap[0].spans.iter().map(|s| s.text.as_str()).collect();

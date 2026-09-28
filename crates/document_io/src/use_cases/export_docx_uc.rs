@@ -1238,11 +1238,20 @@ impl ExportDocxUseCase {
     /// `out`. `quote_depth` is the current blockquote nesting level (0 at the
     /// document body), used to compute left indentation.
     ///
-    /// `comments` is threaded straight through every recursive call — including into a
-    /// blockquote sub-frame, which *is* part of the document's addressable text — but is
+    /// `comments` is threaded straight through the whole walk, into a blockquote
+    /// sub-frame too, which *is* part of the document's addressable text, but is
     /// never passed down into `render_table_docx`'s own cell walk (that call always hands
     /// its cells `None`; see `render_block`'s doc comment for why table cells are out of
     /// scope for comment ranges).
+    ///
+    /// # A loop, not a call a level
+    ///
+    /// Sub-frames are walked with a stack of their own rather than by calling this
+    /// function again for each. A call cost about 31 KiB of stack in a debug build, so
+    /// on the 2 MiB thread an export runs on, a quotation nested 55 deep, fewer than
+    /// the editor and the Djot reader allow, aborted the whole process; a release build
+    /// aborted past about 220. The stack here grows on the heap by one small entry a
+    /// level, so any nesting the document holds exports.
     #[allow(clippy::too_many_arguments)]
     fn render_frame_content(
         &self,
@@ -1258,108 +1267,116 @@ impl ExportDocxUseCase {
         footnote_state: &FootnoteRefState,
         comments: Option<&CommentEmitState<'_>>,
     ) -> Result<()> {
-        if !frame.child_order.is_empty() {
-            for &entry in &frame.child_order {
-                check_cancelled(cancel_flag)?;
-                // `child_order` encodes block ids as positive and sub-frame ids
-                // as negated. Entity ids are 1-based, so a 0 entry is malformed;
-                // skip it rather than dispatching it as the sub-frame `-0`.
-                if entry == 0 {
+        /// A frame being walked: its `child_order`, how far the walk has got through
+        /// it, and what its blocks are rendered with.
+        struct FrameWalk {
+            frame: Frame,
+            next: usize,
+            quote_depth: usize,
+            semantic: Option<SemanticRole>,
+        }
+
+        let mut walks = vec![FrameWalk {
+            frame: frame.clone(),
+            next: 0,
+            quote_depth,
+            semantic: semantic.cloned(),
+        }];
+        while let Some(walk) = walks.last_mut() {
+            if walk.frame.child_order.is_empty() {
+                // Fallback: no child_order recorded, so iterate the Blocks
+                // relationship in document order.
+                let depth = walk.quote_depth;
+                let semantic = walk.semantic.clone();
+                let frame_id = walk.frame.id;
+                walks.pop();
+                let block_ids = uow.get_frame_relationship(
+                    &frame_id,
+                    &common::direct_access::frame::FrameRelationshipField::Blocks,
+                )?;
+                if block_ids.is_empty() {
                     continue;
                 }
-                if entry > 0 {
-                    // Positive: a block id.
-                    let block_id = entry as EntityId;
-                    if let Some(block) = uow.get_block(&block_id)? {
-                        let paragraph = self.render_block(
-                            uow,
-                            &block,
-                            quote_depth,
-                            semantic,
-                            numbering,
-                            notes,
-                            footnote_state,
-                            comments,
-                        )?;
-                        out.push(DocxElement::Paragraph(Box::new(paragraph)));
-                    }
-                } else {
-                    // Negative: a negated sub-frame id.
-                    let sub_frame_id = (-entry) as EntityId;
-                    if cell_frame_ids.contains(&sub_frame_id) {
-                        continue;
-                    }
-                    if let Some(sub_frame) = uow.get_frame(&sub_frame_id)? {
-                        // Table anchor sub-frame.
-                        if let Some(table_id) = sub_frame.table {
-                            let table = self.render_table_docx(
-                                uow,
-                                &table_id,
-                                numbering,
-                                notes,
-                                footnote_state,
-                            )?;
-                            out.push(DocxElement::Table(Box::new(table)));
-                            continue;
-                        }
-                        // A blockquote sub-frame deepens the indent; any other
-                        // sub-frame is rendered inline at the same depth.
-                        let sub_depth = if sub_frame.fmt_is_blockquote == Some(true) {
-                            quote_depth + 1
-                        } else {
-                            quote_depth
-                        };
-                        let sub_semantic = if sub_frame.fmt_is_blockquote == Some(true) {
-                            sub_frame.fmt_semantic_role.as_ref()
-                        } else {
-                            semantic
-                        };
-                        self.render_frame_content(
-                            uow,
-                            &sub_frame,
-                            cell_frame_ids,
-                            sub_depth,
-                            sub_semantic,
-                            numbering,
-                            notes,
-                            cancel_flag,
-                            out,
-                            footnote_state,
-                            comments,
-                        )?;
-                    }
+                let blocks_opt = uow.get_block_multi(&block_ids)?;
+                let mut blocks: Vec<Block> = blocks_opt.into_iter().flatten().collect();
+                // Ordered by where each block starts in the rope: the stored field lags it
+                // by whatever was typed since something last wrote it.
+                common::database::rope_helpers::refresh_block_positions(&mut blocks, &uow.store());
+                blocks.sort_by_key(|b| b.document_position);
+                for block in &blocks {
+                    check_cancelled(cancel_flag)?;
+                    let paragraph = self.render_block(
+                        uow,
+                        block,
+                        depth,
+                        semantic.as_ref(),
+                        numbering,
+                        notes,
+                        footnote_state,
+                        comments,
+                    )?;
+                    out.push(DocxElement::Paragraph(Box::new(paragraph)));
                 }
+                continue;
             }
-        } else {
-            // Fallback: no child_order recorded — iterate the Blocks
-            // relationship in document order.
-            let block_ids = uow.get_frame_relationship(
-                &frame.id,
-                &common::direct_access::frame::FrameRelationshipField::Blocks,
-            )?;
-            if block_ids.is_empty() {
-                return Ok(());
+            let Some(&entry) = walk.frame.child_order.get(walk.next) else {
+                walks.pop();
+                continue;
+            };
+            walk.next += 1;
+            check_cancelled(cancel_flag)?;
+            // `child_order` encodes block ids as positive and sub-frame ids
+            // as negated. Entity ids are 1-based, so a 0 entry is malformed;
+            // skip it rather than dispatching it as the sub-frame `-0`.
+            if entry == 0 {
+                continue;
             }
-            let blocks_opt = uow.get_block_multi(&block_ids)?;
-            let mut blocks: Vec<Block> = blocks_opt.into_iter().flatten().collect();
-            // Ordered by where each block starts in the rope: the stored field lags it by
-            // whatever was typed since something last wrote it.
-            common::database::rope_helpers::refresh_block_positions(&mut blocks, &uow.store());
-            blocks.sort_by_key(|b| b.document_position);
-            for block in &blocks {
-                check_cancelled(cancel_flag)?;
-                let paragraph = self.render_block(
-                    uow,
-                    block,
-                    quote_depth,
-                    semantic,
-                    numbering,
-                    notes,
-                    footnote_state,
-                    comments,
-                )?;
-                out.push(DocxElement::Paragraph(Box::new(paragraph)));
+            if entry > 0 {
+                // Positive: a block id.
+                let block_id = entry as EntityId;
+                if let Some(block) = uow.get_block(&block_id)? {
+                    let paragraph = self.render_block(
+                        uow,
+                        &block,
+                        walk.quote_depth,
+                        walk.semantic.as_ref(),
+                        numbering,
+                        notes,
+                        footnote_state,
+                        comments,
+                    )?;
+                    out.push(DocxElement::Paragraph(Box::new(paragraph)));
+                }
+                continue;
             }
+            // Negative: a negated sub-frame id.
+            let sub_frame_id = (-entry) as EntityId;
+            if cell_frame_ids.contains(&sub_frame_id) {
+                continue;
+            }
+            let Some(sub_frame) = uow.get_frame(&sub_frame_id)? else {
+                continue;
+            };
+            // Table anchor sub-frame.
+            if let Some(table_id) = sub_frame.table {
+                let table =
+                    self.render_table_docx(uow, &table_id, numbering, notes, footnote_state)?;
+                out.push(DocxElement::Table(Box::new(table)));
+                continue;
+            }
+            // A blockquote sub-frame deepens the indent; any other
+            // sub-frame is rendered inline at the same depth.
+            let (sub_depth, sub_semantic) = if sub_frame.fmt_is_blockquote == Some(true) {
+                (walk.quote_depth + 1, sub_frame.fmt_semantic_role.clone())
+            } else {
+                (walk.quote_depth, walk.semantic.clone())
+            };
+            walks.push(FrameWalk {
+                frame: sub_frame,
+                next: 0,
+                quote_depth: sub_depth,
+                semantic: sub_semantic,
+            });
         }
         Ok(())
     }

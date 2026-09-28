@@ -125,14 +125,15 @@ fn typed_after_spaces(spaces: usize) -> TextDocument {
 /// The shapes the editor writes deep: a paragraph typed after 194 spaces, a list
 /// Tabbed 48 deep and a quotation 64 deep. Each is counted at the nesting it has, which
 /// is well within the ceiling, and each reloads as its structure: the paragraph as a
-/// paragraph, every item at its own indent, the quotation 64 deep.
+/// paragraph with its spaces, every item at its own indent, the quotation 64 deep.
 ///
 /// Before the scan followed the parser, the paragraph counted 97 (one level per two
 /// spaces) and reloaded as its own Djot source, spaces and all, and the list counted 47.
 #[test]
 fn the_deep_shapes_the_editor_writes_reload_as_their_structure() {
-    // The paragraph typed after 194 spaces. Djot drops a paragraph's leading
-    // whitespace when it reads one, which no escaping can change; the words stay.
+    // The paragraph typed after 194 spaces, which the writer keeps with an empty
+    // attribute set in front of them: they open no container.
+    let indented = format!("{}Indented paragraph.", " ".repeat(194));
     let djot = typed_after_spaces(194).to_djot().expect("save");
     assert_eq!(nesting_depth(&djot), 0, "{djot:?}");
     assert!(!is_too_deep(&djot));
@@ -140,7 +141,7 @@ fn the_deep_shapes_the_editor_writes_reload_as_their_structure() {
     let texts: Vec<&str> = shown.iter().map(|s| s.text.as_str()).collect();
     assert_eq!(
         texts,
-        ["First.", "Indented paragraph."],
+        ["First.", indented.as_str()],
         "reloaded as raw source: {djot:.80?}"
     );
 
@@ -257,13 +258,25 @@ fn a_document_the_parser_cannot_take_loads_as_its_lines_and_saves_the_same() {
 /// aborted the process inside `set_djot_sync`: the parser reads each further line one
 /// call deeper while the opener waits, and a debug build ran out of a spawned thread's
 /// stack at 730 lines. It now loads with every line.
+///
+/// A backtick left open makes the rest of the paragraph one code span, which keeps its
+/// line breaks, and a line break is a new block to the model: that paragraph loads as a
+/// block a line.
 #[test]
 fn a_long_paragraph_that_keeps_an_opener_waiting_loads_whole() {
     let lines = 3_000;
     for opener in ["_", "[", "`", "\"", "{_"] {
         let (shown, _) = load_and_save(&format!("{opener}{}", "word\n".repeat(lines)));
-        assert_eq!(shown.len(), 1, "{opener:?}: one paragraph");
-        assert_eq!(shown[0].matches("word").count(), lines, "{opener:?}");
+        let blocks = if opener == "`" { lines } else { 1 };
+        assert_eq!(shown.len(), blocks, "{opener:?}: {blocks} blocks");
+        assert_eq!(
+            shown
+                .iter()
+                .map(|s| s.matches("word").count())
+                .sum::<usize>(),
+            lines,
+            "{opener:?}"
+        );
     }
 }
 
@@ -470,5 +483,38 @@ proptest! {
         edits in prop::collection::vec(edit(), 1..7),
     ) {
         lets_through(&edited_djot(&edits))?;
+    }
+}
+
+/// The DOCX writer walked a quotation by calling itself once a level, about 31 KiB of
+/// stack a call in a debug build, on the 2 MiB thread an export runs on: a quotation 55
+/// deep, fewer than the editor nests with its quote command (64) and the reader allows
+/// (128), aborted the whole process. It walks them in a loop now, so the depth a
+/// document can hold is no limit: each export here runs on the library's own export
+/// thread, and every one holds the quoted words.
+#[test]
+fn a_deep_quotation_exports_to_docx() {
+    let dir = tempfile::tempdir().expect("a directory for the exports");
+    for depth in [64, MAX_NESTING_DEPTH, 300] {
+        let doc = quoted(depth);
+        let path = dir.path().join(format!("quoted-{depth}.docx"));
+        let path = path.to_str().expect("a UTF-8 path");
+        doc.to_docx(path)
+            .expect("start the export")
+            .wait()
+            .expect("the export");
+        let bytes = std::fs::read(path).expect("the exported file");
+        let mut zip =
+            zip::ZipArchive::new(std::io::Cursor::new(bytes)).expect("a DOCX is a zip archive");
+        let mut body = String::new();
+        std::io::Read::read_to_string(
+            &mut zip.by_name("word/document.xml").expect("the body part"),
+            &mut body,
+        )
+        .expect("the body is text");
+        assert!(
+            body.contains(">deep<"),
+            "{depth} deep: the quoted words are gone"
+        );
     }
 }

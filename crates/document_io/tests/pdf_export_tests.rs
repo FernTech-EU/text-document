@@ -323,6 +323,179 @@ fn a_page_break_opening_an_epigraph_is_lifted_out_of_it() {
     assert_eq!(count_pdf_pages(&bytes), 2);
 }
 
+/// Typst gives up past a fixed depth of show rules, and each `#quote` spends four of its
+/// 64: the whole export failed for any quotation 17 deep, and from 15 for one holding a
+/// list, a table, a heading, a code block or a note, depths the editor and the reader
+/// both allow. Past eight levels a quotation is now written beside the one it sits in,
+/// indented as far, so every depth the model holds exports.
+#[test]
+fn a_quotation_nested_past_what_typst_lays_out_still_exports() {
+    let content = [
+        "Some *bold _it_* and [a link](http://x) and `code` and ^sup^[^n].",
+        "- a\n\n  - b\n\n    - c",
+        "| a | *b* |\n|---|---|\n| c | d |",
+        "# Title",
+        "```\ncode\n```",
+    ];
+    for depth in [8, 9, 15, 17, 64, 128] {
+        let q = "> ".repeat(depth);
+        let body: Vec<String> = content
+            .iter()
+            .map(|block| {
+                block
+                    .lines()
+                    .map(|line| format!("{q}{line}").trim_end().to_string())
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            })
+            .collect();
+        let djot = format!(
+            "{}\n{}\n\n[^n]: A note with *bold*.\n",
+            body.join(&format!("\n{}\n", q.trim_end())),
+            (1..depth)
+                .map(|d| format!("\n{}level {d}", "> ".repeat(d)))
+                .collect::<String>()
+        );
+        let bytes = pdf_from_djot(&djot, pdf_options());
+        assert!(bytes.starts_with(b"%PDF-"), "{depth} deep must compile");
+    }
+    // A page break opening a deep quotation is lifted out of every container it opens.
+    let q = "> ".repeat(20);
+    let bytes = pdf_from_djot(
+        &format!("Body.\n\n{q}{{page_break_before=true}}\n{q}Quoted matter.\n\nAfter."),
+        pdf_options(),
+    );
+    assert!(bytes.starts_with(b"%PDF-"));
+    assert_eq!(count_pdf_pages(&bytes), 2, "the break must still break");
+}
+
+/// Import `djot` into a fresh document and compile it, or the error the export gives.
+fn try_pdf_from_djot(djot: &str) -> Result<Vec<u8>, String> {
+    let (db, ev, _) = setup().expect("setup");
+    import_djot(&db, &ev, djot);
+    document_io_controller::build_pdf_document(
+        &db,
+        &ExportPdfDto {
+            output_path: String::new(),
+            options: pdf_options(),
+        },
+    )
+    .map_err(|error| format!("{error:#}"))
+}
+
+/// A page break on a paragraph of a quotation other than its first stayed inside the
+/// quotation, where Typst refuses one, and the whole export failed ("pagebreaks are not
+/// allowed inside of containers"), at any depth. It is a column break there now, which
+/// on a page of one column starts the next page, and the quotation goes on at its top.
+#[test]
+fn a_page_break_inside_a_quotation_starts_a_page() {
+    let q = |depth: usize| "> ".repeat(depth);
+    let later_paragraph = |depth: usize| {
+        format!(
+            "{}First.\n{}\n{}{{page_break_before=true}}\n{}Second.\n",
+            q(depth),
+            q(depth).trim_end(),
+            q(depth),
+            q(depth)
+        )
+    };
+    let mut cases: Vec<(String, usize)> = [1, 3, 8, 9, 12, 64]
+        .into_iter()
+        .map(|depth| (later_paragraph(depth), 2))
+        .collect();
+    cases.extend(
+        [
+            // A break opening a quotation nested after text in the one around it.
+            ("> First.\n>\n> > {page_break_before=true}\n> > Second.\n", 2),
+            // The same, past the nesting written as Typst's own quotations.
+            (
+                &*format!(
+                    "{}First.\n{}\n{}{{page_break_before=true}}\n{}Second.\n",
+                    q(9),
+                    q(9).trim_end(),
+                    q(10),
+                    q(10)
+                ),
+                2,
+            ),
+            // On a heading, and on the paragraph after a nested quotation.
+            ("> First.\n>\n> {page_break_before=true}\n> # Second\n", 2),
+            ("> First.\n>\n> > Inner.\n>\n> {page_break_before=true}\n> Second.\n", 2),
+            // Two in one quotation.
+            (
+                "> First.\n>\n> {page_break_before=true}\n> Second.\n>\n> {page_break_before=true}\n> Third.\n",
+                3,
+            ),
+            // Inside an epigraph, and on its attribution.
+            (
+                "Body.\n\n> {semantic_role=epigraph}\n> First.\n>\n> {page_break_before=true}\n> Second.\n>\n> {alignment=right}\n> Author\n",
+                2,
+            ),
+            (
+                "Body.\n\n> {semantic_role=epigraph}\n> First.\n>\n> {alignment=right page_break_before=true}\n> Author\n",
+                2,
+            ),
+        ]
+        .map(|(djot, pages)| (djot.to_string(), pages)),
+    );
+    let mut failures = Vec::new();
+    for (djot, pages) in &cases {
+        match try_pdf_from_djot(djot) {
+            Ok(bytes) if count_pdf_pages(&bytes) == *pages => {}
+            Ok(bytes) => failures.push(format!(
+                "{djot:?}: {} pages, not {pages}",
+                count_pdf_pages(&bytes)
+            )),
+            Err(error) => failures.push(format!("{djot:?}: {error}")),
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+    // Without the break, the same quotation is one page.
+    let bytes = try_pdf_from_djot(&format!(
+        "{}First.\n{}\n{}Second.\n",
+        q(3),
+        q(3).trim_end(),
+        q(3)
+    ));
+    assert_eq!(bytes.map(|bytes| count_pdf_pages(&bytes)), Ok(1));
+}
+
+/// A page break set on a paragraph of a note, which a host can do through the cursor,
+/// sat inside the footnote and failed the whole export. A note cannot start a page, so
+/// it is left out.
+#[test]
+fn a_page_break_in_a_note_is_left_out() {
+    let (db, ev, _) = setup().expect("setup");
+    import_djot(
+        &db,
+        &ev,
+        "Text[^n].\n\n[^n]: First note paragraph.\n\n    Second note paragraph.\n",
+    );
+    {
+        let store = db.get_store();
+        let mut blocks = store.blocks.write();
+        let mut set = 0;
+        for block in blocks.values_mut() {
+            if common::database::rope_helpers::block_content_via_store(block, store)
+                == "Second note paragraph."
+            {
+                block.fmt_page_break_before = Some(true);
+                set += 1;
+            }
+        }
+        assert_eq!(set, 1, "the note's second paragraph is one block");
+    }
+    let bytes = document_io_controller::build_pdf_document(
+        &db,
+        &ExportPdfDto {
+            output_path: String::new(),
+            options: pdf_options(),
+        },
+    )
+    .map_err(|error| format!("{error:#}"));
+    assert_eq!(bytes.map(|bytes| count_pdf_pages(&bytes)), Ok(1));
+}
+
 #[test]
 fn rich_document_writes_a_real_pdf_file_to_disk() {
     let (db, ev, _) = setup().expect("setup");

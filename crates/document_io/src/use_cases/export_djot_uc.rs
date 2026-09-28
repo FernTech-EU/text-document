@@ -14,11 +14,13 @@ use common::parser_tools::DjotExportOptions;
 // exporter's call sites read as they always did, while there is only one escaper to be
 // wrong about the awkward strings.
 use common::parser_tools::djot_escape::{
-    escape_djot_inline_in_context, guard_djot_attribute_continuation,
+    escape_djot_inline_in_context, guard_djot_attribute_continuation, keep_djot_edge_whitespace,
+    reads_as_image_source_escape,
 };
 use common::parser_tools::escape_djot_inline as escape_djot;
 use common::parser_tools::guard_djot_block_start as guard_block_start;
 use common::types::{EntityId, ROOT_ENTITY_ID};
+use std::borrow::Cow;
 use std::collections::HashSet;
 
 pub trait ExportDjotUnitOfWorkFactoryTrait: Send + Sync {
@@ -148,16 +150,15 @@ impl ExportDjotUseCase {
                     // multi-block note body as belonging to the definition
                     // rather than ending it.
                     //
-                    // A line that is itself indented (a nested list item) is
-                    // indented as far as the first line's text starts, past
-                    // `[^label]: `, before its own indentation. The parser takes
-                    // up to the marker's width off every continuation line, so
-                    // with four spaces the item's own indentation was taken
-                    // too, and a list nested in a note was read back one level
-                    // up. The other lines keep the four spaces: the wider
-                    // indentation counts towards the nesting a reader checks
-                    // (`djot_depth`), and a line starting at its own left edge
-                    // has none to lose.
+                    // Every one is indented as far as the first line's text
+                    // starts, past `[^label]: `, before its own indentation. The
+                    // parser takes up to the width of `[^label]:` off each, which
+                    // leaves every line of the body one column in, the first
+                    // included, and the body's own indentation intact under it.
+                    // Lines indented less lost some of their own: with four
+                    // spaces, a list nested in a note was read back one level up,
+                    // and a code block's indented lines lost a column at every
+                    // save, or, indented further than its fence, gained one.
                     if let Some(ref label) = f.footnote_label {
                         let marker = format!("[^{label}]: ");
                         let past_marker = " ".repeat(marker.len());
@@ -172,10 +173,13 @@ impl ExportDjotUseCase {
                             if line.is_empty() {
                                 continue;
                             }
-                            if line.starts_with(' ') {
-                                out.push_str(&past_marker);
+                            // A line of whitespace alone (a code block's) is one the
+                            // parser takes nothing off, the one column in aside, which
+                            // the block's fence stands in and so takes off its lines.
+                            if line.chars().all(|c| c.is_ascii_whitespace()) {
+                                out.push(' ');
                             } else {
-                                out.push_str("    ");
+                                out.push_str(&past_marker);
                             }
                             out.push_str(line);
                         }
@@ -366,6 +370,28 @@ impl ExportDjotUseCase {
     /// Each mismatch either left export short of a fixpoint (the numbers or the
     /// indents changed at the second save) or wrote numbers the reloaded list does
     /// not show.
+    ///
+    /// # A line break inside the block
+    ///
+    /// The model marks a line break by starting a new block, so a block's own text
+    /// should hold none. Some can reach it all the same (text inserted or dropped with
+    /// a `\n` in it), and written raw, each one started a new line of Djot that nothing
+    /// guarded: a blank line ended the paragraph, and the lines after it were read back
+    /// as lists, headings and quotations, nested as deep as their markers said.
+    ///
+    /// Each line is written as a block of its own instead, the block the reader makes
+    /// of a line after a hard break: a paragraph, a heading of the same level, or an
+    /// item of the same list at the same column, numbered on. Each is guarded as any
+    /// block's text is, so the text comes back line for line, and the first save is
+    /// already the one every later save writes. A line with nothing in it is left out:
+    /// the reader keeps no block for an empty paragraph.
+    ///
+    /// Hard breaks would have said the same in one paragraph, but a paragraph costs the
+    /// parser a call a line while an inline opener waits, and one longer than
+    /// [`MAX_LEAF_LINES`](common::parser_tools::djot_depth::MAX_LEAF_LINES) is not
+    /// parsed at all: it is read back as its source lines, every one showing its `\`
+    /// and its escapes, which the next save kept for good. A block a line is one line
+    /// long however many lines the model's block holds.
     fn render_block_line(
         &self,
         uow: &dyn ExportDjotUnitOfWorkTrait,
@@ -377,7 +403,6 @@ impl ExportDjotUseCase {
     ) -> Result<String> {
         // Check if this is a code block
         if block.fmt_is_code_block == Some(true) {
-            let lang = block.fmt_code_language.as_deref().unwrap_or("");
             let block_text = block_content_via_store(block, &uow.store());
             let elements = common::format_runs_query::inline_segments_for_block(
                 &uow.store(),
@@ -397,24 +422,12 @@ impl ExportDjotUseCase {
                 }
             }
 
-            let code_block = if quote_prefix.is_empty() {
-                format!("```{}\n{}\n```", lang, raw_text)
-            } else {
-                let mut lines = Vec::new();
-                lines.push(format!("{}```{}", quote_prefix, lang));
-                for line in raw_text.lines() {
-                    lines.push(format!("{}{}", quote_prefix, line));
-                }
-                // Handle the case where raw_text is empty or ends without newline
-                if raw_text.is_empty() {
-                    lines.push(quote_prefix.to_string());
-                }
-                lines.push(format!("{}```", quote_prefix));
-                lines.join("\n")
-            };
-
             open_levels.clear();
-            return Ok(code_block);
+            return Ok(djot_code_block(
+                &raw_text,
+                block.fmt_code_language.as_deref(),
+                quote_prefix,
+            ));
         }
 
         // Synthesize inline segments view
@@ -436,91 +449,87 @@ impl ExportDjotUseCase {
             None
         };
 
-        // Build inline djot text
-        let inline_md = self.render_inline_segments(&elements)?;
+        // Build inline djot text, one entry per line of the block's text, each written
+        // as a block of its own (see "A line break inside the block" above).
+        let lines = lines_to_write(self.render_inline_segments(&elements, false)?);
+        let separator = block_separator(quote_prefix);
 
-        // Build the block line. Standalone paragraphs and headings may carry a
-        // leading `{key=value}` djot block-attribute line for the optional
-        // block-style attributes; list items and code blocks do not.
-        let attr_line = render_block_attrs(block, frame_role, options);
+        // Standalone paragraphs and headings may carry a leading `{key=value}` djot
+        // block-attribute line for the optional block-style attributes; list items and
+        // code blocks do not. The frame's role and the page break belong where the
+        // block starts, so the blocks written for its later lines leave them out.
+        let first_attrs = render_block_attrs(block, frame_role, options, true);
+        let later_attrs = if lines.len() > 1 {
+            render_block_attrs(block, None, options, false)
+        } else {
+            String::new()
+        };
+        let attrs_of = |i: usize| {
+            if i == 0 {
+                first_attrs.as_str()
+            } else {
+                later_attrs.as_str()
+            }
+        };
         let block_line = if let Some(level) = block.fmt_heading_level {
             open_levels.clear();
-            let prefix = "#".repeat(level as usize);
-            let head = format!("{}{} {}", quote_prefix, prefix, inline_md);
-            prepend_block_attrs(&attr_line, quote_prefix, head)
+            // A heading's text is inline only, so it needs no block guard.
+            let prefix = format!("{quote_prefix}{} ", "#".repeat(level as usize));
+            lines
+                .iter()
+                .enumerate()
+                .map(|(i, line)| {
+                    let head = format!("{prefix}{}", djot_block_text(line, false));
+                    prepend_block_attrs(attrs_of(i), quote_prefix, head)
+                })
+                .collect::<Vec<_>>()
+                .join(&separator)
         } else if let Some(ref list_entity) = list {
             // One level per indent from 0, so the item may open at most the level after
             // the last one. It closes its own level and every deeper one, and takes the
             // place of the item that was open at its own.
             let indent = (list_entity.indent.max(0) as usize).min(open_levels.len());
-            let same_level = open_levels.drain(indent..).next();
-            let mut level = OpenLevel {
-                ordered: None,
-                counter: 0,
-            };
-            let indent_prefix = "  ".repeat(indent);
-            let is_task = matches!(
-                block.fmt_marker,
-                Some(MarkerType::Checked) | Some(MarkerType::Unchecked)
-            );
-            // An item's content is parsed as blocks of its own, so it needs the same guard
-            // as a paragraph: `- 1. not a sublist` is a nested list, `- # x` a heading.
-            let inline_md = guard_block_start(&inline_md);
-            let line = if is_task {
-                // Task list item: `<bullet> [ ]` / `<bullet> [x]`.
-                let bullet = djot_bullet_char(&list_entity.style);
-                let check = if block.fmt_marker == Some(MarkerType::Checked) {
-                    "[x]"
-                } else {
-                    "[ ]"
-                };
-                format!("{quote_prefix}{indent_prefix}{bullet} {check} {inline_md}")
-            } else {
-                match list_entity.style {
-                    ListStyle::Decimal
-                    | ListStyle::LowerAlpha
-                    | ListStyle::UpperAlpha
-                    | ListStyle::LowerRoman
-                    | ListStyle::UpperRoman => {
-                        // Djot needs a delimiter after the number; default to
-                        // `.` if none was recorded.
-                        let suffix = if list_entity.suffix.is_empty() {
-                            "."
-                        } else {
-                            list_entity.suffix.as_str()
-                        };
-                        let marker = OrderedMarker {
-                            style: list_entity.style.clone(),
-                            prefix: list_entity.prefix.clone(),
-                            suffix: suffix.to_string(),
-                        };
-                        level.counter = match same_level {
-                            Some(open) if open.ordered.as_ref() == Some(&marker) => {
-                                open.counter + 1
-                            }
-                            _ => 1,
-                        };
-                        level.ordered = Some(marker);
-                        let token = djot_ordered_token(&list_entity.style, level.counter);
-                        format!(
-                            "{quote_prefix}{indent_prefix}{}{token}{suffix} {inline_md}",
-                            list_entity.prefix
-                        )
-                    }
-                    _ => {
-                        let bullet = djot_bullet_char(&list_entity.style);
-                        format!("{quote_prefix}{indent_prefix}{bullet} {inline_md}")
-                    }
-                }
-            };
-            open_levels.push(level);
-            line
+            let mut at_this_level = open_levels.drain(indent..).next();
+            // Where the parser reads it as nested in the item one level up: see
+            // `OpenLevel::child_column`.
+            let column = open_levels.last().map_or(0, OpenLevel::child_column);
+            let indent_prefix = " ".repeat(column);
+            let mut items = Vec::with_capacity(lines.len());
+            for line in &lines {
+                let (marker, ordered, counter) = djot_list_marker(
+                    list_entity,
+                    block.fmt_marker.as_ref(),
+                    at_this_level.as_ref(),
+                );
+                // An item's content is parsed as blocks of its own, so it needs the same
+                // guard as a paragraph: `- 1. not a sublist` is a nested list, `- # x` a
+                // heading.
+                items.push(format!(
+                    "{quote_prefix}{indent_prefix}{marker} {}",
+                    djot_block_text(line, true)
+                ));
+                at_this_level = Some(OpenLevel {
+                    ordered,
+                    counter,
+                    column,
+                    marker_width: marker.chars().count(),
+                });
+            }
+            open_levels.extend(at_this_level);
+            items.join(&separator)
         } else {
             open_levels.clear();
             // A paragraph's content sits at the start of a line; guard against
             // its leading characters being parsed as a block-construct marker.
-            let para = format!("{}{}", quote_prefix, guard_block_start(&inline_md));
-            prepend_block_attrs(&attr_line, quote_prefix, para)
+            lines
+                .iter()
+                .enumerate()
+                .map(|(i, line)| {
+                    let para = format!("{quote_prefix}{}", djot_block_text(line, true));
+                    prepend_block_attrs(attrs_of(i), quote_prefix, para)
+                })
+                .collect::<Vec<_>>()
+                .join(&separator)
         };
 
         Ok(block_line)
@@ -549,7 +558,7 @@ impl ExportDjotUseCase {
     ///
     /// The price of that order is that the destination sits *inside* the marks,
     /// where a `*` in the URL of a bold link closes the bold and takes the link
-    /// with it. [`djot_link_dest`] percent-encodes exactly those characters.
+    /// with it. [`djot_destination`] percent-encodes exactly those characters.
     ///
     /// # Each run is escaped against its neighbours
     ///
@@ -566,7 +575,33 @@ impl ExportDjotUseCase {
     /// same image. A struck run shaped like `key=value` is written `{-x=5-}`, which is
     /// also a valid attribute, so the struck text disappeared into the image at the
     /// reload. [`guard_djot_attribute_continuation`] escapes the piece written there.
-    fn render_inline_segments(&self, elements: &[InlineSegment]) -> Result<String> {
+    ///
+    /// # One entry per line
+    ///
+    /// The result holds one entry per line of the block's text, split at each `\n` a
+    /// text run holds (see `render_block_line`), each rendered on its own, as the text
+    /// of a block of its own: no markup spans two lines and no neighbour is read across
+    /// one.
+    fn render_inline_segments(
+        &self,
+        elements: &[InlineSegment],
+        in_table_cell: bool,
+    ) -> Result<Vec<String>> {
+        split_segments_at_line_breaks(elements)
+            .iter()
+            .map(|line| self.render_inline_line(line, in_table_cell))
+            .collect()
+    }
+
+    /// Render one line of a block's inline segments (see
+    /// [`render_inline_segments`](Self::render_inline_segments)) as Djot text.
+    /// `in_table_cell` says the line is written inside a table row (see
+    /// [`djot_destination`]).
+    fn render_inline_line(
+        &self,
+        elements: &[InlineSegment],
+        in_table_cell: bool,
+    ) -> Result<String> {
         let line = self.block_text_for_escaping(elements);
         let mut inline = String::new();
         // Whether `inline` ends with the closing fence of a code span. jotdown reads
@@ -632,7 +667,17 @@ impl ExportDjotUseCase {
                     // Djot carries display size as inline attributes. Writing
                     // them keeps a resize durable across a save/reload, and
                     // round-trips through this crate's own importer.
-                    let mut out = format!("![{}]({})", escape_djot(alt), name);
+                    //
+                    // The name is a destination like a link's, and is encoded the same
+                    // way (see `djot_destination`), where the importer decodes it: the
+                    // name is the key a host finds the image under, not a URL whose
+                    // encoded form means the same. A line break in the description
+                    // would end the line the image is written on, so it is a space.
+                    let alt = escape_djot(&alt.replace(['\n', '\r'], " "));
+                    let mut out = format!(
+                        "![{alt}]({})",
+                        djot_destination(name, elem, in_table_cell, Destination::Image)
+                    );
                     if *width > 0 && *height > 0 {
                         let size = format!("{{width={width} height={height}}}");
                         out.push_str(&size);
@@ -668,7 +713,10 @@ impl ExportDjotUseCase {
             // Innermost: the link. Putting it outside the marks writes `[^aa^](url)`,
             // and `[^…]` is a footnote reference — see the note above.
             if let Some(ref href) = elem.fmt_anchor_href {
-                formatted = format!("[{formatted}]({})", djot_link_dest(href, elem));
+                formatted = format!(
+                    "[{formatted}]({})",
+                    djot_destination(href, elem, in_table_cell, Destination::Link)
+                );
             }
             if elem.fmt_vertical_alignment == Some(CharVerticalAlignment::SubScript) {
                 formatted = format!("~{formatted}~");
@@ -785,14 +833,17 @@ impl ExportDjotUseCase {
                 common::database::rope_helpers::refresh_block_positions(&mut blocks, &uow.store());
                 blocks.sort_by_key(|b| b.document_position);
 
+                // A row is one line of Djot, so a cell holds no line break: its blocks,
+                // and the lines of each, are joined with a space. The spaces the parser
+                // trims off a cell's two ends are kept by an empty attribute set.
                 let mut parts: Vec<String> = Vec::new();
                 for block in &blocks {
-                    let inline_md = self.render_inline_djot(uow, block)?;
+                    let inline_md = self.render_inline_djot(uow, block)?.join(" ");
                     if !inline_md.is_empty() {
                         parts.push(inline_md);
                     }
                 }
-                cell_text = parts.join(" ");
+                cell_text = keep_djot_edge_whitespace(&parts.join(" "));
             }
 
             grid[r][c] = cell_text;
@@ -841,11 +892,13 @@ impl ExportDjotUseCase {
         Ok(md)
     }
 
+    /// A table cell's block as inline Djot, one entry per line (see
+    /// [`render_inline_segments`](Self::render_inline_segments)).
     fn render_inline_djot(
         &self,
         uow: &dyn ExportDjotUnitOfWorkTrait,
         block: &Block,
-    ) -> Result<String> {
+    ) -> Result<Vec<String>> {
         let block_text = block_content_via_store(block, &uow.store());
         let elements = common::format_runs_query::inline_segments_for_block(
             &uow.store(),
@@ -853,7 +906,7 @@ impl ExportDjotUseCase {
             &block_text,
         );
 
-        self.render_inline_segments(&elements)
+        self.render_inline_segments(&elements, true)
     }
 }
 
@@ -875,12 +928,35 @@ fn block_separator(quote_prefix: &str) -> String {
 }
 
 /// One list nesting level the parser has open, as written: the last item written at
-/// that level. Its index in `open_levels` is its indent (two spaces per level).
+/// that level. Its index in `open_levels` is its indent.
 struct OpenLevel {
     /// The marker of an ordered item; `None` for a bullet or a task.
     ordered: Option<OrderedMarker>,
     /// The number written for an ordered item; unused otherwise.
     counter: i64,
+    /// The column the item's marker is written at, inside any quotation markers.
+    column: usize,
+    /// The width of the item's marker: 1 for `-`, 2 for `1.`, 4 for `(ii)` and
+    /// `100.`, 5 for a task's `- [ ]`.
+    marker_width: usize,
+}
+
+impl OpenLevel {
+    /// The column an item nested in this one is written at: two spaces in, or as far
+    /// as the marker is wide when that is further.
+    ///
+    /// The parser takes up to the marker's width of indentation (counted from the
+    /// line's own start) off each line it continues the item on. An item nested
+    /// less deep than that keeps nothing of its indentation, which is still enough
+    /// to nest it, but the item nested in *it* then lands in the same column: under
+    /// `- [ ] a`, items written two and four spaces in both came back one level
+    /// down, and so did those under `iii.`, `(ii)` or a hundredth item. Written at
+    /// least the marker's width in, every deeper line keeps the same indentation
+    /// relative to the others, so each level nests in the one above. Two spaces is
+    /// the least, and what a marker one or two wide has always been given.
+    fn child_column(&self) -> usize {
+        self.column + self.marker_width.max(2)
+    }
 }
 
 /// What makes two ordered items at one level one list to the parser: the numbering
@@ -969,10 +1045,16 @@ fn prefix_lines(text: &str, prefix: &str) -> String {
 /// Returns an empty string when the block carries none of the selected
 /// attributes. Keys are the model field names so the importer reads them back
 /// verbatim, making the model→djot→model round-trip a fixpoint.
+///
+/// `starts_the_block` is false for the block written for a line after the first of a
+/// block holding line breaks (see `render_block_line`), which leaves the page break out:
+/// it belongs where the block starts, and on every line it put each one on a page of
+/// its own.
 fn render_block_attrs(
     block: &Block,
     frame_role: Option<&SemanticRole>,
     options: &DjotExportOptions,
+    starts_the_block: bool,
 ) -> String {
     let mut pairs: Vec<String> = Vec::new();
 
@@ -1019,6 +1101,7 @@ fn render_block_attrs(
         pairs.push(format!("non_breakable_lines={nbl}"));
     }
     if options.page_break_before
+        && starts_the_block
         && let Some(pbb) = block.fmt_page_break_before
     {
         pairs.push(format!("page_break_before={pbb}"));
@@ -1201,8 +1284,22 @@ fn split_surrounding_ws(s: &str) -> (&str, &str, &str) {
     }
 }
 
-/// Render a link destination for `[text](dest)`, where `elem` is the segment the
-/// link belongs to.
+/// What a destination written with [`djot_destination`] names.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Destination {
+    /// A link's URL. An encoded character names the same resource, and the reader
+    /// keeps the destination as it is written.
+    Link,
+    /// An image's name: the key a host finds the image under, where an encoded
+    /// character is a different name. The reader decodes what the writer encodes
+    /// (`decode_djot_image_source`), so a `%` that would read as one of those
+    /// encodings is encoded too.
+    Image,
+}
+
+/// Render a destination for `[text](dest)` or `![alt](dest)`, where `elem` is the
+/// segment the link or image belongs to and `in_table_cell` says it is written in a
+/// table row.
 ///
 /// jotdown keeps a destination's source bytes as the URL (a backslash is kept, not
 /// read as an escape) but still runs the inline lexer over them to find the closing
@@ -1212,16 +1309,20 @@ fn split_surrounding_ws(s: &str) -> (&str, &str, &str) {
 ///
 /// * `(` and `)` always: the first `)` ends the destination, balanced or not.
 /// * `` ` `` always: it opens verbatim.
-/// * `\` where the lexer reads it as an escape: before ASCII punctuation or
-///   whitespace, and at the end, where it would escape the closing `)`. Anywhere
-///   else it is plain text and reads back as written, so it is kept: `%5C` is not
-///   the same link, since a URL parser reads a `\` in a web or file address
-///   (`file:///C:\Users\…`) as a `/`. Every character encoded here is ASCII
-///   punctuation, so looking at the next character of the href gives the same
-///   answer as looking at what is written after the `\`.
+/// * `\` only as the last of an odd run of them ending the destination, which
+///   would escape the closing `)`. Anywhere else the lexer may read it as an escape,
+///   but the escaped character is either harmless there or encoded anyway, and the
+///   bytes are kept: `%5C` is not the same link, since a URL parser reads a `\` in a
+///   web or file address (`file:///C:\Users\…`) as a `/`. An earlier rule encoded
+///   every `\` before punctuation or whitespace, which rewrote `C:\Users\Anna\.config`
+///   at the first save.
 /// * `{` and `}` always: `}` completes the closer of an underline (`+}`) or a
 ///   strikeout (`-}`) wrapped around the link.
 /// * `<` and `>` always: not legal in a URL, and `<…>` opens an autolink.
+/// * a line break always: it would end the line the destination is written on.
+/// * `|` in a table cell: the row is split into cells at every `|` outside a code
+///   span, a destination's included, so the link lost its cell and the row's last
+///   cell its place. Elsewhere it is kept.
 /// * `^` right after a `[`: `[^` opens a footnote reference, which the lexer reads to
 ///   the next `]` in the paragraph, past the `)` that ends the destination. With an
 ///   escaped `\]` in the text after the link, the link came back as literal text and
@@ -1232,28 +1333,38 @@ fn split_surrounding_ws(s: &str) -> (&str, &str, &str) {
 ///   `render_inline_segments`), so the mark's own delimiter in the URL closes the
 ///   mark and the re-parse shows the link as literal brackets. Elsewhere they are
 ///   harmless, and common in URLs (`Foo_bar`, `/~user`), so they are kept.
+/// * for an image only, a `%` that the reader would take for one of these encodings
+///   (see [`Destination::Image`]).
 ///
 /// Spaces are kept: jotdown reads them back verbatim. This replaces an earlier
 /// `<dest>` form, which jotdown does not support: the angle brackets became part
 /// of the URL and were percent-encoded again at every save.
-fn djot_link_dest(href: &str, elem: &InlineSegment) -> String {
+fn djot_destination(
+    dest: &str,
+    elem: &InlineSegment,
+    in_table_cell: bool,
+    kind: Destination,
+) -> String {
     let bold = elem.fmt_font_bold == Some(true);
     let italic = elem.fmt_font_italic == Some(true);
     let sup = elem.fmt_vertical_alignment == Some(CharVerticalAlignment::SuperScript);
     let sub = elem.fmt_vertical_alignment == Some(CharVerticalAlignment::SubScript);
-    let mut out = String::with_capacity(href.len());
-    let mut chars = href.chars().peekable();
+    // The byte offset of a backslash that would escape the closing `)`: the last of an
+    // odd run ending the destination.
+    let trailing_backslashes = dest.bytes().rev().take_while(|b| *b == b'\\').count();
+    let escaping_backslash = (trailing_backslashes % 2 == 1).then(|| dest.len() - 1);
+    let mut out = String::with_capacity(dest.len());
     let mut previous = None;
-    while let Some(c) = chars.next() {
+    for (at, c) in dest.char_indices() {
         let encode = match c {
-            '(' | ')' | '`' | '{' | '}' | '<' | '>' => true,
-            '\\' => chars
-                .peek()
-                .is_none_or(|n| n.is_ascii_punctuation() || n.is_ascii_whitespace()),
+            '(' | ')' | '`' | '{' | '}' | '<' | '>' | '\n' | '\r' => true,
+            '\\' => escaping_backslash == Some(at),
+            '|' => in_table_cell,
             '*' => bold,
             '_' => italic,
             '^' => sup || previous == Some('['),
             '~' => sub,
+            '%' => kind == Destination::Image && reads_as_image_source_escape(&dest[at + 1..]),
             _ => false,
         };
         if encode {
@@ -1264,4 +1375,187 @@ fn djot_link_dest(href: &str, elem: &InlineSegment) -> String {
         previous = Some(c);
     }
     out
+}
+
+/// Split a block's segments at each line break a text run holds: one entry per line,
+/// the break itself in neither. A block without one is borrowed whole.
+///
+/// A run holding line breaks is copied once, and each piece of it is that copy with the
+/// piece's text: copying the whole run for every piece copied its whole text once a
+/// line, and saving a block of 64,000 lines took seconds.
+fn split_segments_at_line_breaks(elements: &[InlineSegment]) -> Vec<Cow<'_, [InlineSegment]>> {
+    let breaks =
+        |elem: &InlineSegment| matches!(&elem.content, InlineContent::Text(t) if t.contains('\n'));
+    if !elements.iter().any(breaks) {
+        return vec![Cow::Borrowed(elements)];
+    }
+    let mut lines: Vec<Cow<'_, [InlineSegment]>> = Vec::new();
+    let mut current: Vec<InlineSegment> = Vec::new();
+    for elem in elements {
+        match &elem.content {
+            InlineContent::Text(t) if t.contains('\n') => {
+                let format = InlineSegment {
+                    content: InlineContent::Empty,
+                    ..elem.clone()
+                };
+                for (i, piece) in t.split('\n').enumerate() {
+                    if i > 0 {
+                        lines.push(Cow::Owned(std::mem::take(&mut current)));
+                    }
+                    if !piece.is_empty() {
+                        current.push(InlineSegment {
+                            content: InlineContent::Text(piece.to_string()),
+                            ..format.clone()
+                        });
+                    }
+                }
+            }
+            _ => current.push(elem.clone()),
+        }
+    }
+    lines.push(Cow::Owned(current));
+    lines
+}
+
+/// The lines of a block to write, one block each (see `render_block_line`): every line
+/// that holds something, or, when none does, one empty line, which is how an empty
+/// block has always been written.
+fn lines_to_write(lines: Vec<String>) -> Vec<String> {
+    let kept: Vec<String> = lines.into_iter().filter(|line| !line.is_empty()).collect();
+    if kept.is_empty() {
+        vec![String::new()]
+    } else {
+        kept
+    }
+}
+
+/// One line of a block's inline text, as the text of the block it is written as: guarded
+/// against reading as a block marker where it opens (`guard` is false for a heading, whose
+/// text the parser reads as text whatever it opens with), and keeping the whitespace at
+/// its edges (see [`keep_djot_edge_whitespace`]).
+fn djot_block_text(line: &str, guard: bool) -> String {
+    if guard {
+        keep_djot_edge_whitespace(&guard_block_start(line))
+    } else {
+        keep_djot_edge_whitespace(line)
+    }
+}
+
+/// The marker of a list item written after `previous`, the item the parser has open at
+/// its level (if any): the marker, the ordered marker it continues a list with, and the
+/// number written, which is `previous`'s plus one when the parser reads the two as one
+/// list. `fmt_marker` is the block's task marker.
+fn djot_list_marker(
+    list: &List,
+    fmt_marker: Option<&MarkerType>,
+    previous: Option<&OpenLevel>,
+) -> (String, Option<OrderedMarker>, i64) {
+    if matches!(
+        fmt_marker,
+        Some(MarkerType::Checked | MarkerType::Unchecked)
+    ) {
+        // Task list item: `<bullet> [ ]` / `<bullet> [x]`.
+        let bullet = djot_bullet_char(&list.style);
+        let check = if fmt_marker == Some(&MarkerType::Checked) {
+            "[x]"
+        } else {
+            "[ ]"
+        };
+        return (format!("{bullet} {check}"), None, 0);
+    }
+    match list.style {
+        ListStyle::Decimal
+        | ListStyle::LowerAlpha
+        | ListStyle::UpperAlpha
+        | ListStyle::LowerRoman
+        | ListStyle::UpperRoman => {
+            // Djot needs a delimiter after the number; default to `.` if none was
+            // recorded.
+            let suffix = if list.suffix.is_empty() {
+                "."
+            } else {
+                list.suffix.as_str()
+            };
+            let ordered = OrderedMarker {
+                style: list.style.clone(),
+                prefix: list.prefix.clone(),
+                suffix: suffix.to_string(),
+            };
+            let counter = match previous {
+                Some(open) if open.ordered.as_ref() == Some(&ordered) => open.counter + 1,
+                _ => 1,
+            };
+            let token = djot_ordered_token(&list.style, counter);
+            (
+                format!("{}{token}{suffix}", list.prefix),
+                Some(ordered),
+                counter,
+            )
+        }
+        _ => (djot_bullet_char(&list.style).to_string(), None, 0),
+    }
+}
+
+/// Write a code block of `raw_text` in `language`, inside `quote_prefix`.
+///
+/// * The fence is one backtick longer than the longest run of backticks the text
+///   holds, and never shorter than three. A line of three backticks in the text closed
+///   a fence of three early: the lines after it were read back as prose and a new,
+///   unclosed block.
+/// * A line of whitespace alone, or an empty one, is written after the quotation's
+///   markers without the space that follows the last: the parser strips only the `>`
+///   from such a line, so `> ` gave an empty line a space at every save.
+/// * The language is what the parser reads back as one (see [`djot_code_language`]).
+fn djot_code_block(raw_text: &str, language: Option<&str>, quote_prefix: &str) -> String {
+    let fence = "`".repeat(longest_backtick_run(raw_text).max(2) + 1);
+    let language = djot_code_language(language);
+    let bare_prefix = quote_prefix.trim_end();
+    let mut out = format!("{quote_prefix}{fence}{language}");
+    for line in raw_text.split('\n') {
+        out.push('\n');
+        if line.chars().all(|c| c.is_ascii_whitespace()) {
+            out.push_str(bare_prefix);
+        } else {
+            out.push_str(quote_prefix);
+        }
+        out.push_str(line);
+    }
+    out.push('\n');
+    out.push_str(quote_prefix);
+    out.push_str(&fence);
+    out
+}
+
+/// The longest run of backticks in `text`.
+fn longest_backtick_run(text: &str) -> usize {
+    let mut longest = 0;
+    let mut run = 0;
+    for c in text.chars() {
+        if c == '`' {
+            run += 1;
+            longest = longest.max(run);
+        } else {
+            run = 0;
+        }
+    }
+    longest
+}
+
+/// The language written after a code fence: the first word of `language`.
+///
+/// The parser reads a fence followed by more than one word, or by a word holding a
+/// backtick, as the start of an inline code span, so the block and every line of it
+/// came back as one paragraph: a Markdown info string such as `rust ignore` did that.
+/// A word opening with `=` makes the block raw output for that format, which the
+/// reader drops with its text. Neither is written; the block keeps its text and loses
+/// the rest of its language.
+fn djot_code_language(language: Option<&str>) -> &str {
+    let word = language
+        .and_then(|l| l.split_ascii_whitespace().next())
+        .unwrap_or("");
+    if word.contains('`') || word.starts_with('=') {
+        ""
+    } else {
+        word
+    }
 }

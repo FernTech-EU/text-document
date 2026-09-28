@@ -1,7 +1,9 @@
 //! DocumentFragment — format-agnostic rich text interchange type.
 
 use crate::{CharVerticalAlignment, InlineContent, ListStyle};
-use frontend::common::parser_tools::content_parser::{ParsedElement, ParsedSpan};
+use frontend::common::parser_tools::content_parser::{
+    ParsedBlock, ParsedElement, ParsedSpan, split_block_at_line_breaks,
+};
 use frontend::common::parser_tools::fragment_schema::{
     FragmentBlock, FragmentData, FragmentElement, FragmentTable, FragmentTableCell,
 };
@@ -762,11 +764,48 @@ fn span_to_fragment_element(span: &ParsedSpan) -> FragmentElement {
     }
 }
 
+/// A parsed block as a fragment block: its text and spans, and the block formats a
+/// fragment carries.
+fn parsed_block_to_fragment_block(pb: ParsedBlock) -> FragmentBlock {
+    use frontend::common::parser_tools::fragment_schema::FragmentList;
+
+    let elements: Vec<FragmentElement> = pb.spans.iter().map(span_to_fragment_element).collect();
+    let plain_text: String = spans_plain_text(&pb.spans);
+    let list = pb.list_style.map(|style| FragmentList {
+        style,
+        indent: pb.list_indent as i64,
+        prefix: String::new(),
+        suffix: String::new(),
+    });
+    FragmentBlock {
+        plain_text,
+        elements,
+        heading_level: pb.heading_level,
+        list,
+        alignment: None,
+        indent: None,
+        text_indent: None,
+        marker: None,
+        top_margin: None,
+        bottom_margin: None,
+        left_margin: None,
+        right_margin: None,
+        tab_positions: vec![],
+        line_height: pb.line_height,
+        non_breakable_lines: pb.non_breakable_lines,
+        page_break_before: pb.page_break_before,
+        direction: pb.direction,
+        background_color: pb.background_color,
+        is_code_block: None,
+        code_language: None,
+        hyphenate: None,
+        language: None,
+    }
+}
+
 /// Convert parsed elements (blocks + tables) into a `DocumentFragment`,
 /// preserving table structure as `FragmentTable` entries.
 fn parsed_elements_to_fragment(parsed: Vec<ParsedElement>) -> DocumentFragment {
-    use frontend::common::parser_tools::fragment_schema::FragmentList;
-
     let mut blocks: Vec<FragmentBlock> = Vec::new();
     let mut tables: Vec<FragmentTable> = Vec::new();
 
@@ -777,41 +816,15 @@ fn parsed_elements_to_fragment(parsed: Vec<ParsedElement>) -> DocumentFragment {
             // splice a note's text into the middle of a sentence. The reference
             // travels; the body stays where it is defined.
             ParsedElement::FootnoteDefinition { .. } => {}
+            // A fragment's blocks are prose, a code block's included (it keeps its
+            // lines, not its code-block format), and a line break in prose is a new
+            // block: one line a block, as a plain-text paste gives. Kept in one block,
+            // a pasted `<pre>` held line breaks, which the Djot writer used to write as
+            // they were, and its lines read back as whatever their markers spelled.
             ParsedElement::Block(pb) => {
-                let elements: Vec<FragmentElement> =
-                    pb.spans.iter().map(span_to_fragment_element).collect();
-                let plain_text: String = spans_plain_text(&pb.spans);
-                let list = pb.list_style.map(|style| FragmentList {
-                    style,
-                    indent: pb.list_indent as i64,
-                    prefix: String::new(),
-                    suffix: String::new(),
-                });
-
-                blocks.push(FragmentBlock {
-                    plain_text,
-                    elements,
-                    heading_level: pb.heading_level,
-                    list,
-                    alignment: None,
-                    indent: None,
-                    text_indent: None,
-                    marker: None,
-                    top_margin: None,
-                    bottom_margin: None,
-                    left_margin: None,
-                    right_margin: None,
-                    tab_positions: vec![],
-                    line_height: pb.line_height,
-                    non_breakable_lines: pb.non_breakable_lines,
-                    page_break_before: pb.page_break_before,
-                    direction: pb.direction,
-                    background_color: pb.background_color,
-                    is_code_block: None,
-                    code_language: None,
-                    hyphenate: None,
-                    language: None,
-                });
+                for pb in split_block_at_line_breaks(pb) {
+                    blocks.push(parsed_block_to_fragment_block(pb));
+                }
             }
             ParsedElement::Table(pt) => {
                 let block_insert_index = blocks.len();

@@ -156,8 +156,9 @@ fn is_symbol_char(c: char) -> bool {
 ///
 /// Leading spaces and tabs do not hide a marker from the parser (`\t- item` is a list
 /// item), so they are skipped and the marker behind them is guarded. The whitespace itself
-/// is kept: Djot drops it when the paragraph is read back, which is outside what any
-/// escaping can change.
+/// is left where it is, and the parser drops it from a paragraph it opens: a caller that
+/// has to keep it adds [`keep_djot_edge_whitespace`], as [`plain_text_to_djot`] and the
+/// Djot writer do.
 ///
 /// For an ordered list the **delimiter** is escaped rather than the numeral: a backslash
 /// before a letter or digit is a literal backslash in Djot, so escaping `1` in `1.` would
@@ -441,10 +442,143 @@ fn is_attribute_name_byte(c: u8) -> bool {
     c.is_ascii_alphanumeric() || matches!(c, b':' | b'_' | b'-')
 }
 
+/// The characters the Djot writer percent-encodes in an image's source wherever they
+/// occur, as the `%XX` it writes for each (upper-case hex), and which the reader decodes
+/// wherever it finds them.
+///
+/// An image's source is written like a link's destination, where a character the
+/// inline lexer would act on cannot be written as it is (a `)` ends it, a `|` splits
+/// the table cell it sits in) and a backslash escape is kept as part of it. A link
+/// keeps the encoded form, which names the same resource. An image's source is the
+/// key a host finds the image under, so `photo (1).png` has to come back as itself:
+/// the reader decodes these, the two escapes of [`image_source_escape`] where the
+/// writer uses them, and nothing else, so a source holding `%20` or `%2F` is read as
+/// it always was.
+///
+/// An address an older version saved as it was, holding one of these escapes, reads
+/// back with the character in its place. A URL parser encodes `<`, `>`, `` ` ``, `{` and
+/// `}` in a path again (the WHATWG path percent-encode set), `_` and `~` mean the same
+/// either way, and servers commonly decode `(`, `)`, `*`, `^` and `|` before they look
+/// a file up, so the image found is usually the same one. Only `%0A` and `%0D` change
+/// it, and no working address holds them.
+const IMAGE_SOURCE_ESCAPES: [(char, &str); 14] = [
+    ('\n', "0A"),
+    ('\r', "0D"),
+    ('(', "28"),
+    (')', "29"),
+    ('*', "2A"),
+    ('<', "3C"),
+    ('>', "3E"),
+    ('^', "5E"),
+    ('_', "5F"),
+    ('`', "60"),
+    ('{', "7B"),
+    ('|', "7C"),
+    ('}', "7D"),
+    ('~', "7E"),
+];
+
+/// The character that a `%` followed by `rest` decodes to in an image's source, if the
+/// `%` opens one of the escapes the writer uses there.
+///
+/// Those are the escapes of [`IMAGE_SOURCE_ESCAPES`], anywhere, and two more that the
+/// writer uses only where it has to, which the reader decodes only there:
+///
+/// * `%5C` for a `\` ending the source, which would escape the closing `)`: decoded at
+///   the end only.
+/// * `%25` for a `%` that would otherwise read as an escape: decoded only before
+///   another escape, `%2528` being a `%` written before `28`.
+///
+/// Older versions wrote a source as it was, and a web address for a file named
+/// `100%.png` holds `%25`: decoded everywhere, it read as `100%.png`, an address no
+/// server answers to, and a `%5C` inside one read as a backslash, which a browser takes
+/// for a `/`.
+fn image_source_escape(rest: &str) -> Option<char> {
+    // Past a run of `25`, the `%` is one the writer encoded exactly when an escape
+    // follows the run. The run holds no `%`, so every byte is looked at once, however
+    // many escapes the source holds.
+    let mut after = rest;
+    let mut percent = false;
+    loop {
+        let hex = after.get(..2)?;
+        let decoded = match IMAGE_SOURCE_ESCAPES.iter().find(|(_, code)| *code == hex) {
+            Some((c, _)) => *c,
+            None if hex == "5C" && after.len() == 2 => '\\',
+            None if hex == "25" => {
+                percent = true;
+                after = &after[2..];
+                continue;
+            }
+            None => return None,
+        };
+        return Some(if percent { '%' } else { decoded });
+    }
+}
+
+/// Whether a `%` followed by `rest`, in an image's source, would be read back as one
+/// of the escapes the writer uses there, so that the writer has to encode the `%`
+/// itself for the source to come back as it is.
+pub fn reads_as_image_source_escape(rest: &str) -> bool {
+    image_source_escape(rest).is_some()
+}
+
+/// An image's source as Djot writes it, read back: every escape the writer uses there
+/// decoded, and everything else as it is.
+///
+/// The writer percent-encodes, in upper-case hex, the characters the inline lexer would
+/// act on in a destination (`(`, `)`, `` ` ``, `{`, `}`, `<`, `>`, a line break, a `\`
+/// ending it, a `|` in a table cell, and `*`, `_`, `^` or `~` inside those marks), and a
+/// `%` that would read as one of those escapes. Those are the escapes decoded here, where
+/// the writer puts them (`%25` before another escape, `%5C` at the end), and no others:
+/// a source holding `%20`, `%2F`, a `%25` before plain text or a `%5C` before more of the
+/// source reads as it always did.
+pub fn decode_djot_image_source(src: &str) -> String {
+    let mut out = String::with_capacity(src.len());
+    let mut rest = src;
+    while let Some(at) = rest.find('%') {
+        out.push_str(&rest[..at]);
+        rest = &rest[at + 1..];
+        match image_source_escape(rest) {
+            Some(c) => {
+                out.push(c);
+                rest = &rest[2..];
+            }
+            None => out.push('%'),
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Keep the whitespace `line` opens and ends with, which the parser drops from a
+/// paragraph, a heading, a list item's text and a table cell: an empty attribute set `{}`
+/// before and after it shows nothing and makes the whitespace text.
+///
+/// `line` is the whole text of one such block, on one line of Djot, already escaped and
+/// guarded. A line of whitespace alone gets both: with only the `{}` after it, the line
+/// would be read as a block attribute.
+pub fn keep_djot_edge_whitespace(line: &str) -> String {
+    let opens = line.starts_with(|c: char| c.is_ascii_whitespace());
+    let ends = line.ends_with(|c: char| c.is_ascii_whitespace());
+    if !opens && !ends {
+        return line.to_string();
+    }
+    let mut out = String::with_capacity(line.len() + 4);
+    if opens {
+        out.push_str("{}");
+    }
+    out.push_str(line);
+    if ends {
+        out.push_str("{}");
+    }
+    out
+}
+
 /// Convert a whole plain-text string into Djot that parses back to exactly that text.
 ///
 /// Escapes inline markup everywhere and guards each line's own start, since a line
 /// beginning `- ` is a list item wherever it sits in the string, not only in the first.
+/// The whitespace a line opens or ends with is kept (see [`keep_djot_edge_whitespace`]).
 ///
 /// # Each line becomes its own paragraph, and that is forced, not chosen
 ///
@@ -459,15 +593,15 @@ fn is_attribute_name_byte(c: u8) -> bool {
 /// # The contract, stated exactly
 ///
 /// `djot_to_plain_text(plain_text_to_djot(s)) == s` for every `s` that contains **no
-/// blank line** (no two consecutive newlines, and no leading or trailing one) and no line
-/// that starts or ends with a space or a tab, since Djot drops a paragraph's edge
-/// whitespace.
+/// empty line**: no two consecutive newlines, and no leading or trailing one. A line of
+/// spaces or tabs is not empty, and whitespace at either end of a line is kept.
 ///
-/// That restriction is not a gap left open; it is the shape of the target. `djot_to_plain_text`
-/// never emits two consecutive newlines, because blocks are joined by exactly one — so no
-/// string containing a blank line is in the image of the parse, and none can be recovered by
-/// any encoding. Blank lines in the input collapse, which for the paragraph-joined text this
-/// serves is a no-op. Use [`needs_djot_escaping`] to find values a conversion would alter.
+/// That restriction is not a gap left open; it is how the reader treats an empty
+/// paragraph. `djot_to_plain_text` joins blocks with exactly one newline and reads a
+/// paragraph with nothing in it as no block at all, so it never emits two consecutive
+/// newlines and no string containing an empty line can come back from it. Empty lines in
+/// the input collapse, which for the paragraph-joined text this serves is a no-op. Use
+/// [`needs_djot_escaping`] to find values a conversion would alter.
 pub fn plain_text_to_djot(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut first = true;
@@ -479,7 +613,8 @@ pub fn plain_text_to_djot(s: &str) -> String {
             out.push_str("\n\n");
         }
         first = false;
-        out.push_str(&guard_djot_block_start(&escape_djot_inline(line)));
+        let guarded = guard_djot_block_start(&escape_djot_inline(line));
+        out.push_str(&keep_djot_edge_whitespace(&guarded));
     }
     out
 }
@@ -502,12 +637,11 @@ pub fn needs_djot_escaping(s: &str) -> bool {
 /// Whether converting `s` to Djot and reading it back would **lose text**.
 ///
 /// Distinct from [`needs_djot_escaping`], and not derivable from it: the escape is a pure
-/// string transform, while this runs the real parse. Two shapes are outside the image of
-/// any Djot parse, so no encoding can recover them and this reports both:
-///
-/// * a **blank line** — blocks are joined by exactly one `\n` on the way back, so two
-///   consecutive newlines never come out;
-/// * **whitespace at either end** of a line (spaces and tabs), which Djot strips.
+/// string transform, while this runs the real parse. One shape never comes back from the
+/// reader, so this reports it: an **empty line**. Blocks are joined by exactly one `\n` on
+/// the way back and an empty paragraph is no block, so two consecutive newlines never come
+/// out, nor does one at either end. Whitespace at either end of a line is kept (see
+/// [`plain_text_to_djot`]).
 ///
 /// A migration should report the values this flags rather than rewrite them silently: the
 /// text is the writer's, and quietly dropping a blank line out of someone's remark is the
@@ -624,11 +758,79 @@ mod tests {
         );
     }
 
-    /// Djot strips trailing whitespace, so it is outside the image of any parse too.
+    /// The parser drops a paragraph's edge whitespace, and an empty attribute set keeps
+    /// it: a tab-indented line, trailing spaces, a line of whitespace alone and the other
+    /// ASCII whitespace all come back as they were.
     #[test]
-    fn trailing_whitespace_is_reported_as_lossy() {
-        assert!(djot_round_trip_is_lossy("trailing spaces are content   "));
-        assert!(!djot_round_trip_is_lossy("no trailing space"));
+    fn edge_whitespace_survives_the_round_trip() {
+        for original in [
+            "trailing spaces are content   ",
+            "\tShe opened the door.",
+            "  two leading spaces",
+            " \t mixed \t ",
+            "   ",
+            "\t",
+            "\u{c}form feed\u{c}",
+            "\rcarriage return\r",
+            "\t- a marker behind a tab",
+            "first\n\tsecond, indented\nthird  ",
+            "no edge whitespace",
+        ] {
+            let djot = plain_text_to_djot(original);
+            let round_tripped = djot_to_plain_text(&djot, &DjotImportOptions::default());
+            assert_eq!(
+                round_tripped, original,
+                "{original:?} was written as {djot:?}"
+            );
+            assert!(!djot_round_trip_is_lossy(original), "{original:?}");
+        }
+        assert_eq!(plain_text_to_djot("\tx"), "{}\tx");
+        assert_eq!(plain_text_to_djot("x  "), "x  {}");
+        assert_eq!(plain_text_to_djot("  "), "{}  {}");
+        assert_eq!(plain_text_to_djot("no edges"), "no edges");
+    }
+
+    /// The reader decodes `%25` only before another escape and `%5C` only at the end,
+    /// where the writer puts them, and the other escapes anywhere. An address an older
+    /// version saved as it was, holding `%25` or `%5C` elsewhere, reads as written.
+    #[test]
+    fn an_image_source_is_decoded_only_where_the_writer_encodes() {
+        for (source, name) in [
+            // Where the writer puts them.
+            ("a%28b%29.png", "a(b).png"),
+            ("a%5C", "a\\"),
+            ("a\\%5C", "a\\\\"),
+            ("%2528.png", "%28.png"),
+            ("%255C", "%5C"),
+            ("%252528", "%2528"),
+            ("%%2529", "%%29"),
+            // Anywhere else, as written.
+            (
+                "https://example.com/100%25.png",
+                "https://example.com/100%25.png",
+            ),
+            ("a%5Cb.png", "a%5Cb.png"),
+            ("%5C%5C.png", "%5C%5C.png"),
+            ("%25", "%25"),
+            ("%2525", "%2525"),
+            ("a%20b%2F", "a%20b%2F"),
+            ("a%28b", "a(b"),
+            ("%2", "%2"),
+            ("%", "%"),
+            ("é%28é", "é(é"),
+            ("%é", "%é"),
+        ] {
+            assert_eq!(decode_djot_image_source(source), name, "{source:?}");
+        }
+        // The writer encodes a `%` exactly where the reader would decode it.
+        assert!(reads_as_image_source_escape("28"));
+        assert!(reads_as_image_source_escape("5C"));
+        assert!(reads_as_image_source_escape("2528"));
+        assert!(reads_as_image_source_escape("25255C"));
+        assert!(!reads_as_image_source_escape("5Cb"));
+        assert!(!reads_as_image_source_escape("25"));
+        assert!(!reads_as_image_source_escape("25.png"));
+        assert!(!reads_as_image_source_escape("2F"));
     }
 
     /// Multi-line text is the shape a `.docx`/`.odt` comment body actually arrives in —

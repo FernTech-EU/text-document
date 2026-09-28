@@ -353,21 +353,7 @@ impl ExportMarkdownUseCase {
                 }
             }
 
-            let code_block = if quote_prefix.is_empty() {
-                format!("```{}\n{}\n```", lang, raw_text)
-            } else {
-                let mut lines = Vec::new();
-                lines.push(format!("{}```{}", quote_prefix, lang));
-                for line in raw_text.lines() {
-                    lines.push(format!("{}{}", quote_prefix, line));
-                }
-                // Handle the case where raw_text is empty or ends without newline
-                if raw_text.is_empty() {
-                    lines.push(quote_prefix.to_string());
-                }
-                lines.push(format!("{}```", quote_prefix));
-                lines.join("\n")
-            };
+            let code_block = markdown_code_block(&raw_text, lang, quote_prefix);
 
             open_levels.clear();
             return Ok((code_block, false));
@@ -398,6 +384,8 @@ impl ExportMarkdownUseCase {
         let inline_md = self.render_inline_segments(&elements)?;
 
         // Build the block line
+        // The block's text opens its line, after the marker if it has one.
+        let inline_md = keep_leading_whitespace(&inline_md);
         let block_line = if let Some(level) = block.fmt_heading_level {
             open_levels.clear();
             let prefix = "#".repeat(level as usize);
@@ -507,7 +495,11 @@ impl ExportMarkdownUseCase {
                     } else {
                         // Markdown has no attribute syntax, so display size cannot
                         // survive here; alt and source do.
-                        format!("![{}]({})", alt, name)
+                        format!(
+                            "![{}]({})",
+                            escape_markdown(alt),
+                            markdown_destination(name)
+                        )
                     }
                 }
                 InlineContent::Empty => String::new(),
@@ -521,7 +513,7 @@ impl ExportMarkdownUseCase {
 
             // Apply formatting (innermost first)
             if elem.fmt_font_family.as_deref() == Some("monospace") {
-                formatted = format!("`{}`", formatted);
+                formatted = markdown_code_span(&formatted);
             }
             if elem.fmt_font_strikeout == Some(true) {
                 formatted = format!("~~{}~~", formatted);
@@ -534,7 +526,7 @@ impl ExportMarkdownUseCase {
                 formatted = format!("*{}*", formatted);
             }
             if let Some(ref href) = elem.fmt_anchor_href {
-                formatted = format!("[{}]({})", formatted, href);
+                formatted = format!("[{}]({})", formatted, markdown_destination(href));
             }
 
             inline_md.push_str(&formatted);
@@ -652,17 +644,205 @@ fn prefix_lines(text: &str, prefix: &str) -> String {
         .join("\n")
 }
 
+/// Backslash-escape the characters Markdown reads as markup in text.
+///
+/// Every ASCII punctuation character may be backslash-escaped in CommonMark, and an
+/// escaped one is always text, so a character is escaped wherever it could open
+/// something rather than only where it would. Among them:
+///
+/// * `` ` ``, which opens a code span: `Use `ls` now` came back with `ls` as code, and a
+///   paragraph of three backticks opened a fence that ran to the end of the file, every
+///   escape after it shown as a literal backslash;
+/// * `<`, which opens an autolink or raw HTML: `<http://a.b>` came back as a link whose
+///   address held the backslashes escaping its `.` and `>`;
+/// * `&` where it opens an entity or numeric character reference (`&amp;`, `&#169;`),
+///   which the reader decodes: typed `Tom &amp; Jerry` came back as `Tom & Jerry`. A `&`
+///   that opens none (`AT&T`) is left as it is.
 fn escape_markdown(s: &str) -> String {
     let mut result = String::with_capacity(s.len());
-    for c in s.chars() {
-        match c {
+    for (at, c) in s.char_indices() {
+        let escape = match c {
             '\\' | '*' | '_' | '{' | '}' | '[' | ']' | '(' | ')' | '#' | '+' | '-' | '.' | '!'
-            | '|' | '~' | '>' => {
-                result.push('\\');
-                result.push(c);
-            }
-            _ => result.push(c),
+            | '|' | '~' | '>' | '`' | '<' => true,
+            '&' => opens_character_reference(&s[at + 1..]),
+            _ => false,
+        };
+        if escape {
+            result.push('\\');
         }
+        result.push(c);
     }
     result
+}
+
+/// Whether `rest`, the text after a `&`, makes it an entity or numeric character
+/// reference to a CommonMark reader: `#` and one to seven digits, `#x` and one to six
+/// hex digits, or a name of letters and digits opening with a letter, then `;`. Any
+/// name is taken, not only the ones HTML defines, which escapes a few `&` a reader
+/// would have left alone and misses none it would decode.
+///
+/// The `;` is looked for only as far as a reference can reach: past the longest one, or
+/// past a character none holds, there is none. Looked for in the whole rest of the text,
+/// every `&` scanned to the next `;` or the end, and a paragraph of many `&` and no `;`
+/// took time in the square of its length.
+fn opens_character_reference(rest: &str) -> bool {
+    // A name of 32 characters, then the `;`. Every byte a reference holds is ASCII, so
+    // the `;` is found in the bytes, and the text before it is whole characters.
+    const LONGEST_BODY: usize = 32;
+    let reach = &rest.as_bytes()[..rest.len().min(LONGEST_BODY + 1)];
+    let Some(end) = reach
+        .iter()
+        .position(|b| !(b.is_ascii_alphanumeric() || *b == b'#'))
+        .filter(|at| reach[*at] == b';')
+    else {
+        return false;
+    };
+    let body = &rest[..end];
+    if let Some(number) = body.strip_prefix('#') {
+        if let Some(hex) = number.strip_prefix(['x', 'X']) {
+            return (1..=6).contains(&hex.len()) && hex.chars().all(|c| c.is_ascii_hexdigit());
+        }
+        return (1..=7).contains(&number.len()) && number.chars().all(|c| c.is_ascii_digit());
+    }
+    body.chars().next().is_some_and(|c| c.is_ascii_alphabetic())
+        && body.len() <= LONGEST_BODY
+        && body.chars().all(|c| c.is_ascii_alphanumeric())
+}
+
+/// Write `text` as a code span that reads back as exactly `text`.
+///
+/// The fence is one backtick longer than the longest run of backticks inside, so none
+/// of them closes it. A reader strips one space from each end of a span that has one at
+/// both, and the fence would run on into a backtick at either end, so such a span gets
+/// one space inside each fence, which the reader strips again.
+fn markdown_code_span(text: &str) -> String {
+    let fence = "`".repeat(longest_run(text, '`') + 1);
+    let spaced_ends =
+        text.starts_with(' ') && text.ends_with(' ') && !text.chars().all(|c| c == ' ');
+    let pad = if text.starts_with('`') || text.ends_with('`') || spaced_ends {
+        " "
+    } else {
+        ""
+    };
+    format!("{fence}{pad}{text}{pad}{fence}")
+}
+
+/// The longest run of `mark` in `text`.
+fn longest_run(text: &str, mark: char) -> usize {
+    let mut longest = 0;
+    let mut run = 0;
+    for c in text.chars() {
+        if c == mark {
+            run += 1;
+            longest = longest.max(run);
+        } else {
+            run = 0;
+        }
+    }
+    longest
+}
+
+/// Write a fenced code block of `raw_text` in `language`, each line after `quote_prefix`.
+///
+/// The fence is one backtick longer than the longest run of backticks in the text, and
+/// never shorter than three. A fence of three whatever the block held was closed early
+/// by a line of three backticks in the code: the lines after it came back as prose, and
+/// the fence meant to close the block opened a new one that ran on to the end of the
+/// export, every escape in it shown as a backslash. A language holding a backtick cannot
+/// follow a fence of backticks, which would then be read as text, so that block is
+/// fenced with tildes, one more than the longest run of them in the text.
+///
+/// Every line is written, the last one too when it is empty, as a block outside a
+/// quotation always had it.
+fn markdown_code_block(raw_text: &str, language: &str, quote_prefix: &str) -> String {
+    let mark = if language.contains('`') { '~' } else { '`' };
+    let fence = mark
+        .to_string()
+        .repeat(longest_run(raw_text, mark).max(2) + 1);
+    let mut out = format!("{quote_prefix}{fence}{language}");
+    for line in raw_text.split('\n') {
+        out.push('\n');
+        out.push_str(quote_prefix);
+        out.push_str(line);
+    }
+    out.push('\n');
+    out.push_str(quote_prefix);
+    out.push_str(&fence);
+    out
+}
+
+/// Write `destination`, a link's address or an image's source, so that a reader takes
+/// back exactly `destination`.
+///
+/// It is written as it is where nothing in it would end it or be read inside it: no
+/// space or control character, parentheses only in pairs, not nested, and none of `<`,
+/// `>`, `\`, `|`, or a `&` opening a character reference. Anything else is written
+/// between `<` and `>`, where spaces and parentheses are allowed, with each of those
+/// characters escaped by a backslash, which the reader removes. Written as it was,
+/// `photo (1).png` was cut at its first `)` and the rest of the name came back as prose,
+/// `a b.png` and a source ending in a backslash were not read as images at all, a
+/// backslash before punctuation was dropped from an address, and `&amp;` in one came
+/// back as `&`. A `|` would also end the table cell the destination sits in.
+///
+/// A line break can be written in neither form, so it is percent-encoded, and does not
+/// come back as it was; no working address holds one.
+fn markdown_destination(destination: &str) -> String {
+    let mut open_parenthesis = false;
+    let mut as_it_is = true;
+    for (at, c) in destination.char_indices() {
+        as_it_is = match c {
+            '(' if !open_parenthesis => {
+                open_parenthesis = true;
+                true
+            }
+            ')' if open_parenthesis => {
+                open_parenthesis = false;
+                true
+            }
+            '(' | ')' | '<' | '>' | '\\' | '|' => false,
+            '&' => !opens_character_reference(&destination[at + 1..]),
+            c => !(c == ' ' || c.is_control()),
+        };
+        if !as_it_is {
+            break;
+        }
+    }
+    if as_it_is && !open_parenthesis {
+        return destination.to_string();
+    }
+    let mut out = String::with_capacity(destination.len() + 8);
+    out.push('<');
+    for (at, c) in destination.char_indices() {
+        match c {
+            '<' | '>' | '\\' | '|' => {
+                out.push('\\');
+                out.push(c);
+            }
+            '&' if opens_character_reference(&destination[at + 1..]) => out.push_str("\\&"),
+            '\n' => out.push_str("%0A"),
+            '\r' => out.push_str("%0D"),
+            c => out.push(c),
+        }
+    }
+    out.push('>');
+    out
+}
+
+/// `line` with the spaces and tabs it opens with written as character references.
+///
+/// A reader drops up to three columns of indentation from a paragraph and reads four
+/// or more as a code block: a paragraph typed after a tab was exported as code, its
+/// escapes shown as literal backslashes. A reference is text wherever it sits, so the
+/// whitespace comes back as typed.
+fn keep_leading_whitespace(line: &str) -> String {
+    let body = line.trim_start_matches([' ', '\t']);
+    if body.len() == line.len() {
+        return line.to_string();
+    }
+    let mut out = String::with_capacity(line.len() + 8);
+    for c in line[..line.len() - body.len()].chars() {
+        out.push_str(if c == '\t' { "&#9;" } else { "&#32;" });
+    }
+    out.push_str(body);
+    out
 }

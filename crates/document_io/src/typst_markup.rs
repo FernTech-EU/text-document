@@ -226,34 +226,54 @@ pub fn typst_preamble(options: &PdfExportOptions) -> String {
 
 // ─────────────────────────── Block-level rendering ───────────────────────────
 
-/// Render a slice of blocks (already fetched, in document order) as Typst markup, grouping
-/// consecutive list items into one `#enum(..)`/`#list(..)` call and handling code blocks,
-/// headings, and plain paragraphs. Mirrors the dispatch order `render_blocks_html` uses: code
-/// block, then list membership, then heading/paragraph — and, additionally (Typst-specific, not
-/// present in the HTML mapping), block-level line-height/direction/background/non-breakable/
-/// alignment wraps around each heading/paragraph.
+/// The part [`render_blocks_typst`] emits for a block that starts a new page, outside
+/// every container.
 ///
-/// List items and code blocks intentionally do NOT receive those block-level wraps, mirroring
-/// `render_blocks_html`'s own precedent (its list/code branches carry no `style_attr` either) —
-/// only the "normal block" (heading/paragraph) branch does.
-/// The page-break part [`render_blocks_typst`] emits, verbatim.
-///
-/// Exposed so a caller that is about to wrap the rendered blocks in a *container* can
-/// find one and lift it out first: Typst rejects `#pagebreak` inside any container
-/// outright — "pagebreaks are not allowed inside of containers" — and a whole PDF export
-/// fails on it, so this cannot be left to chance.
+/// A caller that is about to wrap rendered blocks in a *container* has to lift one that
+/// opens them out first: Typst rejects `#pagebreak` inside any container outright
+/// ("pagebreaks are not allowed inside of containers"), and a whole PDF export fails on
+/// it, so this cannot be left to chance. Inside a container the break is written as
+/// [`TYPST_CONTAINED_PAGEBREAK`] instead.
 pub const TYPST_PAGEBREAK: &str = "#pagebreak(weak: true)";
 
-/// Split a leading [`TYPST_PAGEBREAK`] off a rendered body, returning it separately.
+/// The part [`render_blocks_typst`] emits for a block that starts a new page inside a
+/// container: a quotation, or the indentation that stands for one past
+/// `MAX_TYPST_QUOTE_NESTING`.
 ///
-/// A break at the very start of a quotation means "start a page, then quote" — so hoisting
-/// it out of the container is not merely the way to keep Typst happy, it is also what the
-/// break was asking for.
-pub fn hoist_leading_pagebreak(body: &str) -> (Option<&'static str>, &str) {
-    match body.strip_prefix(TYPST_PAGEBREAK) {
-        Some(rest) => (Some(TYPST_PAGEBREAK), rest.trim_start_matches('\n')),
-        None => (None, body),
+/// A page break on any paragraph of a quotation but its first failed the whole export,
+/// since it cannot be lifted out of the quotation without splitting it. A page is laid
+/// out in one column, where a column break is a page break, and Typst accepts one
+/// inside a container: the quotation goes on at the top of the next page. It is weak,
+/// as the page break is, so it opens no blank page. A container's own region starts
+/// empty, where a weak break does nothing, which is why a break opening one is still
+/// lifted out of it (see [`hoist_leading_page_break`]).
+pub const TYPST_CONTAINED_PAGEBREAK: &str = "#colbreak(weak: true)";
+
+/// The page break written for a block that starts a new page: [`TYPST_PAGEBREAK`], or
+/// [`TYPST_CONTAINED_PAGEBREAK`] when it is written inside a container.
+pub fn page_break_in(contained: bool) -> &'static str {
+    if contained {
+        TYPST_CONTAINED_PAGEBREAK
+    } else {
+        TYPST_PAGEBREAK
     }
+}
+
+/// Split a page break, in either form [`page_break_in`] writes, off the start of a
+/// rendered body: whether there was one, and the body after it. The caller writes it
+/// again before the container it wraps the body in, as [`page_break_in`] gives it
+/// there.
+///
+/// A break at the very start of a quotation means "start a page, then quote", so
+/// hoisting it out of the container is not merely the way to keep Typst happy, it is
+/// also what the break was asking for.
+pub fn hoist_leading_page_break(body: &str) -> (bool, &str) {
+    for brk in [TYPST_PAGEBREAK, TYPST_CONTAINED_PAGEBREAK] {
+        if let Some(rest) = body.strip_prefix(brk) {
+            return (true, rest.trim_start_matches('\n'));
+        }
+    }
+    (false, body)
 }
 
 /// Each note's body, already rendered to Typst markup, by label — plus which labels have
@@ -296,11 +316,25 @@ impl TypstNotes {
     }
 }
 
+/// Render a slice of blocks (already fetched, in document order) as Typst markup, grouping
+/// consecutive list items into one `#enum(..)`/`#list(..)` call and handling code blocks,
+/// headings, and plain paragraphs. Mirrors the dispatch order `render_blocks_html` uses: code
+/// block, then list membership, then heading/paragraph, and additionally (Typst-specific, not
+/// present in the HTML mapping) block-level line-height/direction/background/non-breakable/
+/// alignment wraps around each heading/paragraph.
+///
+/// List items and code blocks intentionally do NOT receive those block-level wraps, mirroring
+/// `render_blocks_html`'s own precedent (its list/code branches carry no `style_attr` either):
+/// only the "normal block" (heading/paragraph) branch does.
+///
+/// `contained` says whether the blocks are written inside a container, which decides how
+/// a page break is written (see [`page_break_in`]).
 pub fn render_blocks_typst(
     store: &Store,
     blocks: &[Block],
     options: &PdfExportOptions,
     notes: &TypstNotes,
+    contained: bool,
 ) -> String {
     let image_paths = typst_image_paths(&options.images);
     let mut parts: Vec<String> = Vec::new();
@@ -316,7 +350,7 @@ pub fn render_blocks_typst(
         // a paragraph. `weak: true` means "unless we are already at the top of a page",
         // which keeps a break on the very first block from opening on a blank one.
         if block.fmt_page_break_before == Some(true) {
-            parts.push(TYPST_PAGEBREAK.to_string());
+            parts.push(page_break_in(contained).to_string());
         }
 
         // --- Code block ---

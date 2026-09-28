@@ -19,6 +19,8 @@
 //! feature lost information on the round-trip, `t1 != t2` (or the plain text /
 //! block count would diverge).
 
+use common::parser_tools::content_parser::parse_html;
+use common::parser_tools::djot_depth::{MAX_LEAF_LINES, longest_leaf_lines, nesting_depth};
 use proptest::prelude::*;
 use text_document::{
     CharVerticalAlignment, DjotImportOptions, FindOptions, FragmentContent, MoveMode, TextDocument,
@@ -38,6 +40,9 @@ enum Inline {
     Strike(String),
     Underline(String),
     Link(String, String),
+    /// An image: its description and its source as the seed writes it, percent-encoded
+    /// where the source holds a character the writer encodes (see [`image_source`]).
+    Image(String, String),
 }
 
 /// Optional block-style attributes, emitted as a djot `{…}` block-attribute
@@ -95,6 +100,24 @@ enum Block {
     /// table was short by two characters. The parity property below could not see that,
     /// because it never generated a table.
     Table(Vec<String>, Vec<Vec<String>>),
+    /// A code block inside `depth` quotations, its lines as they are: some empty, some
+    /// of whitespace alone, some of backticks, which the writer's fence has to outrun.
+    QuotedCode(usize, Vec<String>),
+    /// A footnote whose body holds a code block with indented lines, under a label
+    /// whose length decides how much the parser takes off each continuation line.
+    FootnoteCode(String, Vec<String>),
+    /// A list nested three levels deep, each level opened by one of the wide markers
+    /// (`- [ ]`, `iii.`, `(ii)`, `100.`) or a narrow one.
+    Nested(Vec<&'static str>),
+    /// A paragraph whose lines are joined by hard breaks, which the reader splits into
+    /// one block a line, with a page break before it or not: only its first line keeps
+    /// the page break.
+    HardBreaks(bool, Vec<String>),
+    /// A paragraph with whitespace at its edges, kept by empty attribute sets.
+    EdgeWhitespace(String, String, String),
+    /// A table whose first cell holds an image named with a `|` and a link whose
+    /// destination holds one, both percent-encoded in the seed.
+    CellDestinations(String, String),
 }
 
 // ── Dumb emitter: AST → djot text ───────────────────────────────
@@ -110,6 +133,7 @@ fn emit_inline(i: &Inline) -> String {
         Inline::Strike(s) => format!("{{-{s}-}}"),
         Inline::Underline(s) => format!("{{+{s}+}}"),
         Inline::Link(t, u) => format!("[{t}]({u})"),
+        Inline::Image(alt, src) => format!("![{alt}]({src}){{width=60 height=90}}"),
     }
 }
 
@@ -159,15 +183,112 @@ fn emit_block(b: &Block) -> String {
             }
             out
         }
+        Block::QuotedCode(depth, lines) => {
+            let prefix = "> ".repeat(*depth);
+            let fence = "`".repeat(
+                lines
+                    .iter()
+                    .map(|l| backtick_run(l))
+                    .max()
+                    .unwrap_or(0)
+                    .max(2)
+                    + 1,
+            );
+            let mut out = format!("{prefix}{fence}");
+            for line in lines {
+                out.push('\n');
+                if line.trim().is_empty() {
+                    out.push_str(prefix.trim_end());
+                } else {
+                    out.push_str(&prefix);
+                }
+                out.push_str(line);
+            }
+            out.push_str(&format!("\n{prefix}{fence}"));
+            out
+        }
+        Block::FootnoteCode(label, lines) => {
+            // Every line one column past `[^label]:`, where the fence stands, so the
+            // parser takes the same off each; a line of whitespace alone it takes
+            // nothing off but that column.
+            let indent = " ".repeat(label.len() + 5);
+            let fence = "`".repeat(
+                lines
+                    .iter()
+                    .map(|l| backtick_run(l))
+                    .max()
+                    .unwrap_or(0)
+                    .max(2)
+                    + 1,
+            );
+            let mut out = format!("See[^{label}].\n\n[^{label}]: A note.\n\n{indent}{fence}");
+            for line in lines {
+                out.push('\n');
+                if line.trim().is_empty() {
+                    if !line.is_empty() {
+                        out.push(' ');
+                    }
+                } else {
+                    out.push_str(&indent);
+                }
+                out.push_str(line);
+            }
+            out.push_str(&format!("\n{indent}{fence}"));
+            out
+        }
+        Block::Nested(markers) => {
+            let mut out = String::new();
+            let mut column = 0;
+            for (level, marker) in markers.iter().enumerate() {
+                if level > 0 {
+                    out.push_str("\n\n");
+                }
+                out.push_str(&format!("{}{marker} level{level}", " ".repeat(column)));
+                column += marker.chars().count() + 1;
+            }
+            out
+        }
+        Block::HardBreaks(page_break, lines) => {
+            let attributes = if *page_break {
+                "{page_break_before=true}\n"
+            } else {
+                ""
+            };
+            format!("{attributes}{}", lines.join("\\\n"))
+        }
+        Block::EdgeWhitespace(lead, text, trail) => format!("{{}}{lead}{text}{trail}{{}}"),
+        Block::CellDestinations(src, href) => {
+            format!("| ![p]({src}){{width=6 height=9}} [t]({href}) | kept |\n|---|---|\n| a | b |")
+        }
     }
 }
 
+/// The longest run of backticks in `line`.
+fn backtick_run(line: &str) -> usize {
+    line.split(|c| c != '`').map(str::len).max().unwrap_or(0)
+}
+
+/// The seed for `blocks`, with every footnote definition after all of them.
+///
+/// A definition written between two paragraphs leaves the text the document searches
+/// out of step with the text `djot_to_plain_text` extracts, which the property checks;
+/// that is not what these seeds are about, so a definition is written where the writer
+/// puts it.
 fn emit(blocks: &[Block]) -> String {
-    blocks
-        .iter()
-        .map(emit_block)
-        .collect::<Vec<_>>()
-        .join("\n\n")
+    let mut parts: Vec<String> = Vec::new();
+    let mut definitions: Vec<String> = Vec::new();
+    for block in blocks {
+        let text = emit_block(block);
+        match (block, text.split_once("\n\n")) {
+            (Block::FootnoteCode(..), Some((reference, definition))) => {
+                parts.push(reference.to_string());
+                definitions.push(definition.to_string());
+            }
+            _ => parts.push(text),
+        }
+    }
+    parts.extend(definitions);
+    parts.join("\n\n")
 }
 
 // ── Strategies ──────────────────────────────────────────────────
@@ -215,8 +336,43 @@ fn inline() -> impl Strategy<Value = Inline> {
         word().prop_map(Inline::Strike),
         word().prop_map(Inline::Underline),
         (word(), url()).prop_map(|(t, u)| Inline::Link(t, u)),
+        (word(), image_source()).prop_map(|(alt, src)| Inline::Image(alt, src)),
     ]
 }
+
+/// Image sources as the seed writes them: the characters a destination cannot hold
+/// raw percent-encoded as the writer encodes them, and `%` escapes of other characters
+/// that are part of the name as it is.
+fn image_source() -> impl Strategy<Value = String> {
+    prop::collection::vec(
+        prop_oneof![
+            4 => "[a-z0-9./_ :-]{1,4}",
+            1 => prop::sample::select(vec![
+                "%28", "%29", "%60", "%7B", "%7D", "%3C", "%3E", "%5C", "%7C", "%2A",
+                "%5E", "%7E", "%25", "%20", "%2F", "%2525", "%",
+            ]).prop_map(str::to_string),
+        ],
+        1..6,
+    )
+    .prop_map(|pieces| pieces.concat())
+    .prop_filter("a source", |s| {
+        !s.trim().is_empty() && !s.starts_with(' ') && !s.ends_with(' ')
+    })
+}
+
+/// A line of code, as a code block holds it: any of the characters prose holds,
+/// leading spaces, or a run of backticks long enough to close a short fence.
+fn code_line() -> impl Strategy<Value = String> {
+    prop_oneof![
+        4 => "[a-zA-Z0-9 ;=():>\"'.-]{0,16}",
+        1 => "[ ]{0,4}`{1,5}[a-z]{0,3}",
+        1 => "[ ]{1,3}",
+        1 => Just(String::new()),
+    ]
+}
+
+/// The markers a nested list level opens with, wide and narrow.
+const NESTED_MARKERS: &[&str] = &["-", "- [ ]", "- [x]", "1.", "iii.", "(ii)", "100.", "a)"];
 
 fn block_style() -> impl Strategy<Value = BlockStyle> {
     (
@@ -272,6 +428,17 @@ fn block() -> impl Strategy<Value = Block> {
                 )
             })
             .prop_map(|(header, rows)| Block::Table(header, rows)),
+        (1usize..4, prop::collection::vec(code_line(), 1..5))
+            .prop_map(|(depth, lines)| Block::QuotedCode(depth, lines)),
+        ("[a-z0-9-]{1,12}", prop::collection::vec(code_line(), 1..5))
+            .prop_map(|(label, lines)| Block::FootnoteCode(label, lines)),
+        prop::collection::vec(prop::sample::select(NESTED_MARKERS), 3..=3).prop_map(Block::Nested),
+        (any::<bool>(), prop::collection::vec(plain_text(), 2..4))
+            .prop_map(|(page_break, lines)| Block::HardBreaks(page_break, lines)),
+        ("[ \t]{0,3}", plain_text(), "[ \t]{0,3}")
+            .prop_map(|(lead, text, trail)| Block::EdgeWhitespace(lead, text, trail)),
+        (image_source(), url().prop_map(|u| format!("{u}%7Cx")))
+            .prop_map(|(src, href)| Block::CellDestinations(src, href)),
     ]
 }
 
@@ -420,11 +587,11 @@ fn typed_piece() -> impl Strategy<Value = String> {
     ]
 }
 
-/// One typed paragraph. Its edges are trimmed of spaces and tabs because Djot drops
-/// them when it reads a paragraph, which no escaping can change.
+/// One typed paragraph, spaces and tabs at its edges included: the parser drops them
+/// from a paragraph, and the writer keeps them with an empty attribute set.
 fn typed_paragraph() -> impl Strategy<Value = String> {
     prop::collection::vec(typed_piece(), 1..16)
-        .prop_map(|pieces| pieces.concat().trim_matches([' ', '\t']).to_string())
+        .prop_map(|pieces| pieces.concat())
         .prop_filter("a paragraph holds text", |s| !s.is_empty())
 }
 
@@ -577,6 +744,13 @@ const TYPED_CASES: &[(&str, &str)] = &[
     ("inner tab", "a\tb"),
     ("no-break space", "a\u{a0}: b"),
     ("no-break space at the edges", "\u{a0}a\u{a0}"),
+    // The parser dropped a paragraph's edge whitespace.
+    ("tab-indented paragraph", "\tShe opened the door."),
+    ("trailing spaces", "End of line.  "),
+    ("spaces at both ends", "  both  "),
+    ("whitespace alone", " \t "),
+    ("form feed at an edge", "\u{c}page\u{c}"),
+    ("tab before a marker", "\t- (void)someMethod"),
 ];
 
 #[test]
@@ -594,21 +768,21 @@ fn typed_text_that_the_parser_used_to_rewrite_survives_save_and_reload() {
 }
 
 /// A marker behind leading spaces or tabs is still a marker to the parser. The
-/// whitespace itself is dropped with the paragraph's other edges, which no
-/// escaping can prevent; the marker and the rest of the text must stay.
+/// whitespace, the marker and the rest of the text all stay: the parser drops a
+/// paragraph's edge whitespace, and an empty attribute set in front of it keeps it.
 #[test]
 fn a_marker_behind_leading_whitespace_stays_text() {
     let mut failures = Vec::new();
-    for (typed, expected) in [
-        ("\t- (void)someMethod", "- (void)someMethod"),
-        (" \t1.\tIn the main menu", "1.\tIn the main menu"),
-        ("\t## Section 2", "## Section 2"),
-        ("   I. Indented", "I. Indented"),
-        ("\t:::", ":::"),
-        ("  > quoted", "> quoted"),
+    for typed in [
+        "\t- (void)someMethod",
+        " \t1.\tIn the main menu",
+        "\t## Section 2",
+        "   I. Indented",
+        "\t:::",
+        "  > quoted",
     ] {
         let (saved, back, resaved) = save_and_reload_plain(typed);
-        if back != expected || resaved.trim_start() != resaved {
+        if back != typed || resaved != saved || !saved.starts_with("{}") {
             failures.push(format!(
                 "typed {typed:?}, saved {saved:?}, reopened {back:?}, resaved {resaved:?}"
             ));
@@ -716,6 +890,8 @@ enum Piece {
     /// An image, with a display size as the editor always gives one. Djot writes the
     /// size as an attribute set, which the parser continues with a `{` written after it.
     Image,
+    /// An image under a name the writer has to encode (see [`ODD_IMAGE_NAMES`]).
+    NamedImage(&'static str),
 }
 
 /// A document with one paragraph made of `pieces`, every field of each run's format
@@ -741,6 +917,7 @@ fn document_of_pieces(pieces: &[Piece]) -> TextDocument {
             Piece::Image => cursor
                 .insert_image("assets/plate.png", "plate", 600, 900)
                 .unwrap(),
+            Piece::NamedImage(name) => cursor.insert_image(name, "plate", 600, 900).unwrap(),
         }
     }
     for &(start, end, format) in &ranges {
@@ -766,7 +943,7 @@ fn document_of_pieces(pieces: &[Piece]) -> TextDocument {
                     .map(|c| (c, (!matches!(c, ' ' | '\t')).then(|| style.clone())))
                     .collect::<Vec<_>>()
             }
-            Piece::Image => vec![('\u{FFFC}', None)],
+            Piece::Image | Piece::NamedImage(_) => vec![('\u{FFFC}', None)],
         })
         .collect();
     assert_eq!(
@@ -1150,35 +1327,45 @@ fn a_link_whose_text_is_its_url_survives() {
     }
 }
 
-/// A backslash in a destination is an escape to the lexer only before ASCII
-/// punctuation or whitespace, or at the end, where it would escape the closing `)`.
-/// Anywhere else it reads back as written and must be kept as written: `%5C` is a
-/// different link, since a URL parser reads a `\` in a web or file address as `/`.
+/// A backslash in a destination is kept as written. The lexer reads one before
+/// punctuation as an escape, but the destination is taken from its source bytes, and a
+/// character that would act there is encoded whatever precedes it. `%5C` is a different
+/// link, since a URL parser reads a `\` in a web or file address as `/`, and 1.12.2
+/// wrote these exactly: an earlier rule encoded every backslash before punctuation, and
+/// `C:\Users\Anna\.config` came back as `C:\Users\Anna%5C.config` for good.
+///
+/// Only the last of an odd run of backslashes ending the destination is encoded, since
+/// it would escape the closing `)`.
 #[test]
-fn a_backslash_in_a_link_destination_is_encoded_only_where_it_would_escape() {
+fn a_backslash_in_a_link_destination_is_kept_as_written() {
     for href in [
         "file:///C:\\Users\\me\\notes.txt",
         "http://example.com/a\\b",
+        "file:///C:\\Users\\Anna\\Documents\\_Research\\map.pdf",
+        "file:///C:\\Users\\Anna\\.config\\app.ini",
+        "\\\\server\\share\\notes.txt",
+        "http://example.com/a\\.b",
+        "http://example.com/a\\ b",
+        "http://example.com/a\\\\b",
+        "http://example.com/a\\\\",
+        "http://example.com/a\\*b",
+        "http://example.com/a\\]b",
+        "http://example.com/a\\[^b",
     ] {
-        let doc = document_of_runs(&[("t", link(href))]);
+        let doc = document_of_runs(&[("t", link(href)), (" and b] c) d", TextFormat::default())]);
         let saved = doc.to_djot().unwrap();
-        assert!(saved.contains(href), "{href:?} saved as {saved:?}");
         let reopened = TextDocument::new();
         set_djot(&reopened, &saved);
         assert_eq!(
             hrefs(&reopened),
-            vec![href.to_string()],
+            vec![href.replace("[^", "[%5E")],
             "saved as {saved:?}"
         );
         assert_survives_save_and_reload(&doc, href);
     }
     for (href, written) in [
         ("http://example.com/a\\", "a%5C)"),
-        ("http://example.com/a\\(b", "a%5C%28b"),
-        ("http://example.com/a\\ b", "a%5C b"),
-        ("http://example.com/a\\.b", "a%5C.b"),
-        // The second backslash is before a letter again.
-        ("http://example.com/a\\\\b", "a%5C\\b"),
+        ("http://example.com/a\\\\\\", "a\\\\%5C)"),
     ] {
         let doc = document_of_runs(&[("t", link(href))]);
         let saved = doc.to_djot().unwrap();
@@ -1357,6 +1544,9 @@ const STYLED_HREFS: &[&str] = &[
     "https://example.com/path with space",
     "https://example.com/a\\b`c{d}e<f>",
     "mailto:someone@example.com",
+    "file:///C:\\Users\\Anna\\.config\\app.ini",
+    "https://fonts.googleapis.com/css?family=Lora|Inter",
+    "https://example.com/a\\",
 ];
 
 #[derive(Debug, Clone)]
@@ -1402,28 +1592,8 @@ fn styled_piece() -> impl Strategy<Value = Piece> {
     prop_oneof![
         8 => styled_run().prop_map(|r| Piece::Run(r.text, r.format)),
         1 => Just(Piece::Image),
+        1 => prop::sample::select(ODD_IMAGE_NAMES).prop_map(Piece::NamedImage),
     ]
-}
-
-/// Remove the spaces and tabs at the paragraph's two edges, which Djot drops when it
-/// reads a paragraph, taking runs left empty with them. An image at an edge stops it.
-fn trim_paragraph_edges(mut pieces: Vec<Piece>) -> Vec<Piece> {
-    let is_edge = |c: char| c == ' ' || c == '\t';
-    while let Some(Piece::Run(text, _)) = pieces.first_mut() {
-        *text = text.trim_start_matches(is_edge).to_string();
-        if !text.is_empty() {
-            break;
-        }
-        pieces.remove(0);
-    }
-    while let Some(Piece::Run(text, _)) = pieces.last_mut() {
-        *text = text.trim_end_matches(is_edge).to_string();
-        if !text.is_empty() {
-            break;
-        }
-        pieces.pop();
-    }
-    pieces
 }
 
 proptest! {
@@ -1434,8 +1604,6 @@ proptest! {
     /// escaping meets the exporter's own markup and the boundaries between runs.
     #[test]
     fn styled_runs_survive_save_and_reload(pieces in prop::collection::vec(styled_piece(), 1..6)) {
-        let pieces = trim_paragraph_edges(pieces);
-        prop_assume!(!pieces.is_empty());
         let doc = document_of_pieces(&pieces);
         let before = styled_chars(&doc);
         let saved = doc.to_djot().unwrap();
@@ -1445,5 +1613,914 @@ proptest! {
         let plain = |v: &[(char, Option<VisibleStyle>)]| v.iter().map(|(c, _)| *c).collect::<String>();
         prop_assert_eq!(plain(&after), plain(&before), "text changed; saved as {:?}", saved);
         prop_assert_eq!(after, before, "a style changed; saved as {:?}", saved);
+        prop_assert_eq!(image_names(&reopened), image_names(&doc), "saved as {:?}", saved);
+        // Runs Djot cannot tell apart (a size) are one run once reloaded, so it is the
+        // save after the first that has to settle.
+        let resaved = reopened.to_djot().unwrap();
+        let again = TextDocument::new();
+        set_djot(&again, &resaved);
+        prop_assert_eq!(again.to_djot().unwrap(), resaved, "the save does not settle");
+    }
+
+    /// The same runs and images in a table cell, where a `|` in a destination splits
+    /// the row, beside a cell whose text has to keep its place.
+    #[test]
+    fn styled_runs_in_a_table_cell_survive_save_and_reload(
+        pieces in prop::collection::vec(styled_piece(), 1..5)
+    ) {
+        let doc = TextDocument::new();
+        let table = doc.cursor().insert_table(1, 2).unwrap();
+        let second = table.cell(0, 1).unwrap().blocks()[0].position();
+        doc.cursor_at(second).insert_text("kept").unwrap();
+        let start = table.cell(0, 0).unwrap().blocks()[0].position();
+        let cursor = doc.cursor_at(start);
+        let mut links = Vec::new();
+        for piece in &pieces {
+            let from = cursor.position();
+            match piece {
+                Piece::Run(text, format) => {
+                    cursor.insert_formatted_text(text, format).unwrap();
+                    if format.anchor_href.is_some() || format.vertical_alignment.is_some() {
+                        links.push((from, cursor.position(), format.clone()));
+                    }
+                }
+                Piece::Image => cursor.insert_image("assets/plate.png", "p", 60, 90).unwrap(),
+                Piece::NamedImage(name) => cursor.insert_image(name, "p", 60, 90).unwrap(),
+            }
+        }
+        for (from, to, format) in links {
+            let selection = doc.cursor_at(from);
+            selection.set_position(to, MoveMode::KeepAnchor);
+            selection
+                .merge_char_format(&TextFormat {
+                    anchor_href: format.anchor_href.clone(),
+                    vertical_alignment: format.vertical_alignment.clone(),
+                    ..Default::default()
+                })
+                .unwrap();
+        }
+        let saved = doc.to_djot().unwrap();
+        let reopened = TextDocument::new();
+        set_djot(&reopened, &saved);
+        prop_assert_eq!(image_names(&reopened), image_names(&doc), "saved as {:?}", saved);
+        // A link on whitespace alone is written as the whitespace, as in a paragraph.
+        prop_assert_eq!(
+            visible_hrefs(&reopened),
+            visible_hrefs(&doc),
+            "saved as {:?}", saved
+        );
+        let cells: Vec<String> = reopened
+            .blocks()
+            .iter()
+            .filter(|b| b.table_cell().is_some())
+            .map(|b| b.text())
+            .collect();
+        prop_assert_eq!(cells.last().map(String::as_str), Some("kept"), "saved as {:?}", saved);
+        prop_assert_eq!(cells.len(), 2, "saved as {:?}", saved);
+        let resaved = reopened.to_djot().unwrap();
+        let again = TextDocument::new();
+        set_djot(&again, &resaved);
+        prop_assert_eq!(again.to_djot().unwrap(), resaved, "the save does not settle");
+    }
+
+    /// A block holding line breaks, however they got there, saves with each line as
+    /// text: nothing nests, every line that holds something comes back as a block of
+    /// its own in the same list, heading or quotation, each saved one line long, and
+    /// the first save is already a fixpoint. A page break stays on the first line. The
+    /// same text pasted as preformatted HTML is stored one block a line.
+    #[test]
+    fn a_block_holding_line_breaks_saves_its_lines_as_text(
+        lines in prop::collection::vec(prop_oneof![3 => typed_paragraph(), 1 => Just(String::new())], 2..5),
+        container in prop::sample::select(&["", "- ", "# ", "> ", "1. "][..]),
+        page_break in any::<bool>(),
+    ) {
+        let text = lines.join("\n");
+        let doc = TextDocument::new();
+        // Block attributes go on a paragraph or a heading, in a quotation or not; a list
+        // item takes none.
+        let takes_attributes = matches!(container, "" | "# " | "> ");
+        let page_break = page_break && takes_attributes;
+        let attributes = if page_break {
+            format!("{}{{page_break_before=true}}\n", container.trim_start_matches("# "))
+        } else {
+            String::new()
+        };
+        set_djot(&doc, &format!("{attributes}{container}x"));
+        let block = doc.blocks()[0].clone();
+        let shape = block_shapes(&doc)[0].clone();
+        doc.cursor_at(block.position() + 1).insert_text(&text).unwrap();
+        let (saved, reopened, stable) = save_reopen(&doc);
+        prop_assert_eq!(nesting_depth(&saved), usize::from(!container.is_empty() && container != "# "), "saved as {:?}", saved);
+        prop_assert_eq!(longest_leaf_lines(&saved), 1, "saved as {:?}", saved);
+        let expected: Vec<_> = non_empty_lines(&format!("x{text}"))
+            .into_iter()
+            .map(|line| (line, shape.1, shape.2, shape.3))
+            .collect();
+        prop_assert_eq!(block_shapes(&reopened), expected, "saved as {:?}", saved);
+        let breaks: Vec<Option<bool>> = reopened
+            .blocks()
+            .iter()
+            .map(|block| block.block_format().page_break_before)
+            .collect();
+        let expected_breaks: Vec<Option<bool>> = (0..breaks.len())
+            .map(|i| (page_break && i == 0).then_some(true))
+            .collect();
+        prop_assert_eq!(breaks, expected_breaks, "saved as {:?}", saved);
+        prop_assert_eq!(reopened.to_djot().unwrap(), saved.clone(), "the first save is not the fixpoint");
+        prop_assert!(stable, "{:?} does not save stably", saved);
+
+        let html: String = text
+            .replace('&', "&amp;")
+            .replace('<', "&lt;")
+            .replace('>', "&gt;");
+        let pasted = TextDocument::new();
+        pasted.cursor().insert_html(&format!("<pre>{html}</pre>")).unwrap();
+        prop_assert!(block_texts(&pasted).iter().all(|t| !t.contains('\n')));
+        let (saved, reopened, stable) = save_reopen(&pasted);
+        prop_assert_eq!(nesting_depth(&saved), 0, "saved as {:?}", saved);
+        prop_assert_eq!(
+            block_texts(&reopened).into_iter().filter(|t| !t.is_empty()).collect::<Vec<_>>(),
+            non_empty_lines(&text),
+            "saved as {:?}", saved
+        );
+        prop_assert!(stable, "{:?} does not save stably", saved);
+    }
+}
+
+// ── Shapes the 1.12.3 review found ──────────────────────────────
+
+/// The text of every block of `doc`, in order.
+fn block_texts(doc: &TextDocument) -> Vec<String> {
+    doc.blocks().iter().map(|block| block.text()).collect()
+}
+
+/// What a reload shows of each block: its text, its list indent if it is a list item,
+/// its heading level, and how many quotations it sits in.
+fn block_shapes(doc: &TextDocument) -> Vec<(String, Option<u8>, Option<u8>, usize)> {
+    let cursor = doc.cursor();
+    doc.blocks()
+        .iter()
+        .map(|block| {
+            cursor.set_position(block.position(), MoveMode::MoveAnchor);
+            (
+                block.text(),
+                block.list().map(|list| list.indent()),
+                block.block_format().heading_level,
+                cursor.blockquote_depth_at_cursor(),
+            )
+        })
+        .collect()
+}
+
+/// Save `doc`, reopen the Djot in a new document, and return the saved Djot, the
+/// reopened document and whether saving it again changes nothing further.
+fn save_reopen(doc: &TextDocument) -> (String, TextDocument, bool) {
+    let saved = doc.to_djot().unwrap();
+    let reopened = TextDocument::new();
+    set_djot(&reopened, &saved);
+    let resaved = reopened.to_djot().unwrap();
+    let again = TextDocument::new();
+    set_djot(&again, &resaved);
+    let stable = again.to_djot().unwrap() == resaved;
+    (saved, reopened, stable)
+}
+
+/// The lines of `text` that hold something: what a block holding line breaks reads back
+/// as, one block a line. An empty line is an empty paragraph, which the reader keeps
+/// no block for.
+fn non_empty_lines(text: &str) -> Vec<String> {
+    text.split('\n')
+        .filter(|line| !line.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// A block's text can hold a line break (inserted with one, or kept by a paste), and each
+/// was written as it was: a blank line ended the paragraph, and the lines after it were
+/// read back as the lists, headings and quotations their markers spelled, as deep as
+/// they went. Every line is now saved as a paragraph of its own, one line long and
+/// guarded as any paragraph is, so each comes back as text, nothing nests, and the first
+/// save is already the one every later save writes.
+#[test]
+fn a_line_break_inside_a_block_is_saved_as_a_block_a_line() {
+    let deep = format!("x\n\n{}deep", "> ".repeat(97));
+    for typed in [
+        "Steps:\n\n- one\n- two",
+        "On Monday she wrote:\n> > > nested reply\n> > more",
+        "a\n# not a heading\n1. not a list\n: not a definition\n| not | a row |",
+        "trailing break\n",
+        "\nleading break",
+        "  indented\n\tline\nends with spaces  ",
+        "one\n   \ntwo",
+        deep.as_str(),
+    ] {
+        let doc = TextDocument::new();
+        doc.cursor().insert_text(typed).unwrap();
+        assert_eq!(doc.blocks().len(), 1, "{typed:?} is one block");
+        let (saved, reopened, stable) = save_reopen(&doc);
+        assert_eq!(
+            nesting_depth(&saved),
+            0,
+            "{typed:?} saved as {saved:?}, which nests"
+        );
+        assert_eq!(
+            longest_leaf_lines(&saved),
+            1,
+            "{typed:?} saved as {saved:?}"
+        );
+        assert_eq!(reopened.to_djot().unwrap(), saved, "{typed:?}");
+        assert_eq!(
+            block_shapes(&reopened),
+            non_empty_lines(typed)
+                .into_iter()
+                .map(|line| (line, None, None, 0))
+                .collect::<Vec<_>>(),
+            "{typed:?} saved as {saved:?}"
+        );
+        assert!(stable, "{typed:?} does not save stably");
+    }
+}
+
+/// A line break in a list item, a heading, a quotation, a table cell, and inside a
+/// formatted or code run: each line keeps the block's own format, the run's format, and
+/// the container it is in.
+#[test]
+fn a_line_break_keeps_the_block_and_run_it_is_in() {
+    let doc = TextDocument::new();
+    set_djot(
+        &doc,
+        "- item\n\n# Heading\n\n> quoted\n\nplain\n\n| cell | b |\n|---|---|\n| c | d |",
+    );
+    // The end of block `index`, read afresh: every insertion moves the blocks after it.
+    let end_of = |index: usize| {
+        let block = doc.blocks()[index].clone();
+        doc.cursor_at(block.position() + block.text().chars().count())
+    };
+    end_of(4).insert_text("\nsecond line of the cell").unwrap();
+    // A bold run and a code run each holding a break, the code run closing its line.
+    let cursor = end_of(3);
+    cursor
+        .insert_formatted_text(" bold\n- line", &bold())
+        .unwrap();
+    cursor
+        .insert_formatted_text("co`de\nmore code", &code())
+        .unwrap();
+    cursor
+        .insert_formatted_text("\ntail", &TextFormat::default())
+        .unwrap();
+    end_of(2)
+        .insert_text("\n> second line of the quotation")
+        .unwrap();
+    end_of(1)
+        .insert_text("\n# second line of the heading")
+        .unwrap();
+    end_of(0)
+        .insert_text("\n- second line of the item")
+        .unwrap();
+
+    let (saved, reopened, stable) = save_reopen(&doc);
+    assert_eq!(nesting_depth(&saved), 1, "saved as {saved:?}");
+    assert_eq!(longest_leaf_lines(&saved), 1, "saved as {saved:?}");
+    assert_eq!(reopened.to_djot().unwrap(), saved);
+    assert!(stable, "{saved:?} does not save stably");
+    let expected: Vec<(String, Option<u8>, Option<u8>, usize)> = vec![
+        ("item".into(), Some(0), None, 0),
+        ("- second line of the item".into(), Some(0), None, 0),
+        ("Heading".into(), None, Some(1), 0),
+        ("# second line of the heading".into(), None, Some(1), 0),
+        ("quoted".into(), None, None, 1),
+        ("> second line of the quotation".into(), None, None, 1),
+        ("plain bold".into(), None, None, 0),
+        ("- lineco`de".into(), None, None, 0),
+        ("more code".into(), None, None, 0),
+        ("tail".into(), None, None, 0),
+    ];
+    let shapes = block_shapes(&reopened);
+    assert_eq!(
+        &shapes[..expected.len()],
+        &expected[..],
+        "saved as {saved:?}"
+    );
+    // The cell's two lines share its one line of Djot.
+    assert!(
+        reopened
+            .to_plain_text()
+            .unwrap()
+            .contains("cell second line of the cell"),
+        "saved as {saved:?}"
+    );
+    // Each run keeps its format on both of its lines.
+    let styles = styled_chars(&reopened);
+    let text: String = styles.iter().map(|(c, _)| *c).collect();
+    let style_of = |needle: &str| {
+        let at = text.find(needle).map(|at| text[..at].chars().count());
+        at.and_then(|at| styles[at].1.clone())
+    };
+    let is = |needle: &str, f: fn(&VisibleStyle) -> bool| style_of(needle).is_some_and(|s| f(&s));
+    assert!(is("bold", |s| s.bold), "saved as {saved:?}");
+    assert!(is("- line", |s| s.bold), "saved as {saved:?}");
+    assert!(is("co`de", |s| s.code), "saved as {saved:?}");
+    assert!(is("more code", |s| s.code), "saved as {saved:?}");
+    assert!(is("tail", |s| !s.code && !s.bold), "saved as {saved:?}");
+}
+
+/// A paste of preformatted text (`<pre>`, or `white-space: pre` or `pre-wrap`) kept its
+/// line breaks inside one paragraph: the paste turns a code block into prose, and a
+/// preformatted paragraph was never split. The editor showed the lines; the saved Djot
+/// read them back as structure, a line of 97 `> ` as a quotation 97 deep. Each line is
+/// now its own block, as a plain-text paste gives.
+#[test]
+fn pasting_preformatted_html_stores_one_block_a_line() {
+    let quoted = format!("{}deep", "> ".repeat(97));
+    let cases: Vec<(String, Vec<&str>)> = vec![
+        (
+            "<pre>Steps:\n\n- one\n- two</pre>".to_string(),
+            vec!["Before.Steps:", "", "- one", "- two"],
+        ),
+        (
+            "<pre><code>a\n```\nb</code></pre>".to_string(),
+            vec!["Before.a", "```", "b"],
+        ),
+        (
+            "<div style=\"white-space: pre-wrap\">a\n\n- b</div>".to_string(),
+            vec!["Before.", "a", "", "- b"],
+        ),
+        (
+            "<p style=\"white-space: pre\">one\n  two\n</p>".to_string(),
+            vec!["Before.", "one", "  two"],
+        ),
+        (
+            format!("<pre>x\n\n{}deep</pre>", "&gt; ".repeat(97)),
+            vec!["Before.x", "", quoted.as_str()],
+        ),
+    ];
+    for (html, lines) in cases {
+        let doc = TextDocument::new();
+        doc.set_plain_text("Before.").unwrap();
+        doc.cursor_at(7).insert_html(&html).unwrap();
+        let texts = block_texts(&doc);
+        assert!(
+            texts.len() >= lines.len() && texts[..lines.len()] == lines[..],
+            "pasted {html:?} as {texts:?}"
+        );
+        assert!(texts.iter().all(|t| !t.contains('\n')), "{texts:?}");
+        let (saved, reopened, stable) = save_reopen(&doc);
+        assert_eq!(nesting_depth(&saved), 0, "saved as {saved:?}");
+        assert!(stable, "{saved:?} does not save stably");
+        for (text, list, heading, quotes) in block_shapes(&reopened) {
+            assert_eq!(
+                (list, heading, quotes),
+                (None, None, 0),
+                "{text:?} in {saved:?}"
+            );
+        }
+    }
+    // The same text loaded as a document is split the same way, a code block aside.
+    let doc = TextDocument::new();
+    doc.set_html("<div style=\"white-space: pre-wrap\">a\n\n- b</div><pre>c\n- d</pre>")
+        .unwrap()
+        .wait()
+        .unwrap();
+    assert_eq!(block_texts(&doc), ["a", "", "- b", "c\n- d"]);
+}
+
+/// A table row is split into cells at every `|` outside a code span, a link's
+/// destination included, so a link whose address held one lost its cell, and the row's
+/// last cell dropped out of the table at the next save. It is encoded as `%7C` there,
+/// the same address; elsewhere it is kept as it is. An image's name is encoded the same
+/// way and decoded again, since the name is the key its bytes are kept under.
+#[test]
+fn a_pipe_in_a_destination_keeps_its_table_cell() {
+    let doc = TextDocument::new();
+    let table = doc.cursor().insert_table(2, 2).unwrap();
+    let put = |row: usize, col: usize, text: &str, format: Option<TextFormat>| {
+        let position = table.cell(row, col).unwrap().blocks()[0].position();
+        let cursor = doc.cursor_at(position);
+        match format {
+            Some(format) => {
+                cursor.insert_formatted_text(text, &format).unwrap();
+                let selection = doc.cursor_at(position);
+                selection.set_position(position + text.chars().count(), MoveMode::KeepAnchor);
+                selection.merge_char_format(&format).unwrap();
+            }
+            None => cursor.insert_text(text).unwrap(),
+        }
+    };
+    let href = "https://fonts.googleapis.com/css?family=Lora|Inter";
+    put(0, 0, "Font", None);
+    put(0, 1, "Note", None);
+    put(1, 1, "kept", None);
+    put(1, 0, "stylesheet", Some(link(href)));
+    let image_position = table.cell(0, 1).unwrap().blocks()[0].position();
+    doc.cursor_at(image_position)
+        .insert_image("plates/a|b (1).png", "plate", 60, 90)
+        .unwrap();
+    // The empty paragraph a table is inserted with is no block to the reader.
+    let before = non_empty_lines(&doc.to_plain_text().unwrap());
+    let (saved, reopened, stable) = save_reopen(&doc);
+    assert_eq!(
+        non_empty_lines(&reopened.to_plain_text().unwrap()),
+        before,
+        "saved as {saved:?}"
+    );
+    assert!(stable, "{saved:?} does not save stably");
+    assert_eq!(
+        hrefs(&reopened),
+        vec!["https://fonts.googleapis.com/css?family=Lora%7CInter".to_string()],
+        "saved as {saved:?}"
+    );
+    assert_eq!(
+        image_names(&reopened),
+        ["plates/a|b (1).png"],
+        "saved as {saved:?}"
+    );
+
+    // Outside a table the `|` is harmless, and kept.
+    let doc = document_of_runs(&[("t", link(href))]);
+    let (saved, reopened, _) = save_reopen(&doc);
+    assert_eq!(
+        hrefs(&reopened),
+        vec![href.to_string()],
+        "saved as {saved:?}"
+    );
+}
+
+/// The destinations of every link in `doc` on text holding more than whitespace,
+/// percent-decoded, in order.
+fn visible_hrefs(doc: &TextDocument) -> Vec<String> {
+    let mut out = Vec::new();
+    for block in doc.blocks() {
+        for fragment in block.fragments() {
+            if let FragmentContent::Text { text, format, .. } = fragment
+                && let Some(href) = format.anchor_href
+                && !text.trim().is_empty()
+            {
+                out.push(percent_decode(&href));
+            }
+        }
+    }
+    out
+}
+
+/// The names of every image in `doc`, in order.
+fn image_names(doc: &TextDocument) -> Vec<String> {
+    let mut out = Vec::new();
+    for block in doc.blocks() {
+        for fragment in block.fragments() {
+            if let FragmentContent::Image { name, .. } = fragment {
+                out.push(name);
+            }
+        }
+    }
+    out
+}
+
+/// Image names the writer used to put out raw, so that a `)` ended the reference, a
+/// trailing `\` escaped its closing `)`, and the rest came back as prose.
+const ODD_IMAGE_NAMES: &[&str] = &[
+    "a).png",
+    "photo (1).png",
+    "https://ex.com/wiki/File:Gull_(bird).jpg",
+    "a\\",
+    "a\\\\b\\\\",
+    "a`b.png",
+    "{x}.png",
+    "<a>.png",
+    "a b.png",
+    "100%25.png",
+    "a%28b.png",
+    "%%29",
+    "a%2Fb.png",
+    "a%20b.png",
+    "x*y_z^w~v.png",
+    "[^1].png",
+];
+
+/// An image's name is the key its bytes are kept under, so it has to come back as it
+/// was written, whatever it holds, in a paragraph, inside a mark and in a table cell.
+#[test]
+fn an_image_keeps_its_name_whatever_it_holds() {
+    for name in ODD_IMAGE_NAMES {
+        for wrapper in [TextFormat::default(), bold(), struck()] {
+            let doc = TextDocument::new();
+            let cursor = doc.cursor();
+            cursor.insert_text("See ").unwrap();
+            cursor.insert_image(name, "a gull", 600, 900).unwrap();
+            cursor.insert_text(" here.").unwrap();
+            let selection = doc.cursor_at(4);
+            selection.set_position(5, MoveMode::KeepAnchor);
+            selection.merge_char_format(&wrapper).unwrap();
+            let before = doc.to_plain_text().unwrap();
+            let (saved, reopened, stable) = save_reopen(&doc);
+            assert_eq!(image_names(&reopened), [*name], "saved as {saved:?}");
+            assert_eq!(
+                reopened.to_plain_text().unwrap(),
+                before,
+                "saved as {saved:?}"
+            );
+            assert!(stable, "{saved:?} does not save stably");
+        }
+        let doc = TextDocument::new();
+        let table = doc.cursor().insert_table(1, 2).unwrap();
+        let position = table.cell(0, 0).unwrap().blocks()[0].position();
+        doc.cursor_at(position)
+            .insert_image(name, "p", 60, 90)
+            .unwrap();
+        let second = table.cell(0, 1).unwrap().blocks()[0].position();
+        doc.cursor_at(second).insert_text("kept").unwrap();
+        let (saved, reopened, stable) = save_reopen(&doc);
+        assert_eq!(
+            image_names(&reopened),
+            [*name],
+            "in a cell, saved as {saved:?}"
+        );
+        assert!(
+            reopened.to_plain_text().unwrap().contains("kept"),
+            "in a cell, saved as {saved:?}"
+        );
+        assert!(stable, "{saved:?} does not save stably");
+    }
+    // A name holding none of the escapes reads exactly as it always has, `%20` and all.
+    let doc = TextDocument::new();
+    set_djot(&doc, "![x](a%20b%2F%29c.png)");
+    assert_eq!(image_names(&doc), ["a%20b%2F)c.png"]);
+}
+
+/// The parser takes up to the width of a list item's marker off each line it continues
+/// the item on. Nested two spaces a level, the item two levels under a marker four or
+/// more wide (a task's `- [ ]`, `iii.`, `(ii)`, the hundredth item) landed in the same
+/// column as the one between them, came back one level up, and renumbered the list.
+#[test]
+fn a_list_nested_under_a_wide_marker_keeps_its_levels() {
+    let hundred: String = (1..=100).map(|n| format!("{n}. item\n\n")).collect();
+    for (seed, indents) in [
+        ("- [ ] a\n\n      - b\n\n            - c", vec![0, 1, 2]),
+        (
+            "i. x\n\nii. y\n\niii. a\n\n     - b\n\n       - c",
+            vec![0, 0, 0, 1, 2],
+        ),
+        (
+            "(i) x\n\n(ii) a\n\n     1. b\n\n        1. c\n\n     2. e\n\n     3. d",
+            vec![0, 0, 1, 2, 1, 1],
+        ),
+        (
+            "- a\n\n  - [ ] b\n\n        - c\n\n          - d",
+            vec![0, 1, 2, 3],
+        ),
+        (
+            "- [x] a\n\n      - [ ] b\n\n            - [ ] c\n\n                  - d",
+            vec![0, 1, 2, 3],
+        ),
+    ] {
+        let doc = TextDocument::new();
+        set_djot(&doc, seed);
+        let before: Vec<Option<u8>> = doc
+            .blocks()
+            .iter()
+            .map(|b| b.list().map(|l| l.indent()))
+            .collect();
+        assert_eq!(
+            before,
+            indents.iter().map(|i| Some(*i)).collect::<Vec<_>>(),
+            "seed {seed:?}"
+        );
+        let (saved, reopened, stable) = save_reopen(&doc);
+        assert_eq!(
+            block_shapes(&reopened),
+            block_shapes(&doc),
+            "saved as {saved:?}"
+        );
+        assert!(stable, "{saved:?} does not save stably");
+    }
+    let seed = format!("{hundred}   - sub\n\n     - subsub");
+    let doc = TextDocument::new();
+    set_djot(&doc, &seed);
+    let (saved, reopened, stable) = save_reopen(&doc);
+    assert_eq!(
+        block_shapes(&reopened),
+        block_shapes(&doc),
+        "saved as {saved:?}"
+    );
+    assert!(stable);
+    let last: Vec<Option<u8>> = reopened.blocks()[98..]
+        .iter()
+        .map(|b| b.list().map(|l| l.indent()))
+        .collect();
+    assert_eq!(
+        last,
+        [Some(0), Some(0), Some(1), Some(2)],
+        "saved as {saved:?}"
+    );
+}
+
+/// A paragraph's leading tab and trailing spaces were dropped at every save: the parser
+/// strips a paragraph's edge whitespace. An empty attribute set before and after them
+/// shows nothing and keeps them, in a paragraph, a list item, a heading and a table cell.
+#[test]
+fn edge_whitespace_survives_save_and_reload_in_every_block() {
+    for seed in [
+        "{}\tShe opened the door.",
+        "End of line.  {}",
+        "{}  {}",
+        "- {}\titem  {}",
+        "# {}\theading {}",
+        "> {}\tquoted  {}",
+        "| {}\ta | b  {} |\n|---|---|\n| {} c{} | d |",
+        "{}\t- not an item\n\n{}  1. not a list",
+    ] {
+        let doc = TextDocument::new();
+        set_djot(&doc, seed);
+        let before = block_shapes(&doc);
+        let (saved, reopened, stable) = save_reopen(&doc);
+        assert_eq!(
+            block_shapes(&reopened),
+            before,
+            "{seed:?} saved as {saved:?}"
+        );
+        assert!(stable, "{saved:?} does not save stably");
+    }
+    let doc = TextDocument::new();
+    set_djot(&doc, "{}\tShe opened.\n\nEnd.  {}");
+    assert_eq!(block_texts(&doc), ["\tShe opened.", "End.  "]);
+}
+
+/// The code blocks of `doc`, their text in order.
+fn code_blocks(doc: &TextDocument) -> Vec<String> {
+    doc.blocks()
+        .iter()
+        .filter(|b| b.block_format().is_code_block == Some(true))
+        .map(|b| b.text())
+        .collect()
+}
+
+/// Load each seed, check it holds the one code block `code`, save and reload it, and
+/// check the reloaded document holds the same, and saves stably.
+fn assert_code_blocks_survive(cases: &[(&str, &str)]) {
+    for (seed, code) in cases {
+        let doc = TextDocument::new();
+        set_djot(&doc, seed);
+        assert_eq!(code_blocks(&doc), [*code], "seed {seed:?}");
+        let (saved, reopened, stable) = save_reopen(&doc);
+        assert_eq!(
+            code_blocks(&reopened),
+            [*code],
+            "{seed:?} saved as {saved:?}"
+        );
+        assert!(stable, "{saved:?} does not save stably");
+    }
+}
+
+/// A code block was fenced with three backticks whatever it held, so a line of three
+/// backticks in it closed it early, and the rest came back as prose and a new, unclosed
+/// block. And a language of more than one word, a Markdown info string such as `rust
+/// ignore`, made the whole block and every line of it one inline code span.
+#[test]
+fn a_code_block_holding_a_fence_keeps_its_lines() {
+    assert_code_blocks_survive(&[
+        ("````\na\n```\nb\n````", "a\n```\nb"),
+        (
+            "`````md\nBefore\n````\ncode\n```\nAfter\n`````",
+            "Before\n````\ncode\n```\nAfter",
+        ),
+        ("> ````\n> ```\n> ````", "```"),
+    ]);
+    let doc = TextDocument::new();
+    doc.set_markdown("```rust ignore\nfn main() {}\n```\n")
+        .unwrap()
+        .wait()
+        .unwrap();
+    let (saved, reopened, stable) = save_reopen(&doc);
+    let blocks = reopened.blocks();
+    assert_eq!(blocks.len(), 1, "saved as {saved:?}");
+    assert_eq!(
+        blocks[0].block_format().is_code_block,
+        Some(true),
+        "saved as {saved:?}"
+    );
+    assert_eq!(
+        blocks[0].block_format().code_language.as_deref(),
+        Some("rust")
+    );
+    assert_eq!(blocks[0].text(), "fn main() {}");
+    assert!(stable);
+}
+
+/// In a quotation, an empty line of a code block was written as `> `, and the parser
+/// takes only the `>` from a line of whitespace: the line came back as a space, and
+/// gained one more at every save.
+#[test]
+fn a_blank_line_in_a_quoted_code_block_stays_as_it_is() {
+    assert_code_blocks_survive(&[
+        ("> ```\n> ```", ""),
+        ("> ```\n>\n>  \n> x\n>\n> ```", "\n  \nx\n"),
+        ("> > ```\n> >\n> >   \n> > ```", "\n   "),
+    ]);
+}
+
+/// A footnote's continuation lines were indented four spaces, or as far as the note's
+/// text for a line indented already, and the parser takes up to the width of
+/// `[^label]:` off each: a code block's indented lines gained a column at every save
+/// against its fence, or, under four spaces, lost as many as the label was long.
+#[test]
+fn a_code_block_in_a_footnote_keeps_its_indentation() {
+    assert_code_blocks_survive(&[
+        (
+            "Text[^note-7f3a].\n\n[^note-7f3a]: A note.\n\n              ```\n              fn x() {\n                  y\n              }\n              ```",
+            "fn x() {\n    y\n}",
+        ),
+        (
+            "Text[^1].\n\n[^1]: ```\n      fn x() {\n          y\n      }\n      ```",
+            "fn x() {\n    y\n}",
+        ),
+        (
+            "Text[^ab].\n\n[^ab]: A note.\n\n       ```\n         a\n   \n       ```",
+            "  a\n  ",
+        ),
+    ]);
+}
+
+/// A code span keeps its line breaks through the parser, and the model holds none in a
+/// block: a code span written over two lines loads as a block a line, each keeping the
+/// code format, and saves as it loads. Kept in one block, it saved as a hard break and
+/// reloaded as two blocks, never settling.
+#[test]
+fn a_code_span_over_two_lines_loads_as_a_block_a_line() {
+    let doc = TextDocument::new();
+    set_djot(&doc, "a `b\nc` d\n\n- `e\nf`");
+    assert_eq!(
+        block_shapes(&doc),
+        [
+            ("a b".to_string(), None, None, 0),
+            ("c d".to_string(), None, None, 0),
+            ("e".to_string(), Some(0), None, 0),
+            ("f".to_string(), Some(0), None, 0),
+        ]
+    );
+    let styles = styled_chars(&doc);
+    let code: String = styles
+        .iter()
+        .filter(|(_, style)| style.as_ref().is_some_and(|s| s.code))
+        .map(|(c, _)| *c)
+        .collect();
+    assert_eq!(code, "bcef");
+    let saved = doc.to_djot().unwrap();
+    let reopened = TextDocument::new();
+    set_djot(&reopened, &saved);
+    assert_eq!(reopened.to_djot().unwrap(), saved);
+    assert_eq!(
+        block_shapes(&reopened),
+        block_shapes(&doc),
+        "saved as {saved:?}"
+    );
+}
+
+/// A block holding more line breaks than the parser reads in one paragraph
+/// (`MAX_LEAF_LINES`) was saved as one paragraph of hard breaks, which the reader set
+/// down as its source lines: every line came back ending in a backslash and showing its
+/// escapes, and the next save kept them for good. Each line is saved as a paragraph of
+/// its own now, one line long however many the block holds.
+#[test]
+fn a_block_holding_more_lines_than_a_paragraph_may_hold_reloads_as_its_lines() {
+    let lines: Vec<String> = (0..=MAX_LEAF_LINES)
+        .map(|i| {
+            if i % 1000 == 7 {
+                format!("- item {i}")
+            } else {
+                format!("line {i}")
+            }
+        })
+        .collect();
+    let doc = TextDocument::new();
+    doc.cursor().insert_text(&lines.join("\n")).unwrap();
+    assert_eq!(doc.blocks().len(), 1, "the text is one block");
+    let saved = doc.to_djot().unwrap();
+    assert_eq!(
+        longest_leaf_lines(&saved),
+        1,
+        "a paragraph of the save runs over several lines"
+    );
+    let reopened = TextDocument::new();
+    set_djot(&reopened, &saved);
+    let texts = block_texts(&reopened);
+    let changed = texts
+        .iter()
+        .zip(&lines)
+        .filter(|(reloaded, line)| reloaded != line)
+        .count();
+    assert_eq!(texts.len(), lines.len(), "one block a line");
+    assert_eq!(
+        changed, 0,
+        "lines changed, the first reading {:?}",
+        texts[0]
+    );
+    assert_eq!(
+        reopened.to_djot().unwrap(),
+        saved,
+        "the save does not settle"
+    );
+}
+
+/// A page break belongs where its block starts. A block holding line breaks comes back
+/// one block a line, and each line took the page break with it: through a save and a
+/// reload (the reader gave every line after a hard break the paragraph's attributes),
+/// through a paste of preformatted text and through `set_html`, so an export put every
+/// line on a page of its own. Only the first line starts a new page now.
+#[test]
+fn a_page_break_before_a_block_holding_line_breaks_stays_on_its_first_line() {
+    let breaks = |doc: &TextDocument| -> Vec<(String, Option<bool>)> {
+        doc.blocks()
+            .iter()
+            .map(|block| (block.text(), block.block_format().page_break_before))
+            .collect()
+    };
+    let expected = |lines: &[&str]| -> Vec<(String, Option<bool>)> {
+        lines
+            .iter()
+            .enumerate()
+            .map(|(i, line)| (line.to_string(), (i == 0).then_some(true)))
+            .collect()
+    };
+    let chapter = ["Chapter start.", "second line", "third line"];
+
+    // Inserted with its line breaks, then saved and reopened.
+    for container in ["", "# "] {
+        let doc = TextDocument::new();
+        set_djot(
+            &doc,
+            &format!("{{page_break_before=true}}\n{container}Chapter start."),
+        );
+        let block = doc.blocks()[0].clone();
+        doc.cursor_at(block.position() + block.text().chars().count())
+            .insert_text("\nsecond line\nthird line")
+            .unwrap();
+        let (saved, reopened, stable) = save_reopen(&doc);
+        assert_eq!(breaks(&reopened), expected(&chapter), "saved as {saved:?}");
+        assert_eq!(
+            saved.matches("page_break_before").count(),
+            1,
+            "saved as {saved:?}"
+        );
+        assert!(stable, "{saved:?} does not save stably");
+    }
+
+    // Written with hard breaks.
+    for container in ["", "# "] {
+        let doc = TextDocument::new();
+        set_djot(
+            &doc,
+            &format!(
+                "{{page_break_before=true}}\n{container}Chapter start.\\\nsecond line\\\nthird line"
+            ),
+        );
+        assert_eq!(breaks(&doc), expected(&chapter), "{container:?}");
+    }
+
+    // Pasted, and read by the HTML importer, as preformatted HTML. A paste's first and
+    // last blocks join the paragraph it lands in and take its format, so the passage is
+    // pasted between two paragraphs of its own. `set_html` keeps no page break, so the
+    // importer is asked what it read.
+    let passage =
+        "<p style=\"white-space: pre-wrap; page-break-before: always\">one\ntwo\nthree</p>";
+    let pasted = TextDocument::new();
+    pasted
+        .cursor()
+        .insert_html(&format!("<p>before</p>{passage}<p>after</p>"))
+        .unwrap();
+    let mut lines = expected(&["one", "two", "three"]);
+    lines.insert(0, ("before".to_string(), None));
+    lines.push(("after".to_string(), None));
+    assert_eq!(breaks(&pasted), lines, "pasted");
+    let read: Vec<(String, Option<bool>)> = parse_html(passage)
+        .into_iter()
+        .map(|block| {
+            let text = block.spans.iter().map(|span| span.text.as_str()).collect();
+            (text, block.page_break_before)
+        })
+        .collect();
+    assert_eq!(read, expected(&["one", "two", "three"]), "read");
+}
+
+/// Older versions wrote an image's source as it was, so a source saved then can hold
+/// the escapes the writer now uses: a web address naming `100%.png` holds `%25`, and
+/// one with an encoded backslash `%5C`. Decoded, the first read as an address no server
+/// knows and the second as another path. The reader decodes `%25` only before another
+/// of its escapes and `%5C` only at the end, the two places the writer needs them, so
+/// those sources read as they were written, and save as they were read.
+#[test]
+fn an_image_source_an_older_version_saved_reads_as_it_was_written() {
+    for src in [
+        "https://example.com/100%25.png",
+        "https://example.com/a%5Cb.png",
+        "a%25%25b.png",
+        "%25",
+        "a%5C%5Cb.png",
+        "50%25%20off.png",
+    ] {
+        let doc = TextDocument::new();
+        set_djot(&doc, &format!("See ![a picture]({src}) here."));
+        assert_eq!(image_names(&doc), [src], "{src:?} read as another name");
+        let (saved, reopened, stable) = save_reopen(&doc);
+        assert_eq!(image_names(&reopened), [src], "saved as {saved:?}");
+        assert!(stable, "{saved:?} does not save stably");
     }
 }

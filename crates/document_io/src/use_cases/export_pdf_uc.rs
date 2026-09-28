@@ -13,7 +13,8 @@ use crate::ExportPdfDto;
 use crate::ExportPdfResultDto;
 use crate::typst_compile::compile_typst_pdf;
 use crate::typst_markup::{
-    hoist_leading_pagebreak, render_blocks_typst, render_table_typst, typst_preamble,
+    hoist_leading_page_break, page_break_in, render_blocks_typst, render_table_typst,
+    typst_preamble,
 };
 use anyhow::{Result, anyhow};
 use common::database::QueryUnitOfWork;
@@ -227,11 +228,18 @@ impl ExportPdfUseCase {
                 // whatever was typed since something last wrote it.
                 common::database::rope_helpers::refresh_block_positions(&mut blocks, &uow.store());
                 blocks.sort_by_key(|b| b.document_position);
+                // A note cannot start a page: its text is set at the foot of the page
+                // that cites it, inside the footnote, where a page break failed the
+                // whole export. A host can set one on a note's paragraph all the same.
+                for block in &mut blocks {
+                    block.fmt_page_break_before = None;
+                }
                 let body = crate::typst_markup::render_blocks_typst(
                     &uow.store(),
                     &blocks,
                     &self.dto.options,
                     &empty,
+                    false,
                 );
                 note_bodies.insert(label, body.trim().to_string());
             }
@@ -260,7 +268,7 @@ impl ExportPdfUseCase {
             }
 
             let frame_typst =
-                self.render_frame_typst(uow, frame_id, &cell_frame_ids, &note_bodies)?;
+                self.render_frame_typst(uow, frame_id, &cell_frame_ids, &note_bodies, 0)?;
             if !frame_typst.is_empty() {
                 body_parts.push(frame_typst);
             }
@@ -294,12 +302,16 @@ impl ExportPdfUseCase {
     /// Render a frame's content as Typst markup, walking its `child_order` to interleave blocks
     /// and sub-frames (blockquotes/tables). Falls back to sorted blocks when `child_order` is
     /// empty. Mirrors `export_html_uc::render_frame_html`.
+    ///
+    /// `quote_depth` is how many quotations the frame's content sits in: see
+    /// [`MAX_TYPST_QUOTE_NESTING`] for what is written past it.
     fn render_frame_typst(
         &self,
         uow: &dyn ExportPdfUnitOfWorkTrait,
         frame_id: &EntityId,
         cell_frame_ids: &HashSet<EntityId>,
         notes: &crate::typst_markup::TypstNotes,
+        quote_depth: usize,
     ) -> Result<String> {
         let frame = uow
             .get_frame(frame_id)?
@@ -307,17 +319,24 @@ impl ExportPdfUseCase {
 
         // Table anchor frame — render the table instead of blocks.
         if let Some(table_id) = frame.table {
-            return render_table_typst(
+            let table = render_table_typst(
                 &uow.store(),
                 table_id,
                 &crate::typst_markup::typst_image_paths(&self.dto.options.images),
                 notes,
-            );
+            )?;
+            return Ok(indent_past_quote_nesting(&table, quote_depth));
         }
 
         // If child_order is populated, use it to interleave blocks and sub-frames
         if !frame.child_order.is_empty() {
-            return self.render_frame_typst_by_child_order(uow, &frame, cell_frame_ids, notes);
+            return self.render_frame_typst_by_child_order(
+                uow,
+                &frame,
+                cell_frame_ids,
+                notes,
+                quote_depth,
+            );
         }
 
         // Fallback: render all blocks in document_position order (original behaviour)
@@ -337,12 +356,14 @@ impl ExportPdfUseCase {
         common::database::rope_helpers::refresh_block_positions(&mut blocks, &uow.store());
         blocks.sort_by_key(|b| b.document_position);
 
-        Ok(render_blocks_typst(
+        let typst = render_blocks_typst(
             &uow.store(),
             &blocks,
             &self.dto.options,
             notes,
-        ))
+            quote_depth > 0,
+        );
+        Ok(indent_past_quote_nesting(&typst, quote_depth))
     }
 
     /// An epigraph's body and its attribution, rendered separately, or `None` when the
@@ -380,26 +401,30 @@ impl ExportPdfUseCase {
             return Ok(None);
         }
         let attribution_block = blocks.pop().expect("checked non-empty above");
-        let body = render_blocks_typst(&uow.store(), &blocks, &self.dto.options, notes);
+        // Both are written inside the epigraph's quotation.
+        let body = render_blocks_typst(&uow.store(), &blocks, &self.dto.options, notes, true);
         let attribution = render_blocks_typst(
             &uow.store(),
             std::slice::from_ref(&attribution_block),
             &self.dto.options,
             notes,
+            true,
         );
         Ok(Some((body, attribution)))
     }
 
     /// Walk `child_order` entries: positive values are block IDs, negative values are negated
     /// sub-frame IDs. Mirrors `export_html_uc::render_frame_by_child_order`. A blockquote
-    /// sub-frame is wrapped in `#quote(block: true)[...]` — the Typst analogue of LaTeX's
-    /// `\begin{quote}`/HTML's `<blockquote>`.
+    /// sub-frame is wrapped in `#quote(block: true)[...]`, the Typst analogue of LaTeX's
+    /// `\begin{quote}`/HTML's `<blockquote>`, up to [`MAX_TYPST_QUOTE_NESTING`] deep, and
+    /// written beside the quotation it sits in past that.
     fn render_frame_typst_by_child_order(
         &self,
         uow: &dyn ExportPdfUnitOfWorkTrait,
         frame: &Frame,
         cell_frame_ids: &HashSet<EntityId>,
         notes: &crate::typst_markup::TypstNotes,
+        quote_depth: usize,
     ) -> Result<String> {
         let mut parts: Vec<String> = Vec::new();
         // Accumulate consecutive blocks so we can group list items.
@@ -421,9 +446,10 @@ impl ExportPdfUseCase {
                         &pending_blocks,
                         &self.dto.options,
                         notes,
+                        quote_depth > 0,
                     );
                     if !typst.is_empty() {
-                        parts.push(typst);
+                        parts.push(indent_past_quote_nesting(&typst, quote_depth));
                     }
                     pending_blocks.clear();
                 }
@@ -437,7 +463,22 @@ impl ExportPdfUseCase {
 
                 let sub_frame = uow.get_frame(&sub_frame_id)?;
                 if let Some(ref sf) = sub_frame {
-                    if sf.fmt_is_blockquote == Some(true) {
+                    if sf.fmt_is_blockquote == Some(true) && quote_depth >= MAX_TYPST_QUOTE_NESTING
+                    {
+                        // Past the nesting Typst lays out, the quotation is written
+                        // beside the one it sits in, each of its pieces indented as far
+                        // as the quotations it is in.
+                        let inner = self.render_frame_typst(
+                            uow,
+                            &sub_frame_id,
+                            cell_frame_ids,
+                            notes,
+                            quote_depth + 1,
+                        )?;
+                        if !inner.is_empty() {
+                            parts.push(inner);
+                        }
+                    } else if sf.fmt_is_blockquote == Some(true) {
                         // An epigraph uses Typst's own attribution slot rather than
                         // letting the source line fall through as one more paragraph:
                         // `quote` then sets it the way a quotation's attribution is set,
@@ -446,28 +487,42 @@ impl ExportPdfUseCase {
                             && let Some((body, attribution)) =
                                 self.split_epigraph_typst(uow, sf, cell_frame_ids, notes)?
                         {
-                            // A page break opening the quotation has to come out of it —
-                            // Typst refuses one inside a container, and it means "start a
-                            // page, then quote" in any case.
-                            let (brk, body) = hoist_leading_pagebreak(&body);
-                            parts.extend(brk.map(str::to_string));
+                            // A page break opening the quotation has to come out of it:
+                            // a weak break opening a container does nothing, and it means
+                            // "start a page, then quote" in any case.
+                            let (brk, body) = hoist_leading_page_break(&body);
+                            if brk {
+                                parts.push(page_break_in(quote_depth > 0).to_string());
+                            }
                             parts.push(format!(
                                 "#quote(block: true, attribution: [{attribution}])[{body}]"
                             ));
                             continue;
                         }
                         // Recursively render the blockquote frame content
-                        let inner =
-                            self.render_frame_typst(uow, &sub_frame_id, cell_frame_ids, notes)?;
+                        let inner = self.render_frame_typst(
+                            uow,
+                            &sub_frame_id,
+                            cell_frame_ids,
+                            notes,
+                            quote_depth + 1,
+                        )?;
                         if !inner.is_empty() {
-                            let (brk, inner) = hoist_leading_pagebreak(&inner);
-                            parts.extend(brk.map(str::to_string));
+                            let (brk, inner) = hoist_leading_page_break(&inner);
+                            if brk {
+                                parts.push(page_break_in(quote_depth > 0).to_string());
+                            }
                             parts.push(format!("#quote(block: true)[{inner}]"));
                         }
                     } else {
                         // Non-blockquote sub-frame: render normally
-                        let inner =
-                            self.render_frame_typst(uow, &sub_frame_id, cell_frame_ids, notes)?;
+                        let inner = self.render_frame_typst(
+                            uow,
+                            &sub_frame_id,
+                            cell_frame_ids,
+                            notes,
+                            quote_depth,
+                        )?;
                         if !inner.is_empty() {
                             parts.push(inner);
                         }
@@ -478,14 +533,60 @@ impl ExportPdfUseCase {
 
         // Flush remaining blocks
         if !pending_blocks.is_empty() {
-            let typst =
-                render_blocks_typst(&uow.store(), &pending_blocks, &self.dto.options, notes);
+            let typst = render_blocks_typst(
+                &uow.store(),
+                &pending_blocks,
+                &self.dto.options,
+                notes,
+                quote_depth > 0,
+            );
             if !typst.is_empty() {
-                parts.push(typst);
+                parts.push(indent_past_quote_nesting(&typst, quote_depth));
             }
         }
 
         Ok(parts.join("\n\n"))
+    }
+}
+
+/// How many quotations are written inside one another as Typst's own `#quote`.
+///
+/// Typst gives up on content nested past a fixed depth of show rules and layouts: a whole
+/// export failed with "maximum show rule depth exceeded" for any quotation 17 deep, and at
+/// 15 for one holding a list, a table, a heading, a code block or a footnote, which the
+/// editor and the Djot reader both allow many times over. Each `#quote` costs four levels
+/// of the 64, so eight leave half of them for what the quotation holds.
+///
+/// A quotation deeper than this is written beside the one it sits in rather than inside
+/// it, each of its pieces in a `#pad` as wide as the quotations it has left out, the 1em a
+/// side each `#quote` adds (see [`indent_past_quote_nesting`]). Every word is kept, and
+/// the page shows it indented as far as the quotation nests, up to a limit.
+const MAX_TYPST_QUOTE_NESTING: usize = 8;
+
+/// The deepest extra indentation, in quotations, [`indent_past_quote_nesting`] gives a
+/// piece: 1em a side each, on top of the [`MAX_TYPST_QUOTE_NESTING`] quotations around it.
+/// Deeper still, the text keeps this width rather than being squeezed out of the page.
+const MAX_TYPST_QUOTE_INDENT: usize = 8;
+
+/// `typst`, one piece of a frame's content, as it is written inside `quote_depth`
+/// quotations: unchanged within [`MAX_TYPST_QUOTE_NESTING`], since the `#quote`s around
+/// it indent it, and past that in a `#pad` indenting it as far as the quotations left out.
+/// A page break opening it is lifted out first, since a weak break opening a container
+/// does nothing; it stays inside the quotations around the piece.
+fn indent_past_quote_nesting(typst: &str, quote_depth: usize) -> String {
+    let Some(levels) = quote_depth.checked_sub(MAX_TYPST_QUOTE_NESTING) else {
+        return typst.to_string();
+    };
+    if levels == 0 || typst.is_empty() {
+        return typst.to_string();
+    }
+    let em = levels.min(MAX_TYPST_QUOTE_INDENT);
+    let (brk, body) = hoist_leading_page_break(typst);
+    let padded = format!("#pad(x: {em}em)[{body}]");
+    if brk {
+        format!("{}\n{padded}", page_break_in(true))
+    } else {
+        padded
     }
 }
 
@@ -580,6 +681,67 @@ mod tests {
             markup.contains(&format!("#footnote(<{anchor}>)")),
             "the repeat citation must reference that SAME anchor: {markup}"
         );
+    }
+
+    /// Past [`MAX_TYPST_QUOTE_NESTING`] a quotation is written beside the one it sits in,
+    /// in a `#pad` as wide as the quotations it leaves out, and no `#quote` sits inside
+    /// more than that many others: Typst failed the whole export past 16. Every level
+    /// keeps its words, in order.
+    #[test]
+    fn a_quotation_past_the_nesting_typst_lays_out_is_written_beside_it() {
+        let depth = 20;
+        let djot: String = (1..=depth)
+            .map(|d| format!("{}level {d}\n\n", "> ".repeat(d)))
+            .collect();
+        let markup = markup_from_djot(&djot);
+        // Each level sits in the one before it, so one `#quote` a level up to the limit
+        // is all of them nested.
+        assert_eq!(
+            markup.matches("#quote(block: true)[").count(),
+            MAX_TYPST_QUOTE_NESTING,
+            "{markup}"
+        );
+        let mut from = 0;
+        for d in 1..=depth {
+            let at = markup[from..]
+                .find(&format!("level {d}"))
+                .unwrap_or_else(|| panic!("level {d} is missing or out of order: {markup}"));
+            from += at;
+        }
+        for levels in 1..=(depth - MAX_TYPST_QUOTE_NESTING) {
+            let em = levels.min(MAX_TYPST_QUOTE_INDENT);
+            assert!(
+                markup.contains(&format!("#pad(x: {em}em)[level")),
+                "{markup}"
+            );
+        }
+        assert!(!markup.contains("#pad(x: 0em)"), "{markup}");
+    }
+
+    /// A page break inside a quotation is written as a column break, which Typst lays out
+    /// inside a container, and one opening a quotation is lifted out of it, as far out as
+    /// it opens quotations: a `#pagebreak` inside one failed the whole export.
+    #[test]
+    fn a_page_break_inside_a_quotation_is_written_as_a_column_break() {
+        let markup = markup_from_djot(
+            "Body.\n\n> First.\n>\n> {page_break_before=true}\n> Second.\n>\n> > {page_break_before=true}\n> > Third.\n\nBetween.\n\n> > {page_break_before=true}\n> > Fourth.\n",
+        );
+        let column_break = "#colbreak(weak: true)";
+        let page_break = "#pagebreak(weak: true)";
+        assert!(
+            markup.contains(&format!(
+                "#quote(block: true)[First.\n\n{column_break}\n\nSecond.\n\n{column_break}\n\n#quote(block: true)[Third.]]"
+            )),
+            "{markup}"
+        );
+        // Opening a quotation and the one around it, it comes out of both.
+        assert!(
+            markup.contains(&format!(
+                "{page_break}\n\n#quote(block: true)[#quote(block: true)[Fourth.]]"
+            )),
+            "{markup}"
+        );
+        assert_eq!(markup.matches(page_break).count(), 1, "{markup}");
     }
 
     /// Two distinct labels, each cited twice, exercises `TypstNotes::mark_emitted`'s
