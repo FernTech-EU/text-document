@@ -8,8 +8,9 @@ use anyhow::{Result, anyhow};
 use common::database::CommandUnitOfWork;
 use common::database::block_offset_index::OffsetMarker;
 use common::database::rope_helpers::{
-    block_char_length, block_content_via_store, range_covers_table_anchor, refresh_block_positions,
-    rope_remove_markers, snap_off_table_anchor, table_anchor_position,
+    block_char_length, block_content_via_store, holds_a_table_from_its_anchor,
+    range_covers_table_anchor, refresh_block_positions, rope_remove_markers, snap_off_table_anchor,
+    table_anchor_position,
 };
 use common::direct_access::document::document_repository::DocumentRelationshipField;
 use common::direct_access::frame::frame_repository::FrameRelationshipField;
@@ -281,46 +282,6 @@ fn blocks_measured(count: usize) {
     let _ = count;
 }
 
-/// Whether the range from `requested_start` (on or before a table's anchor, which the
-/// range's `start` was moved past) to `end` holds a whole table: the anchor and every
-/// block of its cells.
-fn holds_a_whole_table(
-    store: &common::database::Store,
-    requested_start: i64,
-    start: i64,
-    end: i64,
-) -> bool {
-    if requested_start >= start {
-        return false;
-    }
-    let table_ids: Vec<EntityId> = store.tables.read().keys().copied().collect();
-    table_ids.into_iter().any(|table_id| {
-        let Some(anchor) = table_anchor_position(store, table_id) else {
-            return false;
-        };
-        if anchor < requested_start || anchor >= start {
-            return false;
-        }
-        let table_end = {
-            let offsets = store.block_offsets.read();
-            let rope = store.rope.read();
-            common::database::rope_helpers::table_block_ids(store, table_id)
-                .iter()
-                .filter_map(|block_id| offsets.range_with_successor(OffsetMarker::Block(*block_id)))
-                .map(|(block_start, block_end, has_successor)| {
-                    let text_end = if has_successor && block_end > block_start {
-                        block_end - 1
-                    } else {
-                        block_end
-                    };
-                    rope.byte_to_char(text_end as usize) as i64
-                })
-                .max()
-        };
-        table_end.is_some_and(|table_end| end >= table_end)
-    })
-}
-
 /// Whether `block` holds an image or a footnote reference at or after its position
 /// `char_offset`: in the part of it a deletion ending there keeps.
 fn kept_tail_holds_objects(
@@ -510,7 +471,7 @@ fn execute_delete(
     // end of its last cell holds the whole table, even when its start, moved into the first
     // cell, meets its end there: a table of one empty cell.
     let requested_start = std::cmp::min(dto.position, dto.anchor);
-    let holds_a_whole_table = holds_a_whole_table(&store, requested_start, start, end);
+    let holds_a_whole_table = holds_a_table_from_its_anchor(&store, requested_start, start, end);
     if start >= end && !holds_a_whole_table {
         return Err(NothingToDelete {
             new_position: std::cmp::min(dto.position, dto.anchor),

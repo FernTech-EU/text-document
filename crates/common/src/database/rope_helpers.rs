@@ -1579,6 +1579,63 @@ pub fn range_covers_table_anchor(store: &Store, start: i64, end: i64) -> bool {
         .any(|(marker, _)| !marker.is_block())
 }
 
+/// Whether the range from `requested_start` (on or before a table's anchor, which the
+/// range's `start` was moved past, see [`snap_off_table_anchor`]) to `end` holds a whole
+/// table: the anchor and every block of its cells.
+pub fn holds_a_table_from_its_anchor(
+    store: &Store,
+    requested_start: i64,
+    start: i64,
+    end: i64,
+) -> bool {
+    if requested_start >= start {
+        return false;
+    }
+    let table_ids: Vec<EntityId> = store.tables.read().keys().copied().collect();
+    table_ids.into_iter().any(|table_id| {
+        let Some(anchor) = table_anchor_position(store, table_id) else {
+            return false;
+        };
+        if anchor < requested_start || anchor >= start {
+            return false;
+        }
+        let table_end = {
+            let offsets = store.block_offsets.read();
+            let rope = store.rope.read();
+            table_block_ids(store, table_id)
+                .iter()
+                .filter_map(|block_id| offsets.range_with_successor(OffsetMarker::Block(*block_id)))
+                .map(|(block_start, block_end, has_successor)| {
+                    let text_end = if has_successor && block_end > block_start {
+                        block_end - 1
+                    } else {
+                        block_end
+                    };
+                    rope.byte_to_char(text_end as usize) as i64
+                })
+                .max()
+        };
+        table_end.is_some_and(|table_end| end >= table_end)
+    })
+}
+
+/// Whether a range over the positions `[start, end)` holds a whole table, as a deletion of
+/// it takes one: with its ends moved off any table's anchor (see [`snap_off_table_anchor`]),
+/// it covers a table's anchor, or it starts on a table's anchor and reaches the end of that
+/// table's last cell.
+///
+/// A copy reads a range as the deletion does. It took a table whole whenever the range held
+/// the table's anchor, where the deletion takes it only then: a selection from a table's
+/// anchor into its first cell, which the Right arrow and Shift+Right from the paragraph
+/// before the table make, copied the whole table and cut the characters selected, and the
+/// paste of the cut put the table in a second time.
+pub fn range_holds_a_whole_table(store: &Store, start: i64, end: i64) -> bool {
+    let snapped_start = snap_off_table_anchor(store, start, true);
+    let snapped_end = snap_off_table_anchor(store, end, false);
+    range_covers_table_anchor(store, snapped_start, snapped_end)
+        || holds_a_table_from_its_anchor(store, start, snapped_start, snapped_end)
+}
+
 /// Remove a registered block from the rope: drops its content bytes
 /// plus one boundary `\n` (the one after, if the block has a
 /// successor; the one before, if it's the last entry), removes the

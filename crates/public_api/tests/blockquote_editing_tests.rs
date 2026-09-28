@@ -369,3 +369,103 @@ fn undo_restores_pre_wrap_state() {
         "markdown after undo must not contain `>`; got: {md:?}"
     );
 }
+
+// ── The caret's block ───────────────────────────────────────────────────────
+
+fn loaded(djot: &str) -> TextDocument {
+    let doc = TextDocument::new();
+    doc.set_djot_sync(djot).unwrap();
+    doc
+}
+
+/// Where a caret right after `needle` stands in `doc`.
+fn caret_after(doc: &TextDocument, needle: &str) -> usize {
+    let text = doc.to_addressable_text().unwrap();
+    let start = text[..text.find(needle).expect("the text is in the document")]
+        .chars()
+        .count();
+    start + needle.chars().count()
+}
+
+/// The quotation queries read the block the caret is in, as `current_list` and
+/// `block_at_caret` do. They read the block at the caret's character index, which at the end
+/// of a paragraph is the separator after it, and belongs to the next paragraph: at the end of
+/// a quoted paragraph or a quoted list item followed by an unquoted paragraph, the caret was
+/// out of the quotation, so an editor's Tab there typed a tab where it nests the quotation,
+/// and lifting the paragraph out of its quotation was refused; at the end of an unquoted
+/// paragraph followed by a quotation, the caret was in the quotation.
+#[test]
+fn the_quotation_queries_read_the_caret_s_block() {
+    for (text, before_caret, depth) in [
+        ("> Quoted para.\n\nPlain after.\n", "Quoted para.", 1),
+        ("> - item one\n> - item two\n\nPlain.\n", "item two", 1),
+        ("> > Deep.\n\nPlain.\n", "Deep.", 2),
+        ("Plain first.\n\n> Quoted after.\n", "Plain first.", 0),
+        ("Plain first.\n\n> Quoted after.\n", "", 0),
+    ] {
+        let doc = loaded(text);
+        let caret = caret_after(&doc, before_caret);
+        let cursor = doc.cursor_at(caret);
+        let at = format!("at {caret} in {text:?}");
+        assert_eq!(
+            cursor.is_in_blockquote(),
+            depth > 0,
+            "is_in_blockquote {at}"
+        );
+        assert_eq!(
+            cursor.blockquote_depth_at_cursor(),
+            depth,
+            "blockquote_depth_at_cursor {at}"
+        );
+        assert_eq!(
+            cursor.current_blockquote_frame_id().is_some(),
+            depth > 0,
+            "current_blockquote_frame_id {at}"
+        );
+        assert_eq!(
+            cursor.current_frame().is_some(),
+            depth > 0,
+            "current_frame {at}"
+        );
+    }
+
+    // The start of a quoted paragraph after an unquoted one is in the quotation.
+    let doc = loaded("Plain first.\n\n> Quoted after.\n");
+    let caret = caret_after(&doc, "Plain first.") + 1;
+    assert!(doc.cursor_at(caret).is_in_blockquote());
+
+    // At the end of the last quoted paragraph, the paragraph is the last of its quotation,
+    // and it lifts out of it.
+    let doc = loaded("> One.\n>\n> Two.\n\nAfter.\n");
+    let cursor = doc.cursor_at(caret_after(&doc, "Two."));
+    assert!(cursor.is_last_block_in_current_frame());
+    assert!(!cursor.is_first_block_in_current_frame());
+    cursor.unwrap_current_block_from_blockquote().unwrap();
+    assert_eq!(doc.to_djot().unwrap(), "> One.\n\nTwo.\n\nAfter.");
+}
+
+/// Wrapping in a quotation takes the paragraph the caret is in, and the paragraphs a
+/// selection covers. With the caret at the end of a paragraph, the next paragraph was
+/// quoted; a selection of exactly one paragraph quoted the one after it too; and a
+/// selection of all of a quoted paragraph was taken for one across two frames, and refused.
+#[test]
+fn wrapping_in_a_quotation_takes_the_caret_s_paragraph() {
+    let doc = loaded("First.\n\nSecond.\n");
+    doc.cursor_at(caret_after(&doc, "First."))
+        .insert_blockquote()
+        .unwrap();
+    assert_eq!(doc.to_djot().unwrap(), "> First.\n\nSecond.");
+
+    let doc = loaded("First.\n\nSecond.\n");
+    let cursor = doc.cursor_at(0);
+    cursor.set_position(caret_after(&doc, "First."), MoveMode::KeepAnchor);
+    cursor.wrap_selection_in_blockquote().unwrap();
+    assert_eq!(doc.to_djot().unwrap(), "> First.\n\nSecond.");
+
+    let doc = loaded("> Quoted para.\n\nPlain after.\n");
+    let cursor = doc.cursor_at(0);
+    cursor.set_position(caret_after(&doc, "Quoted para."), MoveMode::KeepAnchor);
+    assert!(!cursor.selection_spans_multiple_frames());
+    cursor.toggle_blockquote().unwrap();
+    assert_eq!(doc.to_djot().unwrap(), "Quoted para.\n\nPlain after.");
+}

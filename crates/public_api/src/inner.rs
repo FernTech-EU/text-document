@@ -54,7 +54,8 @@ pub(crate) struct CursorData {
     /// Whether the cursor's selection is the whole text, as
     /// [`select(SelectionType::Document)`](crate::SelectionType::Document) made it. Set there,
     /// and by a removal of a selection that left the text empty (a cut of all of it), and
-    /// cleared by every other change of the cursor's position or anchor and by every edit. In
+    /// cleared by every other change of the cursor's position or anchor and by every edit,
+    /// whichever cursor makes it (see `TextDocumentInner::end_whole_text_selections`). In
     /// an empty text that selection is empty, the same positions as a caret, and a paste over
     /// it still replaces the text, as a paste over any whole-text selection does (see
     /// `TextCursor::insert_fragment_with_origin`).
@@ -206,10 +207,29 @@ impl TextDocumentInner {
     /// Events are collected while the lock is held, then dispatched
     /// after the lock is released via [`dispatch_queued_events`].
     pub fn queue_event(&mut self, event: DocumentEvent) {
-        if matches!(event, DocumentEvent::ContentsChanged { .. }) {
-            self.content_revision = self.content_revision.wrapping_add(1);
+        match event {
+            DocumentEvent::ContentsChanged { .. } => {
+                self.content_revision = self.content_revision.wrapping_add(1);
+            }
+            DocumentEvent::UndoRedoChanged { .. } => self.end_whole_text_selections(),
+            _ => {}
         }
         self.pending_events.push(event);
+    }
+
+    /// End every cursor's whole-text selection (see [`CursorData::whole_text_selected`]).
+    ///
+    /// Called as the state of the history is announced, which every edit does, a formatting
+    /// edit or a load in place as much as typing: a paste after it goes into the text as the
+    /// edit left it. Only the edits moving text moved the cursors, and only those ended the
+    /// selection: after a cut of everything, a heading, a list item or a quotation made of the
+    /// emptied line, or a text loaded over it, was taken off by the paste that followed.
+    pub(crate) fn end_whole_text_selections(&mut self) {
+        for weak in &self.cursors {
+            if let Some(cursor) = weak.upgrade() {
+                cursor.lock().whole_text_selected = false;
+            }
+        }
     }
 
     /// Return events added since the last `poll_events()` call.

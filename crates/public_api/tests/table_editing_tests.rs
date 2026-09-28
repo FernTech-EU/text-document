@@ -1742,3 +1742,274 @@ fn removing_the_first_row_of_a_row_spanning_cell_keeps_the_reading_order() {
         "the flow's positions go back after inserting a row: {positions:?}"
     );
 }
+
+// ── A caret on a table's anchor ─────────────────────────────────────────────
+
+/// Where `needle` starts in `doc`'s addressable text, as a character position.
+fn position_in(doc: &TextDocument, needle: &str) -> usize {
+    let text = doc.to_addressable_text().unwrap();
+    text[..text.find(needle).expect("the text is in the document")]
+        .chars()
+        .count()
+}
+
+fn loaded(djot: &str) -> TextDocument {
+    let doc = TextDocument::new();
+    doc.set_djot_sync(djot).unwrap();
+    doc
+}
+
+/// A lookup of the block at a table's anchor answers with the table's first cell, as a caret
+/// there reads it. The moves stepping back over the text asked for the block before the
+/// first cell's start, which is on the anchor, met the first cell again, and stopped: from
+/// the start of a table's first cell, a word to the left (Ctrl+Left, and Ctrl+Backspace,
+/// which selects that word to delete it), a paragraph up and the previous word did not move,
+/// and a sentence back crept over the anchor one position at a time.
+#[test]
+fn moving_back_from_the_first_cell_of_a_table_leaves_the_table() {
+    use text_document::MoveOperation;
+    for (text, cell, previous) in [
+        (
+            "Before words\n\n| cell one | two |\n\nAfter\n",
+            "cell one",
+            "words",
+        ),
+        ("Before\n\n> | q1 | q2 |\n\nAfter\n", "q1", "Before"),
+        ("Before\n\n| a |\n\n| b |\n\nAfter\n", "b\nAfter", "a\n"),
+    ] {
+        let doc = loaded(text);
+        let first_cell = position_in(&doc, cell);
+        let previous_word = position_in(&doc, previous);
+        let previous_block = doc.block_at_caret(previous_word).unwrap().start;
+        for (operation, expected) in [
+            (MoveOperation::WordLeft, previous_word),
+            (MoveOperation::PreviousWord, previous_word),
+            (MoveOperation::PreviousBlock, previous_block),
+            (MoveOperation::Up, previous_block),
+            (MoveOperation::StartOfSentence, previous_block),
+        ] {
+            let cursor = doc.cursor_at(first_cell);
+            cursor.move_position(operation, MoveMode::MoveAnchor, 1);
+            assert_eq!(
+                cursor.position(),
+                expected,
+                "{operation:?} from the first cell of {text:?}"
+            );
+        }
+    }
+}
+
+/// The characters of `text` but its spaces, line breaks and anchors, sorted: what it holds,
+/// whatever the order and wherever a cut split a word.
+fn sorted_characters(text: &str) -> Vec<char> {
+    let mut characters: Vec<char> = text
+        .chars()
+        .filter(|c| !c.is_whitespace() && *c != '\u{FFFC}')
+        .collect();
+    characters.sort_unstable();
+    characters
+}
+
+const TWO_TABLES: &str = "Before.\n\n| a1 | b1 |\n| c1 | d1 |\n\nMiddle.\n\n| a3 |\n\nAfter.\n";
+
+/// A selection started on a table's anchor, where the Right arrow or the Down arrow from the
+/// paragraph before a table leaves the caret. The anchor reads as the table's first cell only
+/// while the other end of the selection is in that table: dragged back before the table, the
+/// selection ends there and holds none of it, and dragged into the table before it, it holds
+/// that table whole from its start. Read as in the first cell whatever the other end did, a
+/// selection dragged back into the paragraph before the table jumped forward over the table,
+/// and one dragged into the table before it was taken for a selection between two tables:
+/// the cut emptied the cells of that table, left its grid, and the paste put their words back
+/// into its first cell.
+#[test]
+fn a_selection_started_on_a_tables_anchor_cuts_and_pastes_back_as_it_was() {
+    let reference = loaded(TWO_TABLES);
+    let anchor = position_in(&reference, "Middle.") + "Middle.".len() + 1;
+    for (from, to) in [
+        (anchor, position_in(&reference, "dle.")),
+        (anchor, position_in(&reference, "b1")),
+        (anchor, position_in(&reference, "d1")),
+    ] {
+        let doc = loaded(TWO_TABLES);
+        let original = doc.to_djot().unwrap();
+        let cursor = doc.cursor_at(from);
+        cursor.set_position(to, MoveMode::KeepAnchor);
+        let copied = cursor.selection();
+        cursor.remove_selected_text().unwrap();
+        cursor.insert_fragment(&copied).unwrap();
+        assert_eq!(
+            doc.to_djot().unwrap(),
+            original,
+            "cut from {from} to {to} and pasted back"
+        );
+    }
+}
+
+/// Where a cut of `cursor`'s selection leaves `doc`, and what its copy holds, checked
+/// against `reference`: together they are the text, not a character more or less.
+#[track_caller]
+fn assert_cut_takes_what_it_copies(
+    doc: &TextDocument,
+    cursor: &text_document::TextCursor,
+    reference: &TextDocument,
+    what: &str,
+) {
+    let copied = cursor.selection();
+    cursor.remove_selected_text().unwrap();
+    let mut kept_and_cut = sorted_characters(&doc.to_plain_text().unwrap());
+    kept_and_cut.extend(sorted_characters(copied.to_plain_text()));
+    kept_and_cut.sort_unstable();
+    assert_eq!(
+        kept_and_cut,
+        sorted_characters(&reference.to_plain_text().unwrap()),
+        "{what}: the cut left {:?} and copied {:?}",
+        doc.to_djot().unwrap(),
+        copied.to_plain_text()
+    );
+}
+
+/// A copy of a selection holds what a cut of it removes. A range holding a table's anchor
+/// was copied with the table whole, while the removal takes the table whole only when the
+/// range reaches the end of the table's last cell: the Right arrow onto a table's anchor then
+/// Shift+Right into its first cell copied the table and cut the characters selected, and a
+/// paste of that cut anywhere but back into the cell put the table in a second time.
+#[test]
+fn a_selection_ending_on_a_tables_anchor_cuts_what_it_copies() {
+    use text_document::MoveOperation;
+    const TEXT: &str = TWO_TABLES;
+    let reference = loaded(TEXT);
+    let anchor = position_in(&reference, "Middle.") + "Middle.".len() + 1;
+    let inside_first_table = position_in(&reference, "b1");
+    let in_middle = position_in(&reference, "dle.");
+    let in_own_cell = position_in(&reference, "a3") + 1;
+    let before_first_table = position_in(&reference, "e.");
+    let first_anchor = position_in(&reference, "Before.") + "Before.".len() + 1;
+
+    // The keys: Right from the end of the paragraph before the table, then Shift+Right.
+    let doc = loaded(TEXT);
+    let cursor = doc.cursor_at(anchor - 1);
+    cursor.move_position(MoveOperation::Right, MoveMode::MoveAnchor, 1);
+    assert_eq!(
+        cursor.position(),
+        anchor,
+        "Right puts the caret on the anchor"
+    );
+    cursor.move_position(MoveOperation::Right, MoveMode::KeepAnchor, 3);
+    assert_cut_takes_what_it_copies(
+        &doc,
+        &cursor,
+        &reference,
+        "Shift+Right three times from the anchor",
+    );
+
+    // Selections from and to a table's anchor, dragged anywhere.
+    for (from, to) in [
+        (anchor, in_own_cell),
+        (anchor, in_middle),
+        (in_middle, anchor),
+        (anchor, inside_first_table),
+        (first_anchor, before_first_table),
+        (first_anchor, in_middle),
+    ] {
+        let doc = loaded(TEXT);
+        let cursor = doc.cursor_at(from);
+        cursor.set_position(to, MoveMode::KeepAnchor);
+        assert_cut_takes_what_it_copies(
+            &doc,
+            &cursor,
+            &reference,
+            &format!("a selection from {from} to {to}"),
+        );
+    }
+}
+
+/// A selection started in a table cell and dragged out of the table, into the paragraph
+/// before or after it, is a mixed selection: its copy holds the whole table, as Word selects
+/// every cell of a table a selection runs out of. Its removal does not: the table trap cannot
+/// move the fixed end out of the cell, so the range the removal takes runs from inside the
+/// cell, which empties the cells it meets and keeps the grid. Cut and pasted back, the table
+/// is in the text twice, the second time with the words of the emptied cells. Every table
+/// was reached so before this release; a table in a quotation is now too, since the trap
+/// finds it.
+#[test]
+#[ignore = "a mixed selection's removal takes less than its copy; making the removal take the \
+            whole table changes what Delete and typing over such a selection remove, a design \
+            decision beyond a patch release"]
+fn a_selection_dragged_out_of_a_table_cuts_what_it_copies() {
+    for text in [
+        "Before.\n\n| a1 | b1 |\n| c1 | d1 |\n\nAfter.\n",
+        "Before.\n\n> | a1 | b1 |\n> | c1 | d1 |\n\nAfter.\n",
+    ] {
+        let reference = loaded(text);
+        let in_a_cell = position_in(&reference, "b1") + 1;
+        for outside in [
+            position_in(&reference, "After.") + 3,
+            position_in(&reference, "Before.") + 3,
+        ] {
+            let doc = loaded(text);
+            let original = doc.to_djot().unwrap();
+            let cursor = doc.cursor_at(in_a_cell);
+            cursor.set_position(outside, MoveMode::KeepAnchor);
+            let copied = cursor.selection();
+            cursor.remove_selected_text().unwrap();
+            let mut kept_and_cut = sorted_characters(&doc.to_plain_text().unwrap());
+            kept_and_cut.extend(sorted_characters(copied.to_plain_text()));
+            kept_and_cut.sort_unstable();
+            assert_eq!(
+                kept_and_cut,
+                sorted_characters(&reference.to_plain_text().unwrap()),
+                "a selection from inside a cell to {outside} in {text:?}: the cut left {:?} \
+                 and copied {:?}",
+                doc.to_djot().unwrap(),
+                copied.to_plain_text()
+            );
+            cursor.insert_fragment(&copied).unwrap();
+            assert_eq!(doc.to_djot().unwrap(), original, "cut and pasted back");
+        }
+    }
+}
+
+/// Merging the selected cells reads the cell of the selection's anchor as the caret's cell,
+/// as it reads the position's. A selection from the end of a cell's text into the next cell
+/// read its anchor in the next cell, as the character index there is the separator after
+/// the first: only that cell was merged, with itself, and nothing changed.
+#[test]
+fn merging_cells_from_the_end_of_a_cell_s_text_merges_that_cell() {
+    let merged = |from: usize, to: usize| {
+        let doc = loaded("| aa | bb | cc |\n");
+        let cursor = doc.cursor_at(from);
+        cursor.set_position(to, MoveMode::KeepAnchor);
+        cursor.merge_selected_cells().unwrap();
+        doc.to_djot().unwrap()
+    };
+    let doc = loaded("| aa | bb | cc |\n");
+    let original = doc.to_djot().unwrap();
+    let inside_bb = position_in(&doc, "bb") + 1;
+    let from_inside_aa = merged(position_in(&doc, "aa") + 1, inside_bb);
+    assert_ne!(from_inside_aa, original, "aa and bb are merged");
+    assert_eq!(
+        merged(position_in(&doc, "aa") + 2, inside_bb),
+        from_inside_aa,
+        "a selection from the end of aa into bb"
+    );
+}
+
+/// Merging cells keeps the words of every cell merged, as a word processor merging cells
+/// does. The merge removes every cell but the top left one with its paragraphs: merging `aa`
+/// and `bb` leaves `aa` alone, and `bb` is gone from the text and from every save. 1.12.2
+/// does the same.
+#[test]
+#[ignore = "a merge drops the text of every cell but the first; keeping it means moving each \
+            merged cell's paragraphs into the surviving one, a change to the merge beyond a \
+            patch release"]
+fn merging_cells_keeps_the_text_of_every_cell() {
+    let doc = loaded("| aa | bb | cc |\n");
+    let cursor = doc.cursor_at(position_in(&doc, "aa") + 1);
+    cursor.set_position(position_in(&doc, "bb") + 1, MoveMode::KeepAnchor);
+    cursor.merge_selected_cells().unwrap();
+    let text = doc.to_plain_text().unwrap();
+    assert!(
+        text.contains("bb"),
+        "the merged cell's text is gone: {text:?}"
+    );
+}

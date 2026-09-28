@@ -55,7 +55,15 @@ pub struct TextDocument {
 /// that while. So the reader and the completion handler share one flag, registered here under
 /// the operation's id: whichever sees the new content first clears the history, and the
 /// other finds the flag set and leaves the history alone.
+///
+/// The reader that sees it first also ends every cursor's whole-text selection, as the
+/// completion does when it announces the history (see
+/// `TextDocumentInner::end_whole_text_selections`): a cursor that cut everything before the
+/// load, and pasted once `wait` returned, took off the formatting of the text just loaded.
+/// `doc` is the document's own handle, held weakly: the reader is run by the caller of
+/// [`Operation::wait`] or [`Operation::try_result`], never under the document's lock.
 fn clearing_history_on_success<T: 'static>(
+    doc: &Arc<Mutex<TextDocumentInner>>,
     inner: &mut TextDocumentInner,
     op_id: &str,
     read: impl Fn(&frontend::AppContext, &str) -> Option<Result<T>> + Send + 'static,
@@ -65,10 +73,14 @@ fn clearing_history_on_success<T: 'static>(
         .history_resets
         .insert(op_id.to_string(), Arc::clone(&cleared));
     let stack_id = inner.stack_id;
+    let doc = Arc::downgrade(doc);
     Box::new(move |ctx, id| {
         let result = read(ctx, id)?;
         if result.is_ok() && !cleared.swap(true, std::sync::atomic::Ordering::SeqCst) {
             undo_redo_commands::clear_stack(ctx, stack_id);
+            if let Some(doc) = doc.upgrade() {
+                doc.lock().end_whole_text_selections();
+            }
         }
         Some(result)
     })
@@ -368,7 +380,7 @@ impl TextDocument {
         };
         let op_id = document_io_commands::import_markdown(&inner.ctx, &dto)?;
         inner.own_operations.insert(op_id.clone());
-        let read = clearing_history_on_success(&mut inner, &op_id, |ctx, id| {
+        let read = clearing_history_on_success(&self.inner, &mut inner, &op_id, |ctx, id| {
             document_io_commands::get_import_markdown_result(ctx, id)
                 .ok()
                 .flatten()
@@ -429,7 +441,7 @@ impl TextDocument {
         };
         let op_id = document_io_commands::import_djot(&inner.ctx, &dto)?;
         inner.own_operations.insert(op_id.clone());
-        let read = clearing_history_on_success(&mut inner, &op_id, |ctx, id| {
+        let read = clearing_history_on_success(&self.inner, &mut inner, &op_id, |ctx, id| {
             document_io_commands::get_import_djot_result(ctx, id)
                 .ok()
                 .flatten()
@@ -529,7 +541,7 @@ impl TextDocument {
         };
         let op_id = document_io_commands::import_html(&inner.ctx, &dto)?;
         inner.own_operations.insert(op_id.clone());
-        let read = clearing_history_on_success(&mut inner, &op_id, |ctx, id| {
+        let read = clearing_history_on_success(&self.inner, &mut inner, &op_id, |ctx, id| {
             document_io_commands::get_import_html_result(ctx, id)
                 .ok()
                 .flatten()

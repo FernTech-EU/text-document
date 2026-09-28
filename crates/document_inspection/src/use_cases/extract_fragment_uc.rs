@@ -3,7 +3,7 @@ use crate::ExtractFragmentResultDto;
 use anyhow::{Result, anyhow};
 use common::database::QueryUnitOfWork;
 use common::database::rope_helpers::{
-    block_char_length, block_content_via_store, range_covers_table_anchor,
+    block_char_length, block_content_via_store, range_holds_a_whole_table,
 };
 use common::direct_access::document::document_repository::DocumentRelationshipField;
 use common::direct_access::frame::frame_repository::FrameRelationshipField;
@@ -168,11 +168,12 @@ impl ExtractFragmentUseCase {
 
         // ── Detect cross-cell selection ───────────────────────────
         // Check ALL blocks in range (not just endpoints) — an intermediate
-        // block could be in a different cell. A range holding a table's anchor holds the
-        // table whole, as a deletion of it takes the table: over a table of one cell, from
-        // its anchor on, the range only meets that cell, and a select all of a text that is
-        // such a table copied its words and not the table, which the cut then removed.
-        let is_cross_cell = range_covers_table_anchor(&store, start, end) || {
+        // block could be in a different cell. A range holding a whole table, as a deletion of
+        // it takes the table (see `range_holds_a_whole_table`), is copied with the table
+        // whole: over a table of one cell, from its anchor on, the range only meets that
+        // cell, and a select all of a text that is such a table copied its words and not the
+        // table, which the cut then removed.
+        let is_cross_cell = range_holds_a_whole_table(&store, start, end) || {
             let mut first_cell: Option<Option<EntityId>> = None;
             let mut cross = false;
             for block in &blocks {

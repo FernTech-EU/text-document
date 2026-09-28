@@ -2252,6 +2252,105 @@ fn pasting_into_an_empty_formatted_line_keeps_its_format() {
     assert_eq!(doc.to_djot().unwrap(), "# Kept");
 }
 
+/// A cut of all of a text leaves its cursor standing for the whole of the empty text, so the
+/// paste that follows gives the text back as it was. Any edit made between the two ends
+/// that: a heading, a list item or a quotation the writer makes of the emptied line, by this
+/// cursor or another, or a text a load puts in, is the line the paste goes into, as it is
+/// for a paste into any empty formatted line. The mark outlived every edit that moved no
+/// text, and the paste took off the formatting the writer had just given the line.
+#[test]
+fn an_edit_after_a_cut_of_everything_is_kept_by_the_paste() {
+    type Edit = fn(&TextDocument, &text_document::TextCursor);
+    fn heading() -> text_document::BlockFormat {
+        text_document::BlockFormat {
+            heading_level: Some(1),
+            ..Default::default()
+        }
+    }
+    let edits: [(&str, Edit); 6] = [
+        ("a heading", |_, cursor| {
+            cursor.set_block_format(&heading()).unwrap();
+        }),
+        ("a list item", |_, cursor| {
+            cursor.create_list(text_document::ListStyle::Disc).unwrap();
+        }),
+        ("a quotation", |_, cursor| {
+            cursor.insert_blockquote().unwrap();
+        }),
+        ("a heading another cursor makes", |doc, _| {
+            doc.cursor().set_block_format(&heading()).unwrap();
+        }),
+        ("a heading loaded as Djot", |doc, _| {
+            doc.set_djot_sync("#\n").unwrap();
+        }),
+        ("a heading loaded as HTML", |doc, _| {
+            doc.set_html("<h1></h1>").unwrap().wait().unwrap();
+        }),
+    ];
+    let source = load("One.\n\nTwo.\n");
+    let copied = select(&source, 0, length(&source)).selection();
+    for (name, edit) in edits {
+        // The same edit of a new text's empty line, and the paste into it.
+        let fresh = TextDocument::new();
+        let cursor = fresh.cursor();
+        edit(&fresh, &cursor);
+        cursor.insert_fragment(&copied).unwrap();
+        let expected = fresh.to_djot().unwrap();
+
+        let doc = load("Alpha.\n\nBeta.\n");
+        let cursor = select(&doc, 0, length(&doc));
+        cursor.remove_selected_text().unwrap();
+        edit(&doc, &cursor);
+        cursor.insert_fragment(&copied).unwrap();
+        assert_model(&doc, &format!("{name}, then a paste"));
+        assert_eq!(
+            doc.to_djot().unwrap(),
+            expected,
+            "{name} made of the line a cut of everything left, then a paste"
+        );
+    }
+}
+
+/// Cut everything, paste it back, undo the paste and paste again: the second paste should
+/// give the text back as the first did. It goes into the line the undo leaves, which keeps
+/// the formatting and the quotation of the first paragraph cut, and a scene opening with an
+/// epigraph comes back quoted from end to end. The mark saying that line stands for the whole
+/// text is the cursor's, and ends with the first paste; an undo or a redo back to the empty
+/// text cannot give it back, since the history does not say what that line is.
+#[test]
+#[ignore = "the cut's whole-text mark does not survive an undo or a redo; restoring it needs \
+            the history to carry it, a design change beyond a patch release"]
+fn pasting_again_after_undoing_the_paste_of_a_cut_of_everything_changes_nothing() {
+    let text = "> {semantic_role=epigraph}\n> The sea.\n\n# Title\n\nAlpha.\n";
+    let doc = load(text);
+    let original = doc.to_djot().unwrap();
+    let cursor = select(&doc, 0, length(&doc));
+    let cut = cursor.selection();
+    cursor.remove_selected_text().unwrap();
+    cursor.insert_fragment(&cut).unwrap();
+    assert_eq!(doc.to_djot().unwrap(), original, "the first paste");
+    doc.undo().unwrap();
+    cursor.insert_fragment(&cut).unwrap();
+    assert_eq!(
+        doc.to_djot().unwrap(),
+        original,
+        "a second paste after undoing the first"
+    );
+
+    let doc = load(text);
+    let cursor = select(&doc, 0, length(&doc));
+    let cut = cursor.selection();
+    cursor.remove_selected_text().unwrap();
+    doc.undo().unwrap();
+    doc.redo().unwrap();
+    cursor.insert_fragment(&cut).unwrap();
+    assert_eq!(
+        doc.to_djot().unwrap(),
+        original,
+        "a paste after the cut undone and redone"
+    );
+}
+
 /// Selecting all of a text and pasting a phrase over it, a few words copied from the text or
 /// from a web page, is an edit of the text's first paragraph, as typing over everything is:
 /// the phrase takes that paragraph's direction, alignment, heading level and quotation. Every

@@ -557,3 +557,39 @@ fn cursor_on_empty_document() {
     assert_eq!(c.block_number(), 0);
     assert_eq!(c.position_in_block(), 0);
 }
+
+/// At the end of a paragraph followed by another, the caret is in the paragraph it ends,
+/// and the queries of the caret's block read that paragraph. They read the block at the
+/// caret's character index, which there is the separator after the paragraph, and belongs
+/// to the next one: `at_block_end` was false at the end of every paragraph but the last,
+/// `position_in_block` was 0 there, `block_number` the next paragraph's, a selection of the
+/// block under the caret selected the next paragraph, and a caret ending a paragraph
+/// followed by an empty one was in an empty block.
+#[test]
+fn block_queries_at_the_end_of_a_paragraph_read_that_paragraph() {
+    let doc = new_doc("Hello\n\nWorld");
+    let c = doc.cursor_at(5);
+    assert!(c.at_block_end(), "at the end of Hello");
+    assert!(!c.at_block_start());
+    assert_eq!(c.block_number(), 0);
+    assert_eq!(c.position_in_block(), 5);
+    assert!(!c.current_block_is_empty());
+    c.select(SelectionType::BlockUnderCursor);
+    assert_eq!(c.selected_text().unwrap(), "Hello");
+
+    // The empty paragraph: its own start and end.
+    let c = doc.cursor_at(6);
+    assert!(c.at_block_start() && c.at_block_end());
+    assert!(c.current_block_is_empty());
+    assert_eq!(c.block_number(), 1);
+    assert_eq!(c.position_in_block(), 0);
+
+    // The start of the paragraph after it is in that paragraph.
+    let c = doc.cursor_at(7);
+    assert!(c.at_block_start());
+    assert!(!c.at_block_end());
+    assert_eq!(c.block_number(), 2);
+    assert_eq!(c.position_in_block(), 0);
+    c.select(SelectionType::LineUnderCursor);
+    assert_eq!(c.selected_text().unwrap(), "World");
+}

@@ -522,33 +522,36 @@ impl TextCursor {
     }
 
     // ── Boundary queries ─────────────────────────────────────
+    //
+    // Each reads the caret's block (see `caret_block`): at the end of a paragraph, the
+    // paragraph the caret ends, as `current_list` and `TextDocument::block_at_caret` read it.
+
+    /// The block the caret at `position` is in (see `block_at_caret_dto`). At the end of a
+    /// paragraph, the character index is the separator after it, which belongs to the next
+    /// paragraph: the queries of the caret's block that read the block at the character index
+    /// put a caret ending a quoted paragraph out of its quotation, and one ending the
+    /// paragraph before a quotation in it.
+    fn caret_block(
+        inner: &TextDocumentInner,
+        position: usize,
+    ) -> Option<frontend::document_inspection::BlockInfoDto> {
+        crate::inner::block_at_caret_dto(&inner.ctx, position).ok()
+    }
 
     /// True if the cursor is at the start of a block.
     pub fn at_block_start(&self) -> bool {
         let pos = self.position();
         let inner = self.doc.lock();
-        let dto = frontend::document_inspection::GetBlockAtPositionDto {
-            position: to_i64(pos),
-        };
-        if let Ok(info) = document_inspection_commands::get_block_at_position(&inner.ctx, &dto) {
-            pos == to_usize(info.block_start)
-        } else {
-            false
-        }
+        Self::caret_block(&inner, pos).is_some_and(|info| pos == to_usize(info.block_start))
     }
 
-    /// True if the cursor is at the end of a block.
+    /// True if the cursor is at the end of a block: at the end of every paragraph, not only
+    /// the last one.
     pub fn at_block_end(&self) -> bool {
         let pos = self.position();
         let inner = self.doc.lock();
-        let dto = frontend::document_inspection::GetBlockAtPositionDto {
-            position: to_i64(pos),
-        };
-        if let Ok(info) = document_inspection_commands::get_block_at_position(&inner.ctx, &dto) {
-            pos == to_usize(info.block_start) + to_usize(info.block_length)
-        } else {
-            false
-        }
+        Self::caret_block(&inner, pos)
+            .is_some_and(|info| pos == to_usize(info.block_start) + to_usize(info.block_length))
     }
 
     /// True if the cursor is at position 0.
@@ -567,24 +570,16 @@ impl TextCursor {
     pub fn block_number(&self) -> usize {
         let pos = self.position();
         let inner = self.doc.lock();
-        let dto = frontend::document_inspection::GetBlockAtPositionDto {
-            position: to_i64(pos),
-        };
-        document_inspection_commands::get_block_at_position(&inner.ctx, &dto)
-            .map(|info| to_usize(info.block_number))
-            .unwrap_or(0)
+        Self::caret_block(&inner, pos).map_or(0, |info| to_usize(info.block_number))
     }
 
-    /// The cursor's column within the current block (0-indexed).
+    /// The cursor's column within the current block (0-indexed): at the end of a paragraph,
+    /// the paragraph's length.
     pub fn position_in_block(&self) -> usize {
         let pos = self.position();
         let inner = self.doc.lock();
-        let dto = frontend::document_inspection::GetBlockAtPositionDto {
-            position: to_i64(pos),
-        };
-        document_inspection_commands::get_block_at_position(&inner.ctx, &dto)
-            .map(|info| pos.saturating_sub(to_usize(info.block_start)))
-            .unwrap_or(0)
+        Self::caret_block(&inner, pos)
+            .map_or(0, |info| pos.saturating_sub(to_usize(info.block_start)))
     }
 
     // ── Movement ─────────────────────────────────────────────
@@ -614,7 +609,7 @@ impl TextCursor {
         if mode == MoveMode::KeepAnchor {
             let anchor = self.data.lock().anchor;
             let pos_cell = self.table_cell_at(pos);
-            let anchor_cell = self.table_cell_at(anchor);
+            let anchor_cell = self.selection_anchor_cell(anchor, pos_cell.as_ref());
             match (&pos_cell, &anchor_cell) {
                 (Some(tc), None) => {
                     // Position is inside a table, anchor is outside.
@@ -701,12 +696,8 @@ impl TextCursor {
             SelectionType::BlockUnderCursor | SelectionType::LineUnderCursor => {
                 let pos = self.position();
                 let inner = self.doc.lock();
-                let dto = frontend::document_inspection::GetBlockAtPositionDto {
-                    position: to_i64(pos),
-                };
-                if let Ok(info) =
-                    document_inspection_commands::get_block_at_position(&inner.ctx, &dto)
-                {
+                // The caret's block: at the end of a paragraph, that paragraph.
+                if let Some(info) = Self::caret_block(&inner, pos) {
                     let start = to_usize(info.block_start);
                     let end = start + to_usize(info.block_length);
                     drop(inner);
@@ -1141,11 +1132,12 @@ impl TextCursor {
         origin: InsertionOrigin,
     ) -> Result<()> {
         let (pos, anchor) = self.read_cursor();
-        // All of an empty text selected: nothing to remove, and still the whole text to
-        // replace (see `CursorData::whole_text_selected`).
-        let replacing_an_empty_text = pos == anchor && self.data.lock().whole_text_selected;
         let queued = {
             let mut inner = self.doc.lock();
+            // All of an empty text selected: nothing to remove, and still the whole text to
+            // replace (see `CursorData::whole_text_selected`). Read under the document's
+            // lock, which every edit ending that selection holds.
+            let replacing_an_empty_text = pos == anchor && self.data.lock().whole_text_selected;
 
             // Where the paste went in and what it added are measured, as a
             // deletion's removal is: the caret after a paste does not always
@@ -1464,17 +1456,14 @@ impl TextCursor {
     pub fn current_frame(&self) -> Option<FrameRef> {
         let pos = self.position();
         let inner = self.doc.lock();
-        let dto = frontend::document_inspection::GetBlockAtPositionDto {
-            position: to_i64(pos),
-        };
-        let block_info =
-            document_inspection_commands::get_block_at_position(&inner.ctx, &dto).ok()?;
+        let block_info = Self::caret_block(&inner, pos)?;
         let block_id = block_info.block_id as u64;
         cursor_frame_ref(&inner, block_id)
     }
 
     /// True if the cursor's block lives inside any blockquote frame
-    /// (at any nesting level).
+    /// (at any nesting level). The block is the caret's: at the end of a
+    /// quoted paragraph, that paragraph, whatever follows it.
     pub fn is_in_blockquote(&self) -> bool {
         self.current_blockquote_frame_id().is_some()
     }
@@ -1484,11 +1473,7 @@ impl TextCursor {
     pub fn current_blockquote_frame_id(&self) -> Option<usize> {
         let pos = self.position();
         let inner = self.doc.lock();
-        let dto = frontend::document_inspection::GetBlockAtPositionDto {
-            position: to_i64(pos),
-        };
-        let block_info =
-            document_inspection_commands::get_block_at_position(&inner.ctx, &dto).ok()?;
+        let block_info = Self::caret_block(&inner, pos)?;
         innermost_blockquote_frame_id(&inner, block_info.block_id as u64)
     }
 
@@ -1497,12 +1482,7 @@ impl TextCursor {
     pub fn blockquote_depth_at_cursor(&self) -> usize {
         let pos = self.position();
         let inner = self.doc.lock();
-        let dto = frontend::document_inspection::GetBlockAtPositionDto {
-            position: to_i64(pos),
-        };
-        let Some(block_info) =
-            document_inspection_commands::get_block_at_position(&inner.ctx, &dto).ok()
-        else {
+        let Some(block_info) = Self::caret_block(&inner, pos) else {
             return 0;
         };
         blockquote_depth_for_block(&inner, block_info.block_id as u64)
@@ -1535,12 +1515,7 @@ impl TextCursor {
     pub fn current_block_is_empty(&self) -> bool {
         let pos = self.position();
         let inner = self.doc.lock();
-        let dto = frontend::document_inspection::GetBlockAtPositionDto {
-            position: to_i64(pos),
-        };
-        let Some(block_info) =
-            document_inspection_commands::get_block_at_position(&inner.ctx, &dto).ok()
-        else {
+        let Some(block_info) = Self::caret_block(&inner, pos) else {
             return false;
         };
         let store = inner.ctx.db_context.get_store();
@@ -1567,26 +1542,41 @@ impl TextCursor {
             return false;
         }
         let inner = self.doc.lock();
-        let pos_dto = frontend::document_inspection::GetBlockAtPositionDto {
-            position: to_i64(pos),
-        };
-        let anchor_dto = frontend::document_inspection::GetBlockAtPositionDto {
-            position: to_i64(anchor),
-        };
-        let Some(pos_block) =
-            document_inspection_commands::get_block_at_position(&inner.ctx, &pos_dto).ok()
-        else {
+        // The blocks the selection's first and last characters are in (see
+        // `selection_block_ids`).
+        let Some((first, last)) = Self::selection_block_ids(&inner, pos, anchor) else {
             return false;
         };
-        let Some(anchor_block) =
-            document_inspection_commands::get_block_at_position(&inner.ctx, &anchor_dto).ok()
-        else {
-            return false;
-        };
-        let pos_owner = crate::text_block::find_parent_frame(&inner, pos_block.block_id as u64);
-        let anchor_owner =
-            crate::text_block::find_parent_frame(&inner, anchor_block.block_id as u64);
-        pos_owner != anchor_owner
+        crate::text_block::find_parent_frame(&inner, first)
+            != crate::text_block::find_parent_frame(&inner, last)
+    }
+
+    /// The blocks the selection from `pos` to `anchor` starts and ends in: the block at the
+    /// character index of its start, and the caret's block at its end (see `caret_block`),
+    /// so a selection ending at the end of a paragraph ends in that paragraph. Read at the
+    /// character index, its end was the next paragraph: a selection of exactly one paragraph
+    /// was quoted with the one after it, and a selection of all of a quoted paragraph was
+    /// taken for one across two frames. A caret, `pos` and `anchor` equal, is in the caret's
+    /// block at both ends.
+    fn selection_block_ids(
+        inner: &TextDocumentInner,
+        pos: usize,
+        anchor: usize,
+    ) -> Option<(u64, u64)> {
+        let (lo, hi) = (pos.min(anchor), pos.max(anchor));
+        let last = Self::caret_block(inner, hi)?.block_id as u64;
+        if lo == hi {
+            return Some((last, last));
+        }
+        let first = document_inspection_commands::get_block_at_position(
+            &inner.ctx,
+            &frontend::document_inspection::GetBlockAtPositionDto {
+                position: to_i64(lo),
+            },
+        )
+        .ok()?
+        .block_id as u64;
+        Some((first, last))
     }
 
     // ── Blockquote mutations ──────────
@@ -1748,33 +1738,24 @@ impl TextCursor {
         Ok(())
     }
 
+    /// The caret's block (see `caret_block`): at the end of the last quoted paragraph, the
+    /// paragraph lifted out of its quotation is that one.
     fn current_block_id_for_mutation(&self) -> Result<usize> {
         let pos = self.position();
         let inner = self.doc.lock();
-        let dto = frontend::document_inspection::GetBlockAtPositionDto {
-            position: to_i64(pos),
-        };
-        let block_info = document_inspection_commands::get_block_at_position(&inner.ctx, &dto)
-            .map_err(|e| anyhow::anyhow!("get_block_at_position: {}", e))?;
+        let block_info = crate::inner::block_at_caret_dto(&inner.ctx, pos)?;
         Ok(block_info.block_id as usize)
     }
 
+    /// The first and last blocks of the selection, or the caret's block twice (see
+    /// `selection_block_ids`): with the caret at the end of a paragraph, the paragraph
+    /// quoted is that one, where it was the next.
     fn resolve_selection_block_range(&self) -> Result<(usize, usize)> {
         let (pos, anchor) = self.read_cursor();
-        let lo = pos.min(anchor);
-        let hi = pos.max(anchor);
         let inner = self.doc.lock();
-        let lo_dto = frontend::document_inspection::GetBlockAtPositionDto {
-            position: to_i64(lo),
-        };
-        let hi_dto = frontend::document_inspection::GetBlockAtPositionDto {
-            position: to_i64(hi),
-        };
-        let lo_block = document_inspection_commands::get_block_at_position(&inner.ctx, &lo_dto)
-            .map_err(|e| anyhow::anyhow!("get_block_at_position(start): {}", e))?;
-        let hi_block = document_inspection_commands::get_block_at_position(&inner.ctx, &hi_dto)
-            .map_err(|e| anyhow::anyhow!("get_block_at_position(end): {}", e))?;
-        Ok((lo_block.block_id as usize, hi_block.block_id as usize))
+        let (first, last) = Self::selection_block_ids(&inner, pos, anchor)
+            .ok_or_else(|| DocumentError::NotFound("no block at the selection's ends".into()))?;
+        Ok((first as usize, last as usize))
     }
 
     // ── Table structure mutations (explicit-ID) ──────────
@@ -2074,29 +2055,14 @@ impl TextCursor {
             DocumentError::InvalidCursorContext("cursor position is not inside a table".into())
         })?;
 
-        // Get anchor cell
+        // The anchor's cell, read as the position's is, as a caret's (see `table_cell_at`):
+        // at the end of a cell's text, that cell. Read at the character index, it was the
+        // next cell, and a selection from the end of a cell's text into the next merged the
+        // next cell alone.
         let (_pos, anchor) = self.read_cursor();
-        let anchor_cell = {
-            // Create a temporary block handle at the anchor position
-            let inner = self.doc.lock();
-            let dto = frontend::document_inspection::GetBlockAtPositionDto {
-                position: to_i64(anchor),
-            };
-            let block_info = document_inspection_commands::get_block_at_position(&inner.ctx, &dto)
-                .map_err(|_| {
-                    DocumentError::InvalidCursorContext(
-                        "cursor anchor is not inside a table".into(),
-                    )
-                })?;
-            let block = crate::text_block::TextBlock {
-                doc: self.doc.clone(),
-                block_id: block_info.block_id as usize,
-            };
-            drop(inner);
-            block.table_cell().ok_or_else(|| {
-                DocumentError::InvalidCursorContext("cursor anchor is not inside a table".into())
-            })?
-        };
+        let anchor_cell = self.table_cell_at(anchor).ok_or_else(|| {
+            DocumentError::InvalidCursorContext("cursor anchor is not inside a table".into())
+        })?;
 
         if pos_cell.table.id() != anchor_cell.table.id() {
             return Err(DocumentError::InvalidArgument(
@@ -2174,7 +2140,7 @@ impl TextCursor {
 
         // Look up table cell for position and anchor
         let pos_cell = self.table_cell_at(pos);
-        let anchor_cell = self.table_cell_at(anchor);
+        let anchor_cell = self.selection_anchor_cell(anchor, pos_cell.as_ref());
 
         match (&pos_cell, &anchor_cell) {
             (None, None) => {
@@ -2406,6 +2372,55 @@ impl TextCursor {
         block.table_cell()
     }
 
+    /// The cell a selection's fixed end `anchor` stands in, given the cell `position_cell`
+    /// its moving end stands in, for the table trap of [`set_position`](Self::set_position)
+    /// and for [`selection_kind`](Self::selection_kind).
+    ///
+    /// On a table's anchor, that is the table's first cell only when the moving end is in
+    /// the same table. A selection from a table's anchor that runs back before the table ends
+    /// there and holds none of it; one that runs past the table holds it whole, from its
+    /// start; one that runs into a table before it takes that table in whole, as the table
+    /// trap does for any selection entering a table from outside it. Read as in the first cell
+    /// whatever the moving end did, a selection started on the anchor, where the Right or the
+    /// Down arrow from the paragraph before a table leaves the caret, jumped forward over the
+    /// table when dragged back into that paragraph, and dragged into the table before it was
+    /// taken for one between two tables: the cut emptied that table's cells, left its grid,
+    /// and the paste put their words back into its first cell. A moving end on a table's
+    /// anchor stands in the first cell, as a caret there does: moved onto it from the
+    /// paragraph before, a selection takes the table in.
+    fn selection_anchor_cell(
+        &self,
+        anchor: usize,
+        position_cell: Option<&TableCellRef>,
+    ) -> Option<TableCellRef> {
+        let cell = self.table_cell_at(anchor)?;
+        let on_table_anchor = {
+            let inner = self.doc.lock();
+            common::database::rope_helpers::snap_off_table_anchor(
+                inner.ctx.db_context.get_store(),
+                to_i64(anchor),
+                true,
+            ) != to_i64(anchor)
+        };
+        let moving_end_in_the_table =
+            position_cell.is_some_and(|moving| moving.table.id() == cell.table.id());
+        (!on_table_anchor || moving_end_in_the_table).then_some(cell)
+    }
+
+    /// `position`, or, when it falls on a table's anchor, the end of what comes before the
+    /// table, for the moves that step back over the text. A lookup on the anchor reads the
+    /// table's first cell, as a caret there does (see `block_at_caret_dto`): stepping back
+    /// from the start of that cell met the cell again, and a word to the left, a paragraph
+    /// up or the previous word went nowhere.
+    fn back_off_table_anchor(&self, position: usize) -> usize {
+        let inner = self.doc.lock();
+        to_usize(common::database::rope_helpers::snap_off_table_anchor(
+            inner.ctx.db_context.get_store(),
+            to_i64(position),
+            false,
+        ))
+    }
+
     /// Find the document position at the boundary of the block adjacent to a
     /// table. Used by the table-trap logic in [`set_position`](Self::set_position).
     ///
@@ -2575,7 +2590,7 @@ impl TextCursor {
         let queued = {
             let mut inner = self.doc.lock();
             let (result, removed) = measured_delete(&inner, pos, anchor)?;
-            self.finish_delete(
+            let stands_for_the_empty_text = self.finish_delete(
                 &mut inner,
                 pos.min(anchor),
                 removed,
@@ -2583,7 +2598,10 @@ impl TextCursor {
                 true,
             );
             // Return the deleted text alongside the queued events
-            (result.deleted_text, self.queue_undo_redo_event(&mut inner))
+            (
+                result.deleted_text,
+                self.announce_deletion(&mut inner, stands_for_the_empty_text),
+            )
         };
         crate::inner::dispatch_queued_events(queued.1);
         Ok(queued.0)
@@ -3039,14 +3057,14 @@ impl TextCursor {
         let queued = {
             let mut inner = self.doc.lock();
             let (result, removed) = measured_delete(&inner, pos, anchor)?;
-            self.finish_delete(
+            let stands_for_the_empty_text = self.finish_delete(
                 &mut inner,
                 pos.min(anchor),
                 removed,
                 result.new_position,
                 selection,
             );
-            self.queue_undo_redo_event(&mut inner)
+            self.announce_deletion(&mut inner, stands_for_the_empty_text)
         };
         crate::inner::dispatch_queued_events(queued);
         Ok(())
@@ -3066,6 +3084,11 @@ impl TextCursor {
     /// cut left had kept from the first one: a scene opening with an epigraph
     /// came back quoted from end to end. Typing keeps that formatting, as it
     /// does over a selection, and any other move or edit ends it.
+    ///
+    /// Returns whether the cursor stands for the empty text: the caller marks
+    /// it so once the deletion's history is announced (see
+    /// [`announce_deletion`](Self::announce_deletion)), which ends every
+    /// whole-text selection taken before it.
     fn finish_delete(
         &self,
         inner: &mut TextDocumentInner,
@@ -3073,7 +3096,7 @@ impl TextCursor {
         removed: usize,
         new_position: i64,
         selection: bool,
-    ) {
+    ) -> bool {
         let new_pos = to_usize(new_position);
         // A range that empties a table cell takes the cell's text from its
         // start, which can lie before the range's: the caret goes there, and
@@ -3088,7 +3111,7 @@ impl TextCursor {
             let mut d = self.data.lock();
             d.position = new_pos;
             d.anchor = new_pos;
-            d.whole_text_selected = stands_for_the_empty_text;
+            d.whole_text_selected = false;
         }
         if removed > 0 {
             inner.modified = true;
@@ -3103,6 +3126,21 @@ impl TextCursor {
         }
         inner.check_block_count_changed();
         inner.check_flow_changed();
+        stands_for_the_empty_text
+    }
+
+    /// Close a deletion: its history announced, which ends every whole-text selection (see
+    /// `TextDocumentInner::end_whole_text_selections`), then this cursor marked as standing
+    /// for the whole of the empty text when the removal left it so (see
+    /// [`finish_delete`](Self::finish_delete)). Returns the events to dispatch.
+    fn announce_deletion(
+        &self,
+        inner: &mut TextDocumentInner,
+        stands_for_the_empty_text: bool,
+    ) -> QueuedEvents {
+        let queued = self.queue_undo_redo_event(inner);
+        self.data.lock().whole_text_selected = stands_for_the_empty_text;
+        queued
     }
 
     /// Resolve a MoveOperation to a concrete position.
@@ -3177,10 +3215,16 @@ impl TextCursor {
                         .map(|info| to_usize(info.block_start))
                         .unwrap_or(pos);
                 if block_start >= 2 {
-                    // Skip past the block separator (which maps to the current block)
-                    let prev_dto = frontend::document_inspection::GetBlockAtPositionDto {
-                        position: to_i64(block_start - 2),
-                    };
+                    // Skip past the block separator (which maps to the current block), and
+                    // back over a table's anchor when the block is the table's first cell:
+                    // the anchor reads as that cell, and the move went nowhere.
+                    let before = common::database::rope_helpers::snap_off_table_anchor(
+                        inner.ctx.db_context.get_store(),
+                        to_i64(block_start - 2),
+                        false,
+                    );
+                    let prev_dto =
+                        frontend::document_inspection::GetBlockAtPositionDto { position: before };
                     document_inspection_commands::get_block_at_position(&inner.ctx, &prev_dto)
                         .map(|info| to_usize(info.block_start))
                         .unwrap_or(0)
@@ -3230,8 +3274,12 @@ impl TextCursor {
                     // to find the start of the previous word.
                     let mut search = pos - 1;
                     loop {
+                        // Back over a table's anchor, which reads as the table's first cell:
+                        // from the start of that cell, the scan met the cell's own word and
+                        // stopped where it began.
+                        search = self.back_off_table_anchor(search);
                         let (ws, we) = self.find_word_boundaries(search);
-                        if ws < we {
+                        if ws < we && ws < pos {
                             // Found a word; return its start
                             break ws;
                         }
@@ -3257,7 +3305,8 @@ impl TextCursor {
                     if start < cur && op == MoveOperation::StartOfSentence {
                         cur = start;
                     } else if cur > 0 {
-                        match self.find_sentence_boundaries(cur - 1) {
+                        // Back over a table's anchor (see `back_off_table_anchor`).
+                        match self.find_sentence_boundaries(self.back_off_table_anchor(cur - 1)) {
                             Some((prev, _)) if prev < cur => cur = prev,
                             // Nothing but whitespace behind: fall back to the block edge rather
                             // than stalling, so a repeated keystroke still makes progress.
@@ -3678,10 +3727,8 @@ fn blockquote_depth_for_block(inner: &TextDocumentInner, block_id: u64) -> usize
 fn block_position_in_current_frame(cursor: &TextCursor) -> Option<BlockEdge> {
     let pos = cursor.position();
     let inner = cursor.doc.lock();
-    let dto = frontend::document_inspection::GetBlockAtPositionDto {
-        position: to_i64(pos),
-    };
-    let block_info = document_inspection_commands::get_block_at_position(&inner.ctx, &dto).ok()?;
+    // The caret's block: at the end of the last paragraph of a quotation, that paragraph.
+    let block_info = TextCursor::caret_block(&inner, pos)?;
     let block_id = block_info.block_id as common::types::EntityId;
     let parent_id = crate::text_block::find_parent_frame(&inner, block_info.block_id as u64)?;
     let store = inner.ctx.db_context.get_store();
