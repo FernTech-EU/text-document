@@ -108,3 +108,131 @@ impl Drop for BackendInner {
         self.ctx.shutdown();
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{DocumentEvent, TextDocument};
+    use frontend::common::event::{LongOperationEvent, Origin};
+    use std::sync::mpsc;
+    use std::thread;
+    use std::time::{Duration, Instant};
+
+    /// How long a step that takes microseconds is given before the test calls the
+    /// backend stuck. A deadlock fails the test the same way however long this is,
+    /// so it is generous enough that a loaded CI runner cannot fail it by being slow.
+    const LIMIT: Duration = Duration::from_secs(10);
+
+    /// A document whose last handle is dropped while the pump is inside one of its
+    /// callbacks is destroyed on the pump thread, and the backend has to survive it.
+    ///
+    /// A long-operation callback upgrades the document's weak reference for as long
+    /// as it runs. When the host drops every handle of its own meanwhile, which is
+    /// what closing a tab or ending a test does right after an import returned, that
+    /// upgrade is the last reference, and the document's subscription tokens drop on
+    /// the pump. The pump used to hold the subscriber map across every callback, so
+    /// those tokens waited on the pump itself, and every later subscribe or
+    /// unsubscribe in the backend waited on them: building or dropping any sibling
+    /// document hung the host thread for good.
+    ///
+    /// The interleaving is forced rather than hoped for. The doomed document's
+    /// `Completed` callback takes its undo manager after upgrading, so holding that
+    /// lock parks the pump inside the callback with the reference in hand for as long
+    /// as the test needs to drop its own.
+    #[test]
+    fn a_document_destroyed_on_the_pump_leaves_the_backend_usable() {
+        let backend = DocumentBackend::new();
+
+        // Registered before any document, so on a `Completed` event the pump calls
+        // it first: once it has spoken, every `Progress` event is behind the pump.
+        let (completing_tx, completing_rx) = mpsc::channel();
+        let probe = backend.client().subscribe(
+            Origin::LongOperation(LongOperationEvent::Completed),
+            move |_| {
+                let _ = completing_tx.send(());
+            },
+        );
+
+        let doomed = TextDocument::new_in(&backend);
+        // Outlives `doomed`. Dropping it afterwards is what used to hang the host.
+        let sibling = TextDocument::new_in(&backend);
+
+        // Taken before the import starts, so the pump cannot get past it first. The
+        // import itself never touches the undo manager, only the callback does.
+        let history = Arc::clone(&doomed.inner.lock().ctx.undo_redo_manager);
+        let held = history.lock();
+        let operation = doomed
+            .set_djot("Gone by the time its import is announced.")
+            .expect("start the import");
+
+        let reached_callback = completing_rx.recv_timeout(LIMIT).is_ok() && {
+            // The pump's upgrade is the second reference, beside the test's own.
+            let deadline = Instant::now() + LIMIT;
+            while Arc::strong_count(&doomed.inner) < 2 && Instant::now() < deadline {
+                thread::yield_now();
+            }
+            Arc::strong_count(&doomed.inner) >= 2
+        };
+        assert!(
+            reached_callback,
+            "the import's completion did not reach the document's callback within \
+             {LIMIT:?}, so the interleaving this test forces never happened"
+        );
+
+        // The pump now holds the only reference. Releasing the undo manager lets the
+        // callback finish and destroy the document on the pump thread.
+        drop(doomed);
+        drop(held);
+        drop(operation);
+
+        // Everything the host does next goes through the subscriber map, so it runs
+        // on a thread of its own: a backend that deadlocked fails this test instead
+        // of hanging the test binary.
+        let (outcome_tx, outcome_rx) = mpsc::channel();
+        let host_backend = backend.clone();
+        thread::spawn(move || {
+            drop(sibling);
+            let fresh = TextDocument::new_in(&host_backend);
+            let imported = fresh
+                .set_djot("Still delivered.")
+                .ok()
+                .and_then(|op| op.wait_timeout(LIMIT))
+                .is_some_and(|result| result.is_ok());
+            // `wait` only proves the worker ran. The finished event proves the pump
+            // is still delivering, since it is what bridges that event in.
+            let deadline = Instant::now() + LIMIT;
+            let mut delivered = false;
+            while imported && !delivered && Instant::now() < deadline {
+                delivered = fresh
+                    .poll_events()
+                    .iter()
+                    .any(|e| matches!(e, DocumentEvent::LongOperationFinished { .. }));
+                if !delivered {
+                    thread::sleep(Duration::from_millis(5));
+                }
+            }
+            let _ = outcome_tx.send((imported, delivered));
+        });
+
+        let outcome = outcome_rx.recv_timeout(LIMIT * 3);
+        if outcome.is_err() {
+            // Dropping the probe would lock the map the stuck pump holds, and the
+            // test would hang in its own unwinding instead of failing.
+            std::mem::forget(probe);
+        }
+        let (imported, delivered) = outcome.unwrap_or_else(|_| {
+            panic!(
+                "dropping a sibling document and building a new one in the backend did \
+                 not return within {:?} after a document was destroyed on the pump: the \
+                 pump is waiting on the subscriber map it holds itself",
+                LIMIT * 3
+            )
+        });
+        assert!(imported, "the new document's import did not complete");
+        assert!(
+            delivered,
+            "the new document's import finished but its event never arrived: the pump \
+             stopped delivering after destroying a document"
+        );
+    }
+}
