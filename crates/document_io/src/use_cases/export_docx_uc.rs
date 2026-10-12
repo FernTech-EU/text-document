@@ -788,6 +788,7 @@ impl LongOperation for ExportDocxUseCase {
         })?;
         let mut xml_docx = docx.build();
         patch_comment_extras(&mut xml_docx, &prepared_comments)?;
+        order_section_properties(&mut xml_docx)?;
         xml_docx
             .pack(file)
             .map_err(|e| anyhow!("Failed to write DOCX: {}", e))?;
@@ -1351,6 +1352,7 @@ impl ExportDocxUseCase {
         let (docx, _paragraph_count, prepared_comments) = result?;
         let mut xml_docx = docx.build();
         patch_comment_extras(&mut xml_docx, &prepared_comments)?;
+        order_section_properties(&mut xml_docx)?;
         Ok(xml_docx)
     }
 
@@ -2635,6 +2637,141 @@ fn patch_comment_extras(xml_docx: &mut docx_rs::XMLDocx, spans: &[PreparedSpan])
     Ok(())
 }
 
+// ── Section properties in schema order ───────────────────────────────────────────────
+//
+// `CT_SectPr` is a sequence: its children have one order, and a strict reader may refuse a
+// file that breaks it. docx-rs 0.4.22 writes them in an order of its own
+// (`SectionProperty::build_to`: `pgSz`, `pgMar`, `cols`, `docGrid`, the header and footer
+// references, `pgNumType`, `textDirection`, `type`, `titlePg`), with no API to change it, so
+// the references come after the page geometry and `pgNumType` after `cols`, both out of
+// place. The children are reordered in the built `word/document.xml` instead, the same
+// post-`build()` door `patch_comment_extras` uses.
+
+/// `CT_SectPr`'s children in schema order (ECMA-376 Part 1, 17.6.17). The header and footer
+/// references share one rank: the schema lets them interleave, and their own order is kept.
+const SECT_PR_ORDER: &[&str] = &[
+    "headerReference|footerReference",
+    "footnotePr",
+    "endnotePr",
+    "type",
+    "pgSz",
+    "pgMar",
+    "paperSrc",
+    "pgBorders",
+    "lnNumType",
+    "pgNumType",
+    "cols",
+    "formProt",
+    "vAlign",
+    "noEndnote",
+    "titlePg",
+    "textDirection",
+    "bidi",
+    "rtlGutter",
+    "docGrid",
+    "printerSettings",
+    "sectPrChange",
+];
+
+/// The schema rank of a `w:` child of `w:sectPr`, `None` for a name the schema does not list.
+fn sect_pr_rank(name: &str) -> Option<usize> {
+    SECT_PR_ORDER
+        .iter()
+        .position(|names| names.split('|').any(|n| n == name))
+}
+
+/// Put the children of every `w:sectPr` in `word/document.xml` in schema order.
+fn order_section_properties(xml_docx: &mut docx_rs::XMLDocx) -> Result<()> {
+    let text = String::from_utf8(std::mem::take(&mut xml_docx.document))
+        .map_err(|e| anyhow!("word/document.xml was not valid UTF-8: {e}"))?;
+    xml_docx.document = reorder_sect_prs(&text).into_bytes();
+    Ok(())
+}
+
+/// [`order_section_properties`] over the document's text. A `w:sectPr` whose children are
+/// not a flat run of `w:` elements this function can delimit, or that holds a name the
+/// schema does not list, is left exactly as it was: reordering what it cannot read could
+/// only make it worse.
+fn reorder_sect_prs(xml: &str) -> String {
+    const OPEN: &str = "<w:sectPr>";
+    const CLOSE: &str = "</w:sectPr>";
+    let mut out = String::with_capacity(xml.len());
+    let mut rest = xml;
+    while let Some(start) = rest.find(OPEN) {
+        let inner_start = start + OPEN.len();
+        let Some(inner_len) = rest[inner_start..].find(CLOSE) else {
+            break;
+        };
+        let inner = &rest[inner_start..inner_start + inner_len];
+        out.push_str(&rest[..inner_start]);
+        match sect_pr_children(inner) {
+            Some(mut children) => {
+                // Stable: references keep their own order, and so would any repeat.
+                children.sort_by_key(|(rank, _)| *rank);
+                for (_, child) in children {
+                    out.push_str(child);
+                }
+            }
+            None => out.push_str(inner),
+        }
+        out.push_str(CLOSE);
+        rest = &rest[inner_start + inner_len + CLOSE.len()..];
+    }
+    out.push_str(rest);
+    out
+}
+
+/// The children of one `w:sectPr`'s content, each with its schema rank, or `None` when the
+/// content is anything but a run of `w:` elements with known names. An element is either
+/// self-closing or closed by its own end tag. A `w:sectPrChange` holds a `w:sectPr` of its
+/// own, which the caller's search cannot pair correctly, so meeting one leaves the whole
+/// section as it was.
+fn sect_pr_children(inner: &str) -> Option<Vec<(usize, &str)>> {
+    let mut children = Vec::new();
+    let mut at = 0;
+    while at < inner.len() {
+        let rest = &inner[at..];
+        if rest.starts_with(char::is_whitespace) {
+            let skip = rest.len() - rest.trim_start().len();
+            at += skip;
+            continue;
+        }
+        let name_start = rest.strip_prefix("<w:")?;
+        let name_len = name_start.find(|c: char| c.is_whitespace() || c == '/' || c == '>')?;
+        let name = &name_start[..name_len];
+        if name == "sectPrChange" {
+            return None;
+        }
+        let rank = sect_pr_rank(name)?;
+        let tag_end = tag_end(rest)?;
+        let len = if rest[..tag_end].ends_with("/>") {
+            tag_end
+        } else {
+            let close = format!("</w:{name}>");
+            tag_end + rest[tag_end..].find(&close)? + close.len()
+        };
+        children.push((rank, &rest[..len]));
+        at += len;
+    }
+    Some(children)
+}
+
+/// The length of the start tag `tag` opens with, through its `>`, skipping a `>` inside a
+/// quoted attribute value.
+fn tag_end(tag: &str) -> Option<usize> {
+    let mut quote: Option<char> = None;
+    for (i, c) in tag.char_indices() {
+        match (quote, c) {
+            (Some(q), c) if c == q => quote = None,
+            (Some(_), _) => {}
+            (None, '"' | '\'') => quote = Some(c),
+            (None, '>') => return Some(i + 1),
+            (None, _) => {}
+        }
+    }
+    None
+}
+
 /// Skribisto's own extension namespace, used only to carry
 /// [`common::parser_tools::DocumentComment::uid`] on a `<w:comment>` — see
 /// `patch_comment_extras`. Versioned so a future incompatible shape change
@@ -2684,4 +2821,88 @@ fn xml_attr_escape(s: &str) -> String {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::reorder_sect_prs;
+
+    /// What docx-rs 0.4.22 writes for a body section with a header and a numbering restart.
+    const DOCX_RS_ORDER: &str = "<w:body><w:p/><w:sectPr><w:pgSz w:w=\"11906\" w:h=\"16838\" />\
+         <w:pgMar w:top=\"1440\" w:right=\"1440\" w:bottom=\"1440\" w:left=\"1440\" w:header=\"851\" w:footer=\"992\" w:gutter=\"0\" />\
+         <w:cols w:space=\"425\" w:num=\"1\" /><w:headerReference w:type=\"default\" r:id=\"rIdHeader1\" />\
+         <w:pgNumType w:start=\"1\" /><w:type w:val=\"nextPage\" /><w:titlePg /></w:sectPr></w:body>";
+
+    fn names(xml: &str) -> Vec<String> {
+        let start = xml.find("<w:sectPr>").expect("a section") + "<w:sectPr>".len();
+        let end = xml.find("</w:sectPr>").expect("closed");
+        xml[start..end]
+            .split('<')
+            .filter_map(|t| t.strip_prefix("w:"))
+            .map(|t| t.split([' ', '/', '>']).next().unwrap_or("").to_string())
+            .collect()
+    }
+
+    #[test]
+    fn section_children_come_out_in_schema_order() {
+        let out = reorder_sect_prs(DOCX_RS_ORDER);
+        assert_eq!(
+            names(&out),
+            [
+                "headerReference",
+                "type",
+                "pgSz",
+                "pgMar",
+                "pgNumType",
+                "cols",
+                "titlePg"
+            ]
+        );
+        assert!(
+            out.starts_with("<w:body><w:p/><w:sectPr><w:headerReference "),
+            "{out}"
+        );
+        assert!(out.ends_with("</w:sectPr></w:body>"), "{out}");
+        assert_eq!(
+            out.len(),
+            DOCX_RS_ORDER.len(),
+            "nothing added or lost: {out}"
+        );
+    }
+
+    #[test]
+    fn every_section_is_reordered_and_the_text_between_is_kept() {
+        let two = format!(
+            "<w:p><w:pPr><w:sectPr><w:pgSz w:w=\"1\" /><w:headerReference w:type=\"first\" r:id=\"a\" /></w:sectPr></w:pPr></w:p>{DOCX_RS_ORDER}"
+        );
+        let out = reorder_sect_prs(&two);
+        assert!(
+            out.starts_with("<w:p><w:pPr><w:sectPr><w:headerReference w:type=\"first\" r:id=\"a\" /><w:pgSz w:w=\"1\" /></w:sectPr></w:pPr></w:p>"),
+            "{out}"
+        );
+        assert!(
+            out.contains("<w:sectPr><w:headerReference w:type=\"default\""),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn a_section_it_cannot_read_is_left_alone() {
+        for odd in [
+            "<w:sectPr><w:pgSz /><w:unknownThing /></w:sectPr>",
+            "<w:sectPr><w:pgSz />text<w:cols /></w:sectPr>",
+            "<w:sectPr><w:pgSz /><w:pgNumType w:start=\"1\"></w:sectPr>",
+        ] {
+            assert_eq!(reorder_sect_prs(odd), odd);
+        }
+    }
+
+    #[test]
+    fn a_quoted_bracket_does_not_end_a_tag() {
+        let xml = "<w:sectPr><w:pgSz w:x=\"a>b\" /><w:headerReference r:id=\"c\" /></w:sectPr>";
+        assert_eq!(
+            reorder_sect_prs(xml),
+            "<w:sectPr><w:headerReference r:id=\"c\" /><w:pgSz w:x=\"a>b\" /></w:sectPr>"
+        );
+    }
 }

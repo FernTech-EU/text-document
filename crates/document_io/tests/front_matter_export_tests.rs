@@ -138,18 +138,18 @@ fn odt_options() -> OdtExportOptions {
 fn docx_bytes(djot: &str, options: DocxExportOptions) -> Vec<u8> {
     let (db, ev, _) = setup().expect("setup");
     import_djot(&db, &ev, djot);
-    let docx = document_io_controller::build_docx_document(
+    // The XML the export writes, after its post-`build()` passes (the section order among
+    // them), packed the way `export_docx` packs it.
+    let xml_docx = document_io_controller::build_docx_xml_document(
         &db,
         &ExportDocxDto {
             output_path: String::new(),
             options,
         },
     )
-    .expect("build_docx_document");
+    .expect("build_docx_xml_document");
     let mut buf = std::io::Cursor::new(Vec::new());
-    docx.build()
-        .pack(&mut buf)
-        .expect("docx-rs pack into memory");
+    xml_docx.pack(&mut buf).expect("docx-rs pack into memory");
     buf.into_inner()
 }
 
@@ -265,6 +265,35 @@ fn docx_front_matter_ends_in_a_section_of_its_own_without_a_header() {
         "the body is numbered from 1: {body}"
     );
     assert!(!body.contains("<w:type "), "{body}");
+}
+
+/// The children of the `w:sectPr` element `section`, by local name.
+fn sect_pr_children(section: &str) -> Vec<&str> {
+    section
+        .split('<')
+        .skip(2)
+        .filter_map(|t| t.strip_prefix("w:"))
+        .map(|t| t.split([' ', '/', '>']).next().unwrap_or(""))
+        .collect()
+}
+
+/// Both sections list their children in `CT_SectPr`'s order: references first, then the
+/// page, then the numbering, then the columns. docx-rs writes its own order, which a strict
+/// reader may refuse, and the export puts them back.
+#[test]
+fn docx_sections_list_their_children_in_schema_order() {
+    let xml = zip_text(&docx_bytes(BOOK, docx_options()), "word/document.xml");
+    let byline = docx_paragraph(&xml, "by Ada Vane");
+    let start = byline.find("<w:sectPr>").expect("a section break");
+    let end = start + byline[start..].find("</w:sectPr>").expect("closed");
+    assert_eq!(
+        sect_pr_children(&byline[start..end]),
+        ["pgSz", "pgMar", "cols"]
+    );
+    assert_eq!(
+        sect_pr_children(docx_body_section(&xml)),
+        ["headerReference", "pgSz", "pgMar", "pgNumType", "cols"]
+    );
 }
 
 #[test]
