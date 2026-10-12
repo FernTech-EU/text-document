@@ -922,8 +922,48 @@ fn text_area_twips(o: &common::parser_tools::DocxExportOptions) -> (i64, i64) {
 /// through the recursive frame walk; instead each block/table is rendered into
 /// one of these and applied to the document in a final pass.
 enum DocxElement {
-    Paragraph(Box<docx_rs::Paragraph>),
+    Paragraph {
+        paragraph: Box<docx_rs::Paragraph>,
+        /// The block it renders is marked front matter (`Block::fmt_front_matter`). Read only
+        /// for the top-level walk's leading run: see [`FrontMatterExtent`].
+        front_matter: bool,
+    },
     Table(Box<docx_rs::Table>),
+}
+
+/// How much of a document's top-level content is front matter: the leading run of paragraphs
+/// whose blocks carry `Block::fmt_front_matter`. A flagged block after the first unflagged
+/// element is body like any other, and a table always is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FrontMatterExtent {
+    /// The document opens with its body.
+    None,
+    /// The first `n` elements are front matter and the body follows them.
+    Leading(usize),
+    /// There is no body: every element is front matter.
+    Whole,
+}
+
+impl FrontMatterExtent {
+    fn of(elements: &[DocxElement]) -> Self {
+        let n = elements
+            .iter()
+            .take_while(|e| {
+                matches!(
+                    e,
+                    DocxElement::Paragraph {
+                        front_matter: true,
+                        ..
+                    }
+                )
+            })
+            .count();
+        match n {
+            0 => Self::None,
+            n if n == elements.len() => Self::Whole,
+            n => Self::Leading(n),
+        }
+    }
 }
 
 /// Accumulates the numbering definitions referenced by list paragraphs.
@@ -1212,15 +1252,20 @@ impl ExportDocxUseCase {
         for (abstract_num, num) in numbering.defs {
             docx = docx.add_abstract_numbering(abstract_num).add_numbering(num);
         }
+        // Page geometry + base typography + running header, from the caller's options. A
+        // document that is front matter throughout has no page the header belongs on.
+        let front_matter = FrontMatterExtent::of(&elements);
+        docx = self.apply_document_options(docx, front_matter != FrontMatterExtent::Whole);
+        if let FrontMatterExtent::Leading(len) = front_matter {
+            docx = split_front_matter_section(docx, &mut elements, len);
+        }
+
         for element in elements {
             docx = match element {
-                DocxElement::Paragraph(p) => docx.add_paragraph(*p),
+                DocxElement::Paragraph { paragraph, .. } => docx.add_paragraph(*paragraph),
                 DocxElement::Table(t) => docx.add_table(*t),
             };
         }
-
-        // Page geometry + base typography + running header, from the caller's options.
-        docx = self.apply_document_options(docx);
 
         Ok((docx, paragraph_count, prepared_comments))
     }
@@ -1228,7 +1273,10 @@ impl ExportDocxUseCase {
     /// Apply the document-wide export options (page size, margins, default font/size, and an
     /// optional page-number running header) onto the assembled `Docx`. A default
     /// [`common::parser_tools::DocxExportOptions`] leaves the docx-rs built-in defaults untouched.
-    fn apply_document_options(&self, mut docx: docx_rs::Docx) -> docx_rs::Docx {
+    ///
+    /// `with_header` is false when the document has no body to carry the running header (see
+    /// [`FrontMatterExtent::Whole`]), which then is not written even when the options ask for it.
+    fn apply_document_options(&self, mut docx: docx_rs::Docx, with_header: bool) -> docx_rs::Docx {
         use docx_rs::*;
         let o = &self.dto.options;
 
@@ -1264,7 +1312,7 @@ impl ExportDocxUseCase {
         if let Some(half_pt) = o.font_half_points {
             docx = docx.default_size(half_pt);
         }
-        if o.page_numbers {
+        if o.page_numbers && with_header {
             let mut header_para = Paragraph::new().align(AlignmentType::Right);
             if let Some(text) = &o.running_header
                 && !text.trim().is_empty()
@@ -1387,7 +1435,10 @@ impl ExportDocxUseCase {
                         footnote_state,
                         comments,
                     )?;
-                    out.push(DocxElement::Paragraph(Box::new(paragraph)));
+                    out.push(DocxElement::Paragraph {
+                        paragraph: Box::new(paragraph),
+                        front_matter: block.fmt_front_matter == Some(true),
+                    });
                 }
                 continue;
             }
@@ -1417,7 +1468,10 @@ impl ExportDocxUseCase {
                         footnote_state,
                         comments,
                     )?;
-                    out.push(DocxElement::Paragraph(Box::new(paragraph)));
+                    out.push(DocxElement::Paragraph {
+                        paragraph: Box::new(paragraph),
+                        front_matter: block.fmt_front_matter == Some(true),
+                    });
                 }
                 continue;
             }
@@ -1856,7 +1910,9 @@ impl ExportDocxUseCase {
                         )?;
                         for element in cell_elements {
                             docx_cell = match element {
-                                DocxElement::Paragraph(p) => docx_cell.add_paragraph(*p),
+                                DocxElement::Paragraph { paragraph, .. } => {
+                                    docx_cell.add_paragraph(*paragraph)
+                                }
                                 DocxElement::Table(t) => docx_cell.add_table(*t),
                             };
                         }
@@ -1892,6 +1948,49 @@ impl ExportDocxUseCase {
 
         Ok(docx_table)
     }
+}
+
+/// Give the leading `len` front-matter elements a section of their own, with no running
+/// header, and start the body after them on a new page numbered 1.
+///
+/// OOXML ends a section with a `w:sectPr` inside the `w:pPr` of its last paragraph; the last
+/// section's properties are the document's own (`docx.document.section_property`), which
+/// [`ExportDocxUseCase::apply_document_options`] has already filled in. So:
+///
+/// * The front matter's last paragraph (always a paragraph: a table ends the run, see
+///   [`FrontMatterExtent`]) gets a section property carrying the same page size and margins and
+///   **no** header reference. A first section with no header reference has no header at all;
+///   it inherits from nothing.
+/// * The document's own section, the body, restarts its numbering at 1
+///   (`w:pgNumType w:start="1"`) and keeps the running header. It starts on a new page because
+///   that is what a section with no `w:type` does (the type defaults to `nextPage`). The type
+///   is left out rather than written: docx-rs writes it near the end of `w:sectPr`, where the
+///   schema wants it before `w:pgSz`, and leaving it out says the same thing in no order at all.
+///   The front matter's section has none either, for the same reason.
+/// * The body's first paragraph drops its own page break: the section break already starts the
+///   body on a new page, and both together could leave a blank page between the two.
+fn split_front_matter_section(
+    mut docx: docx_rs::Docx,
+    elements: &mut [DocxElement],
+    len: usize,
+) -> docx_rs::Docx {
+    use docx_rs::*;
+
+    let body = &docx.document.section_property;
+    let front = SectionProperty::new()
+        .page_size(body.page_size.clone())
+        .page_margin(body.page_margin.clone());
+    if let Some(DocxElement::Paragraph { paragraph, .. }) =
+        len.checked_sub(1).and_then(|last| elements.get_mut(last))
+    {
+        paragraph.property.section_property = Some(front);
+    }
+    if let Some(DocxElement::Paragraph { paragraph, .. }) = elements.get_mut(len) {
+        paragraph.property.page_break_before = None;
+    }
+
+    docx.document = docx.document.page_num_type(PageNumType::new().start(1));
+    docx
 }
 
 /// Return `Err` if a cancellation flag is present and set.

@@ -1114,6 +1114,14 @@ fn render_block_attrs(
     {
         pairs.push(format!("page_break_before={pbb}"));
     }
+    // On every block a line of the model's block is written as, unlike the page break
+    // above: a front-matter paragraph split over several Djot blocks is front matter
+    // throughout, and a part left unmarked would end the leading run early.
+    if options.front_matter
+        && let Some(fm) = block.fmt_front_matter
+    {
+        pairs.push(format!("front_matter={fm}"));
+    }
     if options.background_color
         && let Some(bg) = &block.fmt_background_color
     {

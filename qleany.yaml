@@ -244,6 +244,13 @@ entities:
       - name: fmt_page_break_before
         type: bool
         optional: true
+      # This block belongs to the front matter the document opens with: a cover, a
+      # title page. Only the leading run of such blocks counts. The paginated writers
+      # with a running header (DOCX, ODT) give the front matter's pages no header and
+      # no page number, and number the body that follows from 1. Absent means body.
+      - name: fmt_front_matter
+        type: bool
+        optional: true
       - name: fmt_direction
         type: enum
         enum_name: TextDirection

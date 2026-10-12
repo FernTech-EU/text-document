@@ -285,13 +285,19 @@ impl OdtStyleSheet {
     /// When both are empty this returns `parent` directly rather than interning a
     /// property-less style — the shortcut that keeps a default-options export from declaring
     /// one automatic style per paragraph for paragraphs that carry no overrides at all.
+    ///
+    /// `master` is set for a paragraph that opens a page sequence on that master page
+    /// (`style:master-page-name`, an attribute of the style's own opening tag; see
+    /// `export_odt_uc::PageSequence`). The parent shortcut never applies then: the paragraph
+    /// needs a style of its own to carry it, whatever its properties.
     pub(crate) fn paragraph_style(
         &mut self,
         parent: &str,
+        master: Option<&str>,
         para_attrs: &str,
         text_attrs: &str,
     ) -> String {
-        if para_attrs.is_empty() && text_attrs.is_empty() {
+        if master.is_none() && para_attrs.is_empty() && text_attrs.is_empty() {
             return parent.to_string();
         }
         let mut inner = String::new();
@@ -301,10 +307,12 @@ impl OdtStyleSheet {
         if !text_attrs.is_empty() {
             inner.push_str(&format!("<style:text-properties {text_attrs}/>"));
         }
-        self.paragraph_bucket().intern(StyleBody::new(
-            format!("style:parent-style-name=\"{parent}\""),
-            inner,
-        ))
+        let mut open_attrs = format!("style:parent-style-name=\"{parent}\"");
+        if let Some(master) = master {
+            open_attrs.push_str(&format!(" style:master-page-name=\"{master}\""));
+        }
+        self.paragraph_bucket()
+            .intern(StyleBody::new(open_attrs, inner))
     }
 
     /// Intern an automatic **character** style (a `<text:span>` needs one for anything beyond
@@ -318,11 +326,17 @@ impl OdtStyleSheet {
         )))
     }
 
-    /// Intern an automatic table style.
-    pub(crate) fn table_style(&mut self, attrs: &str) -> String {
-        self.table_bucket().intern(StyleBody::inner_only(format!(
-            "<style:table-properties {attrs}/>"
-        )))
+    /// Intern an automatic table style, on master page `master` when the table opens a page
+    /// sequence (see [`Self::paragraph_style`]; ODF allows the attribute on a table
+    /// style for the same purpose).
+    pub(crate) fn table_style(&mut self, master: Option<&str>, attrs: &str) -> String {
+        let open_attrs = master
+            .map(|master| format!("style:master-page-name=\"{master}\""))
+            .unwrap_or_default();
+        self.table_bucket().intern(StyleBody::new(
+            open_attrs,
+            format!("<style:table-properties {attrs}/>"),
+        ))
     }
 
     /// Intern an automatic table-column style.
@@ -576,12 +590,22 @@ pub(crate) fn text_area_pt(options: &common::parser_tools::OdtExportOptions) -> 
     )
 }
 
+/// The master page of a document's front matter (`Block::fmt_front_matter`): the same page
+/// layout as `Standard`, without its header, so a cover or a title page carries neither the
+/// running header nor a page number.
+pub(crate) const FRONT_MATTER_MASTER_PAGE: &str = "Front_Matter";
+
 /// The page-layout + master-page pair that goes in `styles.xml`'s `<office:automatic-styles>`
 /// and `<office:master-styles>` respectively. A master page named exactly `"Standard"` is what
 /// ODF uses as the document's first/only page when nothing in `content.xml` says otherwise — no
 /// per-paragraph reference needed, which is why the walker never has to know this exists.
+///
+/// `front_matter` adds [`FRONT_MATTER_MASTER_PAGE`] beside it, for a document whose first
+/// element enters it (see `export_odt_uc::PageSequence`). Declared only then, so a document
+/// without front matter is written exactly as before.
 pub(crate) fn page_layout_and_master_page_xml(
     options: &common::parser_tools::OdtExportOptions,
+    front_matter: bool,
 ) -> (String, String) {
     let mut layout_attrs = String::new();
     if let (Some(w), Some(h)) = (options.page_width_twips, options.page_height_twips) {
@@ -622,9 +646,15 @@ pub(crate) fn page_layout_and_master_page_xml(
     } else {
         String::new()
     };
-    let master_page = format!(
+    let mut master_page = format!(
         "<style:master-page style:name=\"Standard\" style:page-layout-name=\"PM1\">{header}</style:master-page>"
     );
+    if front_matter {
+        master_page.push_str(&format!(
+            "<style:master-page style:name=\"{FRONT_MATTER_MASTER_PAGE}\" \
+             style:display-name=\"Front Matter\" style:page-layout-name=\"PM1\"/>"
+        ));
+    }
 
     (page_layout, master_page)
 }
@@ -675,12 +705,14 @@ pub(crate) fn content_xml(styles: &OdtStyleSheet, body_xml: &str) -> String {
 }
 
 /// Assemble `styles.xml`: named styles in `<office:styles>`, the page layout in
-/// `<office:automatic-styles>`, the master page in `<office:master-styles>`.
+/// `<office:automatic-styles>`, the master pages in `<office:master-styles>` (the front
+/// matter's too when `front_matter` is set; see [`page_layout_and_master_page_xml`]).
 pub(crate) fn styles_xml(
     options: &common::parser_tools::OdtExportOptions,
     heading_styles: &[common::parser_tools::OdtHeadingStyle],
+    front_matter: bool,
 ) -> String {
-    let (page_layout, master_page) = page_layout_and_master_page_xml(options);
+    let (page_layout, master_page) = page_layout_and_master_page_xml(options, front_matter);
     format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
          <office:document-styles {NAMESPACES} office:version=\"1.3\">\

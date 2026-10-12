@@ -393,6 +393,7 @@ fn import_parsed_elements(
                     fmt_line_height: parsed_block.line_height,
                     fmt_non_breakable_lines: parsed_block.non_breakable_lines,
                     fmt_page_break_before: parsed_block.page_break_before,
+                    fmt_front_matter: parsed_block.front_matter,
                     fmt_direction: parsed_block.direction.clone(),
                     fmt_background_color: parsed_block.background_color.clone(),
                     fmt_top_margin: parsed_block.top_margin,

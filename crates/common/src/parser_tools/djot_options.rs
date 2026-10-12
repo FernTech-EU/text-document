@@ -14,8 +14,8 @@
 //!
 //! The attribute keys used on the wire are the model field names:
 //! `alignment`, `line_height`, `direction`, `non_breakable_lines`,
-//! `page_break_before`, `background_color`, `top_margin`, `text_indent` and
-//! `semantic_role`. Block attributes are only emitted/read for standalone
+//! `page_break_before`, `front_matter`, `background_color`, `top_margin`,
+//! `text_indent` and `semantic_role`. Block attributes are only emitted/read for standalone
 //! paragraphs and headings; list items, code blocks and table cells normalise
 //! their block styling away (the same boundary the other targets observe).
 
@@ -36,6 +36,10 @@ pub struct DjotImportOptions {
     pub non_breakable_lines: bool,
     /// Apply "start on a new page" from `{page_break_before=true|false}`.
     pub page_break_before: bool,
+    /// Mark the block as front matter from `{front_matter=true|false}` (see
+    /// `Block::fmt_front_matter`).
+    #[serde(default)]
+    pub front_matter: bool,
     /// Apply block background color from `{background_color="<value>"}`.
     pub background_color: bool,
     /// Apply the block's own space-above from `{top_margin=<int>}`, overriding
@@ -60,6 +64,7 @@ impl DjotImportOptions {
             direction: true,
             non_breakable_lines: true,
             page_break_before: true,
+            front_matter: true,
             background_color: true,
             top_margin: true,
             text_indent: true,
@@ -76,6 +81,7 @@ impl DjotImportOptions {
             direction: false,
             non_breakable_lines: false,
             page_break_before: false,
+            front_matter: false,
             background_color: false,
             top_margin: false,
             text_indent: false,
@@ -105,6 +111,9 @@ pub struct DjotExportOptions {
     pub non_breakable_lines: bool,
     /// Emit "start on a new page" as `{page_break_before=…}`.
     pub page_break_before: bool,
+    /// Emit the front-matter mark as `{front_matter=…}`.
+    #[serde(default)]
+    pub front_matter: bool,
     /// Emit block background color as `{background_color=…}`.
     pub background_color: bool,
     /// Emit the block's own space-above as `{top_margin=…}`.
@@ -134,6 +143,7 @@ impl DjotExportOptions {
             direction: true,
             non_breakable_lines: true,
             page_break_before: true,
+            front_matter: true,
             background_color: true,
             top_margin: true,
             text_indent: true,
@@ -151,6 +161,7 @@ impl DjotExportOptions {
             direction: false,
             non_breakable_lines: false,
             page_break_before: false,
+            front_matter: false,
             background_color: false,
             top_margin: false,
             text_indent: false,

@@ -182,6 +182,9 @@ fn execute_insert_block(
         // A split tail starts no page: the head kept the break, and inheriting it here
         // would turn one page boundary into two.
         fmt_page_break_before: None,
+        // Unlike the page break, front matter is where the block stands, and both halves of
+        // a split stand in the same place.
+        fmt_front_matter: current_block.fmt_front_matter,
         fmt_direction: current_block.fmt_direction.clone(),
         fmt_background_color: current_block.fmt_background_color.clone(),
         fmt_is_code_block: current_block.fmt_is_code_block,

@@ -198,6 +198,7 @@ impl ParsedElement {
                                 line_height: None,
                                 non_breakable_lines: None,
                                 page_break_before: None,
+                                front_matter: None,
                                 direction: None,
                                 background_color: None,
                                 alignment: None,
@@ -230,6 +231,7 @@ impl ParsedElement {
                 line_height: None,
                 non_breakable_lines: None,
                 page_break_before: None,
+                front_matter: None,
                 direction: None,
                 background_color: None,
                 alignment: None,
@@ -282,6 +284,9 @@ pub struct ParsedBlock {
     /// Start this block on a new page (djot `{page_break_before=true}`). Maps to
     /// `Block.fmt_page_break_before`. `None` when absent.
     pub page_break_before: Option<bool>,
+    /// This block opens the document as front matter (djot `{front_matter=true}`). Maps to
+    /// `Block.fmt_front_matter`. `None` when absent.
+    pub front_matter: Option<bool>,
     pub direction: Option<TextDirection>,
     pub background_color: Option<String>,
     /// Paragraph alignment (djot `{alignment=left|right|center|justify}`). Maps
@@ -312,6 +317,7 @@ impl ParsedBlock {
             && self.line_height.is_none()
             && self.non_breakable_lines.is_none()
             && self.page_break_before.is_none()
+            && self.front_matter.is_none()
             && self.direction.is_none()
             && self.background_color.is_none()
             && self.alignment.is_none()
@@ -501,6 +507,7 @@ pub fn parse_markdown(markdown: &str) -> Vec<ParsedElement> {
                         line_height: None,
                         non_breakable_lines: None,
                         page_break_before: None,
+                        front_matter: None,
                         direction: None,
                         background_color: None,
                         alignment: None,
@@ -535,6 +542,7 @@ pub fn parse_markdown(markdown: &str) -> Vec<ParsedElement> {
                     line_height: None,
                     non_breakable_lines: None,
                     page_break_before: None,
+                    front_matter: None,
                     direction: None,
                     background_color: None,
                     alignment: None,
@@ -577,6 +585,7 @@ pub fn parse_markdown(markdown: &str) -> Vec<ParsedElement> {
                         line_height: None,
                         non_breakable_lines: None,
                         page_break_before: None,
+                        front_matter: None,
                         direction: None,
                         background_color: None,
                         alignment: None,
@@ -614,6 +623,7 @@ pub fn parse_markdown(markdown: &str) -> Vec<ParsedElement> {
                         line_height: None,
                         non_breakable_lines: None,
                         page_break_before: None,
+                        front_matter: None,
                         direction: None,
                         background_color: None,
                         alignment: None,
@@ -659,6 +669,7 @@ pub fn parse_markdown(markdown: &str) -> Vec<ParsedElement> {
                     line_height: None,
                     non_breakable_lines: None,
                     page_break_before: None,
+                    front_matter: None,
                     direction: None,
                     background_color: None,
                     alignment: None,
@@ -869,6 +880,7 @@ pub fn parse_markdown(markdown: &str) -> Vec<ParsedElement> {
                     line_height: None,
                     non_breakable_lines: None,
                     page_break_before: None,
+                    front_matter: None,
                     direction: None,
                     background_color: None,
                     alignment: None,
@@ -915,6 +927,7 @@ pub fn parse_markdown(markdown: &str) -> Vec<ParsedElement> {
                         line_height: None,
                         non_breakable_lines: None,
                         page_break_before: None,
+                        front_matter: None,
                         direction: None,
                         background_color: None,
                         alignment: None,
@@ -943,6 +956,7 @@ pub fn parse_markdown(markdown: &str) -> Vec<ParsedElement> {
                         line_height: None,
                         non_breakable_lines: None,
                         page_break_before: None,
+                        front_matter: None,
                         direction: None,
                         background_color: None,
                         alignment: None,
@@ -1014,6 +1028,7 @@ pub fn parse_markdown(markdown: &str) -> Vec<ParsedElement> {
             line_height: None,
             non_breakable_lines: None,
             page_break_before: None,
+            front_matter: None,
             direction: None,
             background_color: None,
             alignment: None,
@@ -1056,6 +1071,7 @@ pub fn parse_markdown(markdown: &str) -> Vec<ParsedElement> {
             line_height: None,
             non_breakable_lines: None,
             page_break_before: None,
+            front_matter: None,
             direction: None,
             background_color: None,
             alignment: None,
@@ -2087,6 +2103,7 @@ fn read_html_tree(fragment: &scraper::Html, depth_limit: usize) -> Vec<ParsedEle
                         line_height: None,
                         non_breakable_lines: None,
                         page_break_before: None,
+                        front_matter: None,
                         direction: None,
                         background_color: None,
                         alignment: None,
@@ -2182,6 +2199,7 @@ fn read_html_tree(fragment: &scraper::Html, depth_limit: usize) -> Vec<ParsedEle
                             line_height: css.line_height,
                             non_breakable_lines: css.non_breakable_lines,
                             page_break_before: css.page_break_before,
+                            front_matter: None,
                             direction: css.direction,
                             background_color: css.background_color,
                             alignment: None,
@@ -2267,6 +2285,7 @@ fn read_html_tree(fragment: &scraper::Html, depth_limit: usize) -> Vec<ParsedEle
                         line_height: None,
                         non_breakable_lines: None,
                         page_break_before: None,
+                        front_matter: None,
                         direction: None,
                         background_color: None,
                         alignment: None,
@@ -2467,6 +2486,7 @@ fn read_html_tree(fragment: &scraper::Html, depth_limit: usize) -> Vec<ParsedEle
             line_height: None,
             non_breakable_lines: None,
             page_break_before: None,
+            front_matter: None,
             direction: None,
             background_color: None,
             alignment: None,
@@ -2497,6 +2517,7 @@ fn read_html_tree(fragment: &scraper::Html, depth_limit: usize) -> Vec<ParsedEle
             line_height: None,
             non_breakable_lines: None,
             page_break_before: None,
+            front_matter: None,
             direction: None,
             background_color: None,
             alignment: None,
@@ -2701,6 +2722,7 @@ struct DjotBlockStyle {
     line_height: Option<i64>,
     non_breakable_lines: Option<bool>,
     page_break_before: Option<bool>,
+    front_matter: Option<bool>,
     direction: Option<TextDirection>,
     background_color: Option<String>,
     top_margin: Option<i64>,
@@ -2725,6 +2747,9 @@ impl DjotBlockStyle {
         if other.page_break_before.is_some() {
             self.page_break_before = other.page_break_before;
         }
+        if other.front_matter.is_some() {
+            self.front_matter = other.front_matter;
+        }
         if other.direction.is_some() {
             self.direction = other.direction;
         }
@@ -2746,8 +2771,8 @@ impl DjotBlockStyle {
 /// Read the round-tripped block-style attributes off a djot block's
 /// [`jotdown::Attributes`], honouring the import [`DjotImportOptions`]. Keys are
 /// the model field names (`alignment`, `line_height`, `direction`,
-/// `non_breakable_lines`, `page_break_before`, `background_color`, `top_margin`,
-/// `text_indent`, `semantic_role`); unrecognised values are ignored.
+/// `non_breakable_lines`, `page_break_before`, `front_matter`, `background_color`,
+/// `top_margin`, `text_indent`, `semantic_role`); unrecognised values are ignored.
 fn block_attrs_to_style(attrs: &jotdown::Attributes, opts: &DjotImportOptions) -> DjotBlockStyle {
     let mut style = DjotBlockStyle::default();
 
@@ -2789,6 +2814,15 @@ fn block_attrs_to_style(attrs: &jotdown::Attributes, opts: &DjotImportOptions) -
         && let Some(v) = attrs.get_value("page_break_before")
     {
         style.page_break_before = match v.to_string().as_str() {
+            "true" => Some(true),
+            "false" => Some(false),
+            _ => None,
+        };
+    }
+    if opts.front_matter
+        && let Some(v) = attrs.get_value("front_matter")
+    {
+        style.front_matter = match v.to_string().as_str() {
             "true" => Some(true),
             "false" => Some(false),
             _ => None,
@@ -2865,6 +2899,7 @@ fn djot_push_block(
         line_height: style.line_height,
         non_breakable_lines: style.non_breakable_lines,
         page_break_before: style.page_break_before,
+        front_matter: style.front_matter,
         direction: style.direction,
         background_color: style.background_color,
         alignment: style.alignment,

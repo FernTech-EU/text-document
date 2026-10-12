@@ -128,7 +128,10 @@
 //! *any* `<style:paragraph-properties>` element**, rule or not — so an automatic style adding,
 //! say, `fo:margin-left` on top of `"Rule"` would present its own (border-less)
 //! paragraph-properties first and read back as "not a rule" before the walk ever reaches the real
-//! definition. Simplest fix, applied here: a rule paragraph never gets a wrapper style at all.
+//! definition. Simplest fix, applied here: a rule paragraph never gets a wrapper style at all,
+//! with one exception. A rule that opens a page sequence (the first element of the front matter,
+//! or of the body after it; see [`PageSequence`]) must carry a master page, which only a style
+//! of its own can do, and pagination wins there over reading a break back.
 
 use crate::ExportOdtDto;
 use crate::ExportOdtResultDto;
@@ -209,10 +212,101 @@ impl<'a> FootnoteRefState<'a> {
     }
 }
 
+/// Where the main walk stands relative to the document's front matter: the leading run of
+/// blocks that carry `Block::fmt_front_matter`. The ODF analog of
+/// `export_docx_uc::FrontMatterExtent`, decided element by element because this writer emits
+/// as it walks rather than collecting the body first.
+///
+/// ODF switches page sequence on the element that opens it: an automatic style naming a master
+/// page (`style:master-page-name`) starts a new page on that master. So the first element of a
+/// front matter enters [`odt_render::FRONT_MATTER_MASTER_PAGE`], whose pages carry no header,
+/// and the first body element after it goes back to `Standard` with `style:page-number="1"`,
+/// so the body is numbered from 1. A document that opens with its body never names a master
+/// page, exactly as before.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PageSequence {
+    /// Nothing written yet.
+    Start,
+    /// Inside the leading run of front matter.
+    FrontMatter,
+    /// In the body. `after_front_matter` records whether one came first, which is what decides
+    /// whether `styles.xml` has to declare the front matter's master page.
+    Body { after_front_matter: bool },
+}
+
+impl PageSequence {
+    /// Move past one flow element, returning the page sequence it opens, if any. A table is
+    /// never front matter (the same rule as DOCX), so it passes `false`.
+    fn enter(cell: &Cell<PageSequence>, front_matter: bool) -> Option<SequenceSwitch> {
+        let (next, switch) = match (cell.get(), front_matter) {
+            (PageSequence::Start, true) => {
+                (PageSequence::FrontMatter, Some(SequenceSwitch::FrontMatter))
+            }
+            (PageSequence::Start, false) => (
+                PageSequence::Body {
+                    after_front_matter: false,
+                },
+                None,
+            ),
+            (PageSequence::FrontMatter, true) => (PageSequence::FrontMatter, None),
+            (PageSequence::FrontMatter, false) => (
+                PageSequence::Body {
+                    after_front_matter: true,
+                },
+                Some(SequenceSwitch::Body),
+            ),
+            (body @ PageSequence::Body { .. }, _) => (body, None),
+        };
+        cell.set(next);
+        switch
+    }
+
+    /// Whether the walk entered the front matter's master page at all.
+    fn used_front_matter(self) -> bool {
+        matches!(
+            self,
+            PageSequence::FrontMatter
+                | PageSequence::Body {
+                    after_front_matter: true
+                }
+        )
+    }
+}
+
+/// The page sequence one flow element opens: see [`PageSequence`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SequenceSwitch {
+    /// The document's first element, front matter: on the header-less master page.
+    FrontMatter,
+    /// The first body element after the front matter: back on `Standard`, numbered from 1.
+    Body,
+}
+
+impl SequenceSwitch {
+    fn master_page(self) -> &'static str {
+        match self {
+            SequenceSwitch::FrontMatter => odt_render::FRONT_MATTER_MASTER_PAGE,
+            SequenceSwitch::Body => "Standard",
+        }
+    }
+
+    /// The properties the opening element adds, in a paragraph's or a table's own properties
+    /// element alike. The master page already starts a new page, so the element's own page
+    /// break, or one its parent style declares (a heading level that opens a page), is turned
+    /// off: both together could leave a blank page between the two sequences.
+    fn properties(self) -> &'static str {
+        match self {
+            SequenceSwitch::FrontMatter => " fo:break-before=\"auto\"",
+            SequenceSwitch::Body => " fo:break-before=\"auto\" style:page-number=\"1\"",
+        }
+    }
+}
+
 /// Everything the inline-run/block builders need that stays constant across one whole render
 /// pass (either the main walk, or one note body's pre-render), bundled so `render_frame_content`/
 /// `render_block`/`build_run` don't each carry five more parameters on top of the ones that
 /// genuinely vary per call (`styles`, `out`, the recursion-only `quote_depth`/`semantic`).
+#[derive(Clone, Copy)]
 struct WalkCtx<'a> {
     /// Pre-rendered note bodies. Empty during the note-body pre-render pass itself (see
     /// `NoteBodies`'s doc comment) and populated for the main walk.
@@ -232,10 +326,13 @@ struct WalkCtx<'a> {
     /// `draw:name` must be unique per frame in the document; the image's own `src` is not
     /// (the same picture can be embedded twice). A shared counter, not a map, because the
     /// value only needs to be unique, never looked up again.
-    image_seq: Cell<usize>,
+    image_seq: &'a Cell<usize>,
     /// The page's text area in points, `(width, height)`, which every picture is fitted
     /// inside: see [`odt_render::text_area_pt`] and [`build_image_frame`].
     image_box_pt: (f64, f64),
+    /// The main walk's [`PageSequence`], advanced by every element of the document's flow.
+    /// `None` wherever an element is not part of that flow: a note body, a table cell.
+    page_sequence: Option<&'a Cell<PageSequence>>,
 }
 
 // ── Comment ranges (M-T2b) ───────────────────────────────────────────────────────────
@@ -1022,6 +1119,7 @@ impl ExportOdtUseCase {
                 };
                 let empty_notes = NoteBodies::new();
                 let body_footnote_state = FootnoteRefState::new(&notes);
+                let body_image_seq = Cell::new(0);
                 let ctx = WalkCtx {
                     notes: &empty_notes,
                     footnote_state: &body_footnote_state,
@@ -1029,8 +1127,9 @@ impl ExportOdtUseCase {
                     image_hrefs: &image_hrefs,
                     images: &self.dto.options.images,
                     list_numbers: &list_numbers,
-                    image_seq: Cell::new(0),
+                    image_seq: &body_image_seq,
                     image_box_pt: odt_render::text_area_pt(&self.dto.options),
+                    page_sequence: None,
                 };
                 let mut body = String::new();
                 let mut counter = 0i64;
@@ -1053,6 +1152,8 @@ impl ExportOdtUseCase {
         };
 
         let footnote_state = FootnoteRefState::new(&notes);
+        let image_seq = Cell::new(0);
+        let page_sequence = Cell::new(PageSequence::Start);
         let ctx = WalkCtx {
             notes: &note_bodies,
             footnote_state: &footnote_state,
@@ -1060,8 +1161,9 @@ impl ExportOdtUseCase {
             image_hrefs: &image_hrefs,
             images: &self.dto.options.images,
             list_numbers: &list_numbers,
-            image_seq: Cell::new(0),
+            image_seq: &image_seq,
             image_box_pt: odt_render::text_area_pt(&self.dto.options),
+            page_sequence: Some(&page_sequence),
         };
 
         let mut body_xml = String::new();
@@ -1128,7 +1230,11 @@ impl ExportOdtUseCase {
 
         let heading_styles = self.dto.options.resolved_heading_styles();
         let content_xml = odt_render::content_xml(&styles, &body_xml);
-        let styles_xml = odt_render::styles_xml(&self.dto.options, &heading_styles);
+        let styles_xml = odt_render::styles_xml(
+            &self.dto.options,
+            &heading_styles,
+            page_sequence.get().used_front_matter(),
+        );
 
         let mut packaged_images: Vec<(String, Vec<u8>, String)> = Vec::new();
         for (src, href) in &image_hrefs {
@@ -1352,6 +1458,14 @@ impl ExportOdtUseCase {
 
         let quote_indent_pt = quote_depth as f64 * INDENT_STEP_PT;
 
+        // Whether this block opens the front matter or the body after it, and so carries a
+        // master page: see `PageSequence`. Decided before any branch, since every one of them
+        // writes a paragraph that may be the one.
+        let switch = ctx
+            .page_sequence
+            .and_then(|seq| PageSequence::enter(seq, block.fmt_front_matter == Some(true)));
+        let master = switch.map(SequenceSwitch::master_page);
+
         // --- Code block ------------------------------------------------------
         if block.fmt_is_code_block == Some(true) {
             let mut raw = String::new();
@@ -1360,12 +1474,15 @@ impl ExportOdtUseCase {
                     raw.push_str(t);
                 }
             }
-            let attrs = if quote_indent_pt > 0.0 {
+            let mut attrs = if quote_indent_pt > 0.0 {
                 format!("fo:margin-left=\"{}\"", odt_render::fmt_pt(quote_indent_pt))
             } else {
                 String::new()
             };
-            let style = styles.paragraph_style("Code_Block", &attrs, "");
+            if let Some(switch) = switch {
+                attrs.push_str(switch.properties());
+            }
+            let style = styles.paragraph_style("Code_Block", master, attrs.trim(), "");
             return Ok(RenderedBlock::Standalone(format!(
                 "<text:p text:style-name=\"{style}\">{}</text:p>",
                 odt_render::encode_run_text(&raw)
@@ -1399,7 +1516,7 @@ impl ExportOdtUseCase {
             Some(MarkerType::Checked) | Some(MarkerType::Unchecked)
         );
 
-        let common_attrs = common_para_attrs(block, quote_indent_pt);
+        let common_attrs = common_para_attrs(block, quote_indent_pt, switch);
 
         // --- Heading -----------------------------------------------------------
         if let Some(level) = block.fmt_heading_level {
@@ -1411,7 +1528,8 @@ impl ExportOdtUseCase {
                     odt_render::fmt_pt(odt_render::px_to_pt(before))
                 ));
             }
-            let style = styles.paragraph_style(&format!("Heading_{level}"), attrs.trim(), "");
+            let style =
+                styles.paragraph_style(&format!("Heading_{level}"), master, attrs.trim(), "");
             let inner = add_inline_content(
                 &pieces,
                 ctx,
@@ -1431,7 +1549,7 @@ impl ExportOdtUseCase {
             if is_task {
                 // Task items carry a checkbox glyph instead of an auto-number, exactly mirroring
                 // `export_docx_uc`: they never enter the `<text:list>` numbering system at all.
-                let style = styles.paragraph_style("Standard", common_attrs.trim(), "");
+                let style = styles.paragraph_style("Standard", master, common_attrs.trim(), "");
                 let glyph = if block.fmt_marker == Some(MarkerType::Checked) {
                     "\u{2612} " // ☒
                 } else {
@@ -1452,7 +1570,7 @@ impl ExportOdtUseCase {
             }
             let list_style_name =
                 styles.list_style(*list_id, |name| odt_list_style_xml(name, list_entity));
-            let para_style = styles.paragraph_style("Standard", common_attrs.trim(), "");
+            let para_style = styles.paragraph_style("Standard", master, common_attrs.trim(), "");
             let inner = add_inline_content(
                 &pieces,
                 ctx,
@@ -1498,9 +1616,19 @@ impl ExportOdtUseCase {
             && !self.dto.options.keep_scene_break_glyphs
             && looks_like_rule_glyph(&pieces)
         {
-            return Ok(RenderedBlock::Standalone(
-                "<text:p text:style-name=\"Rule\"/>".to_string(),
-            ));
+            // A rule opening a page sequence is the one exception to the bare reference: the
+            // master page can only travel on a style of the paragraph's own. A reader that
+            // stops at that style's properties then no longer sees the border, but a cover or
+            // a body that opens with a scene break has nothing a break could separate.
+            let style = match switch {
+                None => "Rule".to_string(),
+                Some(switch) => {
+                    styles.paragraph_style("Rule", master, switch.properties().trim(), "")
+                }
+            };
+            return Ok(RenderedBlock::Standalone(format!(
+                "<text:p text:style-name=\"{style}\"/>"
+            )));
         }
 
         let mut attrs = common_attrs;
@@ -1570,7 +1698,7 @@ impl ExportOdtUseCase {
             None if quote_depth > 0 => "Quote",
             None => "Standard",
         };
-        let style = styles.paragraph_style(parent, attrs.trim(), "");
+        let style = styles.paragraph_style(parent, master, attrs.trim(), "");
         let inner = add_inline_content(
             &pieces,
             ctx,
@@ -1637,7 +1765,22 @@ impl ExportOdtUseCase {
             None if table.fmt_width.is_some_and(|w| w > 0) => "left",
             None => "margins",
         };
-        let table_style = styles.table_style(&format!("{width_attr} table:align=\"{align}\""));
+        // A table is part of the flow when it is not inside a cell, and never front matter.
+        let switch = ctx
+            .page_sequence
+            .and_then(|seq| PageSequence::enter(seq, false));
+        let table_style = styles.table_style(
+            switch.map(SequenceSwitch::master_page),
+            &format!(
+                "{width_attr} table:align=\"{align}\"{}",
+                switch.map_or("", SequenceSwitch::properties)
+            ),
+        );
+        // Its cells' content is not: a paragraph in a cell never opens a page sequence.
+        let cell_ctx = WalkCtx {
+            page_sequence: None,
+            ..*ctx
+        };
 
         let mut cols_xml = String::new();
         if table.column_widths.is_empty() {
@@ -1718,7 +1861,7 @@ impl ExportOdtUseCase {
                         0,
                         None,
                         styles,
-                        ctx,
+                        &cell_ctx,
                         None,
                         &mut inner,
                         counter,
@@ -1782,7 +1925,14 @@ enum RenderedBlock {
 /// formatting" section at the top of `export_docx_uc::render_block`'s dispatch, applied before
 /// the heading/list/plain branch — everything here except quote indentation is skipped for a
 /// code block, exactly as `export_docx_uc::render_code_block` skips it by returning early.
-fn common_para_attrs(block: &Block, quote_indent_pt: f64) -> String {
+///
+/// `switch` is the page sequence the block opens, if any: its properties replace the block's
+/// own page break (see [`SequenceSwitch::properties`]).
+fn common_para_attrs(
+    block: &Block,
+    quote_indent_pt: f64,
+    switch: Option<SequenceSwitch>,
+) -> String {
     let mut attrs = String::new();
     if let Some(lh) = block.fmt_line_height {
         // thousandths → percent: 1000 = 100% (single spacing), 1500 = 150%.
@@ -1792,8 +1942,12 @@ fn common_para_attrs(block: &Block, quote_indent_pt: f64) -> String {
     if block.fmt_non_breakable_lines == Some(true) {
         attrs.push_str(" fo:keep-together=\"always\"");
     }
-    if block.fmt_page_break_before == Some(true) {
-        attrs.push_str(" fo:break-before=\"page\"");
+    match switch {
+        Some(switch) => attrs.push_str(switch.properties()),
+        None if block.fmt_page_break_before == Some(true) => {
+            attrs.push_str(" fo:break-before=\"page\"");
+        }
+        None => {}
     }
     if let Some(alignment) = &block.fmt_alignment {
         attrs.push_str(&format!(

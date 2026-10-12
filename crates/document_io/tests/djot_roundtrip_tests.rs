@@ -363,6 +363,20 @@ fn a_heading_can_start_a_page() {
     assert_contains(&dj, "# Chapter One");
 }
 
+/// The front-matter mark survives a save/load on each block that carries it, heading or
+/// paragraph, and shares the block's one attribute line.
+#[test]
+fn the_front_matter_mark_round_trips() {
+    let dj =
+        fixpoint("{alignment=center front_matter=true}\n# Title\n\n{front_matter=true}\nby Author");
+    assert_eq!(
+        dj.matches("front_matter=true").count(),
+        2,
+        "both front-matter blocks keep their mark in:\n{dj}"
+    );
+    assert_contains(&dj, "# Title");
+}
+
 #[test]
 fn block_background_color_round_trips() {
     assert_contains(

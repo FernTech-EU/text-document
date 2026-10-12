@@ -390,6 +390,7 @@ fn execute_content_insert(
                 fmt_line_height: None,
                 fmt_non_breakable_lines: None,
                 fmt_page_break_before: None,
+                fmt_front_matter: None,
                 fmt_direction: None,
                 fmt_background_color: None,
                 fmt_is_code_block: None,
@@ -482,6 +483,7 @@ fn execute_content_insert(
             // A split tail starts no page: the head kept the break, and inheriting it here
             // would turn one page boundary into two.
             fmt_page_break_before: None,
+            fmt_front_matter: current_block.fmt_front_matter,
             fmt_direction: current_block.fmt_direction.clone(),
             fmt_background_color: current_block.fmt_background_color.clone(),
             fmt_is_code_block: current_block.fmt_is_code_block,
@@ -613,6 +615,7 @@ fn execute_content_insert(
             fmt_line_height: None,
             fmt_non_breakable_lines: None,
             fmt_page_break_before: None,
+            fmt_front_matter: None,
             fmt_direction: None,
             fmt_background_color: None,
             fmt_is_code_block: None,
@@ -653,6 +656,7 @@ fn execute_content_insert(
             // A split tail starts no page: the head kept the break, and inheriting it here
             // would turn one page boundary into two.
             fmt_page_break_before: None,
+            fmt_front_matter: current_block.fmt_front_matter,
             fmt_direction: current_block.fmt_direction.clone(),
             fmt_background_color: current_block.fmt_background_color.clone(),
             fmt_is_code_block: current_block.fmt_is_code_block,

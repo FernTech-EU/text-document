@@ -155,6 +155,14 @@ pub struct Block {
     /// they can or not at all. `None` means "wherever the text falls".
     #[serde(default)]
     pub fmt_page_break_before: Option<bool>,
+    /// This block belongs to the front matter the document opens with: a cover, a title
+    /// page. Only the **leading** run of such blocks is front matter; a flagged block after
+    /// the first body block is body like any other. The paginated writers that carry a
+    /// running header (DOCX, ODT) give the front matter's pages neither that header nor a
+    /// page number, and start the body on a page of its own numbered 1. The flowing formats
+    /// have no page furniture to withhold and ignore it. `None` means body.
+    #[serde(default)]
+    pub fmt_front_matter: Option<bool>,
     pub fmt_direction: Option<TextDirection>,
     pub fmt_background_color: Option<String>,
     pub fmt_is_code_block: Option<bool>,
