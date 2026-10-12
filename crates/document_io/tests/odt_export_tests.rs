@@ -648,6 +648,109 @@ fn an_image_with_no_bytes_supplied_falls_back_to_its_alt_text() {
     assert!(content.contains("A cat"));
 }
 
+/// A4 with 1" margins, carrying the one test picture: a text area of 451.3 × 697.9 pt.
+fn a4_options_with_image() -> OdtExportOptions {
+    OdtExportOptions {
+        page_width_twips: Some(11906),
+        page_height_twips: Some(16838),
+        margin_top_twips: Some(1440),
+        margin_bottom_twips: Some(1440),
+        margin_left_twips: Some(1440),
+        margin_right_twips: Some(1440),
+        ..options_with_image()
+    }
+}
+
+/// The `(svg:width, svg:height)` of every `draw:frame` in `content.xml`, in points.
+fn frame_sizes_pt(bytes: &[u8]) -> Vec<(f64, f64)> {
+    let content = content_xml(bytes);
+    let attr = |tag: &str, name: &str| -> f64 {
+        let start = tag
+            .find(&format!("{name}=\""))
+            .unwrap_or_else(|| panic!("{name} on {tag}"))
+            + name.len()
+            + 2;
+        let len = tag[start..].find("pt\"").expect("a length in points");
+        tag[start..start + len].parse().expect("a number")
+    };
+    content
+        .match_indices("<draw:frame ")
+        .map(|(at, _)| {
+            let tag = &content[at..at + content[at..].find('>').expect("closing bracket")];
+            (attr(tag, "svg:width"), attr(tag, "svg:height"))
+        })
+        .collect()
+}
+
+/// `fmt_pt` writes two decimals, so a fitted length is exact to within half a hundredth.
+fn assert_pt(actual: f64, expected: f64, what: &str) {
+    assert!(
+        (actual - expected).abs() <= 0.006,
+        "{what}: expected about {expected}pt, got {actual}pt"
+    );
+}
+
+#[test]
+fn a_picture_wider_than_the_text_area_shrinks_to_its_width() {
+    // 2000 × 100 px is 1500 × 75 pt; the text area is 451.3 pt wide.
+    let sizes = frame_sizes_pt(&odt_from_djot(
+        "![wide](cat.png){width=2000 height=100}",
+        a4_options_with_image(),
+    ));
+    let [(w, h)] = sizes[..] else {
+        panic!("one frame expected: {sizes:?}");
+    };
+    assert_pt(w, 451.3, "width fills the text area");
+    assert_pt(h, 75.0 * 451.3 / 1500.0, "height keeps the aspect ratio");
+}
+
+#[test]
+fn a_picture_taller_than_the_text_area_shrinks_to_its_height() {
+    // 100 × 3000 px is 75 × 2250 pt; the text area is 697.9 pt tall.
+    let sizes = frame_sizes_pt(&odt_from_djot(
+        "![tall](cat.png){width=100 height=3000}",
+        a4_options_with_image(),
+    ));
+    let [(w, h)] = sizes[..] else {
+        panic!("one frame expected: {sizes:?}");
+    };
+    assert_pt(h, 697.9, "height fills the text area");
+    assert_pt(w, 75.0 * 697.9 / 2250.0, "width keeps the aspect ratio");
+}
+
+#[test]
+fn a_picture_that_fits_keeps_its_size() {
+    // Its own 4×3 pixels (3 × 2.25 pt), and a stated 40×30 px (30 × 22.5 pt): neither grows.
+    let sizes = frame_sizes_pt(&odt_from_djot(
+        "![own](cat.png)\n\n![stated](cat.png){width=40 height=30}",
+        a4_options_with_image(),
+    ));
+    assert_eq!(sizes, vec![(3.0, 2.25), (30.0, 22.5)]);
+}
+
+#[test]
+fn with_no_page_options_the_picture_fits_the_smaller_reader_default_page() {
+    // No geometry: the reader picks A4 or Letter by locale, with 2 cm margins. The fit uses
+    // the narrower of the two (A4, 595.28 pt) and the shorter (Letter, 792 pt).
+    let sizes = frame_sizes_pt(&odt_from_djot(
+        "![wide](cat.png){width=2000 height=100}\n\n![tall](cat.png){width=100 height=3000}",
+        options_with_image(),
+    ));
+    let [(wide_w, _), (_, tall_h)] = sizes[..] else {
+        panic!("two frames expected: {sizes:?}");
+    };
+    assert_pt(
+        wide_w,
+        595.28 - 2.0 * 56.69,
+        "width fits the narrower default page",
+    );
+    assert_pt(
+        tall_h,
+        792.0 - 2.0 * 56.69,
+        "height fits the shorter default page",
+    );
+}
+
 // --- tables --------------------------------------------------------------------
 //
 // The djot importer has no table syntax (`RICH_DJOT` never contains one), so these tests build

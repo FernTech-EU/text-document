@@ -3,6 +3,7 @@ pub mod document_io_controller;
 pub mod dtos;
 pub(crate) mod footnotes;
 pub(crate) mod html_render;
+pub(crate) mod image_fit;
 pub(crate) mod list_numbers;
 pub(crate) mod odt_render;
 #[cfg(feature = "pdf")]

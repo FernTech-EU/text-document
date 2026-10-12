@@ -985,3 +985,143 @@ fn a_blocks_own_top_margin_becomes_space_before() {
         "a paragraph without the attribute gets no space-above"
     );
 }
+
+// --- pictures fitted to the text area ---------------------------------------
+
+/// A real 4×3 PNG: the writer decodes what it embeds, so a placeholder would fall back to alt
+/// text rather than test the sizing. Mirrors `odt_export_tests.rs::png_bytes`.
+fn png_bytes() -> Vec<u8> {
+    let mut buf = Vec::new();
+    {
+        let mut enc = png::Encoder::new(&mut buf, 4, 3);
+        enc.set_color(png::ColorType::Rgba);
+        enc.set_depth(png::BitDepth::Eight);
+        let mut w = enc.write_header().unwrap();
+        w.write_image_data(&[0u8, 128, 255, 255].repeat(12))
+            .unwrap();
+    }
+    buf
+}
+
+/// A4 with 1" margins, carrying the one test picture: a text area of 9026 × 13958 twips.
+fn a4_options_with_picture() -> DocxExportOptions {
+    DocxExportOptions {
+        page_width_twips: Some(11906),
+        page_height_twips: Some(16838),
+        margin_top_twips: Some(1440),
+        margin_bottom_twips: Some(1440),
+        margin_left_twips: Some(1440),
+        margin_right_twips: Some(1440),
+        images: common::parser_tools::ExportImages::from_iter([(
+            "cat.png",
+            common::parser_tools::ExportImage::new(png_bytes(), "image/png"),
+        )]),
+        ..Default::default()
+    }
+}
+
+/// The `(cx, cy)` of every drawing in the packed `word/document.xml`, in EMUs.
+fn drawing_extents(djot: &str, options: DocxExportOptions) -> Vec<(u64, u64)> {
+    let docx = docx_from_djot_with_options(djot, options);
+    let mut buf = std::io::Cursor::new(Vec::new());
+    docx.build()
+        .pack(&mut buf)
+        .expect("docx-rs pack into memory");
+    let xml = read_zip_entry(&buf.into_inner(), "word/document.xml");
+    let attr = |tag: &str, name: &str| -> u64 {
+        let start = tag
+            .find(&format!("{name}=\""))
+            .unwrap_or_else(|| panic!("{name} on {tag}"))
+            + name.len()
+            + 2;
+        let len = tag[start..].find('"').expect("closing quote");
+        tag[start..start + len].parse().expect("an integer extent")
+    };
+    xml.match_indices("<wp:extent ")
+        .map(|(at, _)| {
+            let tag = &xml[at..at + xml[at..].find("/>").expect("self-closing extent")];
+            (attr(tag, "cx"), attr(tag, "cy"))
+        })
+        .collect()
+}
+
+const EMU_PER_TWIP: u64 = 635;
+const EMU_PER_PX: u64 = 9525;
+
+fn assert_close(actual: u64, expected: f64, what: &str) {
+    assert!(
+        (actual as f64 - expected).abs() <= 1.0,
+        "{what}: expected about {expected}, got {actual}"
+    );
+}
+
+#[test]
+fn a_picture_wider_than_the_text_area_shrinks_to_its_width() {
+    let extents = drawing_extents(
+        "![wide](cat.png){width=2000 height=100}",
+        a4_options_with_picture(),
+    );
+    let [(cx, cy)] = extents[..] else {
+        panic!("one drawing expected: {extents:?}");
+    };
+    let max_w = (9026 * EMU_PER_TWIP) as f64;
+    assert_close(cx, max_w, "width fills the text area");
+    assert_close(
+        cy,
+        (100 * EMU_PER_PX) as f64 * max_w / (2000 * EMU_PER_PX) as f64,
+        "height keeps the aspect ratio",
+    );
+}
+
+#[test]
+fn a_picture_taller_than_the_text_area_shrinks_to_its_height() {
+    let extents = drawing_extents(
+        "![tall](cat.png){width=100 height=3000}",
+        a4_options_with_picture(),
+    );
+    let [(cx, cy)] = extents[..] else {
+        panic!("one drawing expected: {extents:?}");
+    };
+    let max_h = (13958 * EMU_PER_TWIP) as f64;
+    assert_close(cy, max_h, "height fills the text area");
+    assert_close(
+        cx,
+        (100 * EMU_PER_PX) as f64 * max_h / (3000 * EMU_PER_PX) as f64,
+        "width keeps the aspect ratio",
+    );
+}
+
+#[test]
+fn a_picture_that_fits_keeps_its_size() {
+    // Its own 4×3 pixels, and a stated size well inside the page: neither is enlarged.
+    let extents = drawing_extents(
+        "![own](cat.png)\n\n![stated](cat.png){width=40 height=30}",
+        a4_options_with_picture(),
+    );
+    assert_eq!(
+        extents,
+        vec![
+            (4 * EMU_PER_PX, 3 * EMU_PER_PX),
+            (40 * EMU_PER_PX, 30 * EMU_PER_PX)
+        ]
+    );
+}
+
+#[test]
+fn with_no_page_options_the_picture_fits_docx_rs_default_page() {
+    // No geometry in the options: docx-rs writes A4 with 1701-twip side margins, a text area
+    // 11906 - 2 × 1701 = 8504 twips wide.
+    let options = DocxExportOptions {
+        images: a4_options_with_picture().images,
+        ..Default::default()
+    };
+    let extents = drawing_extents("![wide](cat.png){width=2000 height=100}", options);
+    let [(cx, _)] = extents[..] else {
+        panic!("one drawing expected: {extents:?}");
+    };
+    assert_close(
+        cx,
+        (8504 * EMU_PER_TWIP) as f64,
+        "width fills the default text area",
+    );
+}

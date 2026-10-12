@@ -851,6 +851,72 @@ fn px_to_twips(px: i64) -> i32 {
 /// Light-grey fill behind code blocks, as an `RRGGBB` hex string.
 const CODE_BLOCK_FILL: &str = "F5F5F5";
 
+/// docx-rs 0.4.22's own page geometry, written when the options leave it unset: A4
+/// (`PageSize::new`) with its `PageMargin::new` margins. Its fields are private, so the values
+/// are restated here; the version is pinned exactly (see this crate's `Cargo.toml`), and a bump
+/// has to re-read them.
+const DOCX_DEFAULT_PAGE_TWIPS: (i64, i64) = (11906, 16838);
+const DOCX_DEFAULT_MARGINS_TWIPS: Margins = Margins {
+    top: 1985,
+    bottom: 1701,
+    left: 1701,
+    right: 1701,
+};
+
+/// The margin an unset edge gets once the options set any edge at all: `apply_document_options`
+/// starts from 1440 twips (1") on every side, not from docx-rs's defaults above.
+const OPTION_MARGIN_FALLBACK_TWIPS: i32 = 1440;
+
+/// EMUs per twip: 914400 EMU per inch over 1440 twips per inch.
+const EMU_PER_TWIP: f64 = 635.0;
+
+/// The four page margins, in twips.
+struct Margins {
+    top: i64,
+    bottom: i64,
+    left: i64,
+    right: i64,
+}
+
+/// The pictures an export may embed, together with the box every one of them has to fit in.
+struct InlineImages<'a> {
+    bytes: &'a ExportImages,
+    /// The page's text area in EMUs, `(width, height)`: see [`text_area_twips`].
+    max_emu: (f64, f64),
+}
+
+/// The text area of the page this export lays out, `(width, height)` in twips: the page less
+/// its margins, resolved exactly as [`ExportDocxUseCase::apply_document_options`] resolves them.
+/// A page size counts only when both dimensions are given, and an unset margin falls back to
+/// 1" when any margin is set, or to docx-rs's own default when none is.
+fn text_area_twips(o: &common::parser_tools::DocxExportOptions) -> (i64, i64) {
+    let (page_w, page_h) = match (o.page_width_twips, o.page_height_twips) {
+        (Some(w), Some(h)) => (i64::from(w), i64::from(h)),
+        _ => DOCX_DEFAULT_PAGE_TWIPS,
+    };
+    let edges = [
+        o.margin_top_twips,
+        o.margin_bottom_twips,
+        o.margin_left_twips,
+        o.margin_right_twips,
+    ];
+    let margins = if edges.iter().any(Option::is_some) {
+        let edge = |m: Option<i32>| i64::from(m.unwrap_or(OPTION_MARGIN_FALLBACK_TWIPS));
+        Margins {
+            top: edge(o.margin_top_twips),
+            bottom: edge(o.margin_bottom_twips),
+            left: edge(o.margin_left_twips),
+            right: edge(o.margin_right_twips),
+        }
+    } else {
+        DOCX_DEFAULT_MARGINS_TWIPS
+    };
+    (
+        page_w - margins.left - margins.right,
+        page_h - margins.top - margins.bottom,
+    )
+}
+
 /// A rendered top-level document child. The DOCX builder consumes `self` and
 /// returns a new value on every `add_*`, so we cannot thread a `&mut Docx`
 /// through the recursive frame walk; instead each block/table is rendered into
@@ -1174,13 +1240,16 @@ impl ExportDocxUseCase {
             || o.margin_left_twips.is_some()
             || o.margin_right_twips.is_some()
         {
-            // docx-rs's PageMargin defaults each edge to 1440 twips (1"), so an unset edge
-            // keeps that conventional default rather than collapsing to zero.
+            // An unset edge takes the conventional 1" rather than collapsing to zero (or to
+            // docx-rs's own, wider, defaults, which apply only when no edge is set at all).
             let mut m = PageMargin::new();
-            m = m.top(o.margin_top_twips.unwrap_or(1440));
-            m = m.bottom(o.margin_bottom_twips.unwrap_or(1440));
-            m = m.left(o.margin_left_twips.unwrap_or(1440));
-            m = m.right(o.margin_right_twips.unwrap_or(1440));
+            m = m.top(o.margin_top_twips.unwrap_or(OPTION_MARGIN_FALLBACK_TWIPS));
+            m = m.bottom(
+                o.margin_bottom_twips
+                    .unwrap_or(OPTION_MARGIN_FALLBACK_TWIPS),
+            );
+            m = m.left(o.margin_left_twips.unwrap_or(OPTION_MARGIN_FALLBACK_TWIPS));
+            m = m.right(o.margin_right_twips.unwrap_or(OPTION_MARGIN_FALLBACK_TWIPS));
             docx = docx.page_margin(m);
         }
         if let Some(family) = &o.font_family {
@@ -1595,10 +1664,15 @@ impl ExportDocxUseCase {
             }
         }
 
+        let (max_w, max_h) = text_area_twips(&self.dto.options);
+        let images = InlineImages {
+            bytes: &self.dto.options.images,
+            max_emu: (max_w as f64 * EMU_PER_TWIP, max_h as f64 * EMU_PER_TWIP),
+        };
         Ok(add_inline_content(
             paragraph,
             &pieces,
-            &self.dto.options.images,
+            &images,
             notes,
             footnote_state,
             comment_window
@@ -1948,17 +2022,22 @@ fn render_code_block(
 /// `Pic::new` avoids that by transcoding through the `image` crate, but it
 /// `.expect()`s on a decode failure, which would turn a corrupt user file into a
 /// panic. This does the same conversion fallibly.
+///
+/// **Why the size is fitted.** The display size is the one the document states, or the file's
+/// own pixels at 96 dpi, and either can be far larger than the page: a 1024x1536 cover is
+/// 271 x 406 mm at that density. It is shrunk to the text area of `images`, keeping its aspect
+/// ratio and never enlarged, as Word does with a picture it inserts (see [`crate::image_fit`]).
 fn build_image_run(
     name: &str,
     alt: &str,
     width: i64,
     height: i64,
-    images: &ExportImages,
+    images: &InlineImages<'_>,
 ) -> Option<docx_rs::Run> {
     use docx_rs::*;
     use image::GenericImageView;
 
-    let bytes = &images.get(name)?.bytes;
+    let bytes = &images.bytes.get(name)?.bytes;
     let decoded = image::load_from_memory(bytes).ok()?;
     let (natural_w, natural_h) = decoded.dimensions();
 
@@ -1968,12 +2047,25 @@ fn build_image_run(
     // OOXML measures drawings in EMUs: 914400 per inch, and a pixel is 1/96".
     // Display size, when the document carries one, wins over the file's own
     // dimensions — that is what a resize in the editor means.
-    const EMU_PER_PX: u32 = 9525;
-    let display_w = if width > 0 { width as u32 } else { natural_w };
-    let display_h = if height > 0 { height as u32 } else { natural_h };
+    const EMU_PER_PX: f64 = 9525.0;
+    let display_w = if width > 0 {
+        width as f64
+    } else {
+        f64::from(natural_w)
+    };
+    let display_h = if height > 0 {
+        height as f64
+    } else {
+        f64::from(natural_h)
+    };
+    let (max_w, max_h) = images.max_emu;
+    let (fit_w, fit_h) =
+        crate::image_fit::fit_within(display_w * EMU_PER_PX, display_h * EMU_PER_PX, max_w, max_h);
+    // Clamped, not wrapped: a display size from a `{width=…}` attribute is file-controlled.
+    let to_emu = |v: f64| v.round().clamp(1.0, f64::from(u32::MAX)) as u32;
 
     let pic = Pic::new_with_dimensions(png.into_inner(), natural_w, natural_h)
-        .size(display_w * EMU_PER_PX, display_h * EMU_PER_PX);
+        .size(to_emu(fit_w), to_emu(fit_h));
 
     // ⚠ Alt text is lost here, and cannot currently be preserved: OOXML carries
     // it on `wp:docPr/@descr`, but docx-rs's builder for that element accepts
@@ -1991,7 +2083,7 @@ fn build_image_run(
 /// Returns `None` for segments that contribute no text.
 fn build_run(
     elem: &InlineSegment,
-    images: &ExportImages,
+    images: &InlineImages<'_>,
     notes: &std::collections::HashMap<String, Vec<docx_rs::Paragraph>>,
     footnote_state: &FootnoteRefState,
 ) -> Option<docx_rs::Run> {
@@ -2112,7 +2204,7 @@ struct RenderedPiece<'p> {
 fn add_inline_content(
     mut paragraph: docx_rs::Paragraph,
     pieces: &[(InlineSegment, u32, u32)],
-    images: &ExportImages,
+    images: &InlineImages<'_>,
     notes: &std::collections::HashMap<String, Vec<docx_rs::Paragraph>>,
     footnote_state: &FootnoteRefState,
     comments: Option<(&CommentEmitState<'_>, &BlockCommentWindow<'_>)>,

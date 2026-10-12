@@ -225,6 +225,9 @@ struct WalkCtx<'a> {
     /// (the same picture can be embedded twice). A shared counter, not a map, because the
     /// value only needs to be unique, never looked up again.
     image_seq: Cell<usize>,
+    /// The page's text area in points, `(width, height)`, which every picture is fitted
+    /// inside: see [`odt_render::text_area_pt`] and [`build_image_frame`].
+    image_box_pt: (f64, f64),
 }
 
 // ── Comment ranges (M-T2b) ───────────────────────────────────────────────────────────
@@ -1019,6 +1022,7 @@ impl ExportOdtUseCase {
                     images: &self.dto.options.images,
                     list_numbers: &list_numbers,
                     image_seq: Cell::new(0),
+                    image_box_pt: odt_render::text_area_pt(&self.dto.options),
                 };
                 let mut body = String::new();
                 let mut counter = 0i64;
@@ -1049,6 +1053,7 @@ impl ExportOdtUseCase {
             images: &self.dto.options.images,
             list_numbers: &list_numbers,
             image_seq: Cell::new(0),
+            image_box_pt: odt_render::text_area_pt(&self.dto.options),
         };
 
         let mut body_xml = String::new();
@@ -2306,6 +2311,10 @@ fn append_piece(
 /// parts `.png` regardless of content — see that function's own doc comment for the trap), ODF
 /// carries an explicit `manifest:media-type` per part, so the original bytes are embedded
 /// unmodified; no transcoding step exists to fail.
+///
+/// The display size is fitted to the page's text area (`ctx.image_box_pt`), proportionally and
+/// never enlarged, for the reason `export_docx_uc::build_image_run` gives: a picture's own
+/// pixels at 96 dpi, or a size the document states, can be far larger than the page.
 fn build_image_frame(
     name: &str,
     alt: &str,
@@ -2328,6 +2337,14 @@ fn build_image_frame(
         )
     };
 
+    let (box_w, box_h) = ctx.image_box_pt;
+    let (fit_w, fit_h) = crate::image_fit::fit_within(
+        odt_render::px_to_pt(natural_w),
+        odt_render::px_to_pt(natural_h),
+        box_w,
+        box_h,
+    );
+
     let seq = ctx.image_seq.get() + 1;
     ctx.image_seq.set(seq);
     let frame_name = format!("Image{seq}");
@@ -2341,8 +2358,8 @@ fn build_image_frame(
          text:anchor-type=\"as-char\">\
          <draw:image xlink:href=\"{}\" xlink:type=\"simple\" xlink:show=\"embed\" \
          xlink:actuate=\"onLoad\"/>{title}</draw:frame>",
-        odt_render::fmt_pt(odt_render::px_to_pt(natural_w)),
-        odt_render::fmt_pt(odt_render::px_to_pt(natural_h)),
+        odt_render::fmt_pt(fit_w),
+        odt_render::fmt_pt(fit_h),
         odt_render::xml_escape(href),
     ))
 }

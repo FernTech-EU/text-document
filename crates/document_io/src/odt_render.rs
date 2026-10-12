@@ -552,6 +552,30 @@ pub(crate) fn odf_align(alignment: &common::entities::Alignment) -> &'static str
     }
 }
 
+/// The page an export declares no size for, in points: the smaller of A4 and US Letter on each
+/// axis (210 mm wide, 11 in tall). Such a page is left to the reader, which picks one or the other
+/// by locale, so a picture fitted to this one fits on either.
+const READER_DEFAULT_PAGE_PT: (f64, f64) = (595.28, 792.0);
+
+/// The margin an export leaves unset, in points: 2 cm, LibreOffice's own default for every edge.
+const READER_DEFAULT_MARGIN_PT: f64 = 56.69;
+
+/// The page's text area, `(width, height)` in points: the page less its margins, as
+/// [`page_layout_and_master_page_xml`] declares them. An edge or a page size the options leave
+/// unset is not declared at all, so the reader supplies it; the defaults above stand in for what
+/// it is likely to choose, erring small.
+pub(crate) fn text_area_pt(options: &common::parser_tools::OdtExportOptions) -> (f64, f64) {
+    let (page_w, page_h) = match (options.page_width_twips, options.page_height_twips) {
+        (Some(w), Some(h)) => (f64::from(w) / 20.0, f64::from(h) / 20.0),
+        _ => READER_DEFAULT_PAGE_PT,
+    };
+    let edge = |m: Option<i32>| m.map_or(READER_DEFAULT_MARGIN_PT, twips_to_pt);
+    (
+        page_w - edge(options.margin_left_twips) - edge(options.margin_right_twips),
+        page_h - edge(options.margin_top_twips) - edge(options.margin_bottom_twips),
+    )
+}
+
 /// The page-layout + master-page pair that goes in `styles.xml`'s `<office:automatic-styles>`
 /// and `<office:master-styles>` respectively. A master page named exactly `"Standard"` is what
 /// ODF uses as the document's first/only page when nothing in `content.xml` says otherwise — no
