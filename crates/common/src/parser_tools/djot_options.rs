@@ -21,6 +21,12 @@
 
 use serde::{Deserialize, Serialize};
 
+/// The serde default of an attribute added after the options were first serialized: on,
+/// as [`DjotImportOptions::all`] and [`DjotExportOptions::all`], the two `Default`s, have it.
+const fn enabled() -> bool {
+    true
+}
+
 /// Selects which optional block attributes the djot **importer** applies to the
 /// document model. An attribute present in the source but disabled here is
 /// parsed and discarded, exactly like an unrepresentable construct.
@@ -38,7 +44,11 @@ pub struct DjotImportOptions {
     pub page_break_before: bool,
     /// Mark the block as front matter from `{front_matter=true|false}` (see
     /// `Block::fmt_front_matter`).
-    #[serde(default)]
+    ///
+    /// Unlike its older neighbours, which a serialized value must state, this one may be
+    /// missing from a value written before it existed, and is then on, as in
+    /// [`Self::default`]: off would drop the mark on every import that value configures.
+    #[serde(default = "enabled")]
     pub front_matter: bool,
     /// Apply block background color from `{background_color="<value>"}`.
     pub background_color: bool,
@@ -111,8 +121,10 @@ pub struct DjotExportOptions {
     pub non_breakable_lines: bool,
     /// Emit "start on a new page" as `{page_break_before=…}`.
     pub page_break_before: bool,
-    /// Emit the front-matter mark as `{front_matter=…}`.
-    #[serde(default)]
+    /// Emit the front-matter mark as `{front_matter=…}`. Missing from a serialized value
+    /// written before it existed, it is on, as in [`Self::default`]; see
+    /// [`DjotImportOptions::front_matter`].
+    #[serde(default = "enabled")]
     pub front_matter: bool,
     /// Emit block background color as `{background_color=…}`.
     pub background_color: bool,
@@ -175,5 +187,31 @@ impl DjotExportOptions {
 impl Default for DjotExportOptions {
     fn default() -> Self {
         Self::all()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{DjotExportOptions, DjotImportOptions};
+
+    /// A value serialized before `front_matter` existed reads back with it on, as `Default`
+    /// has it, and not silently off.
+    #[test]
+    fn options_serialized_before_front_matter_read_back_with_it_on() {
+        let mut import = serde_json::to_value(DjotImportOptions::all()).unwrap();
+        import.as_object_mut().unwrap().remove("front_matter");
+        let import: DjotImportOptions = serde_json::from_value(import).unwrap();
+        assert_eq!(import, DjotImportOptions::default());
+
+        let mut export = serde_json::to_value(DjotExportOptions::all()).unwrap();
+        export.as_object_mut().unwrap().remove("front_matter");
+        let export: DjotExportOptions = serde_json::from_value(export).unwrap();
+        assert_eq!(export, DjotExportOptions::default());
+
+        // A value that states it is read as stated.
+        let none: DjotImportOptions =
+            serde_json::from_value(serde_json::to_value(DjotImportOptions::none()).unwrap())
+                .unwrap();
+        assert!(!none.front_matter);
     }
 }
