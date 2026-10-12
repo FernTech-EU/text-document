@@ -495,6 +495,69 @@ fn every_known_scene_break_preset_glyph_is_recognised() {
     }
 }
 
+/// The automatic paragraph style `content` declares under `name`, opening tag to closing tag.
+fn automatic_style<'a>(content: &'a str, name: &str) -> &'a str {
+    let start = content
+        .find(&format!("<style:style style:name=\"{name}\""))
+        .unwrap_or_else(|| panic!("style {name} declared: {content}"));
+    let len = content[start..]
+        .find("</style:style>")
+        .expect("a closed style element");
+    &content[start..start + len]
+}
+
+/// The style name of the `<text:p>` whose whole text is `text`.
+fn paragraph_style_of<'a>(content: &'a str, text: &str) -> &'a str {
+    let end = content
+        .find(&format!(">{text}</text:p>"))
+        .unwrap_or_else(|| panic!("a paragraph reading {text:?}: {content}"));
+    let open = content[..end].rfind("<text:p ").expect("an opening tag");
+    let tag = &content[open..end];
+    let start = tag.find("text:style-name=\"").expect("a style name") + 17;
+    let len = tag[start..].find('"').expect("closing quote");
+    &tag[start..start + len]
+}
+
+/// With `keep_scene_break_glyphs`, a glyph line is the centred paragraph of text it was, and
+/// without it the same document still gets the rule: the switch, in both positions.
+#[test]
+fn keep_scene_break_glyphs_writes_the_glyph_as_a_centred_paragraph() {
+    let djot =
+        "Before.\n\n{alignment=center}\n\\#\n\nMiddle.\n\n{alignment=center}\n\\# # #\n\nAfter.";
+
+    let kept = content_xml(&odt_from_djot(
+        djot,
+        OdtExportOptions {
+            keep_scene_break_glyphs: true,
+            ..Default::default()
+        },
+    ));
+    assert!(
+        !kept.contains("text:style-name=\"Rule\""),
+        "no glyph may become a rule when asked to keep them: {kept}"
+    );
+    for glyph in ["#", "# # #"] {
+        let style = paragraph_style_of(&kept, glyph);
+        assert!(
+            automatic_style(&kept, style).contains("fo:text-align=\"center\""),
+            "the {glyph:?} line lost its alignment: {kept}"
+        );
+    }
+
+    let converted = content_xml(&odt_from_djot(djot, OdtExportOptions::default()));
+    assert_eq!(
+        converted
+            .matches("<text:p text:style-name=\"Rule\"/>")
+            .count(),
+        2,
+        "by default both glyph lines still become rules: {converted}"
+    );
+    assert!(
+        !converted.contains(">#</text:p>"),
+        "the default must not also keep the glyph: {converted}"
+    );
+}
+
 /// A paragraph that is a single mark of sentence punctuation is prose, and survives.
 ///
 /// Found on a real 90 000-word manuscript: a paragraph containing only `!` — a beat of

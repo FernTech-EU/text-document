@@ -69,7 +69,8 @@
 //! range falls inside a fenced code block, or on a paragraph the scene-break/rule heuristic
 //! replaced with an empty `"Rule"` paragraph (see this module's own section below), is not
 //! anchored — neither branch ever reaches [`add_inline_content`], the only place a comment
-//! marker is placed. Also out of scope: a footnote body (pre-rendered before the main walk, over
+//! marker is placed (a glyph line kept as text under `keep_scene_break_glyphs` does reach it,
+//! and anchors like any paragraph). Also out of scope: a footnote body (pre-rendered before the main walk, over
 //! content `to_addressable_text` never descends into) and table-cell prose (the addressable text
 //! represents a table by one sentinel character, never by its cells' own content). Any comment
 //! that never finds a home in the walk is a loud, named [`anyhow::Error`] from
@@ -112,6 +113,13 @@
 //! is stripped, is one non-alphanumeric character repeated — true for every glyph above, and for
 //! the CommonMark thematic-break syntax the same way `document_ingest`'s own doc comment already
 //! draws the analogy to.
+//!
+//! The conversion is a default, not a rule: it trades the glyph a preset chose for a line, which
+//! is wrong for a manuscript format that names its mark (Shunn's `#`). With
+//! [`OdtExportOptions::keep_scene_break_glyphs`](common::parser_tools::OdtExportOptions::keep_scene_break_glyphs)
+//! set, a glyph line is written as the plain paragraph it is, alignment and all, exactly as the
+//! DOCX writer always has. A reader that classifies a paragraph by its text rather than its
+//! style reads it back as a break either way.
 //!
 //! **Constraint that shaped [`OdtStyleSheet::paragraph_style`]'s design in `odt_render.rs`:** a
 //! rule paragraph is *always* written referencing the named `"Rule"` style directly, never behind
@@ -1485,7 +1493,11 @@ impl ExportOdtUseCase {
         // legitimately be short, symbol-heavy prose — e.g. a single em dash — and must never be
         // mistaken for a thematic break) and, structurally, only ever produces the bare `"Rule"`
         // reference — see this module's doc comment for why nothing may be layered on top of it.
-        if semantic.is_none() && looks_like_rule_glyph(&pieces) {
+        // A caller that asked to keep its glyphs gets them as the ordinary paragraph below.
+        if semantic.is_none()
+            && !self.dto.options.keep_scene_break_glyphs
+            && looks_like_rule_glyph(&pieces)
+        {
             return Ok(RenderedBlock::Standalone(
                 "<text:p text:style-name=\"Rule\"/>".to_string(),
             ));

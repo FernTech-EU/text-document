@@ -142,6 +142,19 @@ pub struct OdtExportOptions {
     /// Optional running-header text shown before the page number (e.g. `"Lastname / TITLE"`).
     /// Only used when [`page_numbers`](Self::page_numbers) is set.
     pub running_header: Option<String>,
+    /// Write a scene-break glyph line (`#`, `* * *`, `. . .`, `＊`: a plain paragraph holding one
+    /// non-alphanumeric character, possibly repeated) as the text it is, with its alignment and
+    /// every other attribute intact.
+    ///
+    /// Off by default, which keeps the writer's long-standing behaviour: such a line becomes an
+    /// empty paragraph in the `Rule` style, a bottom border alone, which LibreOffice draws as a
+    /// horizontal line and a reader that knows the style (Skribisto's ODT importer does) reads
+    /// back as a thematic break. That costs the glyph itself, so a manuscript format that names
+    /// its break mark (the Shunn standard's `#`) gets a line instead in ODT while DOCX, which has
+    /// no such conversion, keeps the mark. Set this when the glyph is what the reader must see;
+    /// it is then also an ordinary paragraph for comment ranges, which a rule paragraph is not.
+    #[serde(default)]
+    pub keep_scene_break_glyphs: bool,
     /// Definitions for heading levels 1..6, index 0 being level 1. Empty ⇒ the writer falls
     /// back to [`OdtHeadingStyle::default_ramp`] over the body size, because the one thing it
     /// must never do is leave every heading looking like undifferentiated body text.
