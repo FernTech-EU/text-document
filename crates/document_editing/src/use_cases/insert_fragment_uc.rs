@@ -2043,6 +2043,9 @@ fn insert_mixed_fragment(
         updated_current.fmt_line_height = fb.line_height;
         updated_current.fmt_non_breakable_lines = fb.non_breakable_lines;
         updated_current.fmt_page_break_before = fb.page_break_before;
+        // A fragment carries no front-matter mark, and the head takes the fragment's
+        // block formatting whole.
+        updated_current.fmt_front_matter = None;
         updated_current.fmt_direction = fb.direction.clone();
         updated_current.fmt_background_color = fb.background_color.clone();
         updated_current.fmt_is_code_block = fb.is_code_block;
@@ -2942,6 +2945,9 @@ fn paste_fragment(
             updated_current.fmt_line_height = first_frag.line_height;
             updated_current.fmt_non_breakable_lines = first_frag.non_breakable_lines;
             updated_current.fmt_page_break_before = first_frag.page_break_before;
+            // A fragment carries no front-matter mark, and the head takes the fragment's
+            // block formatting whole.
+            updated_current.fmt_front_matter = None;
             updated_current.fmt_direction = first_frag.direction.clone();
             updated_current.fmt_background_color = first_frag.background_color.clone();
             updated_current.fmt_is_code_block = first_frag.is_code_block;
@@ -3281,6 +3287,9 @@ fn paste_fragment(
             updated_current.fmt_line_height = frag_block.line_height;
             updated_current.fmt_non_breakable_lines = frag_block.non_breakable_lines;
             updated_current.fmt_page_break_before = frag_block.page_break_before;
+            // A fragment carries no front-matter mark, and the head takes the fragment's
+            // block formatting whole.
+            updated_current.fmt_front_matter = None;
             updated_current.fmt_direction = frag_block.direction.clone();
             updated_current.fmt_background_color = frag_block.background_color.clone();
             updated_current.fmt_is_code_block = frag_block.is_code_block;

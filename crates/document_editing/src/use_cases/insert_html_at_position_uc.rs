@@ -322,6 +322,7 @@ fn execute_content_insert(
             updated_current.fmt_line_height = first_parsed.line_height;
             updated_current.fmt_non_breakable_lines = first_parsed.non_breakable_lines;
             updated_current.fmt_page_break_before = first_parsed.page_break_before;
+            updated_current.fmt_front_matter = first_parsed.front_matter;
             updated_current.fmt_direction = first_parsed.direction.clone();
             updated_current.fmt_background_color = first_parsed.background_color.clone();
             updated_current.updated_at = now;
@@ -745,6 +746,7 @@ fn execute_content_insert(
             updated_current.fmt_line_height = parsed.line_height;
             updated_current.fmt_non_breakable_lines = parsed.non_breakable_lines;
             updated_current.fmt_page_break_before = parsed.page_break_before;
+            updated_current.fmt_front_matter = parsed.front_matter;
             updated_current.fmt_direction = parsed.direction.clone();
             updated_current.fmt_background_color = parsed.background_color.clone();
             updated_current.updated_at = now;
