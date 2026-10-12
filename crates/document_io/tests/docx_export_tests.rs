@@ -1125,3 +1125,45 @@ fn with_no_page_options_the_picture_fits_docx_rs_default_page() {
         "width fills the default text area",
     );
 }
+
+/// One field of a paragraph's `w:spacing`, through the crate's own JSON serialization (the
+/// fields themselves are private).
+fn spacing_field(p: &Paragraph, field: &str) -> Option<i64> {
+    let ls = p.property.line_spacing.as_ref()?;
+    serde_json::to_value(ls).ok()?.get(field)?.as_i64()
+}
+
+/// A block's own line height survives the spacing written around it. The paragraph's
+/// `w:spacing` is one element, so writing space above or below without the line replaced
+/// the line height the block asked for with the reader's single spacing.
+#[test]
+fn a_blocks_own_line_height_survives_its_space_above_and_below() {
+    let options = DocxExportOptions {
+        line_spacing_twips: Some(480),
+        paragraph_spacing_after_twips: Some(240),
+        ..Default::default()
+    };
+    let docx = docx_from_djot_with_options(
+        "{line_height=1500 top_margin=24}\nOne and a half.\n\nThe document default.",
+        options,
+    );
+    let own = para_containing(&docx, "One and a half.");
+    assert_eq!(
+        spacing_field(own, "line"),
+        Some(360),
+        "the block's line height"
+    );
+    assert_eq!(spacing_field(own, "before"), Some(360), "its space above");
+    assert_eq!(
+        spacing_field(own, "after"),
+        Some(240),
+        "the document's space below"
+    );
+
+    let plain = para_containing(&docx, "The document default.");
+    assert_eq!(
+        spacing_field(plain, "line"),
+        Some(480),
+        "the document's line height"
+    );
+}

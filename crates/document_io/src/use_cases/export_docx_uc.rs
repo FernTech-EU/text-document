@@ -849,6 +849,14 @@ fn px_to_twips(px: i64) -> i32 {
     px.saturating_mul(TWIPS_PER_PX).clamp(0, i32::MAX as i64) as i32
 }
 
+/// A block's own line height (`Block::fmt_line_height`, in thousandths of a line: 1000 is
+/// single, 1500 one and a half) as a `w:spacing/@w:line` in 240ths of a line.
+fn block_line_twips(block: &Block) -> Option<i32> {
+    block
+        .fmt_line_height
+        .map(|lh| (lh as f64 / 1000.0 * 240.0) as i32)
+}
+
 /// Light-grey fill behind code blocks, as an `RRGGBB` hex string.
 const CODE_BLOCK_FILL: &str = "F5F5F5";
 
@@ -1604,9 +1612,7 @@ impl ExportDocxUseCase {
 
         // Common paragraph-level formatting. Heading style is applied in the
         // dispatch below so it does not interfere with list/code handling.
-        if let Some(lh) = block.fmt_line_height {
-            // thousandths → 240ths: 1000 = single (240), 1500 = 1.5 (360).
-            let twips = (lh as f64 / 1000.0 * 240.0) as i32;
+        if let Some(twips) = block_line_twips(block) {
             paragraph = paragraph.line_spacing(
                 LineSpacing::new()
                     .line_rule(LineSpacingType::Auto)
@@ -1653,10 +1659,8 @@ impl ExportDocxUseCase {
             // reaches it.
             if let Some(before) = block.fmt_top_margin.filter(|&t| t > 0) {
                 let mut ls = LineSpacing::new().before(px_to_twips(before) as u32);
-                if let Some(lh) = block.fmt_line_height {
-                    ls = ls
-                        .line_rule(LineSpacingType::Auto)
-                        .line((lh as f64 / 1000.0 * 240.0) as i32);
+                if let Some(twips) = block_line_twips(block) {
+                    ls = ls.line_rule(LineSpacingType::Auto).line(twips);
                 }
                 paragraph = paragraph.line_spacing(ls);
             }
@@ -1751,12 +1755,13 @@ impl ExportDocxUseCase {
         let o = &self.dto.options;
         let rtl = block.fmt_direction == Some(common::entities::TextDirection::RightToLeft);
 
-        // Combined line spacing: line height (unless the block set its own) + space-after.
+        // Combined line spacing: the block's own line height, else the document's, plus the
+        // space around it. One `LineSpacing` holds all three, and setting one replaces the
+        // paragraph's whole `w:spacing`, so the block's own line height is restated here:
+        // `render_block` already set it, and a spacing written without it would drop it.
         let mut ls = LineSpacing::new();
         let mut ls_used = false;
-        if block.fmt_line_height.is_none()
-            && let Some(line) = o.line_spacing_twips
-        {
+        if let Some(line) = block_line_twips(block).or(o.line_spacing_twips) {
             ls = ls.line_rule(LineSpacingType::Auto).line(line);
             ls_used = true;
         }
