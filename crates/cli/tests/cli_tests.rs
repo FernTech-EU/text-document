@@ -2,7 +2,7 @@ use std::fs;
 use std::process::Command;
 
 fn text_document_bin() -> Command {
-    Command::new(env!("CARGO_BIN_EXE_text-document"))
+    Command::new(std::env::var("CARGO_BIN_EXE_text-document").expect("set by cargo test"))
 }
 
 fn tmp_path(name: &str) -> std::path::PathBuf {
