@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: MPL-2.0
+#![cfg(feature = "odt")]
 // SPDX-FileCopyrightText: 2026 FernTech
 
 //! Feature tests for round-trip **marks** in the ODT writer (`export_odt_uc.rs`'s

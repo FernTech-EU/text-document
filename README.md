@@ -16,7 +16,7 @@ Built on a [ropey](https://github.com/cessen/ropey)-backed text store with a [Ql
 - **Rich text model**: Frames, Blocks with character data in a shared `ropey::Rope`, per-block byte-ranged `FormatRun`s, and `ImageAnchor`s (`InlineContent::Text | Image`)
 - **Multi-cursor editing**: Qt-style cursors with automatic position adjustment
 - **Full undo/redo**: Snapshot-based, with composite grouping (`begin_edit_block` / `end_edit_block`), word-level coalescing an embedder can interrupt (`break_undo_merge`), an optional depth cap (`set_undo_limit`), and an untracked stack for writes that must not become history
-- **Import/Export**: Plain text, Markdown, HTML, LaTeX, DOCX
+- **Import/Export**: Plain text, Markdown, HTML, LaTeX, DOCX. DOCX, EPUB and ODT export sit behind the `docx`, `epub` and `odt` cargo features, on by default; with `default-features = false` their `to_*` methods return an error and docx-rs, epub-builder, zip and `image` leave the build. PDF export sits behind `pdf`, off by default.
 - **Search**: Find, find all, regex, replace (undoable)
 - **Formatting**: Character format (`bold`, `italic`, `underline`, ...), block format (`alignment`, `heading_level`, ...), frame format
 - **Syntax highlighting**: Generic `SyntaxHighlighter` trait (Qt's QSyntaxHighlighter-style) — shadow formatting layer visible to layout but invisible to export/cursor/undo. Multi-block state, per-block user data, full format control (colors, bold, italic, underline styles, ...). Auto re-highlights on edits with cascade.

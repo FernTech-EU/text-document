@@ -1,3 +1,4 @@
+#![cfg(all(feature = "docx", feature = "odt"))]
 //! Front matter (`Block::fmt_front_matter`) in the DOCX and ODT writers: the leading run of
 //! marked blocks gets pages with no running header and no page number, and the body after it
 //! starts a fresh page sequence numbered from 1.

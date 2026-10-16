@@ -44,7 +44,7 @@ regex = "1"
 # comments (`comments`/`comments_extended` are still `pub Vec<u8>`), and the auto-collector's
 # `CommentExtended::new(para_id)` is unchanged — same call, same line. Verified by diffing the
 # two extracted crate sources, not assumed.
-docx-rs = "=0.4.22"
+docx-rs = { version = "=0.4.22", optional = true }
 # A comment/reply body is Djot source (`common::parser_tools::DocumentComment::body`);
 # `export_docx_uc.rs`'s `render_comment_body` walks it with the same pull parser `common`
 # uses for the real Djot importer. Matched to `common`'s own `jotdown` version so the two
@@ -54,8 +54,8 @@ jotdown = { version = "0.10", default-features = false }
 # JPEG has to be transcoded. Already in the tree via docx-rs's default `image`
 # feature — naming it directly is what lets the conversion be fallible instead
 # of going through `Pic::new`, which panics on a file it cannot decode.
-image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp", "gif"] }
-epub-builder = "0.8.3"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp", "gif"], optional = true }
+epub-builder = { version = "0.8.3", optional = true }
 # The ODT writer's own zip container. Unlike DOCX (docx-rs) and EPUB (epub-builder), there is
 # no maintained ODF-writing crate to lean on (`open-document` v0.1.0 is a single unstable
 # release — not a dependency), so `export_odt_uc.rs` hand-assembles the OpenDocument package
@@ -64,7 +64,7 @@ epub-builder = "0.8.3"
 # `META-INF/manifest.xml`, `content.xml`, `styles.xml`, deflated. Was a dev-dependency only
 # (used by tests to unzip a packaged DOCX/EPUB for inspection); promoted to a real dependency
 # because the ODT writer itself now needs it at runtime, not only in tests.
-zip = "6"
+zip = { version = "6", optional = true }
 
 # PDF export (via embedded Typst), behind the `pdf` feature — see [features] below.
 # Pinned exactly (`=x.y.z`): typst is pre-1.0 with breaking changes across 0.x bumps, and PDF
@@ -106,6 +106,16 @@ proptest = "1"
 text-document = { path = "../public_api" }
 
 [features]
+# The three packaged office formats. Each writer pulls a container stack of its own (docx-rs,
+# epub-builder, zip with its compression backends, and `image` for the transcoding DOCX and
+# ODT do), which an application that only edits, or exchanges HTML / Markdown / Djot, never
+# calls. On by default so a plain dependency keeps every exporter; turn the defaults off to
+# drop them. Disabled, `export_docx` / `export_epub` / `export_odt` keep their signatures and
+# fail at runtime, the way `export_pdf` does without `pdf`.
+default = ["docx", "epub", "odt"]
+docx = ["dep:docx-rs", "dep:image"]
+epub = ["dep:epub-builder"]
+odt = ["dep:zip", "dep:image"]
 # Embedded Typst PDF export (`typst_compile.rs`/`typst_markup.rs`/`export_pdf_uc.rs`). Off by
 # default: zero typst crates are pulled into a plain `cargo build`/`cargo test`. Deliberately
 # does NOT enable typst-as-lib's `typst-kit-fonts`/`typst-kit-embed-fonts` — those would pull in

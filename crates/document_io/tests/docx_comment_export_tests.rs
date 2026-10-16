@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: MPL-2.0
+#![cfg(feature = "docx")]
 // SPDX-FileCopyrightText: 2026 FernTech
 
 //! Feature tests for M-T1 — DOCX comment-range export

@@ -8,11 +8,14 @@
 //! markup that references it, because the markup was never the part that was
 //! wrong.
 
+#[cfg(any(feature = "docx", feature = "epub"))]
 use std::io::Read;
 
+#[cfg(feature = "epub")]
+use text_document::EpubExportOptions;
 use text_document::{
-    EpubExportOptions, ExportImage, ExportImages, HtmlExportOptions, HtmlImageMode,
-    LatexExportOptions, ResourceType, TextDocument,
+    ExportImage, ExportImages, HtmlExportOptions, HtmlImageMode, LatexExportOptions, ResourceType,
+    TextDocument,
 };
 
 /// A real 4×3 PNG, encoded by the `png` crate so the bytes are a decodable
@@ -46,6 +49,7 @@ fn images() -> ExportImages {
 }
 
 /// Read one entry out of a zip container, by suffix match on its name.
+#[cfg(any(feature = "docx", feature = "epub"))]
 fn zip_entry(archive: &[u8], suffix: &str) -> Option<(String, Vec<u8>)> {
     let mut zip = zip::ZipArchive::new(std::io::Cursor::new(archive.to_vec())).ok()?;
     for i in 0..zip.len() {
@@ -60,6 +64,7 @@ fn zip_entry(archive: &[u8], suffix: &str) -> Option<(String, Vec<u8>)> {
     None
 }
 
+#[cfg(any(feature = "docx", feature = "epub"))]
 fn zip_names(archive: &[u8]) -> Vec<String> {
     let mut zip = zip::ZipArchive::new(std::io::Cursor::new(archive.to_vec())).expect("zip");
     (0..zip.len())
@@ -216,6 +221,7 @@ fn dropping_every_optional_attribute_still_keeps_the_images() {
 
 // ── DOCX ────────────────────────────────────────────────────────────────
 
+#[cfg(feature = "docx")]
 #[test]
 fn docx_embeds_a_real_media_part() {
     let dir = tempfile::tempdir().expect("tmp");
@@ -251,6 +257,7 @@ fn docx_embeds_a_real_media_part() {
     );
 }
 
+#[cfg(feature = "docx")]
 #[test]
 fn docx_without_bytes_degrades_to_the_description() {
     let dir = tempfile::tempdir().expect("tmp");
@@ -270,6 +277,7 @@ fn docx_without_bytes_degrades_to_the_description() {
 
 // ── EPUB ────────────────────────────────────────────────────────────────
 
+#[cfg(feature = "epub")]
 #[test]
 fn epub_packages_the_image_and_points_at_it() {
     let dir = tempfile::tempdir().expect("tmp");
@@ -309,6 +317,7 @@ fn epub_packages_the_image_and_points_at_it() {
     );
 }
 
+#[cfg(feature = "epub")]
 #[test]
 fn epub_without_bytes_degrades_to_the_description() {
     let dir = tempfile::tempdir().expect("tmp");
@@ -329,6 +338,7 @@ fn epub_without_bytes_degrades_to_the_description() {
 
 // ── EPUB cover ──────────────────────────────────────────────────────────
 
+#[cfg(feature = "epub")]
 #[test]
 fn epub_marks_a_cover_in_the_manifest_and_gives_it_a_page() {
     let dir = tempfile::tempdir().expect("tmp");
@@ -379,6 +389,7 @@ fn epub_marks_a_cover_in_the_manifest_and_gives_it_a_page() {
     assert!(page.contains("alt="), "cover image has no alt text: {page}");
 }
 
+#[cfg(feature = "epub")]
 #[test]
 fn an_epub_without_a_cover_gains_no_cover_files() {
     let dir = tempfile::tempdir().expect("tmp");

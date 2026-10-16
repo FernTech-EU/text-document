@@ -1,3 +1,4 @@
+#![cfg(feature = "docx")]
 //! Feature tests for the DOCX exporter.
 //!
 //! Documents are built with the (well-tested) djot importer. Most tests export via the

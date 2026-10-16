@@ -492,6 +492,7 @@ proptest! {
 /// (128), aborted the whole process. It walks them in a loop now, so the depth a
 /// document can hold is no limit: each export here runs on the library's own export
 /// thread, and every one holds the quoted words.
+#[cfg(feature = "docx")]
 #[test]
 fn a_deep_quotation_exports_to_docx() {
     let dir = tempfile::tempdir().expect("a directory for the exports");

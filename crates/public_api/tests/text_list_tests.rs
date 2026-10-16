@@ -879,6 +879,7 @@ fn list_items_pasted_into_a_list_join_it() {
 /// first item wears, as an editor shows it: every `<text:list>` of one list style starts at
 /// the style's start, so a list starting at 3, its second item taken out of it, read 3 and 3
 /// again in LibreOffice where the editor showed 3 and 4.
+#[cfg(feature = "odt")]
 #[test]
 fn a_resumed_run_of_a_list_keeps_its_number_in_odt() {
     let doc = djot("3. a\n4. b\n5. c\n");
@@ -919,6 +920,7 @@ fn a_resumed_run_of_a_list_keeps_its_number_in_odt() {
 /// adds, and the first list's took id 1 too: two definitions under one id, the default's
 /// decimal numbering from 1 first, and which one Word or LibreOffice applies is the reader's
 /// guess. The first list of a text, starting at 3 or bulleted, could come out as 1., 2.
+#[cfg(feature = "docx")]
 #[test]
 fn every_list_s_numbering_has_an_id_of_its_own_in_docx() {
     let doc = djot("- bullet\n\nText.\n\n3. three\n4. four\n");

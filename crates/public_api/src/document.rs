@@ -602,6 +602,9 @@ impl TextDocument {
     /// Export the entire document as DOCX to a file path.
     ///
     /// This is a **long operation**. Returns a typed [`Operation`] handle.
+    ///
+    /// Requires the `docx` cargo feature on `text-document` (on by default). Without it this
+    /// returns `Err(DocumentError::Unsupported(..))`.
     pub fn to_docx(&self, output_path: &str) -> Result<Operation<DocxExportResult>> {
         self.to_docx_with_options(output_path, crate::DocxExportOptions::default())
     }
@@ -610,6 +613,7 @@ impl TextDocument {
     /// *manuscript* style (page size, margins, body font, line spacing, first-line indent,
     /// alignment, and an optional page-number header). Per-block RTL is emitted automatically
     /// from each block's own direction, independent of these options.
+    #[cfg(feature = "docx")]
     pub fn to_docx_with_options(
         &self,
         output_path: &str,
@@ -639,9 +643,25 @@ impl TextDocument {
         ))
     }
 
+    /// As [`to_docx`](Self::to_docx), when the `docx` cargo feature was not enabled at compile
+    /// time: returns [`DocumentError::Unsupported`] immediately, without starting an operation.
+    #[cfg(not(feature = "docx"))]
+    pub fn to_docx_with_options(
+        &self,
+        _output_path: &str,
+        _options: crate::DocxExportOptions,
+    ) -> Result<Operation<DocxExportResult>> {
+        Err(DocumentError::Unsupported(
+            "DOCX export requires the `docx` cargo feature on the `text-document` crate".into(),
+        ))
+    }
+
     /// Export the entire document as an EPUB 3 file to a file path.
     ///
     /// This is a **long operation**. Returns a typed [`Operation`] handle.
+    ///
+    /// Requires the `epub` cargo feature on `text-document` (on by default). Without it this
+    /// returns `Err(DocumentError::Unsupported(..))`.
     pub fn to_epub(&self, output_path: &str) -> Result<Operation<EpubExportResult>> {
         self.to_epub_with_options(output_path, crate::EpubExportOptions::default())
     }
@@ -650,6 +670,7 @@ impl TextDocument {
     /// reading direction). The document is split into chapters at the shallowest heading level
     /// present (e.g. every top-level `# Chapter` heading) — see
     /// [`EpubExportOptions`](crate::EpubExportOptions) for details.
+    #[cfg(feature = "epub")]
     pub fn to_epub_with_options(
         &self,
         output_path: &str,
@@ -679,9 +700,25 @@ impl TextDocument {
         ))
     }
 
+    /// As [`to_epub`](Self::to_epub), when the `epub` cargo feature was not enabled at compile
+    /// time: returns [`DocumentError::Unsupported`] immediately, without starting an operation.
+    #[cfg(not(feature = "epub"))]
+    pub fn to_epub_with_options(
+        &self,
+        _output_path: &str,
+        _options: crate::EpubExportOptions,
+    ) -> Result<Operation<EpubExportResult>> {
+        Err(DocumentError::Unsupported(
+            "EPUB export requires the `epub` cargo feature on the `text-document` crate".into(),
+        ))
+    }
+
     /// Export the entire document as ODT (OpenDocument Text) to a file path.
     ///
     /// This is a **long operation**. Returns a typed [`Operation`] handle.
+    ///
+    /// Requires the `odt` cargo feature on `text-document` (on by default). Without it this
+    /// returns `Err(DocumentError::Unsupported(..))`.
     pub fn to_odt(&self, output_path: &str) -> Result<Operation<OdtExportResult>> {
         self.to_odt_with_options(output_path, crate::OdtExportOptions::default())
     }
@@ -690,6 +727,7 @@ impl TextDocument {
     /// analog of [`to_docx_with_options`](Self::to_docx_with_options), same units and same
     /// per-block-RTL-is-automatic behaviour (see [`OdtExportOptions`](crate::OdtExportOptions)'s
     /// own doc comment).
+    #[cfg(feature = "odt")]
     pub fn to_odt_with_options(
         &self,
         output_path: &str,
@@ -716,6 +754,19 @@ impl TextDocument {
                         })
                     })
             }),
+        ))
+    }
+
+    /// As [`to_odt`](Self::to_odt), when the `odt` cargo feature was not enabled at compile
+    /// time: returns [`DocumentError::Unsupported`] immediately, without starting an operation.
+    #[cfg(not(feature = "odt"))]
+    pub fn to_odt_with_options(
+        &self,
+        _output_path: &str,
+        _options: crate::OdtExportOptions,
+    ) -> Result<Operation<OdtExportResult>> {
+        Err(DocumentError::Unsupported(
+            "ODT export requires the `odt` cargo feature on the `text-document` crate".into(),
         ))
     }
 

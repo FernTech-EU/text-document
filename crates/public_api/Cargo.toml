@@ -44,6 +44,14 @@ tempfile = "3"
 # `pdf` feature. Off by default: no typst crates are pulled in unless a downstream consumer
 # opts in (e.g. `text-document = { ..., features = ["pdf"] }`).
 pdf = ["frontend/pdf"]
+# DOCX, EPUB and ODT export (`to_docx`, `to_epub`, `to_odt`), forwarded to `document_io`. On
+# by default. An application that only edits, or exchanges HTML / Markdown / Djot, can set
+# `default-features = false` and drop docx-rs, epub-builder, zip and `image` from its build;
+# the three methods then return an error at runtime.
+default = ["docx", "epub", "odt"]
+docx = ["frontend/docx"]
+epub = ["frontend/epub"]
+odt = ["frontend/odt"]
 
 [[bench]]
 name = "benchmarks"

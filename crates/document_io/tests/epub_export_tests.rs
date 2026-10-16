@@ -1,3 +1,4 @@
+#![cfg(feature = "epub")]
 //! Feature tests for the EPUB 3 exporter.
 //!
 //! Documents are built with the (well-tested) djot importer, then exported via the file-less

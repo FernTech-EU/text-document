@@ -1,3 +1,4 @@
+#![cfg(feature = "docx")]
 //! Property tests for the DOCX exporter.
 //!
 //! There is no DOCX *importer*, so this cannot be a model→docx→model fixpoint

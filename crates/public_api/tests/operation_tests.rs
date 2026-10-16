@@ -95,6 +95,7 @@ fn html_import_is_done() {
 
 // ── DOCX export (Operation) ──────────────────────────────────────
 
+#[cfg(feature = "docx")]
 #[test]
 fn docx_export_wait() {
     let doc = TextDocument::new();
@@ -109,6 +110,7 @@ fn docx_export_wait() {
     let _ = std::fs::remove_file(&tmp);
 }
 
+#[cfg(feature = "docx")]
 #[test]
 fn docx_export_operation_id() {
     let doc = TextDocument::new();

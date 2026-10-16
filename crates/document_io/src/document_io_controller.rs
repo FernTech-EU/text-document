@@ -22,11 +22,14 @@ use crate::ImportMarkdownDto;
 use crate::ImportMarkdownResultDto;
 use crate::ImportPlainTextDto;
 use crate::units_of_work::export_djot_uow::ExportDjotUnitOfWorkFactory;
+#[cfg(feature = "docx")]
 use crate::units_of_work::export_docx_uow::ExportDocxUnitOfWorkFactory;
+#[cfg(feature = "epub")]
 use crate::units_of_work::export_epub_uow::ExportEpubUnitOfWorkFactory;
 use crate::units_of_work::export_html_uow::ExportHtmlUnitOfWorkFactory;
 use crate::units_of_work::export_latex_uow::ExportLatexUnitOfWorkFactory;
 use crate::units_of_work::export_markdown_uow::ExportMarkdownUnitOfWorkFactory;
+#[cfg(feature = "odt")]
 use crate::units_of_work::export_odt_uow::ExportOdtUnitOfWorkFactory;
 #[cfg(feature = "pdf")]
 use crate::units_of_work::export_pdf_uow::ExportPdfUnitOfWorkFactory;
@@ -36,11 +39,14 @@ use crate::units_of_work::import_html_uow::ImportHtmlUnitOfWorkFactory;
 use crate::units_of_work::import_markdown_uow::ImportMarkdownUnitOfWorkFactory;
 use crate::units_of_work::import_plain_text_uow::ImportPlainTextUnitOfWorkFactory;
 use crate::use_cases::export_djot_uc::ExportDjotUseCase;
+#[cfg(feature = "docx")]
 use crate::use_cases::export_docx_uc::ExportDocxUseCase;
+#[cfg(feature = "epub")]
 use crate::use_cases::export_epub_uc::ExportEpubUseCase;
 use crate::use_cases::export_html_uc::ExportHtmlUseCase;
 use crate::use_cases::export_latex_uc::ExportLatexUseCase;
 use crate::use_cases::export_markdown_uc::ExportMarkdownUseCase;
+#[cfg(feature = "odt")]
 use crate::use_cases::export_odt_uc::ExportOdtUseCase;
 #[cfg(feature = "pdf")]
 use crate::use_cases::export_pdf_uc::ExportPdfUseCase;
@@ -337,6 +343,7 @@ pub fn export_latex(
     Ok(return_dto)
 }
 
+#[cfg(feature = "docx")]
 pub fn export_docx(
     db_context: &DbContext,
     _event_hub: &Arc<EventHub>,
@@ -349,6 +356,18 @@ pub fn export_docx(
     Ok(operation_id)
 }
 
+#[cfg(not(feature = "docx"))]
+pub fn export_docx(
+    _db_context: &DbContext,
+    _event_hub: &Arc<EventHub>,
+    _long_operation_manager: &mut LongOperationManager,
+    _dto: &ExportDocxDto,
+) -> Result<String> {
+    Err(anyhow::anyhow!(
+        "DOCX export requires the `docx` cargo feature on the `text-document-io` crate"
+    ))
+}
+
 /// Build the in-memory DOCX document for `db_context` without writing a file.
 ///
 /// This runs the exact same builder used by [`export_docx`] but returns the
@@ -356,6 +375,7 @@ pub fn export_docx(
 /// inspect the produced structure. Intended for tests; the type is re-exported
 /// as [`crate::docx_rs`] so callers can name it.
 #[doc(hidden)]
+#[cfg(feature = "docx")]
 pub fn build_docx_document(db_context: &DbContext, dto: &ExportDocxDto) -> Result<docx_rs::Docx> {
     let uow_context = ExportDocxUnitOfWorkFactory::new(db_context);
     let uc = ExportDocxUseCase::new(Box::new(uow_context), dto);
@@ -371,6 +391,7 @@ pub fn build_docx_document(db_context: &DbContext, dto: &ExportDocxDto) -> Resul
 /// golden-fixture LibreOffice conversion test, since `docx_rs::Docx::build().pack(..)` alone
 /// would skip the patch entirely.
 #[doc(hidden)]
+#[cfg(feature = "docx")]
 pub fn build_docx_xml_document(
     db_context: &DbContext,
     dto: &ExportDocxDto,
@@ -380,6 +401,7 @@ pub fn build_docx_xml_document(
     uc.build_document_xml()
 }
 
+#[cfg(feature = "docx")]
 pub fn get_export_docx_progress(
     long_operation_manager: &LongOperationManager,
     operation_id: &str,
@@ -387,6 +409,15 @@ pub fn get_export_docx_progress(
     long_operation_manager.get_operation_progress(operation_id)
 }
 
+#[cfg(not(feature = "docx"))]
+pub fn get_export_docx_progress(
+    _long_operation_manager: &LongOperationManager,
+    _operation_id: &str,
+) -> Option<OperationProgress> {
+    None
+}
+
+#[cfg(feature = "docx")]
 pub fn get_export_docx_result(
     long_operation_manager: &LongOperationManager,
     operation_id: &str,
@@ -404,6 +435,15 @@ pub fn get_export_docx_result(
     Ok(Some(result_dto))
 }
 
+#[cfg(not(feature = "docx"))]
+pub fn get_export_docx_result(
+    _long_operation_manager: &LongOperationManager,
+    _operation_id: &str,
+) -> Result<Option<ExportDocxResultDto>> {
+    Ok(None)
+}
+
+#[cfg(feature = "epub")]
 pub fn export_epub(
     db_context: &DbContext,
     _event_hub: &Arc<EventHub>,
@@ -416,12 +456,25 @@ pub fn export_epub(
     Ok(operation_id)
 }
 
+#[cfg(not(feature = "epub"))]
+pub fn export_epub(
+    _db_context: &DbContext,
+    _event_hub: &Arc<EventHub>,
+    _long_operation_manager: &mut LongOperationManager,
+    _dto: &ExportEpubDto,
+) -> Result<String> {
+    Err(anyhow::anyhow!(
+        "EPUB export requires the `epub` cargo feature on the `text-document-io` crate"
+    ))
+}
+
 /// Build the packaged EPUB bytes for `db_context` without writing a file.
 ///
 /// This runs the exact same builder used by [`export_epub`] but returns the assembled `.epub`
 /// zip archive as bytes instead of writing it to disk, so callers (tests, notably) can inspect
 /// the produced package directly — e.g. with the `zip` crate.
 #[doc(hidden)]
+#[cfg(feature = "epub")]
 pub fn build_epub_document(db_context: &DbContext, dto: &ExportEpubDto) -> Result<Vec<u8>> {
     let uow_context = ExportEpubUnitOfWorkFactory::new(db_context);
     let uc = ExportEpubUseCase::new(Box::new(uow_context), dto);
@@ -429,6 +482,7 @@ pub fn build_epub_document(db_context: &DbContext, dto: &ExportEpubDto) -> Resul
     Ok(epub_bytes)
 }
 
+#[cfg(feature = "epub")]
 pub fn get_export_epub_progress(
     long_operation_manager: &LongOperationManager,
     operation_id: &str,
@@ -436,6 +490,15 @@ pub fn get_export_epub_progress(
     long_operation_manager.get_operation_progress(operation_id)
 }
 
+#[cfg(not(feature = "epub"))]
+pub fn get_export_epub_progress(
+    _long_operation_manager: &LongOperationManager,
+    _operation_id: &str,
+) -> Option<OperationProgress> {
+    None
+}
+
+#[cfg(feature = "epub")]
 pub fn get_export_epub_result(
     long_operation_manager: &LongOperationManager,
     operation_id: &str,
@@ -453,6 +516,15 @@ pub fn get_export_epub_result(
     Ok(Some(result_dto))
 }
 
+#[cfg(not(feature = "epub"))]
+pub fn get_export_epub_result(
+    _long_operation_manager: &LongOperationManager,
+    _operation_id: &str,
+) -> Result<Option<ExportEpubResultDto>> {
+    Ok(None)
+}
+
+#[cfg(feature = "odt")]
 pub fn export_odt(
     db_context: &DbContext,
     _event_hub: &Arc<EventHub>,
@@ -465,12 +537,25 @@ pub fn export_odt(
     Ok(operation_id)
 }
 
+#[cfg(not(feature = "odt"))]
+pub fn export_odt(
+    _db_context: &DbContext,
+    _event_hub: &Arc<EventHub>,
+    _long_operation_manager: &mut LongOperationManager,
+    _dto: &ExportOdtDto,
+) -> Result<String> {
+    Err(anyhow::anyhow!(
+        "ODT export requires the `odt` cargo feature on the `text-document-io` crate"
+    ))
+}
+
 /// Build the packaged ODT bytes for `db_context` without writing a file.
 ///
 /// This runs the exact same builder used by [`export_odt`] but returns the assembled `.odt` zip
 /// archive as bytes instead of writing it to disk, so callers (tests, notably) can inspect the
 /// produced package directly — the ODT analog of [`build_epub_document`].
 #[doc(hidden)]
+#[cfg(feature = "odt")]
 pub fn build_odt_document(db_context: &DbContext, dto: &ExportOdtDto) -> Result<Vec<u8>> {
     let uow_context = ExportOdtUnitOfWorkFactory::new(db_context);
     let uc = ExportOdtUseCase::new(Box::new(uow_context), dto);
@@ -478,6 +563,7 @@ pub fn build_odt_document(db_context: &DbContext, dto: &ExportOdtDto) -> Result<
     Ok(odt_bytes)
 }
 
+#[cfg(feature = "odt")]
 pub fn get_export_odt_progress(
     long_operation_manager: &LongOperationManager,
     operation_id: &str,
@@ -485,6 +571,15 @@ pub fn get_export_odt_progress(
     long_operation_manager.get_operation_progress(operation_id)
 }
 
+#[cfg(not(feature = "odt"))]
+pub fn get_export_odt_progress(
+    _long_operation_manager: &LongOperationManager,
+    _operation_id: &str,
+) -> Option<OperationProgress> {
+    None
+}
+
+#[cfg(feature = "odt")]
 pub fn get_export_odt_result(
     long_operation_manager: &LongOperationManager,
     operation_id: &str,
@@ -495,6 +590,14 @@ pub fn get_export_odt_result(
     }
     let result_dto: ExportOdtResultDto = serde_json::from_str(&result_json.unwrap())?;
     Ok(Some(result_dto))
+}
+
+#[cfg(not(feature = "odt"))]
+pub fn get_export_odt_result(
+    _long_operation_manager: &LongOperationManager,
+    _operation_id: &str,
+) -> Result<Option<ExportOdtResultDto>> {
+    Ok(None)
 }
 
 // ─── PDF export (via embedded Typst) — dual-cfg ────────────────────────────

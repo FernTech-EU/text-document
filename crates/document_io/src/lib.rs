@@ -3,8 +3,10 @@ pub mod document_io_controller;
 pub mod dtos;
 pub(crate) mod footnotes;
 pub(crate) mod html_render;
+#[cfg(any(feature = "docx", feature = "odt"))]
 pub(crate) mod image_fit;
 pub(crate) mod list_numbers;
+#[cfg(feature = "odt")]
 pub(crate) mod odt_render;
 #[cfg(feature = "pdf")]
 pub(crate) mod typst_compile;
@@ -19,5 +21,6 @@ pub use dtos::*;
 /// (notably tests inspecting the output of
 /// [`document_io_controller::build_docx_document`]) can name its types against
 /// the exact version this crate links.
+#[cfg(feature = "docx")]
 #[doc(hidden)]
 pub use docx_rs;

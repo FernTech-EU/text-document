@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: MPL-2.0
+#![cfg(feature = "odt")]
 // SPDX-FileCopyrightText: 2026 FernTech
 
 //! Feature tests for M-T2b — ODT comment-range export (`export_odt_uc.rs`'s comment machinery:

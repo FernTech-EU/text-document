@@ -45,6 +45,7 @@ pub enum HtmlImagePolicy<'a> {
     Reference,
     /// Replace `src` via a map of document-src → output-href. Used by the EPUB
     /// exporter, where every image is repackaged under its own name.
+    #[cfg_attr(not(feature = "epub"), allow(dead_code))]
     Rewrite(&'a std::collections::BTreeMap<String, String>),
     /// Inline the bytes as a `data:` URI, producing a self-contained document.
     DataUri(&'a ExportImages),

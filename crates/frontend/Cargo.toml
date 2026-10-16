@@ -35,6 +35,11 @@ document_inspection = { workspace = true }
 # PDF export (via embedded Typst) — forwards to `document_io`'s own `pdf` feature. Off by
 # default: no typst crates are pulled in unless a downstream consumer opts in.
 pdf = ["document_io/pdf"]
+# The packaged office formats, forwarded to `document_io`. See its manifest.
+default = ["docx", "epub", "odt"]
+docx = ["document_io/docx"]
+epub = ["document_io/epub"]
+odt = ["document_io/odt"]
 
 [lints]
 workspace = true

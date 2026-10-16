@@ -291,6 +291,7 @@ fn test_export_latex_without_preamble() -> Result<()> {
 // ─── Export DOCX Tests ──────────────────────────────────────────────
 
 #[test]
+#[cfg(feature = "docx")]
 fn test_export_docx_simple() -> Result<()> {
     let (db_context, event_hub, _) = setup_with_text("Hello World")?;
     let mut long_op_manager = LongOperationManager::new();

@@ -328,6 +328,7 @@ fn markdown_to_latex_roundtrip() {
 
 // ── DOCX export with content ────────────────────────────────────
 
+#[cfg(feature = "docx")]
 #[test]
 fn docx_export_multiblock() {
     let doc = new_doc("Para 1\nPara 2\nPara 3");
@@ -338,6 +339,7 @@ fn docx_export_multiblock() {
     let _ = std::fs::remove_file(&tmp);
 }
 
+#[cfg(feature = "docx")]
 #[test]
 fn docx_export_with_formatting() {
     let doc = new_doc("Bold text");

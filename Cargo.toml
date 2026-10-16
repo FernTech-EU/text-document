@@ -60,9 +60,9 @@ direct_access = { version = "1.13.0", path = "crates/direct_access", package = "
 document_editing = { version = "1.13.0", path = "crates/document_editing", package = "text-document-editing" }
 document_formatting = { version = "1.13.0", path = "crates/document_formatting", package = "text-document-formatting" }
 document_inspection = { version = "1.13.0", path = "crates/document_inspection", package = "text-document-inspection" }
-document_io = { version = "1.13.0", path = "crates/document_io", package = "text-document-io" }
+document_io = { version = "1.13.0", path = "crates/document_io", package = "text-document-io", default-features = false }
 document_search = { version = "1.13.0", path = "crates/document_search", package = "text-document-search" }
-frontend = { version = "1.13.0", path = "crates/frontend", package = "text-document-frontend" }
+frontend = { version = "1.13.0", path = "crates/frontend", package = "text-document-frontend", default-features = false }
 text-document = { version = "1.13.0", path = "crates/public_api" }
 test_harness = { version = "1.13.0", path = "crates/test_harness", package = "text-document-test-harness" }
 
