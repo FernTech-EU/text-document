@@ -458,9 +458,9 @@ fn render_comment_body(djot: &str) -> docx_rs::Paragraph {
     paragraph
 }
 
-/// Append `text` to `paragraph` as one or more runs, splitting on embedded `\n` into
-/// `<w:br/>`-separated runs — the same pattern `render_code_block` uses for a fenced block's
-/// own line breaks.
+/// Append `text` to `paragraph` as one or more runs, splitting on embedded `\n` and line
+/// separators into `<w:br/>`-separated runs — the same pattern `render_code_block` uses for
+/// a fenced block's own line breaks.
 fn append_formatted_text(
     mut paragraph: docx_rs::Paragraph,
     text: &str,
@@ -470,7 +470,7 @@ fn append_formatted_text(
     strikeout: bool,
 ) -> docx_rs::Paragraph {
     use docx_rs::*;
-    for (i, line) in text.split('\n').enumerate() {
+    for (i, line) in text.split(['\n', LINE_SEPARATOR]).enumerate() {
         let mut run = Run::new();
         if i > 0 {
             run = run.add_break(BreakType::TextWrapping);

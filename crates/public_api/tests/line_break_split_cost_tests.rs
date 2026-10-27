@@ -3,7 +3,8 @@
 
 //! Splitting a block at its line breaks must cost memory in proportion to its text.
 //!
-//! The model keeps no line break inside a block, so three paths split one: a paste of
+//! A `\n` is not a line break inside a block to the model (that is a `LINE_SEPARATOR`),
+//! so three paths split a block holding one: a paste of
 //! preformatted HTML (`DocumentFragment::from_html`, which an editor calls on its
 //! interface thread), `set_html` of a paragraph that keeps its whitespace, and the Djot
 //! writer, for a block that holds line breaks all the same (text inserted or dropped with

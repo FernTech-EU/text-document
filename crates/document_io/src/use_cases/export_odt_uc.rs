@@ -586,9 +586,7 @@ fn annotation_open_xml(
 ///
 /// A Djot soft line break (an ordinary wrapped line inside one source paragraph) becomes a
 /// space, and a hard break (`jotdown::Event::Hardbreak`, Djot's backslash-newline) becomes a
-/// real `<text:line-break/>` — `export_docx_uc::render_comment_body` does not distinguish either
-/// event at all (both fall through its catch-all `_ => {}` arm), which is a gap that function's
-/// own one-paragraph-per-body constraint mostly hides; this writer has no reason to repeat it.
+/// real `<text:line-break/>`, as `export_docx_uc::render_comment_body` writes them.
 fn render_comment_body_odt(djot: &str, styles: &mut OdtStyleSheet) -> String {
     use jotdown::{Container as C, Event as E};
 

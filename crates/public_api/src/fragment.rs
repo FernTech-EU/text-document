@@ -292,7 +292,13 @@ impl DocumentFragment {
                 table_cursor += 1;
             }
 
-            let inline_text = render_inline_markdown(&block.elements, "\\\n");
+            // An ATX heading is one line, so its line breaks are spaces.
+            let line_break = if block.heading_level.is_some() {
+                " "
+            } else {
+                "\\\n"
+            };
+            let inline_text = render_inline_markdown(&block.elements, line_break);
             let is_list = block.list.is_some();
 
             let indent_prefix = match block.indent {
@@ -607,10 +613,49 @@ fn escape_markdown(s: &str) -> String {
 
 /// A block's inline content as Markdown, each line break inside it
 /// ([`LINE_SEPARATOR`]) written as `line_break`: a backslash hard break in a block, a
-/// space in a table cell, which is one line.
+/// space in a heading or a table cell, which are one line.
+///
+/// A break at the very end of the block is left out: a backslash there is not a hard
+/// break to a reader but the text `\`, and Markdown has nothing else to write it as. A
+/// code span cannot hold a hard break, so one over a break is written as one code span a
+/// line.
 fn render_inline_markdown(elements: &[FragmentElement], line_break: &str) -> String {
+    // The breaks the block ends with, in whichever elements hold them.
+    let mut trailing = 0usize;
+    for elem in elements.iter().rev() {
+        match &elem.content {
+            InlineContent::Text(t) => {
+                let kept = t.trim_end_matches(LINE_SEPARATOR);
+                trailing += t.len() - kept.len();
+                if !kept.is_empty() {
+                    break;
+                }
+            }
+            InlineContent::Empty => {}
+            _ => break,
+        }
+    }
+    let mut to_drop = trailing;
+    let trimmed: Vec<FragmentElement> = elements
+        .iter()
+        .rev()
+        .map(|elem| match &elem.content {
+            InlineContent::Text(t) if to_drop > 0 => {
+                let keep = t.len().saturating_sub(to_drop);
+                to_drop -= t.len() - keep;
+                FragmentElement {
+                    content: InlineContent::Text(t[..keep].to_string()),
+                    ..elem.clone()
+                }
+            }
+            _ => elem.clone(),
+        })
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
     let mut out = String::new();
-    for elem in elements {
+    for elem in &trimmed {
         let raw_text = match &elem.content {
             InlineContent::Text(t) => t.clone(),
             // `name` was used as both alt and source, so a pasted image
@@ -630,10 +675,18 @@ fn render_inline_markdown(elements: &[FragmentElement], line_break: &str) -> Str
         let is_anchor = elem.fmt_is_anchor.unwrap_or(false);
 
         if is_monospace {
-            // A code span is one line.
-            out.push('`');
-            out.push_str(&raw_text.replace(LINE_SEPARATOR, " "));
-            out.push('`');
+            // A code span is one line: one a line, the break between them.
+            let spans: Vec<String> = raw_text
+                .split(LINE_SEPARATOR)
+                .map(|line| {
+                    if line.is_empty() {
+                        String::new()
+                    } else {
+                        format!("`{line}`")
+                    }
+                })
+                .collect();
+            out.push_str(&spans.join(line_break));
         } else {
             let mut text = escape_markdown(&raw_text).replace(LINE_SEPARATOR, line_break);
             if is_bold && is_italic {
@@ -874,8 +927,9 @@ fn parsed_elements_to_fragment(parsed: Vec<ParsedElement>, from: ParsedFrom) -> 
             // travels; the body stays where it is defined.
             ParsedElement::FootnoteDefinition { .. } => {}
             // A code block of a text in a saved syntax is a code block, and holds its lines.
-            // Any other block is prose, and a line break in prose is a new block: one line a
-            // block, as a plain-text paste gives. A pasted `<pre>` is prose too (see
+            // Any other block is prose, and a `\n` in prose is a new block: one line a
+            // block, as a plain-text paste gives. A line break inside the block (a
+            // `LINE_SEPARATOR`) is not one of those, and stays. A pasted `<pre>` is prose too (see
             // `ParsedFrom::Html`). Kept in one block, it held line breaks, which the Djot
             // writer used to write as they were, and its lines read back as whatever their
             // markers spelled.

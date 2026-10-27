@@ -468,9 +468,15 @@ impl ExportLatexUseCase {
                         c, content
                     );
                 }
-                // Wrap with non-breakable lines
+                // Wrap with non-breakable lines. A box takes no `\\`, so the lines a
+                // line break sets apart are the rows of a one-column table instead,
+                // each kept whole as the box keeps its one line.
                 if block.fmt_non_breakable_lines == Some(true) {
-                    content = format!("\\mbox{{{}}}", content);
+                    content = if content.contains(LATEX_LINE_BREAK) {
+                        format!("\\begin{{tabular}}[t]{{@{{}}l@{{}}}}{content}\\end{{tabular}}")
+                    } else {
+                        format!("\\mbox{{{}}}", content)
+                    };
                 }
 
                 parts.push(content);

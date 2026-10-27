@@ -1296,15 +1296,15 @@ fn collapse_inline_whitespace(spans: &mut [ParsedSpan]) {
     }
 }
 
-/// `block` as one block per line of its text.
+/// `block` as one block per line of its text, a line ending at each `\n`.
 ///
-/// The model has no line break inside a block: a new line is a new block, which is
-/// what the Djot reader makes of a hard break and what a plain-text paste makes of a
-/// line break. Text that kept its source's line breaks (`<pre>`, `white-space: pre`)
-/// held them inside one block, where the editor showed them as lines and the Djot
-/// writer had nothing to write them as. Written raw, a blank line ended the paragraph
-/// and the lines after it were read back as the lists, headings and quotations their
-/// markers spelled, however deep.
+/// A `\n` is not a line break inside a block, which the model holds as
+/// [`LINE_SEPARATOR`]: in the rope it separates two blocks, so a new line of this kind
+/// is a new block, which is what a plain-text paste makes of one. Text that kept its
+/// source's line breaks (`<pre>`, `white-space: pre`) held them inside one block, where
+/// the editor showed them as lines and the Djot writer had nothing to write them as.
+/// Written raw, a blank line ended the paragraph and the lines after it were read back
+/// as the lists, headings and quotations their markers spelled, however deep.
 ///
 /// Each line keeps the block's own formatting and its spans' formatting, but for the
 /// page break, which stays with the first line: it is where the block starts, and on
@@ -2143,19 +2143,68 @@ fn read_html_tree(fragment: &scraper::Html, depth_limit: usize) -> Vec<ParsedEle
                 }
 
                 if tag == "blockquote" {
-                    // Blockquote is a container — recurse into children with increased depth
                     let first = elements.len();
-                    for child in node.children() {
-                        walk_node(
-                            child,
+                    // A quotation holding inline content alone is one paragraph of it, as
+                    // a `<p>` is, its `<br>`s line breaks: verse is pasted from the web as
+                    // `<blockquote>a line<br>the next</blockquote>`. Walked child by child,
+                    // each line was a paragraph of its own and each `<br>` an empty one.
+                    let inline_only = node.children().all(|child| match child.value() {
+                        Node::Element(el) => !matches!(
+                            el.name(),
+                            "p" | "div"
+                                | "h1"
+                                | "h2"
+                                | "h3"
+                                | "h4"
+                                | "h5"
+                                | "h6"
+                                | "li"
+                                | "pre"
+                                | "blockquote"
+                                | "ul"
+                                | "ol"
+                                | "table"
+                        ),
+                        _ => true,
+                    });
+                    if inline_only {
+                        let mut spans: Vec<ParsedSpan> = Vec::new();
+                        let mut nested_elements: Vec<ParsedElement> = Vec::new();
+                        collect_inline_spans(
+                            node,
                             &new_state,
-                            elements,
+                            &mut spans,
                             &new_list,
+                            &mut nested_elements,
                             bq_depth,
                             new_list_depth,
                             depth + 1,
                             limit,
                         );
+                        collapse_inline_whitespace(&mut spans);
+                        if spans_carry_content(&spans) {
+                            elements.push(ParsedElement::Block(ParsedBlock {
+                                spans,
+                                blockquote_depth: bq_depth,
+                                blockquote_opens: 0,
+                                ..ParsedBlock::default()
+                            }));
+                        }
+                        elements.append(&mut nested_elements);
+                    } else {
+                        // A container: recurse into children with increased depth.
+                        for child in node.children() {
+                            walk_node(
+                                child,
+                                &new_state,
+                                elements,
+                                &new_list,
+                                bq_depth,
+                                new_list_depth,
+                                depth + 1,
+                                limit,
+                            );
+                        }
                     }
                     mark_quotation_opened(elements, first);
                 } else if is_block_tag && tag != "br" {

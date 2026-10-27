@@ -453,3 +453,131 @@ fn a_copied_fragment_carries_its_line_breaks() {
     target.cursor_at(0).insert_fragment(&fragment).unwrap();
     assert_eq!(texts(&target), [format!("a{LS}b"), "c".into()]);
 }
+
+// ── What the reviews found ──────────────────────────────────────
+
+/// Verse is pasted from the web as a quotation holding its lines alone,
+/// `<blockquote>a line<br>the next</blockquote>`: one paragraph of the quotation, its
+/// `<br>`s line breaks. Walked child by child, each line was a paragraph of its own and
+/// each `<br>` an empty one.
+#[test]
+fn a_quotation_of_lines_alone_is_one_paragraph() {
+    for html in [
+        "<blockquote>a line<br>the next</blockquote>",
+        "<blockquote><em>a line<br>the next</em></blockquote>",
+    ] {
+        let doc = TextDocument::new();
+        doc.set_html(html).unwrap().wait().unwrap();
+        assert_eq!(texts(&doc), [format!("a line{LS}the next")], "{html}");
+        assert!(doc.to_djot().unwrap().starts_with("> "), "{html}");
+    }
+    // A quotation holding paragraphs keeps them.
+    let doc = TextDocument::new();
+    doc.set_html("<blockquote><p>one</p><p>two<br>three</p></blockquote>")
+        .unwrap()
+        .wait()
+        .unwrap();
+    assert_eq!(texts(&doc), ["one".to_string(), format!("two{LS}three")]);
+}
+
+/// A block whose lines fill the parser's limit exactly, and a break after them: the
+/// last piece written was the empty line alone, an empty paragraph the reader keeps no
+/// block for, and the break was lost. The line before it goes with it now.
+#[test]
+fn a_break_after_a_block_of_the_parsers_limit_survives() {
+    let lines: Vec<String> = (0..MAX_LEAF_LINES).map(|i| format!("l{i}")).collect();
+    let doc = djot(&lines[0]);
+    let rest = format!("{LS}{}{LS}", lines[1..].join(LS));
+    doc.cursor_at(lines[0].chars().count())
+        .insert_text(&rest)
+        .unwrap();
+    let (saved, reopened, stable) = save_reopen(&doc);
+    assert!(longest_leaf_lines(&saved) <= MAX_LEAF_LINES);
+    assert_eq!(
+        texts(&reopened),
+        [
+            lines[..MAX_LEAF_LINES - 1].join(LS),
+            format!("{}{LS}", lines[MAX_LEAF_LINES - 1])
+        ]
+    );
+    assert!(stable);
+}
+
+/// The plain-text views written to a file or a terminal set each line apart.
+#[test]
+fn the_indented_text_view_writes_lines() {
+    assert_eq!(
+        djot("> a\\\n> b").to_plain_text_indented().unwrap(),
+        "    a\n    b"
+    );
+}
+
+/// The clipboard's Markdown: a break at the end of a block is left out, where it read
+/// back as a literal `\`; a heading is one line; a code span over a break is one code
+/// span a line.
+#[test]
+fn a_copied_fragment_writes_markdown_a_reader_reads_back() {
+    let markdown_of = |doc: &TextDocument| {
+        let cursor = doc.cursor_at(0);
+        cursor.move_position(MoveOperation::End, MoveMode::KeepAnchor, 1);
+        cursor.selection().to_markdown()
+    };
+    assert_eq!(markdown_of(&djot("a\\\n{}")), "a");
+    assert_eq!(markdown_of(&djot("# a\\\n# b")), "# a b");
+    let html = TextDocument::new();
+    html.set_html("<p><code>a<br>b</code></p>")
+        .unwrap()
+        .wait()
+        .unwrap();
+    assert_eq!(markdown_of(&html), "`a`\\\n`b`");
+    let back = TextDocument::new();
+    back.set_markdown(&markdown_of(&html))
+        .unwrap()
+        .wait()
+        .unwrap();
+    assert_eq!(texts(&back), [format!("a{LS}b")]);
+}
+
+/// A paragraph set to keep its lines whole is boxed in LaTeX, and a box takes no `\\`:
+/// its lines are the rows of a one-column table instead.
+#[test]
+fn latex_keeps_a_paragraph_of_unbroken_lines_compilable() {
+    let doc = TextDocument::new();
+    doc.set_html(r#"<p style="white-space: nowrap">a<br>b</p>"#)
+        .unwrap()
+        .wait()
+        .unwrap();
+    let latex = doc.to_latex("article", false).unwrap();
+    assert!(
+        latex.contains("\\begin{tabular}[t]{@{}l@{}}a\\mbox{}\\\\{}b\\end{tabular}"),
+        "{latex}"
+    );
+    assert!(!latex.contains("\\mbox{a"), "{latex}");
+}
+
+/// Typst takes a line break in a table cell, as in a paragraph.
+#[cfg(feature = "pdf")]
+#[test]
+fn a_line_break_in_a_table_cell_compiles_to_pdf() {
+    let doc = djot("| a | b |\n|---|---|\n| c | d |");
+    let cell = doc
+        .blocks()
+        .into_iter()
+        .find(|block| block.text() == "c")
+        .expect("the cell");
+    doc.cursor_at(cell.position() + 1)
+        .insert_text(&format!("{LS}(sic){LS}12. e"))
+        .unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("cell.pdf");
+    let options = text_document::PdfExportOptions {
+        font_family: "DejaVu Serif".to_string(),
+        font_bytes: vec![include_bytes!("../../document_io/tests/assets/DejaVuSerif.ttf").to_vec()],
+        ..Default::default()
+    };
+    doc.to_pdf(path.to_str().unwrap(), options)
+        .unwrap()
+        .wait()
+        .unwrap();
+    assert!(std::fs::read(&path).unwrap().starts_with(b"%PDF-"));
+}

@@ -1421,16 +1421,29 @@ fn djot_destination(
 /// `render_block_line`): every block that holds something, a line break included, or,
 /// when none does, one empty block, which is how an empty block has always been
 /// written. A block of more than [`MAX_LEAF_LINES`] lines is cut into blocks of that
-/// many.
+/// many, short of a last one holding only the empty line a final break leaves: written
+/// alone, that is an empty paragraph, which the reader keeps no block for, and the break
+/// was lost. The line before it goes with it.
 fn blocks_to_write(blocks: Vec<Vec<String>>) -> Vec<Vec<String>> {
     let mut kept: Vec<Vec<String>> = Vec::new();
     for lines in blocks {
         if lines.len() == 1 && lines[0].is_empty() {
             continue;
         }
+        let first = kept.len();
         let mut lines = lines.into_iter().peekable();
         while lines.peek().is_some() {
             kept.push(lines.by_ref().take(MAX_LEAF_LINES).collect());
+        }
+        if kept.len() - first > 1
+            && kept
+                .last()
+                .is_some_and(|last| last.len() == 1 && last[0].is_empty())
+        {
+            let at = kept.len() - 2;
+            if let Some(line) = kept[at].pop() {
+                kept[at + 1].insert(0, line);
+            }
         }
     }
     if kept.is_empty() {

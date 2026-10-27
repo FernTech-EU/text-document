@@ -32,6 +32,7 @@ pub fn export_plain_text_indented(ctx: &AppContext) -> Result<ExportPlainTextDto
         ctx,
         PlainTextExportOptions {
             quote_indent: true,
+            line_breaks: true,
             ..PlainTextExportOptions::addressable()
         },
     )

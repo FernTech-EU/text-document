@@ -6,7 +6,7 @@ use std::process;
 use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 
-use text_document::{FindOptions, TextDocument};
+use text_document::{FindOptions, PlainTextExportOptions, TextDocument};
 
 #[derive(Parser)]
 #[command(
@@ -188,13 +188,23 @@ fn format_name(fmt: FileFormat) -> &'static str {
 
 // ── Command handlers ────────────────────────────────────────────
 
+/// `doc` as the text of a `.txt` file or a terminal: each line break inside a
+/// paragraph a line of its own, where the addressable text keeps it as the one
+/// character the document holds.
+fn plain_text(doc: &TextDocument) -> Result<String> {
+    Ok(doc.to_plain_text_with(PlainTextExportOptions {
+        line_breaks: true,
+        ..PlainTextExportOptions::addressable()
+    })?)
+}
+
 fn cmd_convert(input: &str, output: &str, document_class: &str, preamble: bool) -> Result<()> {
     let doc = load_document(input)?;
     let out_format = detect_format(output);
 
     match out_format {
         FileFormat::PlainText => {
-            let text = doc.to_plain_text()?;
+            let text = plain_text(&doc)?;
             std::fs::write(output, text)?;
         }
         FileFormat::Markdown => {
@@ -278,10 +288,10 @@ fn cmd_replace(
     let out_path = output.unwrap_or(file);
     let out_format = detect_format(out_path);
     let content = match out_format {
-        FileFormat::PlainText => doc.to_plain_text()?,
+        FileFormat::PlainText => plain_text(&doc)?,
         FileFormat::Markdown => doc.to_markdown()?,
         FileFormat::Html => doc.to_html()?,
-        _ => doc.to_plain_text()?,
+        _ => plain_text(&doc)?,
     };
     std::fs::write(out_path, content)?;
     eprintln!("{count} replacement(s), written to {out_path}");
@@ -291,7 +301,7 @@ fn cmd_replace(
 fn cmd_cat(file: &str, format: &OutputFormat) -> Result<()> {
     let doc = load_document(file)?;
     let content = match format {
-        OutputFormat::Plain => doc.to_plain_text()?,
+        OutputFormat::Plain => plain_text(&doc)?,
         OutputFormat::Markdown => doc.to_markdown()?,
         OutputFormat::Html => doc.to_html()?,
         OutputFormat::Latex => doc.to_latex("article", false)?,

@@ -521,6 +521,21 @@ fn a_comment_body_keeps_its_line_breaks_and_its_spaces() {
     assert!(br < second, "{comments_xml}");
 }
 
+/// A line separator a body holds as a character (a host that stored a block's own text,
+/// which holds one after Shift+Enter) is a line break in Word too.
+#[test]
+fn a_comment_body_s_line_separator_is_a_line_break() {
+    let comments_xml = comments_xml_for("first\u{2028}second".to_string());
+    let first = comments_xml.find("first<").expect("the first line");
+    let br = comments_xml[first..]
+        .find("<w:br")
+        .expect("a break after it")
+        + first;
+    let second = comments_xml.find(">second<").expect("the second line");
+    assert!(br < second, "{comments_xml}");
+    assert!(!comments_xml.contains('\u{2028}'), "{comments_xml}");
+}
+
 /// A heading of 65,536 `#` made the parser panic. The body goes through the importer's
 /// door to the parser, which puts a backslash before the first `#`, so it is written as
 /// a paragraph of its text.
