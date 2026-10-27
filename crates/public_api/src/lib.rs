@@ -53,11 +53,11 @@ pub use frontend::common::parser_tools::{
     CommentReply, CountMethod, DjotExportOptions, DjotImportOptions, DocumentComment,
     DocumentComments, DocumentMark, DocumentMarks, DocxExportOptions, DocxHeadingStyle,
     EpubExportOptions, ExportImage, ExportImages, HTML_FOOTNOTE_ATTR, HtmlExportOptions,
-    HtmlImageMode, LatexExportOptions, MAX_BOOKMARK_NAME_LEN, MarkdownExportOptions,
-    OdtExportOptions, OdtHeadingStyle, PdfExportOptions, PlainTextExportOptions, Sentence,
-    TABLE_ANCHOR, WordCharCounts, count, count_djot, djot_round_trip_is_lossy, djot_to_plain_text,
-    escape_djot_inline, guard_djot_block_start, needs_djot_escaping, plain_text_to_djot,
-    sentence_bounds, sentences,
+    HtmlImageMode, LINE_SEPARATOR, LatexExportOptions, MAX_BOOKMARK_NAME_LEN,
+    MarkdownExportOptions, OdtExportOptions, OdtHeadingStyle, PdfExportOptions,
+    PlainTextExportOptions, Sentence, TABLE_ANCHOR, WordCharCounts, count, count_djot,
+    djot_round_trip_is_lossy, djot_to_plain_text, escape_djot_inline, guard_djot_block_start,
+    needs_djot_escaping, plain_text_to_djot, sentence_bounds, sentences,
 };
 
 /// The matcher, as a pure function over `&str` — no document, no store, no threads.

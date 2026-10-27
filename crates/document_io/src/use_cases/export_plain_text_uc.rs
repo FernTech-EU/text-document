@@ -9,7 +9,7 @@ use common::database::rope_helpers::{
 use common::entities::{Block, Document, Frame, Root};
 use common::format_runs::InlineContent;
 use common::format_runs_query::inline_segments_for_block;
-use common::parser_tools::{FORM_FEED, PlainTextExportOptions};
+use common::parser_tools::{FORM_FEED, LINE_SEPARATOR, PlainTextExportOptions};
 use common::types::{EntityId, ROOT_ENTITY_ID};
 use std::collections::HashMap;
 
@@ -45,6 +45,16 @@ fn blockquote_depth(frame_id: EntityId, frames: &HashMap<EntityId, Frame>) -> us
         current = frame.parent_frame;
     }
     depth
+}
+
+/// `text` with each line break inside a block written as a `\n` when `line_breaks` asks
+/// for it (see [`PlainTextExportOptions::line_breaks`]).
+fn lines_of_breaks(text: String, line_breaks: bool) -> String {
+    if line_breaks && text.contains(LINE_SEPARATOR) {
+        text.replace(LINE_SEPARATOR, "\n")
+    } else {
+        text
+    }
 }
 
 /// Indent every non-empty line of `text` by `depth` levels.
@@ -178,6 +188,7 @@ impl ExportPlainTextUseCase {
             page_breaks,
             strip_images,
             endnote_footnotes,
+            line_breaks,
         } = options;
         let uow = self.uow_factory.create();
         uow.begin_transaction()?;
@@ -229,7 +240,10 @@ impl ExportPlainTextUseCase {
         {
             uow.end_transaction()?;
             return Ok(ExportPlainTextDto {
-                plain_text: strip_image_sentinels(&plain_text, strip_images),
+                plain_text: lines_of_breaks(
+                    strip_image_sentinels(&plain_text, strip_images),
+                    line_breaks,
+                ),
             });
         }
 
@@ -318,6 +332,8 @@ impl ExportPlainTextUseCase {
                     endnote_footnotes,
                     &notes,
                 );
+                // Before the indent, so a quoted stanza's every line is indented.
+                let text = lines_of_breaks(text, line_breaks);
                 let text = match quote_depth.get(&block.id) {
                     Some(&depth) => indent_quoted(&text, depth),
                     None => text,
@@ -360,6 +376,13 @@ impl ExportPlainTextUseCase {
                     .map(|b| block_content_via_store(b, &store))
                     .collect::<Vec<_>>()
                     .join(" ");
+                // An endnote is one line, its paragraphs joined by spaces, so its line
+                // breaks are spaces too.
+                let body = if line_breaks {
+                    body.replace(LINE_SEPARATOR, " ")
+                } else {
+                    body
+                };
                 let body = body.trim();
                 if body.is_empty() {
                     continue;

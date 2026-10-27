@@ -1,6 +1,6 @@
 //! DocumentFragment — format-agnostic rich text interchange type.
 
-use crate::{CharVerticalAlignment, InlineContent, ListStyle};
+use crate::{CharVerticalAlignment, InlineContent, LINE_SEPARATOR, ListStyle};
 use frontend::common::parser_tools::content_parser::{
     ParsedBlock, ParsedElement, ParsedSpan, split_block_at_line_breaks,
 };
@@ -292,7 +292,7 @@ impl DocumentFragment {
                 table_cursor += 1;
             }
 
-            let inline_text = render_inline_markdown(&block.elements);
+            let inline_text = render_inline_markdown(&block.elements, "\\\n");
             let is_list = block.list.is_some();
 
             let indent_prefix = match block.indent {
@@ -459,7 +459,7 @@ fn block_style_attr(block: &FragmentBlock) -> String {
 fn push_inline_html(out: &mut String, elements: &[FragmentElement]) {
     for elem in elements {
         let text = match &elem.content {
-            InlineContent::Text(t) => escape_html(t),
+            InlineContent::Text(t) => escape_html(t).replace(LINE_SEPARATOR, "<br>"),
             // A reference carried onto the clipboard keeps its marker; the note
             // body is not part of the fragment.
             InlineContent::FootnoteRef { label } => {
@@ -605,7 +605,10 @@ fn escape_markdown(s: &str) -> String {
     out
 }
 
-fn render_inline_markdown(elements: &[FragmentElement]) -> String {
+/// A block's inline content as Markdown, each line break inside it
+/// ([`LINE_SEPARATOR`]) written as `line_break`: a backslash hard break in a block, a
+/// space in a table cell, which is one line.
+fn render_inline_markdown(elements: &[FragmentElement], line_break: &str) -> String {
     let mut out = String::new();
     for elem in elements {
         let raw_text = match &elem.content {
@@ -627,11 +630,12 @@ fn render_inline_markdown(elements: &[FragmentElement]) -> String {
         let is_anchor = elem.fmt_is_anchor.unwrap_or(false);
 
         if is_monospace {
+            // A code span is one line.
             out.push('`');
-            out.push_str(&raw_text);
+            out.push_str(&raw_text.replace(LINE_SEPARATOR, " "));
             out.push('`');
         } else {
-            let mut text = escape_markdown(&raw_text);
+            let mut text = escape_markdown(&raw_text).replace(LINE_SEPARATOR, line_break);
             if is_bold && is_italic {
                 text = format!("***{}***", text);
             } else if is_bold {
@@ -661,7 +665,7 @@ fn render_table_markdown(table: &FragmentTable) -> String {
         let text: String = cell
             .blocks
             .iter()
-            .map(|b| render_inline_markdown(&b.elements))
+            .map(|b| render_inline_markdown(&b.elements, " "))
             .collect::<Vec<_>>()
             .join(" ");
         if cell.row < table.rows && cell.column < table.columns {

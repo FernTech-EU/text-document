@@ -504,6 +504,23 @@ fn a_comment_body_too_deep_to_parse_is_exported_as_its_text() {
     );
 }
 
+/// A comment body's hard break (`\\` at the end of a line) is a line break in Word, and a
+/// line wrapped inside one of its paragraphs a space. Both used to be dropped, and the words
+/// either side ran together.
+#[test]
+fn a_comment_body_keeps_its_line_breaks_and_its_spaces() {
+    let comments_xml = comments_xml_for("first line\\\nsecond line\nwrapped".to_string());
+    let first = comments_xml.find("first line<").expect("the first line");
+    let br = comments_xml[first..]
+        .find("<w:br")
+        .expect("a break after it")
+        + first;
+    let second = comments_xml
+        .find("second line wrapped<")
+        .expect("the wrapped line joined by a space");
+    assert!(br < second, "{comments_xml}");
+}
+
 /// A heading of 65,536 `#` made the parser panic. The body goes through the importer's
 /// door to the parser, which puts a backslash before the first `#`, so it is written as
 /// a paragraph of its text.

@@ -9,6 +9,7 @@ use common::entities::{
     TextDirection,
 };
 use common::format_runs::InlineContent;
+use common::parser_tools::LINE_SEPARATOR;
 use common::types::{EntityId, ROOT_ENTITY_ID};
 use std::collections::HashMap;
 use std::collections::HashSet;
@@ -404,7 +405,14 @@ impl ExportLatexUseCase {
                         3 => "subsubsection",
                         _ => "paragraph",
                     };
-                    format!("\\{}{{{}}}", cmd, inline_latex)
+                    // A sectioning title is a moving argument, copied to the table of
+                    // contents and the running head, where a line break is fragile. It is
+                    // one line there anyway, so its line breaks are spaces.
+                    format!(
+                        "\\{}{{{}}}",
+                        cmd,
+                        inline_latex.replace(LATEX_LINE_BREAK, " ")
+                    )
                 } else {
                     inline_latex
                 };
@@ -490,7 +498,8 @@ impl ExportLatexUseCase {
         let mut text = String::new();
         for elem in &elements {
             match &elem.content {
-                InlineContent::Text(t) => text.push_str(t),
+                // A `verbatim` keeps its line breaks as they are typed.
+                InlineContent::Text(t) => text.push_str(&t.replace(LINE_SEPARATOR, "\n")),
                 // Plain-text extraction of a block: an image has no textual
                 // form, so its description is the only honest substitute. The
                 // filename was being emitted here, which put a path into prose.
@@ -684,7 +693,11 @@ impl ExportLatexUseCase {
 
                         let mut cell_parts: Vec<String> = Vec::new();
                         for block in &blocks {
-                            let inline_latex = self.render_inline_latex(uow, block)?;
+                            // `\\` ends a `tabular` row, so a cell's line breaks are
+                            // spaces, as its paragraphs are.
+                            let inline_latex = self
+                                .render_inline_latex(uow, block)?
+                                .replace(LATEX_LINE_BREAK, " ");
                             if !inline_latex.is_empty() {
                                 cell_parts.push(inline_latex);
                             }
@@ -748,10 +761,20 @@ impl ExportLatexUseCase {
     }
 }
 
+/// A line break inside a paragraph ([`LINE_SEPARATOR`]).
+///
+/// `\\` alone is not enough. At the start of a paragraph, or on a line it left empty,
+/// it has no line to end and stops the build ("There's no line here to end"); the empty
+/// box gives it one. And it reads a `*` or a `[` straight after it as its own
+/// arguments, which would take `[sic]` or `*` off the next line; the empty group ends it
+/// first.
+const LATEX_LINE_BREAK: &str = "\\mbox{}\\\\{}";
+
 fn escape_latex(s: &str) -> String {
     let mut result = String::with_capacity(s.len());
     for ch in s.chars() {
         match ch {
+            LINE_SEPARATOR => result.push_str(LATEX_LINE_BREAK),
             '\\' => result.push_str("\\textbackslash{}"),
             '&' => result.push_str("\\&"),
             '%' => result.push_str("\\%"),

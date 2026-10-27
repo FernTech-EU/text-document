@@ -12,8 +12,8 @@ use common::database::QueryUnitOfWork;
 use common::database::Store;
 use common::entities::{Block, Document, Frame, List, Root, SemanticRole, Table, TableCell};
 use common::long_operation::{LongOperation, OperationProgress};
-use common::parser_tools::EpubExportOptions;
 use common::parser_tools::ExportImages;
+use common::parser_tools::{EpubExportOptions, LINE_SEPARATOR};
 use common::types::{EntityId, ROOT_ENTITY_ID};
 use epub_builder::{
     EpubBuilder, EpubContent, EpubVersion, PageDirection, ReferenceType, ZipLibrary,
@@ -659,7 +659,9 @@ fn push_block_run_units(
                 notes,
                 numbers,
             );
-            let text = html_render::block_plain_text(store, &blocks[i]);
+            // A chapter's title in the table of contents is one line.
+            let text =
+                html_render::block_plain_text(store, &blocks[i]).replace(LINE_SEPARATOR, " ");
             let footnote_labels =
                 footnote_labels_in_blocks(store, std::slice::from_ref(&blocks[i]));
             out.push(RenderUnit {

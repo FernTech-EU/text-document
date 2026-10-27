@@ -109,9 +109,8 @@ enum Block {
     /// A list nested three levels deep, each level opened by one of the wide markers
     /// (`- [ ]`, `iii.`, `(ii)`, `100.`) or a narrow one.
     Nested(Vec<&'static str>),
-    /// A paragraph whose lines are joined by hard breaks, which the reader splits into
-    /// one block a line, with a page break before it or not: only its first line keeps
-    /// the page break.
+    /// A paragraph whose lines are joined by hard breaks, which the reader keeps as one
+    /// block holding a line break between each two, with a page break before it or not.
     HardBreaks(bool, Vec<String>),
     /// A paragraph with whitespace at its edges, kept by empty attribute sets.
     EdgeWhitespace(String, String, String),
@@ -2420,11 +2419,12 @@ fn a_block_holding_more_lines_than_a_paragraph_may_hold_reloads_as_its_lines() {
     );
 }
 
-/// A page break belongs where its block starts. A block holding line breaks comes back
-/// one block a line, and each line took the page break with it: through a save and a
-/// reload (the reader gave every line after a hard break the paragraph's attributes),
-/// through a paste of preformatted text and through `set_html`, so an export put every
-/// line on a page of its own. Only the first line starts a new page now.
+/// A page break belongs where its block starts. A block holding `\n`s comes back one
+/// block a line, and each line took the page break with it: through a save and a reload
+/// (the reader gave every line after a hard break the paragraph's attributes), through a
+/// paste of preformatted text and through `set_html`, so an export put every line on a
+/// page of its own. Only the first line starts a new page now. A paragraph written with
+/// hard breaks is one block, and its page break is that block's.
 #[test]
 fn a_page_break_before_a_block_holding_line_breaks_stays_on_its_first_line() {
     let breaks = |doc: &TextDocument| -> Vec<(String, Option<bool>)> {
@@ -2463,7 +2463,7 @@ fn a_page_break_before_a_block_holding_line_breaks_stays_on_its_first_line() {
         assert!(stable, "{saved:?} does not save stably");
     }
 
-    // Written with hard breaks.
+    // Written with hard breaks: one block, its lines held by line breaks, saved once.
     for container in ["", "# "] {
         let doc = TextDocument::new();
         set_djot(
@@ -2472,7 +2472,16 @@ fn a_page_break_before_a_block_holding_line_breaks_stays_on_its_first_line() {
                 "{{page_break_before=true}}\n{container}Chapter start.\\\nsecond line\\\nthird line"
             ),
         );
-        assert_eq!(breaks(&doc), expected(&chapter), "{container:?}");
+        let one_block = vec![(chapter.join("\u{2028}"), Some(true))];
+        assert_eq!(breaks(&doc), one_block, "{container:?}");
+        let (saved, reopened, stable) = save_reopen(&doc);
+        assert_eq!(breaks(&reopened), one_block, "saved as {saved:?}");
+        assert_eq!(
+            saved.matches("page_break_before").count(),
+            1,
+            "saved as {saved:?}"
+        );
+        assert!(stable, "{saved:?} does not save stably");
     }
 
     // Pasted, and read by the HTML importer, as preformatted HTML. A paste's first and

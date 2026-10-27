@@ -1115,6 +1115,28 @@ impl TextCursor {
         Ok(())
     }
 
+    /// Insert a line break inside the block, the one Shift+Enter makes in a word
+    /// processor. Replaces selection if any.
+    ///
+    /// The next line is more of the same paragraph, list item, quotation or heading,
+    /// where [`insert_block`](Self::insert_block) starts a new one. The block's text
+    /// holds it as one [`LINE_SEPARATOR`](crate::LINE_SEPARATOR), which every writer
+    /// puts out as its format's own line break.
+    ///
+    /// Reports [`InsertionOrigin::Unspecified`], as [`insert_text`](Self::insert_text)
+    /// does. Use [`insert_line_break_with_origin`](Self::insert_line_break_with_origin)
+    /// to say.
+    pub fn insert_line_break(&self) -> Result<()> {
+        self.insert_line_break_with_origin(InsertionOrigin::Unspecified)
+    }
+
+    /// [`insert_line_break`](Self::insert_line_break), saying which channel it came
+    /// through (see [`insert_text_with_origin`](Self::insert_text_with_origin)).
+    pub fn insert_line_break_with_origin(&self, origin: InsertionOrigin) -> Result<()> {
+        let mut buffer = [0; 4];
+        self.insert_text_with_origin(crate::LINE_SEPARATOR.encode_utf8(&mut buffer), origin)
+    }
+
     /// Insert a block break (new paragraph). Replaces selection if any.
     pub fn insert_block(&self) -> Result<()> {
         let (pos, anchor) = self.read_cursor();

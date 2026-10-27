@@ -37,6 +37,7 @@
 //! conversion this module needs (1px = 0.75pt exactly at 96 dpi — not lossy at all, in fact,
 //! since 96 and 72 share a clean ratio).
 
+use common::parser_tools::LINE_SEPARATOR;
 use common::types::EntityId;
 use std::collections::HashMap;
 
@@ -73,9 +74,10 @@ pub(crate) fn xml_escape(s: &str) -> String {
 /// Encode one run's literal text as ODF inline content: a run of two or more spaces becomes
 /// `<text:s text:c="N"/>` (ODF's own construct for "a specific number of consecutive spaces",
 /// mirrored from how `document_ingest::sources::odt::Walker::inline` reads it back — see that
-/// module's `(Some(NS_TEXT), "s")` arm), a tab becomes `<text:tab/>`, and an embedded newline
-/// (only ever seen inside a code block; see `render_code_block`) becomes `<text:line-break/>`.
-/// Everything else passes through [`xml_escape`].
+/// module's `(Some(NS_TEXT), "s")` arm), a tab becomes `<text:tab/>`, and a line break inside
+/// the block ([`LINE_SEPARATOR`]) or an embedded newline (only ever seen inside a code block;
+/// see `render_code_block`) becomes `<text:line-break/>`. Everything else passes through
+/// [`xml_escape`].
 ///
 /// This matters for more than cosmetics: LibreOffice's own *rendering* collapses runs of
 /// whitespace in ordinary text nodes the way a browser does, so a paragraph that skipped this
@@ -88,7 +90,7 @@ pub(crate) fn encode_run_text(text: &str) -> String {
     let mut chars = text.chars().peekable();
     while let Some(c) = chars.next() {
         match c {
-            '\n' => {
+            '\n' | LINE_SEPARATOR => {
                 flush_literal(&mut out, &mut literal);
                 out.push_str("<text:line-break/>");
             }

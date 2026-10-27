@@ -862,32 +862,33 @@ pub fn parse_markdown(markdown: &str) -> Vec<ParsedElement> {
                     current_spans.push(span);
                 }
             }
-            Event::HardBreak if !current_spans.is_empty() || in_block => {
-                // Finalize current block
-                elements.push(ParsedElement::Block(ParsedBlock {
-                    spans: std::mem::take(&mut current_spans),
-                    heading_level: current_heading.take(),
-                    list_style: current_list_style.clone(),
-                    list_indent: current_list_indent,
-                    list_prefix: String::new(),
-                    list_suffix: String::new(),
-                    list_start: current_list_start,
-                    marker: None,
-                    is_code_block,
-                    code_language: code_language.clone(),
-                    blockquote_depth,
-                    blockquote_opens: 0,
-                    line_height: None,
-                    non_breakable_lines: None,
-                    page_break_before: None,
-                    front_matter: None,
-                    direction: None,
-                    background_color: None,
-                    alignment: None,
-                    top_margin: None,
-                    text_indent: None,
-                    semantic_role: None,
-                }));
+            // A hard break (two spaces or a backslash at the end of the line) is a line
+            // of the same block, as in the Djot reader. A table cell is one line, and so
+            // is an image's description.
+            Event::HardBreak if pending_image.is_some() => {
+                if let Some(img) = pending_image.as_mut() {
+                    img.alt.push(' ');
+                }
+            }
+            Event::HardBreak => {
+                let span = ParsedSpan {
+                    text: if in_table { " " } else { LINE_SEPARATOR_STR }.to_string(),
+                    bold,
+                    italic,
+                    underline: false,
+                    strikeout,
+                    code: false,
+                    superscript: false,
+                    subscript: false,
+                    link_href: link_href.clone(),
+                    image: None,
+                    footnote_ref: None,
+                };
+                if in_table {
+                    current_cell_spans.push(span);
+                } else {
+                    current_spans.push(span);
+                }
             }
             Event::Start(Tag::BlockQuote(_)) => {
                 blockquote_depth += 1;
@@ -1227,18 +1228,33 @@ fn collapse_inline_whitespace(spans: &mut [ParsedSpan]) {
     }
 
     // The block's start counts as "already ended on a space", so a run opening
-    // the block is dropped outright.
+    // the block is dropped outright. A line break (the span a `<br>` leaves) ends one
+    // line and starts the next, so the runs either side of it go as the block's own
+    // ends do: `x <br> y` is two lines, "x" and "y".
     let mut prev_ends_with_space = true;
-    for span in spans.iter_mut() {
+    // The last span holding text since the line began, whose trailing space a line
+    // break takes off.
+    let mut line_end: Option<usize> = None;
+    for i in 0..spans.len() {
+        let span = &mut spans[i];
         if is_replaced(span) {
             prev_ends_with_space = false;
+            line_end = None;
             continue;
         }
         if span.text.is_empty() {
-            // The empty span a `<br>` leaves. It contributes no text, but it
-            // still ends the collapsible run either side of it — without that,
-            // `x <br> y` closes up into "xy".
+            // A span that held no text to begin with. It contributes none, but it
+            // still ends the collapsible run either side of it.
             prev_ends_with_space = false;
+            continue;
+        }
+        if span.text == LINE_SEPARATOR_STR {
+            if let Some(end) = line_end.take()
+                && spans[end].text.ends_with(' ')
+            {
+                spans[end].text.pop();
+            }
+            prev_ends_with_space = true;
             continue;
         }
         if prev_ends_with_space && span.text.starts_with(' ') {
@@ -1248,17 +1264,29 @@ fn collapse_inline_whitespace(spans: &mut [ParsedSpan]) {
         // it: the space it carried belongs to the run its neighbours share.
         if !span.text.is_empty() {
             prev_ends_with_space = span.text.ends_with(' ');
+            line_end = Some(i);
         }
     }
 
     // The block's trailing run, in whichever span still holds it. Replaced
     // content stops the walk: a space before a trailing image is between two
-    // pieces of content, not after the last one.
+    // pieces of content, not after the last one. A line break at the very end
+    // starts no line of its own, as a browser shows it (a second one does: `a<br><br>`
+    // is "a" and an empty line), so the last one goes, with the run before it.
+    let mut trailing_break_dropped = false;
     for span in spans.iter_mut().rev() {
         if is_replaced(span) {
             break;
         }
         if span.text.is_empty() {
+            continue;
+        }
+        if span.text == LINE_SEPARATOR_STR {
+            if trailing_break_dropped {
+                break;
+            }
+            span.text.clear();
+            trailing_break_dropped = true;
             continue;
         }
         if span.text.ends_with(' ') {
@@ -2412,12 +2440,10 @@ fn read_html_tree(fragment: &scraper::Html, depth_limit: usize) -> Vec<ParsedEle
                     );
 
                     if tag == "br" {
-                        // br within a block: treat as splitting into new block
-                        // For simplicity, just add a newline to current span
-                        spans.push(ParsedSpan {
-                            text: String::new(),
-                            ..Default::default()
-                        });
+                        // A line break inside the block, in the formatting around it.
+                        // `collapse_inline_whitespace` then drops the spaces either side,
+                        // as a browser lays them out.
+                        spans.push(text_span(LINE_SEPARATOR_STR.to_string(), state));
                     } else if nested_block || tag == "table" {
                         // Flush as separate element
                         walk_node(
@@ -3138,13 +3164,26 @@ pub fn parse_djot(djot: &str, options: &DjotImportOptions) -> Vec<ParsedElement>
         }};
     }
 
-    // A line break inside a block: a new block, which is what the model means by one,
-    // with the list, quotation, heading and block style the line was in. A table cell
-    // is one line, so there it is a space.
+    // A hard break: a line break inside the block, [`LINE_SEPARATOR`] in its text, so the
+    // next line is more of the same paragraph, list item, quotation or heading. A table
+    // cell is one line, and an image's description is one too, so there it is a space.
+    macro_rules! line_break {
+        () => {{
+            if in_table_cell || pending_image.is_some() {
+                push_text!(" ");
+            } else {
+                push_text!(LINE_SEPARATOR_STR);
+            }
+        }};
+    }
+
+    // A line ending inside a code span (see `E::Str` below): a new block, with the list,
+    // quotation, heading and block style the line was in. A table cell is one line, so
+    // there it is a space.
     //
     // The page break is the one style that stays with the first line: it is where the
     // block starts, and copied to every line it put each on a page of its own.
-    macro_rules! line_break {
+    macro_rules! split_line {
         () => {{
             if in_table_cell {
                 push_text!(" ");
@@ -3170,8 +3209,6 @@ pub fn parse_djot(djot: &str, options: &DjotImportOptions) -> Vec<ParsedElement>
                 );
                 pending_style.page_break_before = None;
             } else if !current_spans.is_empty() {
-                // Mirrors the Markdown importer: a hard break splits the
-                // paragraph into a new block.
                 djot_push_block(
                     &mut elements,
                     std::mem::take(&mut current_spans),
@@ -3534,20 +3571,20 @@ pub fn parse_djot(djot: &str, options: &DjotImportOptions) -> Vec<ParsedElement>
             ) => skip_depth = 1,
 
             // ── Text + atoms ──
-            // A line ending inside a code span is kept by the parser as a line
-            // break in the span's text, the one a paragraph's text can hold. It is
-            // read as a hard break is, a new block with the list, quotation or
-            // heading the line was in, so the model holds no line break inside a
-            // block. Kept inside the span, the Djot writer saved the code run's
-            // lines as blocks of their own, which reloaded as two blocks: a document
-            // that did not settle into the Djot it saves as. Such a span is what an
-            // older version wrote for a code run holding a line break, a pasted
-            // `<pre><code>` passage above all, and reading its lines as blocks is how
-            // that passage reads in the editor.
+            // A line ending inside a code span is kept by the parser as a `\n` in the
+            // span's text. It is read as a new block with the list, quotation or heading
+            // the line was in, as a `\n` pasted into a block is (see
+            // `split_block_at_line_breaks`). Kept inside the span, the Djot writer saved
+            // the code run's lines as blocks of their own, which reloaded as two blocks: a
+            // document that did not settle into the Djot it saves as. Such a span is what
+            // an older version wrote for a code run holding a line break, a pasted
+            // `<pre><code>` passage above all, and reading its lines as blocks is how that
+            // passage reads in the editor. It is not a hard break: nothing in it asked for
+            // a line of the same paragraph.
             E::Str(s) if code && !is_code_block && pending_image.is_none() && s.contains('\n') => {
                 for (i, piece) in s.split('\n').enumerate() {
                     if i > 0 {
-                        line_break!();
+                        split_line!();
                     }
                     if !piece.is_empty() {
                         push_text!(piece);
@@ -4421,6 +4458,24 @@ mod djot_tests {
 /// the first table is short by the two characters (the sentinel and its separator) that the
 /// document really holds there.
 pub const TABLE_ANCHOR: &str = "\u{FFFC}";
+
+/// `U+2028 LINE SEPARATOR`: a line break inside a block, the one Shift+Enter makes in a
+/// word processor.
+///
+/// A block's text holds it as one character, where it starts a new line of the same
+/// paragraph, list item, quotation or heading. It is the character Qt's `QTextDocument`
+/// uses for the same thing. It cannot be `\n`: the rope already uses `\n` between two
+/// blocks, so a search, an offset or a plain-text export could not tell a line from a
+/// paragraph.
+///
+/// The readers make one of every hard break they meet (Djot's `\` at the end of a line,
+/// Markdown's, an HTML `<br>` inside a paragraph), and each writer puts it back as its
+/// format's own line break. A table cell is one line in Djot and Markdown, so there a
+/// line break is read as a space.
+pub const LINE_SEPARATOR: char = '\u{2028}';
+
+/// [`LINE_SEPARATOR`] as text, for the readers' span builders.
+const LINE_SEPARATOR_STR: &str = "\u{2028}";
 
 /// One span's contribution to the addressable text.
 ///

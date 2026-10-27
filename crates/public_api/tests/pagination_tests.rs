@@ -97,6 +97,7 @@ fn the_form_feed_is_the_only_difference() {
             page_breaks: true,
             strip_images: true,
             endnote_footnotes: true,
+            line_breaks: true,
         })
         .expect("paged");
     assert_eq!(paged.replace('\u{000C}', ""), plain);

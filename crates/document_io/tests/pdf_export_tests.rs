@@ -131,6 +131,23 @@ fn plain_paragraph_exports_a_valid_pdf() {
     assert!(count_pdf_pages(&bytes) >= 1);
 }
 
+/// Line breaks inside a block compile wherever a block can hold one: a paragraph (at its
+/// start, twice in a row, before a parenthesis or a list number, at its end), a
+/// quotation, a list item, a heading and a code span.
+#[test]
+fn line_breaks_compile_in_every_block() {
+    let bytes = pdf_from_djot(
+        "\\\nRoses are red,\\\n\\\n(violets) are *blue*\\\n12. sugar\\\n{}\n\n\
+         > quoted\\\n> lines\n\n\
+         - an item\\\n  its second line\n\n\
+         # A title\\\n# on two lines\n\n\
+         `code`{}\\\nafter",
+        pdf_options(),
+    );
+    assert!(bytes.starts_with(b"%PDF-"));
+    assert!(count_pdf_pages(&bytes) >= 1);
+}
+
 #[test]
 fn heading_levels_all_compile() {
     for level in 1..=6 {

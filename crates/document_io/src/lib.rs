@@ -5,6 +5,7 @@ pub(crate) mod footnotes;
 pub(crate) mod html_render;
 #[cfg(any(feature = "docx", feature = "odt"))]
 pub(crate) mod image_fit;
+pub(crate) mod inline_lines;
 pub(crate) mod list_numbers;
 #[cfg(feature = "odt")]
 pub(crate) mod odt_render;

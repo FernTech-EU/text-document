@@ -62,6 +62,14 @@ pub struct PlainTextExportOptions {
     /// the endnote list is what a manuscript printed without markup has always
     /// done.
     pub endnote_footnotes: bool,
+    /// Write each line break inside a block ([`LINE_SEPARATOR`](super::LINE_SEPARATOR))
+    /// as a `\n`, so the lines of a stanza or a letter are lines of the file.
+    ///
+    /// **Presentation only.** It changes no offset, a line break and a `\n` being one
+    /// character each, but the addressable view is the document's own text, and there a
+    /// `\n` is what separates two blocks: a search or a replace reading it back could not
+    /// tell a line from a paragraph.
+    pub line_breaks: bool,
 }
 
 impl PlainTextExportOptions {
@@ -74,6 +82,7 @@ impl PlainTextExportOptions {
             page_breaks: false,
             strip_images: false,
             endnote_footnotes: false,
+            line_breaks: false,
         }
     }
 
@@ -84,6 +93,7 @@ impl PlainTextExportOptions {
             page_breaks: true,
             strip_images: true,
             endnote_footnotes: true,
+            line_breaks: true,
         }
     }
 }

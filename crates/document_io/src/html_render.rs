@@ -28,6 +28,7 @@ use common::database::rope_helpers::block_content_via_store;
 use common::entities::{Alignment, Block, ListStyle, TableCell, TextDirection};
 use common::format_runs::InlineContent;
 use common::format_runs_query::inline_segments_for_block;
+use common::parser_tools::LINE_SEPARATOR;
 use common::parser_tools::image_options::{ExportImages, base64_encode};
 use common::types::EntityId;
 
@@ -114,7 +115,8 @@ pub fn render_blocks_html(
 
         // --- Code block ---
         if block.fmt_is_code_block == Some(true) {
-            let raw_text = block_plain_text(store, block);
+            // A `<pre>` keeps its line breaks as they are typed.
+            let raw_text = block_plain_text(store, block).replace(LINE_SEPARATOR, "\n");
             let escaped = escape_html(&raw_text);
 
             let code_open = if let Some(ref lang) = block.fmt_code_language {
@@ -282,7 +284,9 @@ pub fn render_inline_html(
 
     for elem in &elements {
         let text = match &elem.content {
-            InlineContent::Text(t) => escape_html(t),
+            // A line break inside the block is HTML's own, `<br/>`, which XHTML (EPUB)
+            // reads as well.
+            InlineContent::Text(t) => escape_html(t).replace(LINE_SEPARATOR, "<br/>"),
             // A footnote reference.
             //
             // Both the `epub:type` and the DPUB-ARIA role: `epub:type` alone

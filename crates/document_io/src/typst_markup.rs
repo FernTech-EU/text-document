@@ -26,7 +26,7 @@ use common::entities::{
 };
 use common::format_runs::InlineContent;
 use common::format_runs_query::inline_segments_for_block;
-use common::parser_tools::{ExportImages, PdfExportOptions};
+use common::parser_tools::{ExportImages, LINE_SEPARATOR, PdfExportOptions};
 use common::types::EntityId;
 
 // ─────────────────────────── Escaping ───────────────────────────
@@ -80,6 +80,10 @@ pub fn escape_typst(s: &str) -> String {
             '/' => out.push_str("\\/"),
             '=' => out.push_str("\\="),
             '+' => out.push_str("\\+"),
+            // A line break inside the block. The call, not `\` and a newline, which would
+            // start a line of source a `12.` could open as a list; and ended by `;`, or the
+            // `(` of a following "(sic)" would be read as more arguments to it.
+            LINE_SEPARATOR => out.push_str("#linebreak();"),
             _ => out.push(ch),
         }
     }
@@ -134,7 +138,7 @@ fn escape_typst_string(s: &str) -> String {
         match ch {
             '\\' => out.push_str("\\\\"),
             '"' => out.push_str("\\\""),
-            '\n' => out.push_str("\\n"),
+            '\n' | LINE_SEPARATOR => out.push_str("\\n"),
             '\r' => out.push_str("\\r"),
             '\t' => out.push_str("\\t"),
             _ => out.push(ch),
@@ -866,6 +870,15 @@ mod tests {
             let want = format!("a{expected}b");
             assert_eq!(escape_typst(&input), want, "escaping {ch:?}");
         }
+    }
+
+    /// A line break is Typst's own, ended so a "(sic)" after it is text, not more
+    /// arguments; in a string literal (a code span's `#raw`) it is a newline.
+    #[test]
+    fn a_line_break_is_a_linebreak_call() {
+        assert_eq!(escape_typst("a\u{2028}(sic)"), "a#linebreak();(sic)");
+        assert_eq!(escape_typst("a\u{2028}12. b"), "a#linebreak();12. b");
+        assert_eq!(escape_typst_string("a\u{2028}b"), "a\\nb");
     }
 
     #[test]

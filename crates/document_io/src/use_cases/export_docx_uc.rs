@@ -10,7 +10,7 @@ use common::entities::{
 };
 use common::format_runs::{InlineContent, InlineSegment};
 use common::long_operation::LongOperation;
-use common::parser_tools::{DocumentComments, DocumentMarks, ExportImages};
+use common::parser_tools::{DocumentComments, DocumentMarks, ExportImages, LINE_SEPARATOR};
 use common::types::{EntityId, ROOT_ENTITY_ID};
 use regex::Regex;
 use std::collections::{HashMap, HashSet};
@@ -423,6 +423,23 @@ fn render_comment_body(djot: &str) -> docx_rs::Paragraph {
                     buf_strikeout = strikeout;
                 }
                 buffer.push_str(s.as_ref());
+            }
+            // A line of the source wrapped inside one paragraph is a space between its
+            // words, and a hard break (`\` at the end of the line) a line break, as in the
+            // ODT writer. Both fell through to the arm below, and the words either side
+            // of them ran together.
+            E::Softbreak => {
+                if buffer.is_empty() {
+                    buf_bold = bold;
+                    buf_italic = italic;
+                    buf_underline = underline;
+                    buf_strikeout = strikeout;
+                }
+                buffer.push(' ');
+            }
+            E::Hardbreak => {
+                flush!();
+                paragraph = paragraph.add_run(Run::new().add_break(BreakType::TextWrapping));
             }
             E::LeftSingleQuote => buffer.push('\u{2018}'),
             E::RightSingleQuote => buffer.push('\u{2019}'),
@@ -2095,7 +2112,7 @@ fn render_code_block(
         paragraph = paragraph.indent(Some(quote_indent), None, None, None);
     }
 
-    for (idx, line) in raw.split('\n').enumerate() {
+    for (idx, line) in raw.split(['\n', LINE_SEPARATOR]).enumerate() {
         let mut run = Run::new()
             .fonts(RunFonts::new().ascii("Courier New").hi_ansi("Courier New"))
             .shading(
@@ -2258,7 +2275,17 @@ fn build_run(
 /// ever touches anyway.
 fn text_run_with_format(text: &str, elem: &InlineSegment) -> docx_rs::Run {
     use docx_rs::*;
-    let mut run = Run::new().add_text(text);
+    // A line break inside the block is Word's own, `<w:br/>`, between the run's pieces
+    // of text, so the line keeps the run's formatting.
+    let mut run = Run::new();
+    for (i, piece) in text.split(LINE_SEPARATOR).enumerate() {
+        if i > 0 {
+            run = run.add_break(BreakType::TextWrapping);
+        }
+        if !piece.is_empty() {
+            run = run.add_text(piece);
+        }
+    }
     if elem.fmt_font_bold == Some(true) {
         run = run.bold();
     }
