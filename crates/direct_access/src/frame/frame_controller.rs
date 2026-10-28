@@ -488,4 +488,103 @@ mod tests {
             get_relationship_count(&ctx.db, &created.id, &FrameRelationshipField::Blocks).unwrap();
         assert_eq!(count, 0);
     }
+
+    // -----------------------------------------------------------------------
+    // relationship: undo and redo
+    // -----------------------------------------------------------------------
+
+    fn blocks_of(ctx: &TestContext, frame: EntityId) -> Vec<EntityId> {
+        get_relationship(&ctx.db, &frame, &FrameRelationshipField::Blocks).unwrap()
+    }
+
+    /// The undo of a set or a move puts back that one list and nothing else, keeps no
+    /// savepoint, and survives a second undo and redo.
+    #[test]
+    fn test_relationship_undo_redo_touches_only_that_list() {
+        use crate::block::block_controller;
+        use crate::block::dtos::CreateBlockDto;
+        use common::undo_redo::UNTRACKED_STACK_ID;
+
+        let mut ctx = TestContext::new();
+        let frame = create_one(&mut ctx).id;
+        let mut block = || {
+            block_controller::create_orphan(
+                &ctx.db,
+                &ctx.hub,
+                &mut ctx.undo,
+                None,
+                &CreateBlockDto::default(),
+            )
+            .unwrap()
+            .id
+        };
+        let (a, b, c) = (block(), block(), block());
+
+        set_relationship(
+            &ctx.db,
+            &ctx.hub,
+            &mut ctx.undo,
+            None,
+            &FrameRelationshipDto {
+                id: frame,
+                field: FrameRelationshipField::Blocks,
+                right_ids: vec![a, b, c],
+            },
+        )
+        .unwrap();
+        move_relationship(
+            &ctx.db,
+            &ctx.hub,
+            &mut ctx.undo,
+            None,
+            &frame,
+            &FrameRelationshipField::Blocks,
+            &[c],
+            0,
+        )
+        .unwrap();
+        assert_eq!(blocks_of(&ctx, frame), vec![c, a, b]);
+
+        // A write no undo history records, made after both.
+        let untracked = create_orphan(
+            &ctx.db,
+            &ctx.hub,
+            &mut ctx.undo,
+            Some(UNTRACKED_STACK_ID),
+            &CreateFrameDto::default(),
+        )
+        .unwrap()
+        .id;
+
+        for cycle in 1..=2 {
+            ctx.undo.undo(None).unwrap();
+            assert_eq!(
+                blocks_of(&ctx, frame),
+                vec![a, b, c],
+                "undo of the move, {cycle}"
+            );
+            ctx.undo.undo(None).unwrap();
+            assert!(
+                blocks_of(&ctx, frame).is_empty(),
+                "undo of the set, {cycle}"
+            );
+            assert!(
+                get(&ctx.db, &untracked).unwrap().is_some(),
+                "the undo puts back the list, not the whole store"
+            );
+            ctx.undo.redo(None).unwrap();
+            assert_eq!(
+                blocks_of(&ctx, frame),
+                vec![a, b, c],
+                "redo of the set, {cycle}"
+            );
+            ctx.undo.redo(None).unwrap();
+            assert_eq!(
+                blocks_of(&ctx, frame),
+                vec![c, a, b],
+                "redo of the move, {cycle}"
+            );
+        }
+        assert_eq!(ctx.db.get_store().savepoint_count(), 0);
+    }
 }

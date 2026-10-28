@@ -197,6 +197,16 @@ impl use_cases::OwnedWriteUoW for TableCellWriteUoW {
 }
 
 impl use_cases::WriteRelUoW<TableCellRelationshipField> for TableCellWriteUoW {
+    fn get_relationship(
+        &self,
+        id: &EntityId,
+        field: &TableCellRelationshipField,
+    ) -> Result<Vec<EntityId>> {
+        let transaction = self.transaction.as_ref().expect("Transaction not started");
+        let repo = repository_factory::write::create_table_cell_repository(transaction)?;
+        Ok(repo.get_relationship(id, field)?)
+    }
+
     fn set_relationship(
         &self,
         id: &EntityId,

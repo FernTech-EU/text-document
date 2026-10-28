@@ -197,6 +197,16 @@ impl use_cases::OwnedWriteUoW for BlockWriteUoW {
 }
 
 impl use_cases::WriteRelUoW<BlockRelationshipField> for BlockWriteUoW {
+    fn get_relationship(
+        &self,
+        id: &EntityId,
+        field: &BlockRelationshipField,
+    ) -> Result<Vec<EntityId>> {
+        let transaction = self.transaction.as_ref().expect("Transaction not started");
+        let repo = repository_factory::write::create_block_repository(transaction)?;
+        Ok(repo.get_relationship(id, field)?)
+    }
+
     fn set_relationship(
         &self,
         id: &EntityId,

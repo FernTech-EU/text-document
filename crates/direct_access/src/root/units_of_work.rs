@@ -169,6 +169,16 @@ impl use_cases::WriteUoW for RootWriteUoW {
 }
 
 impl use_cases::WriteRelUoW<RootRelationshipField> for RootWriteUoW {
+    fn get_relationship(
+        &self,
+        id: &EntityId,
+        field: &RootRelationshipField,
+    ) -> Result<Vec<EntityId>> {
+        let transaction = self.transaction.as_ref().expect("Transaction not started");
+        let repo = repository_factory::write::create_root_repository(transaction)?;
+        Ok(repo.get_relationship(id, field)?)
+    }
+
     fn set_relationship(
         &self,
         id: &EntityId,

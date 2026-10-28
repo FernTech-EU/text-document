@@ -96,6 +96,8 @@ pub trait ReadRelUoWFactory<RF> {
 }
 
 pub trait WriteRelUoW<RF>: CommandUnitOfWork {
+    /// The current list, read before a set or move so that its undo can put it back.
+    fn get_relationship(&self, id: &EntityId, field: &RF) -> Result<Vec<EntityId>>;
     fn set_relationship(&self, id: &EntityId, field: &RF, right_ids: &[EntityId]) -> Result<()>;
     fn move_relationship(
         &self,
