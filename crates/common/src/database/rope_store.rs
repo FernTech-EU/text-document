@@ -162,6 +162,12 @@ impl RopeStore {
         self.savepoints.write().remove(&savepoint_id);
     }
 
+    /// How many savepoints the store holds: one for each write transaction still open, and
+    /// each one created explicitly and not discarded yet.
+    pub fn savepoint_count(&self) -> usize {
+        self.savepoints.read().len()
+    }
+
     /// Get-and-increment counter for an entity type.
     pub(crate) fn next_id(&self, entity_name: &str) -> EntityId {
         let mut counters = self.counters.write();

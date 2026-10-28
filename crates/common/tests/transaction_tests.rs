@@ -79,6 +79,48 @@ fn test_drop_without_commit_restores_savepoint() -> Result<()> {
 }
 
 #[test]
+fn a_rolled_back_transaction_leaves_no_savepoint_behind() -> Result<()> {
+    let db_context = DbContext::new()?;
+    let store = db_context.get_store();
+    let before = store.savepoint_count();
+
+    let mut txn = Transaction::begin_write_transaction(&db_context)?;
+    assert_eq!(store.savepoint_count(), before + 1);
+    txn.rollback()?;
+    assert_eq!(store.savepoint_count(), before);
+    drop(txn);
+    assert_eq!(store.savepoint_count(), before);
+    Ok(())
+}
+
+#[test]
+fn a_dropped_transaction_leaves_no_savepoint_behind() -> Result<()> {
+    let db_context = DbContext::new()?;
+    let store = db_context.get_store();
+    let before = store.savepoint_count();
+
+    for _ in 0..3 {
+        let _txn = Transaction::begin_write_transaction(&db_context)?;
+        assert_eq!(store.savepoint_count(), before + 1);
+    }
+    assert_eq!(store.savepoint_count(), before);
+    Ok(())
+}
+
+#[test]
+fn a_committed_transaction_leaves_no_savepoint_behind() -> Result<()> {
+    let db_context = DbContext::new()?;
+    let store = db_context.get_store();
+    let before = store.savepoint_count();
+
+    let mut txn = Transaction::begin_write_transaction(&db_context)?;
+    txn.commit()?;
+    drop(txn);
+    assert_eq!(store.savepoint_count(), before);
+    Ok(())
+}
+
+#[test]
 fn test_entity_tree_snapshot_default() {
     let snap = EntityTreeSnapshot::default();
     assert!(snap.store_snapshot.is_none());
