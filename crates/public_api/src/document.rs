@@ -2443,11 +2443,19 @@ pub(crate) struct UndoBlockState {
     format: BlockFormat,
 }
 
-/// Capture the state of all blocks, sorted by document_position.
+/// The blocks of the document, sorted by position, and its addressable text, as they were
+/// at one moment: what [`emit_content_change_events`] compares with the document as it is.
+pub(crate) struct BlockStates {
+    blocks: Vec<UndoBlockState>,
+    text: String,
+}
+
+/// Capture the state of all blocks, sorted by document_position, and the document's
+/// addressable text.
 ///
 /// Reads through the store rather than the plain-text cache, so a caller does
 /// not have to have invalidated anything first.
-pub(crate) fn capture_block_state(inner: &TextDocumentInner) -> Vec<UndoBlockState> {
+pub(crate) fn capture_block_state(inner: &TextDocumentInner) -> BlockStates {
     let mut all_blocks =
         frontend::commands::block_commands::get_all_block(&inner.ctx).unwrap_or_default();
     let store = inner.ctx.db_context.get_store();
@@ -2470,16 +2478,65 @@ pub(crate) fn capture_block_state(inner: &TextDocumentInner) -> Vec<UndoBlockSta
         })
         .collect();
     states.sort_by_key(|s| s.position);
-    states
+    let text = addressable_text_of(store, &states);
+    BlockStates {
+        blocks: states,
+        text,
+    }
 }
 
-/// Build the full document text from sorted block states (joined with newlines).
+/// The document's addressable text ([`TextDocument::to_addressable_text`]), which `blocks`
+/// are the sorted blocks of.
+///
+/// Every position the document deals out (a cursor, a block's position, `text_at`) indexes
+/// this string, so a diff over it moves cursors and reports changes in their own space.
+/// Joined without the `U+FFFC` anchor and separator of each table, as it once was, every
+/// change after a table was read two characters early per table before it: an undo of
+/// typing in a cell moved a cursor standing after the typing back by two, and inserting or
+/// removing a table reported less than it changed.
+///
+/// It is the rope, as `to_addressable_text` reads it, whenever the rope's positions are the
+/// document's. Otherwise it is rebuilt from the blocks' positions, each gap between two
+/// blocks being their newline and, for each table between them, its anchor and the newline
+/// after it.
+fn addressable_text_of(store: &common::database::Store, blocks: &[UndoBlockState]) -> String {
+    let text = common::database::rope_helpers::rope_full_text_if_flow_matches(store)
+        .unwrap_or_else(|| build_doc_text(blocks));
+    let end = blocks.last().map_or(0, |last| {
+        last.position.max(0) as usize + last.text_length.max(0) as usize
+    });
+    debug_assert_eq!(
+        end,
+        text.chars().count(),
+        "the blocks' positions are not positions in the addressable text"
+    );
+    text
+}
+
+/// The addressable text rebuilt from sorted block states (see [`addressable_text_of`]).
 fn build_doc_text(states: &[UndoBlockState]) -> String {
-    states
-        .iter()
-        .map(|s| s.plain_text.as_str())
-        .collect::<Vec<_>>()
-        .join("\n")
+    let mut text = String::new();
+    let mut length = 0usize;
+    for (i, state) in states.iter().enumerate() {
+        if i > 0 {
+            text.push('\n');
+            length += 1;
+        }
+        let position = state.position.max(0) as usize;
+        debug_assert!(
+            position >= length && (position - length).is_multiple_of(2),
+            "a gap of {} characters before the block at {position} is not tables' anchors",
+            position.saturating_sub(length)
+        );
+        while length + 2 <= position {
+            text.push_str(crate::TABLE_ANCHOR);
+            text.push('\n');
+            length += 2;
+        }
+        text.push_str(&state.plain_text);
+        length += state.plain_text.chars().count();
+    }
+    text
 }
 
 /// Compute the precise edit between two strings by comparing common prefix and suffix.
@@ -2560,8 +2617,8 @@ fn compute_text_edit_near(
 /// the document's text that lands, and working it out by hand would be seven
 /// separate opportunities to be subtly wrong.
 ///
-/// Used by undo, redo, and every structural table edit.
-pub(crate) fn emit_content_change_events(inner: &mut TextDocumentInner, before: &[UndoBlockState]) {
+/// Used by undo, redo, every structural table edit, and inserting a table or a frame.
+pub(crate) fn emit_content_change_events(inner: &mut TextDocumentInner, before: &BlockStates) {
     emit_content_change_events_near(inner, before, None);
 }
 
@@ -2572,10 +2629,12 @@ pub(crate) fn emit_content_change_events(inner: &mut TextDocumentInner, before: 
 /// nearest `near`, the cursor's position before the change.
 fn emit_content_change_events_near(
     inner: &mut TextDocumentInner,
-    before: &[UndoBlockState],
+    before: &BlockStates,
     near: Option<usize>,
 ) -> Option<usize> {
     let after = capture_block_state(inner);
+    let (before_text, after_text) = (&before.text, &after.text);
+    let (before, after) = (&before.blocks, &after.blocks);
     let mut changed_text_end = None;
 
     // Build a map of block id → state for the "before" set.
@@ -2588,13 +2647,12 @@ fn emit_content_change_events_near(
     let mut content_changed = false;
     let mut earliest_pos: Option<usize> = None;
     let mut old_end: usize = 0;
-    let mut new_end: usize = 0;
     let mut blocks_affected: usize = 0;
 
     let mut format_only_changes: Vec<(usize, usize)> = Vec::new(); // (position, length)
 
     // Check blocks present in both before and after.
-    for after_state in &after {
+    for after_state in after {
         if let Some(before_state) = before_map.get(&after_state.id) {
             let text_changed = before_state.plain_text != after_state.plain_text
                 || before_state.text_length != after_state.text_length;
@@ -2609,7 +2667,6 @@ fn emit_content_change_events_near(
                     before_state.position.max(0) as usize
                         + before_state.text_length.max(0) as usize,
                 );
-                new_end = new_end.max(pos + after_state.text_length.max(0) as usize);
             } else if format_changed {
                 let pos = after_state.position.max(0) as usize;
                 let len = after_state.text_length.max(0) as usize;
@@ -2621,7 +2678,6 @@ fn emit_content_change_events_near(
             blocks_affected += 1;
             let pos = after_state.position.max(0) as usize;
             earliest_pos = Some(earliest_pos.map_or(pos, |p: usize| p.min(pos)));
-            new_end = new_end.max(pos + after_state.text_length.max(0) as usize);
         }
     }
 
@@ -2637,23 +2693,40 @@ fn emit_content_change_events_near(
     }
 
     if content_changed {
-        let position = earliest_pos.unwrap_or(0);
-        let chars_removed = old_end.saturating_sub(position);
-        let chars_added = new_end.saturating_sub(position);
-
         // Use a precise text-level diff for cursor adjustment so cursors land
         // at the actual edit point rather than the end of the affected block.
-        let before_text = build_doc_text(before);
-        let after_text = build_doc_text(&after);
         let (edit_offset, precise_removed, precise_added) =
-            compute_text_edit(&before_text, &after_text);
+            compute_text_edit(before_text, after_text);
+
+        // The event reports the blocks that changed when they hold the precise change, and
+        // the precise change when they do not: the blocks leave out a table's anchor,
+        // which belongs to no block, so a table inserted or removed reported less than it
+        // changed. A range that holds the precise change maps the text before onto the
+        // text after, so the figures are a splice a consumer can shift its offsets by.
+        let before_len = before_text.chars().count();
+        let after_len = after_text.chars().count();
+        let region_start = earliest_pos.unwrap_or(0).min(before_len);
+        let region_end = old_end.clamp(region_start, before_len);
+        let precise = precise_removed > 0 || precise_added > 0;
+        let (position, chars_removed, chars_added) = if !precise
+            || (region_start <= edit_offset && edit_offset + precise_removed <= region_end)
+        {
+            let removed = region_end - region_start;
+            (
+                region_start,
+                removed,
+                (removed + after_len).saturating_sub(before_len),
+            )
+        } else {
+            (edit_offset, precise_removed, precise_added)
+        };
         if precise_removed > 0 || precise_added > 0 {
             inner.adjust_cursors(edit_offset, precise_removed, precise_added);
             changed_text_end = Some(match near {
                 Some(near) => {
                     let (offset, _, added) = compute_text_edit_near(
-                        &before_text,
-                        &after_text,
+                        before_text,
+                        after_text,
                         (edit_offset, precise_removed, precise_added),
                         near,
                     );
@@ -2678,11 +2751,22 @@ fn emit_content_change_events_near(
         // That figure is the size of the restored region, which is non-zero for
         // an undo that removes text: reporting it would put `Replayed` on a
         // count of characters nothing brought back. A test caught exactly that.
+        //
+        // Reported where that text starts: where the change does, unless it starts on a
+        // table's anchor, which belongs to no block, and the text then starts in the
+        // table's first cell (an undo of the table's removal brings back the anchor, its
+        // separator and then the cells' text).
         let before_len: i64 = before.iter().map(|b| b.text_length.max(0)).sum();
         let after_len: i64 = after.iter().map(|a| a.text_length.max(0)).sum();
         if after_len > before_len {
+            let text_start = after
+                .iter()
+                .map(|state| state.position.max(0) as usize)
+                .zip(after.iter().map(|state| state.text_length.max(0) as usize))
+                .find(|&(start, length)| start + length >= edit_offset)
+                .map_or(edit_offset, |(start, _)| start.max(edit_offset));
             inner.queue_event(DocumentEvent::TextInserted {
-                position,
+                position: text_start,
                 chars_inserted: (after_len - before_len) as usize,
                 origin: crate::InsertionOrigin::Replayed,
             });

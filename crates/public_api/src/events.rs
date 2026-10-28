@@ -125,14 +125,21 @@ pub enum DocumentEvent {
     /// reports both, and a caller wanting to know how much text an edit brought
     /// in cannot get it from here.
     ///
-    /// For `undo`, `redo` and the table edits the delta is computed as a diff
-    /// over blocks joined by newlines, which is not the same string
-    /// [`TextDocument::to_plain_text`] renders when the document contains a
-    /// table. Consumers that shift offsets by these figures are consistent with
-    /// each other; a consumer reconciling them against `to_plain_text` is not.
+    /// The figures are in the document's own positions, the ones a cursor,
+    /// [`TextDocument::text_at`] and [`TextDocument::to_addressable_text`] use,
+    /// where a table is its `U+FFFC` anchor and the separator after it. Each
+    /// event is a splice of that text: the text before the edit, with
+    /// `chars_removed` characters at `position` replaced by the `chars_added`
+    /// characters at `position` in the text after it, is the text after it.
+    /// `undo`, `redo`, the table edits and inserting a table or a frame work the
+    /// change out by a diff of that text, and report the blocks that changed
+    /// when those hold the whole of it. [`TextDocument::to_plain_text`] is not
+    /// that text when the document contains a table: it leaves the anchors out.
     ///
     /// [`TextDocument::content_revision`]: crate::TextDocument::content_revision
     /// [`TextDocument::to_plain_text`]: crate::TextDocument::to_plain_text
+    /// [`TextDocument::text_at`]: crate::TextDocument::text_at
+    /// [`TextDocument::to_addressable_text`]: crate::TextDocument::to_addressable_text
     ContentsChanged {
         position: usize,
         chars_removed: usize,

@@ -17,14 +17,9 @@
 //! is the claim: a table edit is as visible as an undo, and reports through one
 //! audited mechanism rather than seven hand-written descriptions of an edit.
 //!
-//! ⚠ **The delta is not asserted against `to_plain_text`.** It does not
-//! reconcile against it, and it does not for undo and redo either: the diff is
-//! computed over blocks joined by newlines, which is a different string from the
-//! one `to_plain_text` renders for a document containing a table. That predates
-//! this file and is left exactly as found. A test claiming the two agree would
-//! be asserting something about the whole API that nobody has established, and
-//! quietly changing which coordinate space these events speak in would be far
-//! worse than the silence this fixes.
+//! The delta is not asserted against `to_plain_text`, which leaves a table's
+//! `U+FFFC` anchor out: it is a splice of the addressable text, which
+//! `table_event_position_tests.rs` checks.
 
 use text_document::{DocumentEvent, TextDocument};
 

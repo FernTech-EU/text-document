@@ -1698,22 +1698,18 @@ impl TextCursor {
         let (pos, anchor) = self.read_cursor();
         let queued = {
             let mut inner = self.doc.lock();
+            // The frame's paragraph is reported, and moves the cursors after it, as the
+            // diff of the text finds it (see `remove_table`).
+            let before = crate::document::capture_block_state(&inner);
             let dto = frontend::document_editing::InsertFrameDto {
                 position: to_i64(pos),
                 anchor: to_i64(anchor),
             };
             document_editing_commands::insert_frame(&inner.ctx, Some(inner.stack_id), &dto)?;
-            // Frame insertion adds structural content; adjust cursors and emit event.
-            // The backend doesn't return a new_position, so the cursor stays put.
             inner.modified = true;
             inner.invalidate_text_cache();
             inner.rehighlight_affected(pos.min(anchor));
-            inner.queue_event(DocumentEvent::ContentsChanged {
-                position: pos.min(anchor),
-                chars_removed: 0,
-                chars_added: 0,
-                blocks_affected: 1,
-            });
+            crate::document::emit_content_change_events(&mut inner, &before);
             inner.check_block_count_changed();
             inner.check_flow_changed();
             self.queue_undo_redo_event(&mut inner)
@@ -1732,6 +1728,9 @@ impl TextCursor {
         let (pos, anchor) = self.read_cursor();
         let (table_id, queued) = {
             let mut inner = self.doc.lock();
+            // The table's anchor and cells are reported, and move the cursors after
+            // them, as the diff of the text finds them (see `remove_table`).
+            let before = crate::document::capture_block_state(&inner);
             let dto = frontend::document_editing::InsertTableDto {
                 position: to_i64(pos),
                 anchor: to_i64(anchor),
@@ -1742,7 +1741,8 @@ impl TextCursor {
                 document_editing_commands::insert_table(&inner.ctx, Some(inner.stack_id), &dto)?;
             let new_pos = to_usize(result.new_position);
             let table_id = to_usize(result.table_id);
-            inner.adjust_cursors(pos.min(anchor), 0, new_pos - pos.min(anchor));
+            inner.invalidate_text_cache();
+            crate::document::emit_content_change_events(&mut inner, &before);
             {
                 let mut d = self.data.lock();
                 d.position = new_pos;
@@ -1751,14 +1751,7 @@ impl TextCursor {
                 d.anchor_in_table = None;
             }
             inner.modified = true;
-            inner.invalidate_text_cache();
             inner.rehighlight_affected(pos.min(anchor));
-            inner.queue_event(DocumentEvent::ContentsChanged {
-                position: pos.min(anchor),
-                chars_removed: 0,
-                chars_added: new_pos - pos.min(anchor),
-                blocks_affected: 1,
-            });
             inner.check_block_count_changed();
             inner.check_flow_changed();
             (table_id, self.queue_undo_redo_event(&mut inner))
