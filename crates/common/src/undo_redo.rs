@@ -317,6 +317,9 @@ struct CompositeLevel {
 struct StackData {
     undo_stack: Vec<UndoEntry>,
     redo_stack: Vec<UndoEntry>,
+    /// How many commands were recorded on this stack: see
+    /// [`UndoRedoManager::commands_recorded`].
+    commands_recorded: u64,
 }
 
 impl fmt::Debug for StackData {
@@ -638,7 +641,10 @@ impl UndoRedoManager {
             && !self.composite_levels.is_empty()
         {
             if let Some(composite) = &mut self.in_progress_composite {
+                let dropped = composite.commands.len().saturating_sub(level.start);
                 let _ = composite.cancel_since(level.start);
+                let stack_id = composite.stack_id;
+                self.forget_recorded(stack_id, dropped);
             }
             // A name this level gave the group goes with it.
             if level.named {
@@ -653,6 +659,8 @@ impl UndoRedoManager {
         // in this composite
         if let Some(ref mut composite) = self.in_progress_composite {
             let _ = composite.undo();
+            let (stack_id, dropped) = (composite.stack_id, composite.commands.len());
+            self.forget_recorded(stack_id, dropped);
         }
 
         self.in_progress_composite = None;
@@ -663,6 +671,14 @@ impl UndoRedoManager {
         self.last_pushed_seq = None;
 
         self.emit(UndoRedoEvent::CancelComposite, cancelled_on);
+    }
+
+    /// Take `dropped` commands a cancelled group held off what `stack_id` has recorded (see
+    /// [`commands_recorded`](Self::commands_recorded)).
+    fn forget_recorded(&mut self, stack_id: u64, dropped: usize) {
+        if let Some(stack) = self.stacks.get_mut(&stack_id) {
+            stack.commands_recorded = stack.commands_recorded.wrapping_sub(dropped as u64);
+        }
     }
 
     /// Adds a command to the global undo stack (ID 0).
@@ -701,6 +717,9 @@ impl UndoRedoManager {
                 ));
             }
             composite.add_command(command);
+            if let Some(stack) = self.stacks.get_mut(&composite.stack_id) {
+                stack.commands_recorded = stack.commands_recorded.wrapping_add(1);
+            }
             // The history did not grow: the group is still open, and it is the
             // group — not this command — that will get a sequence. Clearing the
             // register is what stops a caller reading `last_pushed_seq` here and
@@ -729,12 +748,14 @@ impl UndoRedoManager {
             // which for a burst of coalesced typing is the burst.
             let seq = last.seq;
             stack.redo_stack.clear();
+            stack.commands_recorded = stack.commands_recorded.wrapping_add(1);
             self.last_pushed_seq = Some(seq);
             self.emit(UndoRedoEvent::StackChanged, target_stack_id);
             return Ok(());
         }
 
         // If we couldn't merge, just add the command normally.
+        stack.commands_recorded = stack.commands_recorded.wrapping_add(1);
         self.push_entry(target_stack_id, command);
         Ok(())
     }
@@ -876,6 +897,21 @@ impl UndoRedoManager {
     /// composite).
     pub fn last_pushed_seq(&self) -> Option<u64> {
         self.last_pushed_seq
+    }
+
+    /// How many commands have been recorded on a stack: pushed as an entry, merged into
+    /// its head, or added to a group opened on it. Zero for a missing stack.
+    ///
+    /// For a caller to tell whether a call recorded anything: a group's
+    /// [`last_pushed_seq`](Self::last_pushed_seq) is `None` until it ends, and a merge
+    /// keeps the head's sequence, so neither says it. An undo, a redo and the push of a
+    /// group that ends record no command and leave it as it is. A
+    /// [`cancel_composite`](Self::cancel_composite) takes back the commands it drops, so
+    /// a call whose group was cancelled leaves it as it found it: it recorded nothing.
+    pub fn commands_recorded(&self, stack_id: Option<u64>) -> u64 {
+        self.stacks
+            .get(&stack_id.unwrap_or(0))
+            .map_or(0, |s| s.commands_recorded)
     }
 
     /// The sequence number now on top of a stack, if any.

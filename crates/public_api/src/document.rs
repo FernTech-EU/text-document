@@ -1769,11 +1769,19 @@ impl TextDocument {
     // ── Undo / Redo ──────────────────────────────────────────
 
     /// Undo the last operation.
+    ///
+    /// The cursor the edit was made with goes where QTextDocument puts it: where the text
+    /// an undone insertion put in was, and after the text an undone deletion took away, as
+    /// TextEdit and Word leave it too. An undone format change leaves it as it stands.
+    /// Every other cursor moves only by what the undo changed.
     pub fn undo(&self) -> Result<()> {
         let _settled = self.settle_transient_edits();
         let queued = {
             let mut inner = self.inner.lock();
             let before = capture_block_state(&inner);
+            let entry = undo_redo_commands::head_seq(&inner.ctx, Some(inner.stack_id));
+            let edited_with = inner.edit_caret_cursor(entry);
+            let near = edited_with.as_ref().map(|cursor| cursor.lock().position);
             let stepped = undo_redo_commands::can_undo(&inner.ctx, Some(inner.stack_id));
             let result = undo_redo_commands::undo(&inner.ctx, Some(inner.stack_id));
             inner.invalidate_text_cache();
@@ -1802,7 +1810,16 @@ impl TextDocument {
             }
             result?;
             inner.rehighlight_all();
-            emit_content_change_events(&mut inner, &before);
+            let changed_text_end = emit_content_change_events_near(&mut inner, &before, near);
+            if let (Some(cursor), Some(end)) = (edited_with, changed_text_end) {
+                let end =
+                    crate::cursor::max_cursor_position_of(&inner).map_or(end, |max| end.min(max));
+                let mut data = cursor.lock();
+                data.position = end;
+                data.anchor = end;
+                data.anchor_in_table = None;
+                data.cell_selection_override = None;
+            }
             inner.check_block_count_changed();
             inner.check_flow_changed();
             let can_undo = undo_redo_commands::can_undo(&inner.ctx, Some(inner.stack_id));
@@ -1815,6 +1832,12 @@ impl TextDocument {
     }
 
     /// Redo the last undone operation.
+    ///
+    /// The cursor the edit was made with goes back where the edit left it: after a redone
+    /// insertion its end, after a redone deletion the deletion point, after a redone format
+    /// change the selection it was made on. It goes there wherever it went since, as in
+    /// QTextDocument, TextEdit and Word. Every other cursor moves only by what the redo
+    /// changed.
     pub fn redo(&self) -> Result<()> {
         let _settled = self.settle_transient_edits();
         let queued = {
@@ -1834,6 +1857,10 @@ impl TextDocument {
             result?;
             inner.rehighlight_all();
             emit_content_change_events(&mut inner, &before);
+            if stepped {
+                let entry = undo_redo_commands::head_seq(&inner.ctx, Some(inner.stack_id));
+                inner.restore_edit_caret(entry, crate::cursor::max_cursor_position_of(&inner));
+            }
             inner.check_block_count_changed();
             inner.check_flow_changed();
             let can_undo = undo_redo_commands::can_undo(&inner.ctx, Some(inner.stack_id));
@@ -2438,6 +2465,38 @@ fn compute_text_edit(before: &str, after: &str) -> (usize, usize, usize) {
     (prefix_len, removed, added)
 }
 
+/// The edit `minimal` ([`compute_text_edit`] of `before` and `after`) moved as far back as
+/// `near` when it reads the same there: inside a run of repeated text, the same change can
+/// start at several places, and [`compute_text_edit`] takes the last. Otherwise `minimal`.
+fn compute_text_edit_near(
+    before: &str,
+    after: &str,
+    minimal: (usize, usize, usize),
+    near: usize,
+) -> (usize, usize, usize) {
+    if near >= minimal.0 {
+        return minimal;
+    }
+    let before_chars: Vec<char> = before.chars().collect();
+    let after_chars: Vec<char> = after.chars().collect();
+    let before_remaining = before_chars.len() - near;
+    let after_remaining = after_chars.len() - near;
+    let suffix_len = before_chars
+        .iter()
+        .rev()
+        .zip(after_chars.iter().rev())
+        .take(before_remaining.min(after_remaining))
+        .take_while(|(a, b)| a == b)
+        .count();
+    let removed = before_remaining - suffix_len;
+    let added = after_remaining - suffix_len;
+    if (removed, added) == (minimal.1, minimal.2) {
+        (near, removed, added)
+    } else {
+        minimal
+    }
+}
+
 /// Compare block state before and after an edit and emit
 /// `ContentsChanged` / `FormatChanged` events for the affected regions.
 ///
@@ -2456,7 +2515,21 @@ fn compute_text_edit(before: &str, after: &str) -> (usize, usize, usize) {
 ///
 /// Used by undo, redo, and every structural table edit.
 pub(crate) fn emit_content_change_events(inner: &mut TextDocumentInner, before: &[UndoBlockState]) {
+    emit_content_change_events_near(inner, before, None);
+}
+
+/// [`emit_content_change_events`], also saying where the text that changed ends now: where
+/// an undo leaves the cursor that made the edit (see [`TextDocument::undo`]). `None` when
+/// no text changed. Where the change sits inside a run of repeated text is ambiguous (a
+/// deletion of the first `a` of `aab` reads the same as one of the second), and is read
+/// nearest `near`, the cursor's position before the change.
+fn emit_content_change_events_near(
+    inner: &mut TextDocumentInner,
+    before: &[UndoBlockState],
+    near: Option<usize>,
+) -> Option<usize> {
     let after = capture_block_state(inner);
+    let mut changed_text_end = None;
 
     // Build a map of block id → state for the "before" set.
     let before_map: std::collections::HashMap<u64, &UndoBlockState> =
@@ -2529,6 +2602,18 @@ pub(crate) fn emit_content_change_events(inner: &mut TextDocumentInner, before: 
             compute_text_edit(&before_text, &after_text);
         if precise_removed > 0 || precise_added > 0 {
             inner.adjust_cursors(edit_offset, precise_removed, precise_added);
+            changed_text_end = Some(match near {
+                Some(near) => {
+                    let (offset, _, added) = compute_text_edit_near(
+                        &before_text,
+                        &after_text,
+                        (edit_offset, precise_removed, precise_added),
+                        near,
+                    );
+                    offset + added
+                }
+                None => edit_offset + precise_added,
+            });
         }
 
         inner.queue_event(DocumentEvent::ContentsChanged {
@@ -2565,6 +2650,7 @@ pub(crate) fn emit_content_change_events(inner: &mut TextDocumentInner, before: 
             kind: FormatChangeKind::Block,
         });
     }
+    changed_text_end
 }
 
 // ── Flow helpers ──────────────────────────────────────────────

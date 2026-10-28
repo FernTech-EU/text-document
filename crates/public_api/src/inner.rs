@@ -27,6 +27,7 @@ pub(crate) type QueuedEvents = Vec<(
 use crate::Result;
 use frontend::AppContext;
 use frontend::EventHubClient;
+use frontend::commands::undo_redo_commands;
 use frontend::common::types::EntityId;
 use frontend::event_hub_client::SubscriptionToken;
 
@@ -182,6 +183,50 @@ pub(crate) struct TextDocumentInner {
     /// transient edits, while what is kept beside the store in the positions of the
     /// document as it shows (a host's highlight ranges) has to be moved back across them.
     pub reading_recorded: bool,
+    /// Where each recorded edit left the cursor that made it, by the sequence of the undo
+    /// entry the edit went into: what a redo of the entry puts that cursor back to, and
+    /// which cursor an undo of it moves (see [`EditCaret`]). Oldest dropped first, past
+    /// twice the history's length (see [`TextDocumentInner::note_edit_caret`]).
+    pub edit_carets: std::collections::BTreeMap<u64, EditCaret>,
+    /// How many commands the document's stack had recorded at the last announcement of its
+    /// history ([`DocumentEvent::UndoRedoChanged`]): an edit that leaves the count as it was
+    /// recorded nothing, and its cursor is not where any entry's edit left it.
+    pub commands_seen: u64,
+    /// How many edit blocks are open on this document
+    /// ([`TextCursor::begin_edit_block`](crate::TextCursor::begin_edit_block)), and where
+    /// the last edit inside them left its cursor: the entry the outermost one becomes when
+    /// it ends is named only then.
+    pub edit_block_depth: usize,
+    pub edit_block_caret: Option<EditCaret>,
+}
+
+/// Where a recorded edit left the cursor that made it.
+///
+/// A redo of the edit puts that cursor back there, its selection included, wherever it
+/// went in between, as QTextDocument, TextEdit and Word do: typing `abc def`, undoing,
+/// redoing and typing `Y` gives `abc defY`. Moving every cursor by what the redo changed
+/// left a caret at the start of a redone insertion. An undo moves the same cursor to the
+/// end of the text it changed (see `TextDocument::undo`). Other cursors move only by what
+/// the step changed. A cursor dropped since leaves no one to move.
+pub(crate) struct EditCaret {
+    cursor: Weak<Mutex<CursorData>>,
+    position: usize,
+    anchor: usize,
+    anchor_in_table: Option<usize>,
+    cell_selection_override: Option<crate::flow::CellRange>,
+}
+
+impl EditCaret {
+    fn of(cursor: &Arc<Mutex<CursorData>>) -> Self {
+        let data = cursor.lock();
+        EditCaret {
+            cursor: Arc::downgrade(cursor),
+            position: data.position,
+            anchor: data.anchor,
+            anchor_in_table: data.anchor_in_table,
+            cell_selection_override: data.cell_selection_override.clone(),
+        }
+    }
 }
 
 /// The one empty paragraph the main text is: the block, the list it is an item of and the
@@ -319,6 +364,72 @@ impl TextDocumentInner {
         }
     }
 
+    /// Note where a recorded edit left `cursor`, the one that made it, for an undo and a
+    /// redo of the entry it went into (see [`EditCaret`]). Called as the edit announces the
+    /// history, before the announcement: an edit that recorded nothing (a backspace at the
+    /// start of the text) notes nothing, and the entry below keeps where its own edit left
+    /// its cursor. Inside an edit block the entry is the block's, named when it ends.
+    pub(crate) fn note_edit_caret(&mut self, cursor: &Arc<Mutex<CursorData>>) {
+        let recorded = undo_redo_commands::commands_recorded(&self.ctx, Some(self.stack_id));
+        if recorded == self.commands_seen {
+            return;
+        }
+        self.commands_seen = recorded;
+        let caret = EditCaret::of(cursor);
+        if self.edit_block_depth > 0 {
+            self.edit_block_caret = Some(caret);
+        } else if let Some(seq) = undo_redo_commands::head_seq(&self.ctx, Some(self.stack_id)) {
+            self.keep_edit_caret(seq, caret);
+        }
+    }
+
+    /// Close one edit block, naming the entry the outermost one became for where its last
+    /// edit left its cursor.
+    pub(crate) fn end_edit_block_caret(&mut self) {
+        self.edit_block_depth = self.edit_block_depth.saturating_sub(1);
+        if self.edit_block_depth == 0
+            && let Some(caret) = self.edit_block_caret.take()
+            && let Some(seq) = undo_redo_commands::head_seq(&self.ctx, Some(self.stack_id))
+        {
+            self.keep_edit_caret(seq, caret);
+        }
+    }
+
+    fn keep_edit_caret(&mut self, seq: u64, caret: EditCaret) {
+        self.edit_carets.insert(seq, caret);
+        // Entries trimmed by the undo limit, cleared with the history or dropped with a
+        // redo branch are never stepped again. They are the oldest, apart from the redo
+        // branches, so dropping from the oldest past twice the history keeps every entry
+        // that can still be stepped.
+        let keep = 2 * undo_redo_commands::get_stack_size(&self.ctx, self.stack_id) + 64;
+        while self.edit_carets.len() > keep {
+            self.edit_carets.pop_first();
+        }
+    }
+
+    /// The cursor the edit that made entry `seq` was made with, if it is still alive.
+    pub(crate) fn edit_caret_cursor(&self, seq: Option<u64>) -> Option<Arc<Mutex<CursorData>>> {
+        self.edit_carets.get(&seq?)?.cursor.upgrade()
+    }
+
+    /// After a redo of entry `seq`: the cursor its edit was made with back where the edit
+    /// left it (see [`EditCaret`]), within `max_position`.
+    pub(crate) fn restore_edit_caret(&self, seq: Option<u64>, max_position: Option<usize>) {
+        let Some(caret) = seq.and_then(|seq| self.edit_carets.get(&seq)) else {
+            return;
+        };
+        let Some(cursor) = caret.cursor.upgrade() else {
+            return;
+        };
+        let clamp = |p: usize| max_position.map_or(p, |max| p.min(max));
+        let mut data = cursor.lock();
+        data.position = clamp(caret.position);
+        data.anchor = clamp(caret.anchor);
+        data.anchor_in_table = caret.anchor_in_table.map(clamp);
+        data.cell_selection_override = caret.cell_selection_override.clone();
+        data.whole_text_selected = false;
+    }
+
     /// Register a new cursor and return its shared data.
     pub fn register_cursor(&mut self, position: usize) -> Arc<Mutex<CursorData>> {
         self.prune_dead_cursors();
@@ -343,7 +454,11 @@ impl TextDocumentInner {
             DocumentEvent::ContentsChanged { .. } => {
                 self.content_revision = self.content_revision.wrapping_add(1);
             }
-            DocumentEvent::UndoRedoChanged { .. } => self.end_whole_text_selections(),
+            DocumentEvent::UndoRedoChanged { .. } => {
+                self.end_whole_text_selections();
+                self.commands_seen =
+                    undo_redo_commands::commands_recorded(&self.ctx, Some(self.stack_id));
+            }
             // A text loaded in place is not the one a removal emptied, however alike its
             // empty paragraph looks.
             DocumentEvent::DocumentReset => self.emptied_text = None,
@@ -644,6 +759,7 @@ impl TextDocumentInner {
         // upwards on its own and read as a leak.
         LIVE_DOCUMENTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
+        let commands_seen = undo_redo_commands::commands_recorded(&ctx, Some(stack_id));
         Ok(Self {
             ctx,
             event_client,
@@ -671,6 +787,10 @@ impl TextDocumentInner {
             emptied_text: None,
             transient: None,
             reading_recorded: false,
+            edit_carets: std::collections::BTreeMap::new(),
+            commands_seen,
+            edit_block_depth: 0,
+            edit_block_caret: None,
         })
     }
 }

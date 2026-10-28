@@ -136,6 +136,46 @@ fn undo_in_one_document_leaves_its_sibling_alone() {
     );
 }
 
+/// Each document keeps its own history, its edit blocks included: an edit block open in
+/// one document neither refuses nor closes one in its sibling, and each groups only its
+/// own edits.
+#[test]
+fn edit_blocks_in_sibling_documents_group_their_own_edits() {
+    let _serial = serial();
+    let backend = DocumentBackend::new();
+    let a = TextDocument::new_in(&backend);
+    let b = TextDocument::new_in(&backend);
+    a.set_plain_text("a").expect("set a");
+    b.set_plain_text("b").expect("set b");
+
+    let in_a = a.cursor_at(1);
+    let in_b = b.cursor_at(1);
+    in_a.begin_edit_block();
+    in_a.insert_text("1").unwrap();
+    in_b.begin_edit_block();
+    in_a.end_edit_block();
+    in_b.insert_text("2").unwrap();
+    in_b.insert_text(" 3").unwrap();
+    in_a.begin_edit_block();
+    in_b.end_edit_block();
+    in_a.insert_text("4").unwrap();
+    in_a.end_edit_block();
+    assert_eq!(b.to_plain_text().unwrap(), "b2 3");
+
+    b.undo().unwrap();
+    assert_eq!(b.to_plain_text().unwrap(), "b", "the block was one step");
+    b.redo().unwrap();
+    assert_eq!(
+        in_b.position(),
+        4,
+        "the redo puts b's caret where its block left it"
+    );
+    a.undo().unwrap();
+    assert_eq!(a.to_plain_text().unwrap(), "a1");
+    a.undo().unwrap();
+    assert_eq!(a.to_plain_text().unwrap(), "a");
+}
+
 /// A document dropped out of a backend must not take the pump with it. The
 /// survivor still works, which it could not if the shared hub had been shut
 /// down by the first drop.

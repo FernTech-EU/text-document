@@ -94,6 +94,13 @@ pub fn last_pushed_seq(ctx: &AppContext) -> Option<u64> {
     undo_redo_manager.last_pushed_seq()
 }
 
+/// How many commands have been recorded on a stack: pushed, merged into its head, or
+/// added to a group opened on it.
+pub fn commands_recorded(ctx: &AppContext, stack_id: Option<u64>) -> u64 {
+    let undo_redo_manager = ctx.undo_redo_manager.lock();
+    undo_redo_manager.commands_recorded(stack_id)
+}
+
 /// The sequence number now on top of a stack, if any.
 pub fn head_seq(ctx: &AppContext, stack_id: Option<u64>) -> Option<u64> {
     let undo_redo_manager = ctx.undo_redo_manager.lock();

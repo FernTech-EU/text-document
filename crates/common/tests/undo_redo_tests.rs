@@ -1312,3 +1312,41 @@ fn test_redo_stack_size_follows_undo_and_redo() {
         .unwrap();
     assert_eq!(manager.get_redo_stack_size(stack), 0);
 }
+
+#[test]
+fn test_a_cancelled_group_takes_back_what_it_recorded() {
+    let mut manager = UndoRedoManager::new();
+    let stack = manager.create_new_stack();
+    let counter = Arc::new(Mutex::new(0));
+    let push = |manager: &mut UndoRedoManager, value| {
+        manager
+            .add_command_to_stack(
+                Box::new(TestCommand::new(counter.clone(), value)),
+                Some(stack),
+            )
+            .unwrap();
+    };
+    push(&mut manager, 1);
+    let recorded = manager.commands_recorded(Some(stack));
+
+    // A replace whose second half fails: one command recorded, then the group cancelled.
+    manager.begin_composite(Some(stack)).unwrap();
+    push(&mut manager, 2);
+    manager.cancel_composite();
+    assert_eq!(
+        manager.commands_recorded(Some(stack)),
+        recorded,
+        "a cancelled group recorded nothing"
+    );
+
+    // Inside a group that goes on, a cancelled level takes back only its own.
+    manager.begin_composite(Some(stack)).unwrap();
+    push(&mut manager, 3);
+    manager.begin_composite(Some(stack)).unwrap();
+    push(&mut manager, 4);
+    push(&mut manager, 5);
+    manager.cancel_composite();
+    assert_eq!(manager.commands_recorded(Some(stack)), recorded + 1);
+    manager.end_composite();
+    assert_eq!(manager.commands_recorded(Some(stack)), recorded + 1);
+}

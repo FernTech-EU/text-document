@@ -95,7 +95,7 @@ fn main_text_is_empty(inner: &TextDocumentInner) -> bool {
 /// `None` only when the document entity cannot be read, so each caller keeps the
 /// fallback position it already chose for that case rather than being handed a
 /// zero that reads as an empty document.
-fn max_cursor_position_of(inner: &TextDocumentInner) -> Option<usize> {
+pub(crate) fn max_cursor_position_of(inner: &TextDocumentInner) -> Option<usize> {
     let store = inner.ctx.db_context.get_store();
     if common::database::rope_helpers::rope_positions_match_flow(store) {
         return Some(store.rope.read().len_chars());
@@ -3373,15 +3373,23 @@ impl TextCursor {
     // ── Edit blocks (composite undo) ─────────────────────────
 
     /// Begin a group of operations that will be undone as a single unit.
+    ///
+    /// The block belongs to the document, not to this cursor: the edits of every cursor go
+    /// into it while it is open, and any cursor's [`end_edit_block`](Self::end_edit_block)
+    /// ends the innermost block open on the document. Every begin must be balanced by one
+    /// end: a block left open keeps gathering every later edit, and none of them reaches
+    /// the undo history until it ends.
     pub fn begin_edit_block(&self) {
-        let inner = self.doc.lock();
+        let mut inner = self.doc.lock();
         undo_redo_commands::begin_composite(&inner.ctx, Some(inner.stack_id));
+        inner.edit_block_depth += 1;
     }
 
     /// End the current edit block.
     pub fn end_edit_block(&self) {
-        let inner = self.doc.lock();
+        let mut inner = self.doc.lock();
         undo_redo_commands::end_composite(&inner.ctx);
+        inner.end_edit_block_caret();
     }
 
     /// Alias for [`begin_edit_block`](Self::begin_edit_block).
@@ -3396,8 +3404,10 @@ impl TextCursor {
 
     // ── Private helpers ─────────────────────────────────────
 
-    /// Queue an `UndoRedoChanged` event and return all queued events for dispatch.
+    /// Queue an `UndoRedoChanged` event and return all queued events for dispatch, having
+    /// noted where the edit left this cursor for an undo and a redo of it.
     fn queue_undo_redo_event(&self, inner: &mut TextDocumentInner) -> QueuedEvents {
+        inner.note_edit_caret(&self.data);
         let can_undo = undo_redo_commands::can_undo(&inner.ctx, Some(inner.stack_id));
         let can_redo = undo_redo_commands::can_redo(&inner.ctx, Some(inner.stack_id));
         inner.queue_event(DocumentEvent::UndoRedoChanged { can_undo, can_redo });
