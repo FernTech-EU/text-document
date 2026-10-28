@@ -26,6 +26,43 @@ use crate::{BlockFormat, FrameFormat, MoveMode, MoveOperation, SelectionType, Te
 
 use crate::document::get_main_frame_id;
 
+/// Whether an edit goes into the document's undo history or is a transient edit, which
+/// nothing records (see [`TextCursor::insert_text_transient`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Recording {
+    History,
+    Transient,
+}
+
+impl Recording {
+    /// The undo stack the edit's commands go to: the document's own, or none at all.
+    fn stack(self, inner: &TextDocumentInner) -> Option<u64> {
+        match self {
+            Recording::History => Some(inner.stack_id),
+            Recording::Transient => Some(common::undo_redo::UNTRACKED_STACK_ID),
+        }
+    }
+}
+
+/// A transient edit must change exactly the positions it was asked to: `[pos, anchor)`
+/// replaced by what it inserted, which is what a revert maps the cursors back through and
+/// what a commit replaces. A range across a table's cells empties them instead, and one
+/// holding part of a table and text outside it takes the whole table: both are refused
+/// (the store goes back as it was, see `TextCursor::edit_transiently`).
+fn check_transient_change(
+    recording: Recording,
+    pos: usize,
+    anchor: usize,
+    removed: usize,
+) -> Result<()> {
+    if recording == Recording::Transient && removed != pos.max(anchor) - pos.min(anchor) {
+        return Err(DocumentError::TransientEdits(
+            crate::TransientRefusal::CrossesTableCells,
+        ));
+    }
+    Ok(())
+}
+
 /// Whether the main text holds nothing but one empty paragraph, whatever the bodies of the
 /// footnotes after it hold.
 fn main_text_is_empty(inner: &TextDocumentInner) -> bool {
@@ -90,6 +127,7 @@ fn measured_delete(
     pos: usize,
     anchor: usize,
     selection: bool,
+    recording: Recording,
 ) -> Result<(frontend::document_editing::DeleteTextResultDto, usize)> {
     let (pos, anchor) = if selection {
         whole_tables_selected(inner, pos, anchor)
@@ -102,7 +140,7 @@ fn measured_delete(
         anchor: to_i64(anchor),
     };
     let result =
-        match document_editing_commands::delete_text(&inner.ctx, Some(inner.stack_id), &dto) {
+        match document_editing_commands::delete_text(&inner.ctx, recording.stack(inner), &dto) {
             Ok(result) => result,
             // Refused because it would remove nothing, so that no undo entry
             // records it: an edit that removed nothing, the caret where the use
@@ -162,18 +200,49 @@ fn delete_then<R>(
     anchor: usize,
     insert: impl FnOnce(usize) -> Result<R>,
 ) -> Result<(R, usize, usize)> {
-    undo_redo_commands::begin_composite(&inner.ctx, Some(inner.stack_id));
-    let outcome = measured_delete(inner, pos, anchor, true).and_then(|(deleted, removed)| {
-        let at = to_usize(deleted.new_position);
-        insert(at).map(|value| (value, removed, at))
-    });
+    delete_then_as(inner, pos, anchor, Recording::History, insert)
+}
+
+/// [`delete_then`], recorded as `recording` says. A transient edit opens no composite:
+/// nothing records its two halves, and when one fails the transient write it runs in puts
+/// the store back as it found it.
+///
+/// A recorded edit that finds transient edits outstanding is refused before it opens one.
+/// It reverted them before it took the lock, so they were made since, from another thread,
+/// and the store would refuse every write of the composite: opened, it would only be
+/// cancelled again, announcing a group that never held anything.
+fn delete_then_as<R>(
+    inner: &TextDocumentInner,
+    pos: usize,
+    anchor: usize,
+    recording: Recording,
+    insert: impl FnOnce(usize) -> Result<R>,
+) -> Result<(R, usize, usize)> {
+    let grouped = recording == Recording::History;
+    if grouped && inner.transient.is_some() {
+        return Err(DocumentError::TransientEdits(
+            crate::TransientRefusal::LayerOutstanding,
+        ));
+    }
+    if grouped {
+        undo_redo_commands::begin_composite(&inner.ctx, Some(inner.stack_id));
+    }
+    let outcome =
+        measured_delete(inner, pos, anchor, true, recording).and_then(|(deleted, removed)| {
+            let at = to_usize(deleted.new_position);
+            insert(at).map(|value| (value, removed, at))
+        });
     match outcome {
         Ok(done) => {
-            undo_redo_commands::end_composite(&inner.ctx);
+            if grouped {
+                undo_redo_commands::end_composite(&inner.ctx);
+            }
             Ok(done)
         }
         Err(error) => {
-            undo_redo_commands::cancel_composite(&inner.ctx);
+            if grouped {
+                undo_redo_commands::cancel_composite(&inner.ctx);
+            }
             Err(error)
         }
     }
@@ -272,7 +341,7 @@ impl Clone for TextCursor {
 impl TextCursor {
     // ── Helpers (called while doc lock is NOT held) ──────────
 
-    fn read_cursor(&self) -> (usize, usize) {
+    pub(crate) fn read_cursor(&self) -> (usize, usize) {
         let d = self.data.lock();
         (d.position, d.anchor)
     }
@@ -351,6 +420,38 @@ impl TextCursor {
         flow_may_change: bool,
         origin: InsertionOrigin,
     ) -> QueuedEvents {
+        self.finish_edit_as(
+            inner,
+            edit_pos,
+            removed,
+            inserted,
+            new_pos,
+            blocks_affected,
+            flow_may_change,
+            origin,
+            Recording::History,
+        )
+    }
+
+    /// As [`finish_edit_from`](Self::finish_edit_from), for an edit recorded as
+    /// `recording` says. A transient edit moves the cursors and announces the change as
+    /// any edit does, and leaves alone what only a recorded edit changes: the modified
+    /// flag, [`DocumentEvent::TextInserted`] (nothing has arrived: the text is shown, not
+    /// entered) and [`DocumentEvent::UndoRedoChanged`] (the history has not moved).
+    #[allow(clippy::too_many_arguments)]
+    fn finish_edit_as(
+        &self,
+        inner: &mut TextDocumentInner,
+        edit_pos: usize,
+        removed: usize,
+        inserted: Insertion,
+        new_pos: usize,
+        blocks_affected: usize,
+        flow_may_change: bool,
+        origin: InsertionOrigin,
+        recording: Recording,
+    ) -> QueuedEvents {
+        let recorded = recording == Recording::History;
         // Defensive: a use case can return new_position < edit_pos when
         // invoked through a stale or out-of-range cursor (e.g. after an
         // undo restores a state where the previously-saved cursor position
@@ -381,7 +482,9 @@ impl TextCursor {
             d.whole_text_selected = false;
             d.anchor_in_table = None;
         }
-        inner.modified = true;
+        if recorded {
+            inner.modified = true;
+        }
         inner.invalidate_text_cache();
         inner.rehighlight_affected(edit_pos);
         inner.queue_event(DocumentEvent::ContentsChanged {
@@ -393,7 +496,7 @@ impl TextCursor {
         // Only when something was actually inserted. An edit that only deletes
         // has no origin to report, and emitting one with `chars_inserted: 0`
         // would put a channel's name on text that never arrived.
-        if added > 0 {
+        if added > 0 && recorded {
             inner.queue_event(DocumentEvent::TextInserted {
                 position: inserted_at,
                 chars_inserted: added,
@@ -404,7 +507,11 @@ impl TextCursor {
         if flow_may_change {
             inner.check_flow_changed();
         }
-        self.queue_undo_redo_event(inner)
+        if recorded {
+            self.queue_undo_redo_event(inner)
+        } else {
+            inner.take_queued_events()
+        }
     }
 
     // ── Position & selection ─────────────────────────────────
@@ -908,63 +1015,84 @@ impl TextCursor {
     /// The origin reaches consumers as [`DocumentEvent::TextInserted`]. It is a
     /// fact about the channel and never about who was at the other end of it.
     pub fn insert_text_with_origin(&self, text: &str, origin: InsertionOrigin) -> Result<()> {
+        let _settled = self.settle_transient_edits();
         let (pos, anchor) = self.read_cursor();
+        let queued = {
+            let mut inner = self.doc.lock();
+            self.insert_text_locked(
+                &mut inner,
+                pos,
+                anchor,
+                text,
+                Default::default(),
+                origin,
+                Recording::History,
+            )?
+        };
+        crate::inner::dispatch_queued_events(queued);
+        Ok(())
+    }
 
+    /// Insert `text` over `[pos, anchor)` (either order), the document locked, recorded as
+    /// `recording` says, and leave this cursor after it. `policy` is what the text wears
+    /// where it replaces formatted text within one block. Returns the events to dispatch.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn insert_text_locked(
+        &self,
+        inner: &mut TextDocumentInner,
+        pos: usize,
+        anchor: usize,
+        text: &str,
+        policy: crate::ReplaceFormatPolicy,
+        origin: InsertionOrigin,
+        recording: Recording,
+    ) -> Result<QueuedEvents> {
         // Try direct insert first (handles same-block selection and no-selection cases)
         let dto = frontend::document_editing::InsertTextDto {
-            format_policy: Default::default(),
+            format_policy: policy,
             position: to_i64(pos),
             anchor: to_i64(anchor),
             text: text.into(),
         };
-
-        let queued = {
-            let mut inner = self.doc.lock();
-            let edit_pos = pos.min(anchor);
-            let before = max_cursor_position_of(&inner);
-            let result = match document_editing_commands::insert_text(
-                &inner.ctx,
-                Some(inner.stack_id),
-                &dto,
-            ) {
-                Ok(r) => r,
-                // Cross-block selection: compose delete + insert as a single
-                // undo unit.
-                Err(_) if pos != anchor => {
-                    delete_then(&inner, pos, anchor, |at| {
-                        let ins_dto = frontend::document_editing::InsertTextDto {
-                            format_policy: Default::default(),
-                            position: to_i64(at),
-                            anchor: to_i64(at),
-                            text: text.into(),
-                        };
-                        Ok(document_editing_commands::insert_text(
-                            &inner.ctx,
-                            Some(inner.stack_id),
-                            &ins_dto,
-                        )?)
-                    })?
-                    .0
-                }
-                Err(e) => return Err(e.into()),
-            };
-
-            let new_pos = to_usize(result.new_position);
-            let added = text.chars().count();
-            let removed = removed_since(&inner, before, added, pos.max(anchor) - edit_pos);
-            self.finish_edit_from(
-                &mut inner,
-                edit_pos,
-                removed,
-                Insertion::ending_at(new_pos, added),
-                new_pos,
-                to_usize(result.blocks_affected),
-                false,
-                origin,
-            )
+        let stack = recording.stack(inner);
+        let edit_pos = pos.min(anchor);
+        let before = max_cursor_position_of(inner);
+        let result = match document_editing_commands::insert_text(&inner.ctx, stack, &dto) {
+            Ok(r) => r,
+            // Cross-block selection: compose delete + insert as a single
+            // undo unit.
+            Err(_) if pos != anchor => {
+                delete_then_as(inner, pos, anchor, recording, |at| {
+                    let ins_dto = frontend::document_editing::InsertTextDto {
+                        format_policy: Default::default(),
+                        position: to_i64(at),
+                        anchor: to_i64(at),
+                        text: text.into(),
+                    };
+                    Ok(document_editing_commands::insert_text(
+                        &inner.ctx, stack, &ins_dto,
+                    )?)
+                })?
+                .0
+            }
+            Err(e) => return Err(e.into()),
         };
-        crate::inner::dispatch_queued_events(queued);
-        Ok(())
+
+        let new_pos = to_usize(result.new_position);
+        let added = text.chars().count();
+        let removed = removed_since(inner, before, added, pos.max(anchor) - edit_pos);
+        check_transient_change(recording, pos, anchor, removed)?;
+        Ok(self.finish_edit_as(
+            inner,
+            edit_pos,
+            removed,
+            Insertion::ending_at(new_pos, added),
+            new_pos,
+            to_usize(result.blocks_affected),
+            false,
+            origin,
+            recording,
+        ))
     }
 
     /// Replace `[start, end)` with `text`, choosing what the replacement wears where it
@@ -980,6 +1108,14 @@ impl TextCursor {
     /// undo unit, exactly like [`insert_text`](Self::insert_text)'s existing cross-block
     /// fallback — `format_policy` only has meaning within one block, since
     /// [`crate::ReplaceFormatPolicy`] operates on a single block's format runs.
+    ///
+    /// With [transient edits](crate::transient) outstanding, they are reverted first, and
+    /// `start` and `end`, read in the document as it was with them, are moved back so that
+    /// the range holds the recorded text it held (see the
+    /// [module documentation](crate::transient#positions)). A non-empty range that comes
+    /// back empty held only transient text and names nothing left: nothing is replaced, and
+    /// the call returns [`DocumentError::TransientEdits`] so the caller can tell (the
+    /// transient edits are reverted all the same).
     pub fn replace(
         &self,
         start: usize,
@@ -987,62 +1123,42 @@ impl TextCursor {
         text: &str,
         policy: crate::ReplaceFormatPolicy,
     ) -> Result<()> {
-        let (pos, anchor) = (start, end);
-
-        let dto = frontend::document_editing::InsertTextDto {
-            format_policy: policy,
-            position: to_i64(pos),
-            anchor: to_i64(anchor),
-            text: text.into(),
-        };
-
-        let queued = {
+        let (result, rest) = {
             let mut inner = self.doc.lock();
-            let edit_pos = pos.min(anchor);
-            let before = max_cursor_position_of(&inner);
-            let result = match document_editing_commands::insert_text(
-                &inner.ctx,
-                Some(inner.stack_id),
-                &dto,
-            ) {
-                Ok(r) => r,
-                // Cross-block selection: compose delete + insert as a single undo unit,
-                // same as insert_text. format_policy is dropped here — it has no
-                // single-block meaning across a boundary.
-                Err(_) if pos != anchor => {
-                    delete_then(&inner, pos, anchor, |at| {
-                        let ins_dto = frontend::document_editing::InsertTextDto {
-                            format_policy: Default::default(),
-                            position: to_i64(at),
-                            anchor: to_i64(at),
-                            text: text.into(),
-                        };
-                        Ok(document_editing_commands::insert_text(
-                            &inner.ctx,
-                            Some(inner.stack_id),
-                            &ins_dto,
-                        )?)
-                    })?
-                    .0
-                }
-                Err(e) => return Err(e.into()),
+            // Reverted under the lock the replacement takes, so that no other write lands
+            // between the revert and the replacement and the mapped range stays true.
+            let reverted = inner.revert_transient_edits();
+            let (pos, anchor) = crate::transient::map_range_back(&reverted, start, end);
+            let result = if start != end && pos == anchor {
+                Err(DocumentError::TransientEdits(
+                    crate::TransientRefusal::RangeOfTransientTextOnly,
+                ))
+            } else {
+                self.insert_text_locked(
+                    &mut inner,
+                    pos,
+                    anchor,
+                    text,
+                    policy,
+                    InsertionOrigin::Unspecified,
+                    Recording::History,
+                )
             };
-
-            let new_pos = to_usize(result.new_position);
-            let added = text.chars().count();
-            let removed = removed_since(&inner, before, added, pos.max(anchor) - edit_pos);
-            self.finish_edit_ext(
-                &mut inner,
-                edit_pos,
-                removed,
-                Insertion::ending_at(new_pos, added),
-                new_pos,
-                to_usize(result.blocks_affected),
-                false,
-            )
+            // What is still queued: the revert's events when the replacement did not take
+            // them with its own.
+            (result, inner.take_queued_events())
         };
-        crate::inner::dispatch_queued_events(queued);
-        Ok(())
+        match result {
+            Ok(mut queued) => {
+                queued.extend(rest);
+                crate::inner::dispatch_queued_events(queued);
+                Ok(())
+            }
+            Err(error) => {
+                crate::inner::dispatch_queued_events(rest);
+                Err(error)
+            }
+        }
     }
 
     /// Insert text with a specific character format. Replaces selection if any.
@@ -1059,8 +1175,36 @@ impl TextCursor {
         format: &TextFormat,
         origin: InsertionOrigin,
     ) -> Result<()> {
+        let _settled = self.settle_transient_edits();
         let (pos, anchor) = self.read_cursor();
+        let queued = {
+            let mut inner = self.doc.lock();
+            self.insert_formatted_text_locked(
+                &mut inner,
+                pos,
+                anchor,
+                text,
+                format,
+                origin,
+                Recording::History,
+            )?
+        };
+        crate::inner::dispatch_queued_events(queued);
+        Ok(())
+    }
 
+    /// [`insert_text_locked`](Self::insert_text_locked) for formatted text.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn insert_formatted_text_locked(
+        &self,
+        inner: &mut TextDocumentInner,
+        pos: usize,
+        anchor: usize,
+        text: &str,
+        format: &TextFormat,
+        origin: InsertionOrigin,
+        recording: Recording,
+    ) -> Result<QueuedEvents> {
         let make_dto = |p: usize, a: usize| frontend::document_editing::InsertFormattedTextDto {
             position: to_i64(p),
             anchor: to_i64(a),
@@ -1072,47 +1216,44 @@ impl TextCursor {
             font_underline: format.font_underline.unwrap_or(false),
             font_strikeout: format.font_strikeout.unwrap_or(false),
         };
-
-        let queued = {
-            let mut inner = self.doc.lock();
-            let edit_pos = pos.min(anchor);
-            let before = max_cursor_position_of(&inner);
-            let result = match document_editing_commands::insert_formatted_text(
-                &inner.ctx,
-                Some(inner.stack_id),
-                &make_dto(pos, anchor),
-            ) {
-                Ok(r) => r,
-                // Cross-block selection: compose delete + insert as a single undo unit
-                Err(_) if pos != anchor => {
-                    delete_then(&inner, pos, anchor, |at| {
-                        Ok(document_editing_commands::insert_formatted_text(
-                            &inner.ctx,
-                            Some(inner.stack_id),
-                            &make_dto(at, at),
-                        )?)
-                    })?
-                    .0
-                }
-                Err(e) => return Err(e.into()),
-            };
-
-            let new_pos = to_usize(result.new_position);
-            let added = text.chars().count();
-            let removed = removed_since(&inner, before, added, pos.max(anchor) - edit_pos);
-            self.finish_edit_from(
-                &mut inner,
-                edit_pos,
-                removed,
-                Insertion::ending_at(new_pos, added),
-                new_pos,
-                1,
-                false,
-                origin,
-            )
+        let stack = recording.stack(inner);
+        let edit_pos = pos.min(anchor);
+        let before = max_cursor_position_of(inner);
+        let result = match document_editing_commands::insert_formatted_text(
+            &inner.ctx,
+            stack,
+            &make_dto(pos, anchor),
+        ) {
+            Ok(r) => r,
+            // Cross-block selection: compose delete + insert as a single undo unit
+            Err(_) if pos != anchor => {
+                delete_then_as(inner, pos, anchor, recording, |at| {
+                    Ok(document_editing_commands::insert_formatted_text(
+                        &inner.ctx,
+                        stack,
+                        &make_dto(at, at),
+                    )?)
+                })?
+                .0
+            }
+            Err(e) => return Err(e.into()),
         };
-        crate::inner::dispatch_queued_events(queued);
-        Ok(())
+
+        let new_pos = to_usize(result.new_position);
+        let added = text.chars().count();
+        let removed = removed_since(inner, before, added, pos.max(anchor) - edit_pos);
+        check_transient_change(recording, pos, anchor, removed)?;
+        Ok(self.finish_edit_as(
+            inner,
+            edit_pos,
+            removed,
+            Insertion::ending_at(new_pos, added),
+            new_pos,
+            1,
+            false,
+            origin,
+            recording,
+        ))
     }
 
     /// Insert a line break inside the block, the one Shift+Enter makes in a word
@@ -1139,6 +1280,7 @@ impl TextCursor {
 
     /// Insert a block break (new paragraph). Replaces selection if any.
     pub fn insert_block(&self) -> Result<()> {
+        let _settled = self.settle_transient_edits();
         let (pos, anchor) = self.read_cursor();
         let queued = {
             let mut inner = self.doc.lock();
@@ -1301,6 +1443,7 @@ impl TextCursor {
         fragment: &DocumentFragment,
         origin: InsertionOrigin,
     ) -> Result<()> {
+        let _settled = self.settle_transient_edits();
         let (pos, anchor) = self.read_cursor();
         let queued = {
             let mut inner = self.doc.lock();
@@ -1478,6 +1621,7 @@ impl TextCursor {
     /// Refused, with the text left as it was, in a code block: a code block is
     /// verbatim text, which the save writes without an image.
     pub fn insert_image(&self, name: &str, alt: &str, width: u32, height: u32) -> Result<()> {
+        let _settled = self.settle_transient_edits();
         let (pos, anchor) = self.read_cursor();
         let queued = {
             let mut inner = self.doc.lock();
@@ -1525,6 +1669,7 @@ impl TextCursor {
 
     /// Insert a new frame at the cursor.
     pub fn insert_frame(&self) -> Result<()> {
+        let _settled = self.settle_transient_edits();
         let (pos, anchor) = self.read_cursor();
         let queued = {
             let mut inner = self.doc.lock();
@@ -1558,6 +1703,7 @@ impl TextCursor {
     /// The cursor moves into the first cell of the table.
     /// Returns a handle to the created table.
     pub fn insert_table(&self, rows: usize, columns: usize) -> Result<TextTable> {
+        let _settled = self.settle_transient_edits();
         let (pos, anchor) = self.read_cursor();
         let (table_id, queued) = {
             let mut inner = self.doc.lock();
@@ -1768,6 +1914,7 @@ impl TextCursor {
     /// parent frame. Returns an error if the selection spans multiple
     /// frames.
     pub fn wrap_selection_in_blockquote(&self) -> Result<()> {
+        let _settled = self.settle_transient_edits();
         if self.selection_spans_multiple_frames() {
             return Err(DocumentError::InvalidArgument(
                 "Cannot wrap selection in blockquote: selection spans multiple frames".into(),
@@ -1816,6 +1963,7 @@ impl TextCursor {
     /// nesting level. Equivalent to `wrap_selection_in_blockquote()`
     /// when there is no selection.
     pub fn insert_blockquote(&self) -> Result<()> {
+        let _settled = self.settle_transient_edits();
         self.wrap_selection_in_blockquote()
     }
 
@@ -1824,6 +1972,7 @@ impl TextCursor {
     /// Otherwise, wrap the current block / selection in a new
     /// blockquote. Mirrors the toggle behaviour of a toolbar button.
     pub fn toggle_blockquote(&self) -> Result<()> {
+        let _settled = self.settle_transient_edits();
         if let Some(frame_id) = self.current_blockquote_frame_id() {
             self.unwrap_frame_by_id(frame_id)
         } else {
@@ -1835,6 +1984,7 @@ impl TextCursor {
     /// just blockquotes). Errors if the cursor's block sits in the root
     /// frame.
     pub fn unwrap_current_frame(&self) -> Result<()> {
+        let _settled = self.settle_transient_edits();
         let frame_ref = self.current_frame().ok_or_else(|| {
             DocumentError::InvalidCursorContext("Cursor is not inside any sub-frame".into())
         })?;
@@ -1845,6 +1995,7 @@ impl TextCursor {
     /// blockquote frame, lifting it one nesting level. If the cursor is
     /// not in a blockquote, errors.
     pub fn unwrap_current_block_from_blockquote(&self) -> Result<()> {
+        let _settled = self.settle_transient_edits();
         if self.current_blockquote_frame_id().is_none() {
             return Err(DocumentError::InvalidCursorContext(
                 "Cursor is not inside a blockquote".into(),
@@ -1880,6 +2031,7 @@ impl TextCursor {
     /// is already inside a blockquote, this creates a deeper nested
     /// quote (depth + 1). If outside, this creates a top-level quote.
     pub fn increase_blockquote_depth(&self) -> Result<()> {
+        let _settled = self.settle_transient_edits();
         self.wrap_selection_in_blockquote()
     }
 
@@ -1889,6 +2041,7 @@ impl TextCursor {
     /// current block is the only one in the quote, the whole quote is
     /// unwrapped.
     pub fn decrease_blockquote_depth(&self) -> Result<()> {
+        let _settled = self.settle_transient_edits();
         if self.current_blockquote_frame_id().is_none() {
             return Err(DocumentError::InvalidCursorContext(
                 "Cursor is not inside a blockquote to decrease depth".into(),
@@ -1944,6 +2097,7 @@ impl TextCursor {
 
     /// Remove a table from the document by its ID.
     pub fn remove_table(&self, table_id: usize) -> Result<()> {
+        let _settled = self.settle_transient_edits();
         let queued = {
             let mut inner = self.doc.lock();
             // ⚠ Snapshotted **before** the command, so the text change it makes
@@ -1971,6 +2125,7 @@ impl TextCursor {
 
     /// Insert a row into a table at the given index.
     pub fn insert_table_row(&self, table_id: usize, row_index: usize) -> Result<()> {
+        let _settled = self.settle_transient_edits();
         let queued = {
             let mut inner = self.doc.lock();
             let before = crate::document::capture_block_state(&inner);
@@ -1992,6 +2147,7 @@ impl TextCursor {
 
     /// Insert a column into a table at the given index.
     pub fn insert_table_column(&self, table_id: usize, column_index: usize) -> Result<()> {
+        let _settled = self.settle_transient_edits();
         let queued = {
             let mut inner = self.doc.lock();
             let before = crate::document::capture_block_state(&inner);
@@ -2013,6 +2169,7 @@ impl TextCursor {
 
     /// Remove a row from a table. Fails if only one row remains.
     pub fn remove_table_row(&self, table_id: usize, row_index: usize) -> Result<()> {
+        let _settled = self.settle_transient_edits();
         let queued = {
             let mut inner = self.doc.lock();
             let before = crate::document::capture_block_state(&inner);
@@ -2034,6 +2191,7 @@ impl TextCursor {
 
     /// Remove a column from a table. Fails if only one column remains.
     pub fn remove_table_column(&self, table_id: usize, column_index: usize) -> Result<()> {
+        let _settled = self.settle_transient_edits();
         let queued = {
             let mut inner = self.doc.lock();
             let before = crate::document::capture_block_state(&inner);
@@ -2062,6 +2220,7 @@ impl TextCursor {
         end_row: usize,
         end_column: usize,
     ) -> Result<()> {
+        let _settled = self.settle_transient_edits();
         let queued = {
             let mut inner = self.doc.lock();
             let before = crate::document::capture_block_state(&inner);
@@ -2091,6 +2250,7 @@ impl TextCursor {
         split_rows: usize,
         split_columns: usize,
     ) -> Result<()> {
+        let _settled = self.settle_transient_edits();
         let queued = {
             let mut inner = self.doc.lock();
             let before = crate::document::capture_block_state(&inner);
@@ -2119,6 +2279,7 @@ impl TextCursor {
         table_id: usize,
         format: &crate::flow::TableFormat,
     ) -> Result<()> {
+        let _settled = self.settle_transient_edits();
         let queued = {
             let mut inner = self.doc.lock();
             let dto = format.to_set_dto(table_id);
@@ -2141,6 +2302,7 @@ impl TextCursor {
         cell_id: usize,
         format: &crate::flow::CellFormat,
     ) -> Result<()> {
+        let _settled = self.settle_transient_edits();
         let queued = {
             let mut inner = self.doc.lock();
             let dto = format.to_set_dto(cell_id);
@@ -2166,6 +2328,7 @@ impl TextCursor {
     /// Remove the table the cursor is currently inside.
     /// Returns an error if the cursor is not inside a table.
     pub fn remove_current_table(&self) -> Result<()> {
+        let _settled = self.settle_transient_edits();
         let table = self.current_table().ok_or_else(|| {
             DocumentError::InvalidCursorContext("cursor is not inside a table".into())
         })?;
@@ -2175,6 +2338,7 @@ impl TextCursor {
     /// Insert a row above the cursor's current row.
     /// Returns an error if the cursor is not inside a table.
     pub fn insert_row_above(&self) -> Result<()> {
+        let _settled = self.settle_transient_edits();
         let cell_ref = self.current_table_cell().ok_or_else(|| {
             DocumentError::InvalidCursorContext("cursor is not inside a table".into())
         })?;
@@ -2184,6 +2348,7 @@ impl TextCursor {
     /// Insert a row below the cursor's current row.
     /// Returns an error if the cursor is not inside a table.
     pub fn insert_row_below(&self) -> Result<()> {
+        let _settled = self.settle_transient_edits();
         let cell_ref = self.current_table_cell().ok_or_else(|| {
             DocumentError::InvalidCursorContext("cursor is not inside a table".into())
         })?;
@@ -2193,6 +2358,7 @@ impl TextCursor {
     /// Insert a column before the cursor's current column.
     /// Returns an error if the cursor is not inside a table.
     pub fn insert_column_before(&self) -> Result<()> {
+        let _settled = self.settle_transient_edits();
         let cell_ref = self.current_table_cell().ok_or_else(|| {
             DocumentError::InvalidCursorContext("cursor is not inside a table".into())
         })?;
@@ -2202,6 +2368,7 @@ impl TextCursor {
     /// Insert a column after the cursor's current column.
     /// Returns an error if the cursor is not inside a table.
     pub fn insert_column_after(&self) -> Result<()> {
+        let _settled = self.settle_transient_edits();
         let cell_ref = self.current_table_cell().ok_or_else(|| {
             DocumentError::InvalidCursorContext("cursor is not inside a table".into())
         })?;
@@ -2211,6 +2378,7 @@ impl TextCursor {
     /// Remove the row at the cursor's current position.
     /// Returns an error if the cursor is not inside a table.
     pub fn remove_current_row(&self) -> Result<()> {
+        let _settled = self.settle_transient_edits();
         let cell_ref = self.current_table_cell().ok_or_else(|| {
             DocumentError::InvalidCursorContext("cursor is not inside a table".into())
         })?;
@@ -2220,6 +2388,7 @@ impl TextCursor {
     /// Remove the column at the cursor's current position.
     /// Returns an error if the cursor is not inside a table.
     pub fn remove_current_column(&self) -> Result<()> {
+        let _settled = self.settle_transient_edits();
         let cell_ref = self.current_table_cell().ok_or_else(|| {
             DocumentError::InvalidCursorContext("cursor is not inside a table".into())
         })?;
@@ -2233,6 +2402,7 @@ impl TextCursor {
     /// Returns an error if the cursor is not inside a table or position
     /// and anchor are in different tables.
     pub fn merge_selected_cells(&self) -> Result<()> {
+        let _settled = self.settle_transient_edits();
         let pos_cell = self.current_table_cell().ok_or_else(|| {
             DocumentError::InvalidCursorContext("cursor position is not inside a table".into())
         })?;
@@ -2263,6 +2433,7 @@ impl TextCursor {
     /// Split the cell at the cursor's current position.
     /// Returns an error if the cursor is not inside a table.
     pub fn split_current_cell(&self, split_rows: usize, split_columns: usize) -> Result<()> {
+        let _settled = self.settle_transient_edits();
         let cell_ref = self.current_table_cell().ok_or_else(|| {
             DocumentError::InvalidCursorContext("cursor is not inside a table".into())
         })?;
@@ -2278,6 +2449,7 @@ impl TextCursor {
     /// Set formatting on the table the cursor is currently inside.
     /// Returns an error if the cursor is not inside a table.
     pub fn set_current_table_format(&self, format: &crate::flow::TableFormat) -> Result<()> {
+        let _settled = self.settle_transient_edits();
         let table = self.current_table().ok_or_else(|| {
             DocumentError::InvalidCursorContext("cursor is not inside a table".into())
         })?;
@@ -2287,6 +2459,7 @@ impl TextCursor {
     /// Set formatting on the cell the cursor is currently inside.
     /// Returns an error if the cursor is not inside a table.
     pub fn set_current_cell_format(&self, format: &crate::flow::CellFormat) -> Result<()> {
+        let _settled = self.settle_transient_edits();
         let cell_ref = self.current_table_cell().ok_or_else(|| {
             DocumentError::InvalidCursorContext("cursor is not inside a table".into())
         })?;
@@ -2661,6 +2834,7 @@ impl TextCursor {
 
     /// Delete the character after the cursor (Delete key).
     pub fn delete_char(&self) -> Result<()> {
+        let _settled = self.settle_transient_edits();
         let (pos, anchor) = self.read_cursor();
         let (del_pos, del_anchor) = if pos != anchor {
             (pos, anchor)
@@ -2687,6 +2861,7 @@ impl TextCursor {
 
     /// Delete the character before the cursor (Backspace key).
     pub fn delete_previous_char(&self) -> Result<()> {
+        let _settled = self.settle_transient_edits();
         let (pos, anchor) = self.read_cursor();
         let (del_pos, del_anchor) = if pos != anchor {
             (pos, anchor)
@@ -2730,28 +2905,43 @@ impl TextCursor {
     /// reference into a code block join nothing, and a selection across one takes its text
     /// and joins nothing.
     pub fn remove_selected_text(&self) -> Result<String> {
+        let _settled = self.settle_transient_edits();
         let (pos, anchor) = self.read_cursor();
         if pos == anchor {
             return Ok(String::new());
         }
-        let queued = {
+        let (deleted, queued) = {
             let mut inner = self.doc.lock();
-            let (result, removed) = measured_delete(&inner, pos, anchor, true)?;
-            let stands_for_the_empty_text = self.finish_delete(
-                &mut inner,
-                pos.min(anchor),
-                removed,
-                result.new_position,
-                true,
-            );
-            // Return the deleted text alongside the queued events
-            (
-                result.deleted_text,
-                self.announce_deletion(&mut inner, stands_for_the_empty_text),
-            )
+            self.remove_locked(&mut inner, pos, anchor, Recording::History)?
         };
-        crate::inner::dispatch_queued_events(queued.1);
-        Ok(queued.0)
+        crate::inner::dispatch_queued_events(queued);
+        Ok(deleted)
+    }
+
+    /// Remove the selection `[pos, anchor)` (either order), the document locked, recorded
+    /// as `recording` says, and leave this cursor where it was. Returns the removed text
+    /// and the events to dispatch.
+    pub(crate) fn remove_locked(
+        &self,
+        inner: &mut TextDocumentInner,
+        pos: usize,
+        anchor: usize,
+        recording: Recording,
+    ) -> Result<(String, QueuedEvents)> {
+        let (result, removed) = measured_delete(inner, pos, anchor, true, recording)?;
+        check_transient_change(recording, pos, anchor, removed)?;
+        let stands_for_the_empty_text = self.finish_delete(
+            inner,
+            pos.min(anchor),
+            removed,
+            result.new_position,
+            true,
+            recording,
+        );
+        Ok((
+            result.deleted_text,
+            self.announce_deletion(inner, stands_for_the_empty_text, recording),
+        ))
     }
 
     // ── List operations ──────────────────────────────────────
@@ -2784,6 +2974,7 @@ impl TextCursor {
     /// crossing one makes a list on each side of it. Blocks that leave another
     /// list for this one take that list away when they were all it held.
     pub fn create_list(&self, style: ListStyle) -> Result<()> {
+        let _settled = self.settle_transient_edits();
         let (pos, anchor) = self.read_cursor();
         let queued = {
             let mut inner = self.doc.lock();
@@ -2809,6 +3000,7 @@ impl TextCursor {
 
     /// Insert a new list item at the cursor position.
     pub fn insert_list(&self, style: ListStyle) -> Result<()> {
+        let _settled = self.settle_transient_edits();
         let (pos, anchor) = self.read_cursor();
         let queued = {
             let mut inner = self.doc.lock();
@@ -2842,6 +3034,7 @@ impl TextCursor {
 
     /// Set formatting on a list by its ID.
     pub fn set_list_format(&self, list_id: usize, format: &crate::ListFormat) -> Result<()> {
+        let _settled = self.settle_transient_edits();
         let queued = {
             let mut inner = self.doc.lock();
             let dto = format.to_set_dto(list_id);
@@ -2861,6 +3054,7 @@ impl TextCursor {
     /// Set formatting on the list that the current block belongs to.
     /// Returns an error if the cursor is not inside a list item.
     pub fn set_current_list_format(&self, format: &crate::ListFormat) -> Result<()> {
+        let _settled = self.settle_transient_edits();
         let list = self.current_list().ok_or_else(|| {
             DocumentError::InvalidCursorContext("cursor is not inside a list".into())
         })?;
@@ -2869,6 +3063,7 @@ impl TextCursor {
 
     /// Add a block to a list by their IDs.
     pub fn add_block_to_list(&self, block_id: usize, list_id: usize) -> Result<()> {
+        let _settled = self.settle_transient_edits();
         let queued = {
             let mut inner = self.doc.lock();
             let dto = frontend::document_editing::AddBlockToListDto {
@@ -2897,6 +3092,7 @@ impl TextCursor {
     /// Add the block at the cursor position to a list: the caret's block, as
     /// [`current_list`](Self::current_list) reads it.
     pub fn add_current_block_to_list(&self, list_id: usize) -> Result<()> {
+        let _settled = self.settle_transient_edits();
         let pos = self.position();
         let inner = self.doc.lock();
         let block_info = crate::inner::block_at_caret_dto(&inner.ctx, pos)?;
@@ -2906,6 +3102,7 @@ impl TextCursor {
 
     /// Remove a block from its list by block ID.
     pub fn remove_block_from_list(&self, block_id: usize) -> Result<()> {
+        let _settled = self.settle_transient_edits();
         let queued = {
             let mut inner = self.doc.lock();
             let dto = frontend::document_editing::RemoveBlockFromListDto {
@@ -2934,6 +3131,7 @@ impl TextCursor {
     /// block, as [`current_list`](Self::current_list) reads it.
     /// Returns an error if the current block is not a list item.
     pub fn remove_current_block_from_list(&self) -> Result<()> {
+        let _settled = self.settle_transient_edits();
         let pos = self.position();
         let inner = self.doc.lock();
         let block_info = crate::inner::block_at_caret_dto(&inner.ctx, pos)?;
@@ -2944,6 +3142,7 @@ impl TextCursor {
     /// Remove a list item by index within the list.
     /// Resolves the index to a block, then removes it from the list.
     pub fn remove_list_item(&self, list_id: usize, index: usize) -> Result<()> {
+        let _settled = self.settle_transient_edits();
         let list = crate::text_list::TextList {
             doc: self.doc.clone(),
             list_id,
@@ -3033,6 +3232,7 @@ impl TextCursor {
 
     /// Set the character format for the selection.
     pub fn set_char_format(&self, format: &TextFormat) -> Result<()> {
+        let _settled = self.settle_transient_edits();
         let (pos, anchor) = self.read_cursor();
         let queued = {
             let mut inner = self.doc.lock();
@@ -3088,6 +3288,7 @@ impl TextCursor {
     /// nothing, here as everywhere else. Callers editing an existing link
     /// should select its [`LinkExtent`] first.
     pub fn clear_char_anchor(&self) -> Result<()> {
+        let _settled = self.settle_transient_edits();
         self.merge_char_format(&TextFormat {
             clear_link: true,
             ..Default::default()
@@ -3096,6 +3297,7 @@ impl TextCursor {
 
     /// Merge a character format into the selection.
     pub fn merge_char_format(&self, format: &TextFormat) -> Result<()> {
+        let _settled = self.settle_transient_edits();
         let (pos, anchor) = self.read_cursor();
         let queued = {
             let mut inner = self.doc.lock();
@@ -3126,6 +3328,7 @@ impl TextCursor {
     /// writes without them. A table cell's paragraph is never made a code block: a table
     /// cell is written as one line of text, and the other formats asked for still apply.
     pub fn set_block_format(&self, format: &BlockFormat) -> Result<()> {
+        let _settled = self.settle_transient_edits();
         let (pos, anchor) = self.read_cursor();
         let queued = {
             let mut inner = self.doc.lock();
@@ -3147,6 +3350,7 @@ impl TextCursor {
 
     /// Set the frame format.
     pub fn set_frame_format(&self, frame_id: usize, format: &FrameFormat) -> Result<()> {
+        let _settled = self.settle_transient_edits();
         let (pos, anchor) = self.read_cursor();
         let queued = {
             let mut inner = self.doc.lock();
@@ -3203,15 +3407,17 @@ impl TextCursor {
     fn do_delete(&self, pos: usize, anchor: usize, selection: bool) -> Result<()> {
         let queued = {
             let mut inner = self.doc.lock();
-            let (result, removed) = measured_delete(&inner, pos, anchor, selection)?;
+            let (result, removed) =
+                measured_delete(&inner, pos, anchor, selection, Recording::History)?;
             let stands_for_the_empty_text = self.finish_delete(
                 &mut inner,
                 pos.min(anchor),
                 removed,
                 result.new_position,
                 selection,
+                Recording::History,
             );
-            self.announce_deletion(&mut inner, stands_for_the_empty_text)
+            self.announce_deletion(&mut inner, stands_for_the_empty_text, Recording::History)
         };
         crate::inner::dispatch_queued_events(queued);
         Ok(())
@@ -3236,6 +3442,10 @@ impl TextCursor {
     /// it so once the deletion's history is announced (see
     /// [`announce_deletion`](Self::announce_deletion)), which ends every
     /// whole-text selection taken before it.
+    ///
+    /// A transient deletion (`recording`) leaves the modified flag alone, as a transient
+    /// insertion does (see [`finish_edit_as`](Self::finish_edit_as)), and never stands for
+    /// the empty text: what it leaves is not what the recorded text is.
     fn finish_delete(
         &self,
         inner: &mut TextDocumentInner,
@@ -3243,7 +3453,9 @@ impl TextCursor {
         removed: usize,
         new_position: i64,
         selection: bool,
+        recording: Recording,
     ) -> bool {
+        let recorded = recording == Recording::History;
         let new_pos = to_usize(new_position);
         // A range that empties a table cell takes the cell's text from its
         // start, which can lie before the range's: the caret goes there, and
@@ -3253,7 +3465,7 @@ impl TextCursor {
             inner.adjust_cursors(edit_pos, removed, 0);
         }
         let stands_for_the_empty_text =
-            selection && removed > 0 && new_pos == 0 && main_text_is_empty(inner);
+            recorded && selection && removed > 0 && new_pos == 0 && main_text_is_empty(inner);
         if stands_for_the_empty_text {
             // What the removal left, for a paste into it after an undo or a redo back to it
             // (see `EmptiedText`).
@@ -3267,7 +3479,9 @@ impl TextCursor {
             d.anchor_in_table = None;
         }
         if removed > 0 {
-            inner.modified = true;
+            if recorded {
+                inner.modified = true;
+            }
             inner.invalidate_text_cache();
             inner.rehighlight_affected(edit_pos);
             inner.queue_event(DocumentEvent::ContentsChanged {
@@ -3286,12 +3500,18 @@ impl TextCursor {
     /// `TextDocumentInner::end_whole_text_selections`), then this cursor marked as standing
     /// for the whole of the empty text when the removal left it so (see
     /// [`finish_delete`](Self::finish_delete)). Returns the events to dispatch.
+    ///
+    /// A transient deletion announces no history, which has not moved.
     fn announce_deletion(
         &self,
         inner: &mut TextDocumentInner,
         stands_for_the_empty_text: bool,
+        recording: Recording,
     ) -> QueuedEvents {
-        let queued = self.queue_undo_redo_event(inner);
+        let queued = match recording {
+            Recording::History => self.queue_undo_redo_event(inner),
+            Recording::Transient => inner.take_queued_events(),
+        };
         self.data.lock().whole_text_selected = stands_for_the_empty_text;
         queued
     }

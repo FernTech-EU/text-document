@@ -43,6 +43,7 @@ mod text_block;
 mod text_frame;
 mod text_list;
 mod text_table;
+pub mod transient;
 
 // ── Re-exports from entity DTOs (enums that consumers need) ──────
 pub use backend::DocumentBackend;
@@ -89,7 +90,7 @@ pub use frontend::resource::dtos::ResourceType;
 
 // ── Error type ───────────────────────────────────────────────────
 pub use batch::BatchDocument;
-pub use error::{DocumentError, Result};
+pub use error::{DocumentError, Result, TransientRefusal};
 
 // ── Public API types ─────────────────────────────────────────────
 pub use cursor::TextCursor;

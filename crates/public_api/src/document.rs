@@ -263,6 +263,7 @@ impl TextDocument {
 
     /// Replace the entire document with plain text. Clears undo history.
     pub fn set_plain_text(&self, text: &str) -> Result<()> {
+        let _settled = self.settle_transient_edits();
         let queued = {
             let mut inner = self.inner.lock();
             let dto = frontend::document_io::ImportPlainTextDto {
@@ -373,6 +374,7 @@ impl TextDocument {
     ///
     /// This is a **long operation**. Returns a typed [`Operation`] handle.
     pub fn set_markdown(&self, markdown: &str) -> Result<Operation<MarkdownImportResult>> {
+        let _settled = self.settle_transient_edits();
         let mut inner = self.inner.lock();
         inner.invalidate_text_cache();
         let dto = frontend::document_io::ImportMarkdownDto {
@@ -433,6 +435,7 @@ impl TextDocument {
         djot: &str,
         options: DjotImportOptions,
     ) -> Result<Operation<DjotImportResult>> {
+        let _settled = self.settle_transient_edits();
         let mut inner = self.inner.lock();
         inner.invalidate_text_cache();
         let dto = frontend::document_io::ImportDjotDto {
@@ -484,6 +487,7 @@ impl TextDocument {
         djot: &str,
         options: DjotImportOptions,
     ) -> Result<DjotImportResult> {
+        let _settled = self.settle_transient_edits();
         let (queued, block_count) = {
             let mut inner = self.inner.lock();
             inner.invalidate_text_cache();
@@ -534,6 +538,7 @@ impl TextDocument {
     ///
     /// This is a **long operation**. Returns a typed [`Operation`] handle.
     pub fn set_html(&self, html: &str) -> Result<Operation<HtmlImportResult>> {
+        let _settled = self.settle_transient_edits();
         let mut inner = self.inner.lock();
         inner.invalidate_text_cache();
         let dto = frontend::document_io::ImportHtmlDto {
@@ -837,6 +842,7 @@ impl TextDocument {
 
     /// Clear all document content and reset to an empty state.
     pub fn clear(&self) -> Result<()> {
+        let _settled = self.settle_transient_edits();
         let queued = {
             let mut inner = self.inner.lock();
             let dto = frontend::document_io::ImportPlainTextDto {
@@ -1569,6 +1575,7 @@ impl TextDocument {
         replace_all: bool,
         options: &crate::ReplaceOptions,
     ) -> Result<usize> {
+        let _settled = self.settle_transient_edits();
         let (count, queued) = {
             let mut inner = self.inner.lock();
             let dto = options.to_replace_dto(query, replacement, replace_all);
@@ -1616,18 +1623,46 @@ impl TextDocument {
     ///
     /// Ranges that straddle a block boundary, or that overlap one another, are **skipped**;
     /// the returned count reflects only what was actually applied.
+    ///
+    /// With [transient edits](crate::transient) outstanding, they are reverted first, and the
+    /// ranges, read in the document as it was with them, are moved back so that each holds
+    /// the recorded text it held (see the [module documentation](crate::transient#positions));
+    /// a non-empty range that comes back empty held only transient text, names nothing left,
+    /// and is skipped too.
     pub fn replace_ranges(
         &self,
         ranges: &[ReplaceRange],
         options: &crate::ReplaceOptions,
     ) -> Result<usize> {
-        let (count, queued) = {
+        let (result, rest) = {
             let mut inner = self.inner.lock();
-            let count = Self::replace_ranges_locked(&mut inner, ranges, options)?;
-            (count, inner.take_queued_events())
+            // Reverted under the lock the replacement takes, so that no other write lands
+            // between the revert and the replacement and the mapped ranges stay true.
+            let reverted = inner.revert_transient_edits();
+            let mapped: Vec<ReplaceRange>;
+            let ranges = match &reverted {
+                None => ranges,
+                Some(reverted) => {
+                    mapped = ranges
+                        .iter()
+                        .filter_map(|range| {
+                            let (start, end) =
+                                reverted.map_range(range.position, range.position + range.length);
+                            (range.length == 0 || end > start).then(|| ReplaceRange {
+                                position: start,
+                                length: end - start,
+                                replacement: range.replacement.clone(),
+                            })
+                        })
+                        .collect();
+                    &mapped
+                }
+            };
+            let result = Self::replace_ranges_locked(&mut inner, ranges, options);
+            (result, inner.take_queued_events())
         };
-        crate::inner::dispatch_queued_events(queued);
-        Ok(count)
+        crate::inner::dispatch_queued_events(rest);
+        result
     }
 
     /// Find every match of `query` and let `decide` choose what each becomes — **atomically**.
@@ -1661,6 +1696,7 @@ impl TextDocument {
         options: &crate::ReplaceOptions,
         mut decide: impl FnMut(&str, usize) -> Option<String>,
     ) -> Result<usize> {
+        let _settled = self.settle_transient_edits();
         let (count, queued) = {
             let mut inner = self.inner.lock();
 
@@ -1746,6 +1782,7 @@ impl TextDocument {
         mime_type: &str,
         data: &[u8],
     ) -> Result<()> {
+        let _settled = self.settle_transient_edits();
         let mut inner = self.inner.lock();
         let dto = frontend::resource::dtos::CreateResourceDto {
             created_at: Default::default(),
@@ -1803,6 +1840,7 @@ impl TextDocument {
 
     /// Undo the last operation.
     pub fn undo(&self) -> Result<()> {
+        let _settled = self.settle_transient_edits();
         let queued = {
             let mut inner = self.inner.lock();
             let before = capture_block_state(&inner);
@@ -1848,6 +1886,7 @@ impl TextDocument {
 
     /// Redo the last undone operation.
     pub fn redo(&self) -> Result<()> {
+        let _settled = self.settle_transient_edits();
         let queued = {
             let mut inner = self.inner.lock();
             let before = capture_block_state(&inner);
@@ -1983,6 +2022,7 @@ impl TextDocument {
 
     /// Set the document title.
     pub fn set_title(&self, title: &str) -> Result<()> {
+        let _settled = self.settle_transient_edits();
         let inner = self.inner.lock();
         let doc = document_commands::get_document(&inner.ctx, &inner.document_id)?
             .ok_or_else(|| DocumentError::NotFound("document not found".into()))?;
@@ -2004,6 +2044,7 @@ impl TextDocument {
 
     /// Set the text direction.
     pub fn set_text_direction(&self, direction: TextDirection) -> Result<()> {
+        let _settled = self.settle_transient_edits();
         let inner = self.inner.lock();
         let doc = document_commands::get_document(&inner.ctx, &inner.document_id)?
             .ok_or_else(|| DocumentError::NotFound("document not found".into()))?;
@@ -2025,6 +2066,7 @@ impl TextDocument {
 
     /// Set the default wrap mode.
     pub fn set_default_wrap_mode(&self, mode: WrapMode) -> Result<()> {
+        let _settled = self.settle_transient_edits();
         let inner = self.inner.lock();
         let doc = document_commands::get_document(&inner.ctx, &inner.document_id)?
             .ok_or_else(|| DocumentError::NotFound("document not found".into()))?;
@@ -2049,6 +2091,7 @@ impl TextDocument {
     /// Set the document-wide default language (ISO 639-1 code). Blocks
     /// without an explicit `language` inherit this for hyphenation.
     pub fn set_default_language(&self, language: &str) -> Result<()> {
+        let _settled = self.settle_transient_edits();
         let inner = self.inner.lock();
         let doc = document_commands::get_document(&inner.ctx, &inner.document_id)?
             .ok_or_else(|| DocumentError::NotFound("document not found".into()))?;

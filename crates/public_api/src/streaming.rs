@@ -161,6 +161,8 @@ impl TextDocument {
                 "append_line takes a single line; text must not contain '\\n'".into(),
             ));
         }
+        // After the argument is checked: a refused append leaves a composition shown.
+        let _settled = self.settle_transient_edits();
 
         let mut inner = self.inner.lock();
         let frame_id = get_main_frame_id(&inner);
@@ -171,7 +173,7 @@ impl TextDocument {
         }
 
         // Everything below either all lands or none of it does.
-        let atomic = Atomic::begin(&inner);
+        let atomic = Atomic::begin(&inner)?;
         let appended = append_one(&mut inner, frame_id, text)?;
         let new_count = commit_counts(&mut inner, 1, text.chars().count() as i64)?;
         atomic.commit();
@@ -222,6 +224,9 @@ impl TextDocument {
             let inner = self.inner.lock();
             return Ok(current_block_count(&inner)? as usize);
         }
+        // After the arguments are checked: a refused or empty append leaves a composition
+        // shown.
+        let _settled = self.settle_transient_edits();
 
         let mut inner = self.inner.lock();
         let frame_id = get_main_frame_id(&inner);
@@ -234,7 +239,7 @@ impl TextDocument {
         // The batch is one unit: a line failing halfway would otherwise leave
         // its predecessors appended with the document's counts never updated,
         // since those are written once at the end.
-        let atomic = Atomic::begin(&inner);
+        let atomic = Atomic::begin(&inner)?;
         let mut edit_pos = None;
         let mut chars_added = 0usize;
         for line in &lines {
@@ -275,6 +280,7 @@ impl TextDocument {
     ///
     /// **Not undoable**, by design — see the module docs.
     pub fn truncate_front(&self, n: usize) -> Result<usize> {
+        let _settled = self.settle_transient_edits();
         if n == 0 {
             return Ok(0);
         }
@@ -329,7 +335,7 @@ impl TextDocument {
         // a failure partway through the entity loop would leave the rope
         // already stripped of victims whose blocks still exist and are still
         // referenced by the frame.
-        let atomic = Atomic::begin(&inner);
+        let atomic = Atomic::begin(&inner)?;
 
         // Unmirror from the rope first: `rope_remove_block` resolves each block
         // through the offset index, which the entity must still exist for.
@@ -453,10 +459,14 @@ struct Atomic {
 }
 
 impl Atomic {
-    fn begin(inner: &TextDocumentInner) -> Self {
+    /// Begun as every write to the store is (`RopeStore::check_write_allowed`): refused
+    /// over transient edits made since the append reverted them, and counted open until
+    /// its savepoint is discarded.
+    fn begin(inner: &TextDocumentInner) -> Result<Self> {
         let store = Arc::clone(inner.ctx.db_context.get_store());
+        store.check_write_allowed()?;
         let savepoint = Some(store.create_savepoint());
-        Self { store, savepoint }
+        Ok(Self { store, savepoint })
     }
 
     /// Keep the mutations and drop the snapshot.
@@ -585,4 +595,39 @@ fn finish(inner: &mut TextDocumentInner, edit_pos: usize, added: usize, blocks_a
         chars_added: added,
         blocks_affected,
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A streaming append that finds transient edits made since its revert (another
+    /// thread's, between the revert and its lock) is refused before it writes the rope.
+    #[test]
+    fn an_append_finding_transient_edits_is_refused_before_it_writes() {
+        let doc = TextDocument::new();
+        doc.append_line("first").unwrap();
+        doc.cursor_at(2).insert_text_transient("n").unwrap();
+        let shown = doc.to_plain_text().unwrap();
+        let refused = {
+            let inner = doc.inner.lock();
+            Atomic::begin(&inner).err()
+        };
+        assert!(matches!(
+            refused,
+            Some(DocumentError::TransientEdits(
+                crate::TransientRefusal::LayerOutstanding
+            ))
+        ));
+        assert_eq!(doc.to_plain_text().unwrap(), shown);
+        assert!(doc.has_transient_edits());
+        // Once they are reverted the append is begun, and counted open until it ends.
+        doc.revert_transient_edits();
+        let inner = doc.inner.lock();
+        let atomic = Atomic::begin(&inner).expect("nothing outstanding");
+        let store = inner.ctx.db_context.get_store();
+        assert!(store.begin_transient_write().is_err(), "the append is open");
+        atomic.commit();
+        assert!(store.begin_transient_write().is_ok());
+    }
 }

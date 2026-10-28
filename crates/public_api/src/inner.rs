@@ -172,6 +172,11 @@ pub(crate) struct TextDocumentInner {
     /// is that paragraph, looking the same, replaces it, by whichever cursor and after
     /// whatever brought the text back to it.
     pub emptied_text: Option<EmptiedText>,
+    /// The outstanding transient edits: changes the document shows and no undo history
+    /// holds, which a revert takes away (see [`crate::transient`]). `None` while there are
+    /// none, and kept in step with the store's own record of them
+    /// (`RopeStore::has_transient_edits`).
+    pub transient: Option<crate::transient::TransientLayer>,
 }
 
 /// The one empty paragraph the main text is: the block, the list it is an item of and the
@@ -285,6 +290,12 @@ impl TextDocumentInner {
     /// Called while the document lock is held. Then locks individual
     /// CursorData mutexes (safe per lock ordering: doc before cursor).
     pub fn adjust_cursors(&mut self, edit_pos: usize, removed: usize, added: usize) {
+        // While transient edits are outstanding, every edit is one of them (every other
+        // write reverts them first): what it did to the positions is what a revert maps
+        // the cursors back through.
+        if let Some(layer) = self.transient.as_mut() {
+            layer.record(edit_pos, removed, added);
+        }
         self.prune_dead_cursors();
         for weak in &self.cursors {
             if let Some(cursor) = weak.upgrade() {
@@ -653,6 +664,7 @@ impl TextDocumentInner {
             own_operations: std::collections::HashSet::new(),
             history_resets: HashMap::new(),
             emptied_text: None,
+            transient: None,
         })
     }
 }
