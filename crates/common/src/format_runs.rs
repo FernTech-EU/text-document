@@ -607,6 +607,68 @@ pub fn shift_runs_for_insert(runs: &mut [FormatRun], byte_offset: u32, inserted_
     }
 }
 
+/// [`shift_runs_for_insert`] for text typed into the block, which also
+/// inherits a format at the start of the block. There nothing precedes the
+/// insertion, and the text takes the format of the run that begins there: the
+/// format of the block's first character, as Qt (`QTextCursor::charFormat` at a
+/// block start), Word and TextEdit give it. So text typed at the start of a
+/// bold paragraph is bold. Anywhere else this is `shift_runs_for_insert`.
+///
+/// A link is not part of that format: text typed before a link that opens the
+/// paragraph is not part of the link, as in Word (its target, its being an
+/// anchor, the names it is the target of and its tooltip are left out, and
+/// the rest of the first character's format is kept).
+///
+/// For typing, not for content that brings its own formats (a paste, an
+/// import), whose unformatted parts must stay unformatted.
+pub fn shift_runs_for_typed_insert(
+    runs: &mut Vec<FormatRun>,
+    byte_offset: u32,
+    inserted_bytes: u32,
+) {
+    if inserted_bytes == 0 {
+        return;
+    }
+    let first = runs
+        .iter()
+        .position(|run| run.byte_start == 0 && run.byte_end > 0);
+    let Some(first) = first.filter(|_| byte_offset == 0) else {
+        shift_runs_for_insert(runs, byte_offset, inserted_bytes);
+        return;
+    };
+    let format = &runs[first].format;
+    let inherited = CharacterFormat {
+        anchor_href: None,
+        anchor_names: Vec::new(),
+        is_anchor: None,
+        tooltip: None,
+        ..format.clone()
+    };
+    if inherited == *format {
+        for (index, run) in runs.iter_mut().enumerate() {
+            if index != first {
+                run.byte_start += inserted_bytes;
+            }
+            run.byte_end += inserted_bytes;
+        }
+        return;
+    }
+    for run in runs.iter_mut() {
+        run.byte_start += inserted_bytes;
+        run.byte_end += inserted_bytes;
+    }
+    if inherited != CharacterFormat::default() {
+        runs.insert(
+            0,
+            FormatRun {
+                byte_start: 0,
+                byte_end: inserted_bytes,
+                format: inherited,
+            },
+        );
+    }
+}
+
 /// Apply a "delete byte range `[byte_start..byte_end)`" mutation to a
 /// block's runs. Splices the range with empty replacement (clipping
 /// straddling runs) and shifts everything past `byte_end` back by the
@@ -1300,6 +1362,47 @@ mod tests {
     fn empty_runs_are_well_formed() {
         debug_assert_well_formed(&[], 0);
         debug_assert_well_formed(&[], 100);
+    }
+
+    // ── shift_runs_for_typed_insert ───────────────────────────────────────
+
+    fn link(s: u32, e: u32, bold: Option<bool>) -> FormatRun {
+        FormatRun {
+            byte_start: s,
+            byte_end: e,
+            format: CharacterFormat {
+                font_bold: bold,
+                anchor_href: Some("https://example.org".into()),
+                anchor_names: vec!["target".into()],
+                is_anchor: Some(true),
+                tooltip: Some("Example".into()),
+                ..Default::default()
+            },
+        }
+    }
+
+    #[test]
+    fn typed_at_the_start_of_a_block_extends_its_first_run() {
+        let mut runs = vec![run(0, 4, true), run(4, 8, false)];
+        shift_runs_for_typed_insert(&mut runs, 0, 2);
+        assert_eq!(runs, vec![run(0, 6, true), run(6, 10, false)]);
+    }
+
+    #[test]
+    fn typed_before_a_link_at_the_start_of_a_block_is_not_part_of_the_link() {
+        let mut runs = vec![link(0, 4, Some(true)), run(4, 8, false)];
+        shift_runs_for_typed_insert(&mut runs, 0, 2);
+        assert_eq!(
+            runs,
+            vec![run(0, 2, true), link(2, 6, Some(true)), run(6, 10, false)],
+            "the typed text keeps the bold and leaves the link out"
+        );
+        debug_assert_well_formed(&runs, 10);
+
+        let mut runs = vec![link(0, 4, None)];
+        shift_runs_for_typed_insert(&mut runs, 0, 2);
+        assert_eq!(runs, vec![link(2, 6, None)], "a bare link leaves it plain");
+        debug_assert_well_formed(&runs, 6);
     }
 
     // ── merge_runs_and_anchors ────────────────────────────────────────────

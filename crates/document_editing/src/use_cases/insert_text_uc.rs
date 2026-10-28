@@ -15,7 +15,7 @@ use common::direct_access::table::TableRelationshipField;
 use common::entities::{Block, Document, Frame, Root, TableCell};
 use common::format_runs::{
     FootnoteRefAnchor, FormatRun, ImageAnchor, debug_assert_well_formed, logical_offset_to_byte,
-    shift_footnote_refs_for_insert, shift_images_for_insert, shift_runs_for_insert,
+    shift_footnote_refs_for_insert, shift_images_for_insert, shift_runs_for_typed_insert,
 };
 
 use common::types::{EntityId, ROOT_ENTITY_ID};
@@ -273,7 +273,7 @@ fn execute_insert_simple(
     {
         let mut runs_map = store.format_runs.write();
         let runs = runs_map.entry(block.id).or_default();
-        shift_runs_for_insert(runs, byte_offset, inserted_byte_len);
+        shift_runs_for_typed_insert(runs, byte_offset, inserted_byte_len);
         debug_assert_well_formed(runs, new_plain.len());
     }
     {
