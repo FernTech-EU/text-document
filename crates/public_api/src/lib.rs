@@ -96,7 +96,7 @@ pub use error::{DocumentError, Result, TransientRefusal};
 // ── Public API types ─────────────────────────────────────────────
 pub use cursor::TextCursor;
 pub use document::TextDocument;
-pub use events::{DocumentEvent, InsertionOrigin, Subscription};
+pub use events::{DocumentEvent, EventHold, InsertionOrigin, Subscription};
 pub use fragment::DocumentFragment;
 pub use highlight::{
     HighlightContext, HighlightFormat, HighlightMask, HighlightSpan, RangeHighlight, SessionId,

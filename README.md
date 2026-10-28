@@ -22,7 +22,7 @@ Built on a [ropey](https://github.com/cessen/ropey)-backed text store with a [Ql
 - **Syntax highlighting**: Generic `SyntaxHighlighter` trait (Qt's QSyntaxHighlighter-style) — shadow formatting layer visible to layout but invisible to export/cursor/undo. Multi-block state, per-block user data, full format control (colors, bold, italic, underline styles, ...). Auto re-highlights on edits with cascade.
 - **Tables**: Insert, remove, row/column operations, cell merge/split, table/cell formatting, cursor-position-based convenience methods
 - **Layout engine API**: Read-only handles (`TextBlock`, `TextFrame`, `TextTable`, `TextTableCell`, `TextList`), flow traversal, fragment-based text shaping, atomic snapshots (`TextFrame::snapshot()`, `FlowElement::snapshot()`), block parent context (`parent_frame_id`, `TableCellContext`), efficient block queries (`blocks()`, `blocks_in_range()`), incremental change events
-- **Event system**: Callback-based (`on_change`) and polling-based (`poll_events`), with `FormatChangeKind` (Block vs Character), flow-level insert/remove events, and granular `ContentsChanged`/`FormatChanged` on undo/redo
+- **Event system**: Callback-based (`on_change`) and polling-based (`poll_events`), with `FormatChangeKind` (Block vs Character), flow-level insert/remove events, and granular `ContentsChanged`/`FormatChanged` on undo/redo. `hold_events` keeps them back while a host edits under an input method's lock, and delivers them in order when it ends
 - **Thread-safe**: `Send + Sync` throughout, `Arc<Mutex<...>>` interior mutability
 - **Resources**: Image and stylesheet storage with base64 encoding
 

@@ -3,6 +3,8 @@
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
+use parking_lot::Mutex;
+
 use crate::inner::{CallbackEntry, TextDocumentInner};
 
 /// Events emitted by a [`TextDocument`](crate::TextDocument).
@@ -255,6 +257,30 @@ where
     inner.callbacks.push(CallbackEntry {
         alive: Arc::downgrade(&alive),
         callback: Arc::new(callback),
+        since: inner.events_queued,
     });
     Subscription { alive }
+}
+
+/// Holds back the document's events while it is alive: made by
+/// [`TextDocument::hold_events`](crate::TextDocument::hold_events), and dropping it releases
+/// them.
+///
+/// Owns a handle on the document, so it may be kept in a host's state between the call
+/// that begins a batch and the one that ends it.
+#[must_use = "the events are released as soon as the hold is dropped"]
+pub struct EventHold {
+    pub(crate) doc: Arc<Mutex<TextDocumentInner>>,
+}
+
+impl std::fmt::Debug for EventHold {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EventHold").finish_non_exhaustive()
+    }
+}
+
+impl Drop for EventHold {
+    fn drop(&mut self) {
+        crate::inner::release_event_hold(&self.doc);
+    }
 }

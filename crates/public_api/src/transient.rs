@@ -86,6 +86,20 @@
 //! transient edits it made itself tells its layer from another with
 //! [`TextDocument::transient_layer`].
 //!
+//! # Under a host's lock
+//!
+//! An input method that edits under a lock of its own (Windows' Text Services Framework
+//! grants one, and reads back what it wrote under the same lock) must not see application
+//! code write the document while it holds the lock: a recorded write by a change callback
+//! would revert the layer, and the input method would read back text other than the text it
+//! wrote. The host holds the document's events for the lock's duration
+//! ([`TextDocument::hold_events`]). Under the hold, the transient edits, their revert, their
+//! commit and every other edit change the document and move its cursors at once, and every
+//! read ([`TextDocument::transient_range`], the text, a cursor's position) sees them; only
+//! their events wait, and go out in the order they were queued when the hold is dropped,
+//! after the lock. A callback that then writes the document reverts or ends the layer as
+//! any recorded write does, outside the lock.
+//!
 //! # Refusals
 //!
 //! What the layer cannot do is refused with [`DocumentError::TransientEdits`], whose

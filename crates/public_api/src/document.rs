@@ -2089,9 +2089,56 @@ impl TextDocument {
     /// This delivery path is independent of callback dispatch via
     /// [`on_change`](Self::on_change) — using both simultaneously is safe
     /// and each path sees every event exactly once.
+    ///
+    /// While events are held ([`hold_events`](Self::hold_events)) it returns nothing, and
+    /// the events held are returned by the first call after the release.
     pub fn poll_events(&self) -> Vec<DocumentEvent> {
         let mut inner = self.inner.lock();
         inner.drain_poll_events()
+    }
+
+    /// Hold back the document's events until the returned [`EventHold`](crate::EventHold) is dropped.
+    ///
+    /// For a host that edits the document where application code must not run: an input
+    /// method's lock, during which the host writes the text the input method asks for and
+    /// reads it back, and no application code may write the document (which would end the
+    /// transient edits the input method's composition is, see the
+    /// [transient module](crate::transient#under-a-hosts-lock)).
+    ///
+    /// It holds back events only. A [`SyntaxHighlighter`](crate::SyntaxHighlighter) is
+    /// application code that runs during the hold all the same: it runs as part of each
+    /// edit, under the document's lock, held or not, so it must not wait on anything the
+    /// host holds during the hold.
+    ///
+    /// While a hold is alive, no event goes out: the [`on_change`](Self::on_change)
+    /// callbacks are not called and [`poll_events`](Self::poll_events) returns nothing.
+    /// Every edit, by any cursor or clone of the document and on any thread, queues its
+    /// events as usual, and so do the transient edits, their revert and their commit, undo
+    /// and redo, and the long operations' progress. Everything else happens at once: the
+    /// edit itself, the cursors it moves, [`content_revision`](Self::content_revision),
+    /// [`can_undo`](Self::can_undo) and every other read, which see the document as it is
+    /// now. Only notification is deferred.
+    ///
+    /// Holds nest: the events go out when the last hold alive is dropped, in the order they
+    /// were queued, each as it was queued (none is merged with another or left out), on the
+    /// thread that drops it, outside the document's lock. An edit a callback makes while
+    /// they go out is delivered after them, in order, never in the middle of them. A hold
+    /// taken while they go out (by a callback that keeps it, or on another thread) stops
+    /// the delivery, and its own release delivers the rest. A subscription made during the
+    /// hold receives only what is queued after it was made, and one dropped receives
+    /// nothing more. A callback that panics ends the delivery as it ends any other, and the
+    /// panic goes on from the drop.
+    ///
+    /// A delivery already under way when the hold is taken, on this thread (the hold taken
+    /// by a callback) or on another, finishes the events it had taken: the hold keeps back
+    /// what is queued from then on. The order holds within one delivery: events another
+    /// thread was still delivering when the hold was released can reach their callbacks
+    /// after the ones the release delivers.
+    pub fn hold_events(&self) -> crate::EventHold {
+        self.inner.lock().event_holds += 1;
+        crate::EventHold {
+            doc: Arc::clone(&self.inner),
+        }
     }
 
     // ── Syntax highlighting ──────────────────────────────────

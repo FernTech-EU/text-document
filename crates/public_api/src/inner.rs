@@ -18,11 +18,8 @@ use std::sync::{Arc, Weak};
 
 use parking_lot::Mutex;
 
-/// A batch of events paired with the callbacks to invoke for each.
-pub(crate) type QueuedEvents = Vec<(
-    crate::events::DocumentEvent,
-    Vec<Arc<dyn Fn(crate::events::DocumentEvent) + Send + Sync>>,
-)>;
+/// A batch of events paired with the subscriptions to deliver each to.
+pub(crate) type QueuedEvents = Vec<(crate::events::DocumentEvent, Vec<CallbackEntry>)>;
 
 use crate::Result;
 use frontend::AppContext;
@@ -71,9 +68,23 @@ pub(crate) struct CursorData {
 }
 
 /// Callback entry for document event subscriptions.
+#[derive(Clone)]
 pub(crate) struct CallbackEntry {
     pub alive: Weak<AtomicBool>,
     pub callback: Arc<dyn Fn(DocumentEvent) + Send + Sync>,
+    /// The sequence number of the first event the subscription receives (see
+    /// `TextDocumentInner::events_queued`): none queued before it was made, even when they
+    /// are delivered after, as the events a hold kept back are.
+    pub since: u64,
+}
+
+impl CallbackEntry {
+    /// Whether its [`Subscription`](crate::Subscription) is still alive.
+    fn is_live(&self) -> bool {
+        self.alive
+            .upgrade()
+            .is_some_and(|alive| alive.load(std::sync::atomic::Ordering::Relaxed))
+    }
 }
 
 /// The shared document interior, behind `Arc<Mutex<>>`.
@@ -121,6 +132,15 @@ pub(crate) struct TextDocumentInner {
     pub callback_cursor: usize,
     /// Next event index for `poll_events()`.
     pub poll_cursor: usize,
+    /// How many events were ever queued: the sequence number the next one gets.
+    pub events_queued: u64,
+    /// How many [`EventHold`](crate::EventHold)s are alive: while there is one, neither
+    /// delivery path hands out anything.
+    pub event_holds: usize,
+    /// Whether the release of the last hold is delivering what was held: the callback path
+    /// then hands out nothing either, and the release delivers what is queued meanwhile
+    /// after what was held (see [`release_event_hold`]).
+    pub delivering_held_events: bool,
 
     // Resource name → entity ID cache for O(1) lookups by name.
     pub resource_cache: HashMap<String, u64>,
@@ -465,6 +485,7 @@ impl TextDocumentInner {
             _ => {}
         }
         self.pending_events.push(event);
+        self.events_queued += 1;
     }
 
     /// Whether the main text is the empty paragraph the last removal of all of it left,
@@ -496,6 +517,9 @@ impl TextDocumentInner {
     /// `poll_events()` and `on_change()` simultaneously is safe and
     /// each path sees every event exactly once.
     pub fn drain_poll_events(&mut self) -> Vec<DocumentEvent> {
+        if self.event_holds > 0 {
+            return Vec::new();
+        }
         if self.poll_cursor >= self.pending_events.len() {
             self.trim_delivered_events();
             return Vec::new();
@@ -510,39 +534,42 @@ impl TextDocumentInner {
     ///
     /// Only events added since the last call are returned. The caller
     /// should release the lock and then invoke callbacks via
-    /// [`dispatch_queued_events`].
+    /// [`dispatch_queued_events`]. Nothing while events are held (see
+    /// [`EventHold`](crate::EventHold)): they stay queued for the release.
     pub fn take_queued_events(&mut self) -> QueuedEvents {
+        if self.event_holds > 0 || self.delivering_held_events {
+            return Vec::new();
+        }
+        self.take_events_now()
+    }
+
+    /// [`take_queued_events`](Self::take_queued_events) whether or not events are held.
+    fn take_events_now(&mut self) -> QueuedEvents {
         if self.callback_cursor >= self.pending_events.len() {
             return Vec::new();
         }
 
-        self.callbacks
-            .retain(|entry| entry.alive.strong_count() > 0);
+        self.callbacks.retain(CallbackEntry::is_live);
 
-        let live_callbacks: Vec<Arc<dyn Fn(DocumentEvent) + Send + Sync>> = self
-            .callbacks
-            .iter()
-            .filter_map(|entry| {
-                let alive = entry.alive.upgrade()?;
-                if alive.load(std::sync::atomic::Ordering::Relaxed) {
-                    Some(Arc::clone(&entry.callback))
-                } else {
-                    None
-                }
-            })
-            .collect();
-
-        if live_callbacks.is_empty() {
-            self.callback_cursor = self.pending_events.len();
+        let first = self.events_queued - self.pending_events.len() as u64;
+        let start = self.callback_cursor;
+        self.callback_cursor = self.pending_events.len();
+        if self.callbacks.is_empty() {
             return Vec::new();
         }
 
-        let new_events: Vec<DocumentEvent> = self.pending_events[self.callback_cursor..].to_vec();
-        self.callback_cursor = self.pending_events.len();
-
-        new_events
-            .into_iter()
-            .map(|e| (e, live_callbacks.clone()))
+        self.pending_events[start..]
+            .iter()
+            .zip(first + start as u64..)
+            .filter_map(|(event, seq)| {
+                let targets: Vec<CallbackEntry> = self
+                    .callbacks
+                    .iter()
+                    .filter(|entry| entry.since <= seq)
+                    .cloned()
+                    .collect();
+                (!targets.is_empty()).then(|| (event.clone(), targets))
+            })
             .collect()
     }
 
@@ -774,6 +801,9 @@ impl TextDocumentInner {
             callbacks: Vec::new(),
             callback_cursor: 0,
             poll_cursor: 0,
+            events_queued: 0,
+            event_holds: 0,
+            delivering_held_events: false,
             resource_cache: HashMap::new(),
             plain_text_cache: None,
             last_block_count: 1, // new document starts with one block
@@ -836,10 +866,58 @@ impl Drop for TextDocumentInner {
 ///
 /// Call this after releasing the document mutex to avoid deadlocks
 /// when callbacks call back into the document.
+///
+/// A subscription dropped meanwhile, by a callback called before it among them, receives
+/// nothing more.
 pub(crate) fn dispatch_queued_events(queued: QueuedEvents) {
     for (event, callbacks) in queued {
-        for cb in &callbacks {
-            cb(event.clone());
+        for entry in &callbacks {
+            if entry.is_live() {
+                (entry.callback)(event.clone());
+            }
+        }
+    }
+}
+
+/// The end of an [`EventHold`](crate::EventHold): the outermost one delivers what was held.
+///
+/// The events go out in the order they were queued, to the callbacks outside the lock, and
+/// the events a callback's own edit queues meanwhile go out after them, by this loop, never
+/// in the middle: until the queue is empty, the callback path hands out nothing else.
+/// Delivery stops when a hold is taken again meanwhile (by a callback that keeps it, or on
+/// another thread), and that hold's release delivers the rest. A callback's panic ends the
+/// delivery, as it ends any other: what its batch had still to deliver is dropped, what was
+/// queued after waits for the next delivery, and the panic is resumed, unless the hold is
+/// being dropped by a panic already, which is then the one that goes on.
+pub(crate) fn release_event_hold(doc: &Arc<Mutex<TextDocumentInner>>) {
+    let mut inner = doc.lock();
+    inner.event_holds -= 1;
+    if inner.event_holds > 0 || inner.delivering_held_events {
+        return;
+    }
+    inner.delivering_held_events = true;
+    loop {
+        let queued = inner.take_events_now();
+        if queued.is_empty() {
+            inner.delivering_held_events = false;
+            return;
+        }
+        drop(inner);
+        let delivered = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            dispatch_queued_events(queued)
+        }));
+        inner = doc.lock();
+        if let Err(panic) = delivered {
+            inner.delivering_held_events = false;
+            drop(inner);
+            if !std::thread::panicking() {
+                std::panic::resume_unwind(panic);
+            }
+            return;
+        }
+        if inner.event_holds > 0 {
+            inner.delivering_held_events = false;
+            return;
         }
     }
 }
