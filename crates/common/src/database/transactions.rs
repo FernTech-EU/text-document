@@ -17,6 +17,9 @@ pub struct Transaction {
 impl Transaction {
     pub fn begin_write_transaction(db_context: &DbContext) -> Result<Transaction> {
         let store = Arc::clone(db_context.get_store());
+        // Refused, before anything is written, over outstanding transient edits unless
+        // this is the transient write making them: see `RopeStore::begin_transient_write`.
+        store.check_write_allowed()?;
         let savepoint = Some(store.create_savepoint());
         Ok(Transaction {
             store,
