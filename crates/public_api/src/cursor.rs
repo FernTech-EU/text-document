@@ -1047,6 +1047,25 @@ impl TextCursor {
         origin: InsertionOrigin,
         recording: Recording,
     ) -> Result<QueuedEvents> {
+        self.insert_text_merging_locked(inner, pos, anchor, text, policy, None, origin, recording)
+    }
+
+    /// [`insert_text_locked`](Self::insert_text_locked), then `merge` (when given) merged
+    /// into the inserted text, as part of the same edit: done before the edit is noted, so
+    /// a refused merge leaves a transient edit undone with the rest of it. Recorded, the
+    /// merge would be an undo entry of its own: the transient insert is its one caller.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn insert_text_merging_locked(
+        &self,
+        inner: &mut TextDocumentInner,
+        pos: usize,
+        anchor: usize,
+        text: &str,
+        policy: crate::ReplaceFormatPolicy,
+        merge: Option<&TextFormat>,
+        origin: InsertionOrigin,
+        recording: Recording,
+    ) -> Result<QueuedEvents> {
         // Try direct insert first (handles same-block selection and no-selection cases)
         let dto = frontend::document_editing::InsertTextDto {
             format_policy: policy,
@@ -1082,6 +1101,12 @@ impl TextCursor {
         let added = text.chars().count();
         let removed = removed_since(inner, before, added, pos.max(anchor) - edit_pos);
         check_transient_change(recording, pos, anchor, removed)?;
+        if let Some(format) = merge
+            && added > 0
+        {
+            let dto = format.to_merge_dto(new_pos - added, new_pos);
+            document_formatting_commands::merge_text_format(&inner.ctx, stack, &dto)?;
+        }
         Ok(self.finish_edit_as(
             inner,
             edit_pos,

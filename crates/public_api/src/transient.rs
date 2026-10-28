@@ -11,6 +11,7 @@
 //! typing. Nothing arrives yet, so there is no [`DocumentEvent::TextInserted`].
 //!
 //! The edits are [`TextCursor::insert_text_transient`],
+//! [`TextCursor::insert_text_transient_merged`],
 //! [`TextCursor::insert_formatted_text_transient`] and
 //! [`TextCursor::remove_selected_text_transient`].
 //!
@@ -816,6 +817,37 @@ impl TextCursor {
                 anchor,
                 text,
                 format,
+                InsertionOrigin::Unspecified,
+                Recording::Transient,
+            )?;
+            Ok(((), queued))
+        })
+    }
+
+    /// As [`insert_text_transient`](Self::insert_text_transient), with `format` merged into
+    /// the inserted text: the text takes the format it inherits, as typed text does, and
+    /// every field `format` sets replaces that field of it, the others staying inherited.
+    /// For a composition shown in the format the writer toggled on the caret before it
+    /// (Bold with nothing selected), where
+    /// [`insert_formatted_text_transient`](Self::insert_formatted_text_transient) would also
+    /// set the fields left unset (the font family and size among them).
+    ///
+    /// One transient edit, refused as `insert_text_transient` is and reverted, committed or
+    /// ended by a recorded write in the same way. The merged format is part of what the
+    /// transient edits show and goes with them: a commit records the text it is given in
+    /// the format it inherits, and a host that wants the format recorded merges it into the
+    /// committed text in the same edit block
+    /// ([`begin_edit_block`](Self::begin_edit_block)).
+    pub fn insert_text_transient_merged(&self, text: &str, format: &TextFormat) -> Result<()> {
+        self.edit_transiently(|inner| {
+            let (pos, anchor) = self.read_cursor();
+            let queued = self.insert_text_merging_locked(
+                inner,
+                pos,
+                anchor,
+                text,
+                ReplaceFormatPolicy::default(),
+                Some(format),
                 InsertionOrigin::Unspecified,
                 Recording::Transient,
             )?;
