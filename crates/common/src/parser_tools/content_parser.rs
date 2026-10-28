@@ -43,6 +43,10 @@ pub struct ParsedSpan {
     /// Set when this span is a footnote *reference* rather than text — the
     /// label naming the note, never the number a reader sees.
     pub footnote_ref: Option<String>,
+    /// The text keeps its whitespace as it is: it came from an element styled
+    /// `white-space: pre`, `pre-wrap` or `break-spaces`, where a tab or two spaces in a
+    /// row are the text's own. An HTML reader collapses none of it.
+    pub preserve_whitespace: bool,
 }
 
 /// A parsed table cell containing inline spans.
@@ -777,6 +781,7 @@ pub fn parse_markdown(markdown: &str) -> Vec<ParsedElement> {
                         link_href: link_href.clone(),
                         image: Some(image),
                         footnote_ref: None,
+                        preserve_whitespace: false,
                     };
                     if in_table {
                         current_cell_spans.push(span);
@@ -809,6 +814,7 @@ pub fn parse_markdown(markdown: &str) -> Vec<ParsedElement> {
                     link_href: link_href.clone(),
                     image: None,
                     footnote_ref: None,
+                    preserve_whitespace: false,
                 };
                 if in_table {
                     current_cell_spans.push(span);
@@ -832,6 +838,7 @@ pub fn parse_markdown(markdown: &str) -> Vec<ParsedElement> {
                     link_href: link_href.clone(),
                     image: None,
                     footnote_ref: None,
+                    preserve_whitespace: false,
                 };
                 if in_table {
                     current_cell_spans.push(span);
@@ -855,6 +862,7 @@ pub fn parse_markdown(markdown: &str) -> Vec<ParsedElement> {
                     link_href: link_href.clone(),
                     image: None,
                     footnote_ref: None,
+                    preserve_whitespace: false,
                 };
                 if in_table {
                     current_cell_spans.push(span);
@@ -883,6 +891,7 @@ pub fn parse_markdown(markdown: &str) -> Vec<ParsedElement> {
                     link_href: link_href.clone(),
                     image: None,
                     footnote_ref: None,
+                    preserve_whitespace: false,
                 };
                 if in_table {
                     current_cell_spans.push(span);
@@ -997,6 +1006,7 @@ pub fn parse_markdown(markdown: &str) -> Vec<ParsedElement> {
                     link_href: link_href.clone(),
                     image: None,
                     footnote_ref: Some(label.to_string()),
+                    preserve_whitespace: false,
                 };
                 if in_table {
                     current_cell_spans.push(span);
@@ -1169,6 +1179,113 @@ fn parse_block_styles(style: &str) -> BlockStyles {
     result
 }
 
+/// What an inline `style` says of the whitespace in an element's text: `Some(true)` when
+/// `white-space` keeps it as it is (`pre`, `pre-wrap`, `break-spaces`), `Some(false)` when
+/// it collapses it (`normal`, `nowrap`, `pre-line`), `None` when the style does not say.
+/// The last declaration wins, as in CSS, unless an earlier one is `!important` and it is
+/// not.
+fn style_keeps_whitespace(style: &str) -> Option<bool> {
+    let mut kept = None;
+    let mut important_kept = false;
+    for part in style.split(';') {
+        let Some((property, value)) = part.split_once(':') else {
+            continue;
+        };
+        if !property.trim().eq_ignore_ascii_case("white-space") {
+            continue;
+        }
+        let value = value.trim().to_ascii_lowercase();
+        let (value, important) = value
+            .strip_suffix("important")
+            .and_then(|rest| rest.trim_end().strip_suffix('!'))
+            .map_or((value.as_str(), false), |rest| (rest.trim_end(), true));
+        let says = match value {
+            "pre" | "pre-wrap" | "break-spaces" => true,
+            "normal" | "nowrap" | "pre-line" => false,
+            _ => continue,
+        };
+        if important || !important_kept {
+            kept = Some(says);
+            important_kept |= important;
+        }
+    }
+    kept
+}
+
+/// Write `text`, a run of a paragraph's text, into `out` as HTML: each of its lines (it
+/// separates them with [`LINE_SEPARATOR`]) escaped by `escape`, the lines joined by
+/// `line_break`, and a line whose whitespace an HTML reader would collapse put in a
+/// `<span style="white-space: pre-wrap">`, where browsers, Qt and this crate's own HTML
+/// reader keep it as it is.
+///
+/// A line is wrapped when it holds a tab or another HTML space but the plain space, two
+/// spaces in a row, a space at its start when `after_space` (the text before it on its
+/// line ends in whitespace, or the line starts with it), or a space at its end when
+/// `ends_line` (its line ends with it). Written bare, a tab came back as a space and a
+/// writer's double space as one, so the HTML of a text read back was not the HTML it had
+/// been read from. Text an HTML reader keeps as it is goes out bare, as before.
+///
+/// `after_space` for the next run is [`html_text_ends_open`].
+pub fn push_html_text(
+    out: &mut String,
+    text: &str,
+    after_space: bool,
+    ends_line: bool,
+    escape: impl Fn(&str) -> String,
+    line_break: &str,
+) {
+    let mut lines = text.split(LINE_SEPARATOR).peekable();
+    let mut first = true;
+    while let Some(line) = lines.next() {
+        if !first {
+            out.push_str(line_break);
+        }
+        let opens_on_space = if first { after_space } else { true };
+        let ends = ends_line || lines.peek().is_some();
+        first = false;
+        let collapses = line.chars().any(|ch| ch != ' ' && is_html_space(ch))
+            || line.contains("  ")
+            || (opens_on_space && line.starts_with(' '))
+            || (ends && line.ends_with(' '));
+        if collapses {
+            out.push_str("<span style=\"white-space: pre-wrap\">");
+            out.push_str(&escape(line));
+            out.push_str("</span>");
+        } else {
+            out.push_str(&escape(line));
+        }
+    }
+}
+
+/// Whether a paragraph's line ends before `rest`, the inline content after a run of its
+/// text: the `ends_line` of that run (see [`push_html_text`]). It does when nothing but
+/// empty content follows, or when the next text starts a line.
+pub fn html_line_ends_before<'a>(
+    rest: impl IntoIterator<Item = &'a crate::format_runs::InlineContent>,
+) -> bool {
+    use crate::format_runs::InlineContent;
+    for content in rest {
+        match content {
+            InlineContent::Empty => {}
+            InlineContent::Text(text) if text.is_empty() => {}
+            InlineContent::Text(text) => return text.starts_with(LINE_SEPARATOR),
+            _ => return false,
+        }
+    }
+    true
+}
+
+/// Whether the text of a paragraph's line, `text` added to what came before it on its
+/// line, ends in whitespace an HTML reader would collapse a space after it into: the
+/// `after_space` of the run after it (see [`push_html_text`]). `after_space` says the same
+/// of the text before `text`, and is the answer when `text` is empty.
+pub fn html_text_ends_open(text: &str, after_space: bool) -> bool {
+    match text.chars().next_back() {
+        None => after_space,
+        Some(ch) => ch == LINE_SEPARATOR || is_html_space(ch),
+    }
+}
+
 /// The five characters HTML calls whitespace.
 ///
 /// Deliberately not `char::is_whitespace`, which is `true` for U+00A0: a
@@ -1208,7 +1325,7 @@ fn collapse_inline_whitespace(spans: &mut [ParsedSpan]) {
     // is what lets the second pass read `is_empty()` as "this span held no text
     // to begin with" — the marker a `<br>` leaves behind.
     for span in spans.iter_mut() {
-        if is_replaced(span) {
+        if is_replaced(span) || span.preserve_whitespace {
             continue;
         }
         let mut out = String::with_capacity(span.text.len());
@@ -1257,6 +1374,13 @@ fn collapse_inline_whitespace(spans: &mut [ParsedSpan]) {
             prev_ends_with_space = true;
             continue;
         }
+        // Kept whitespace is the text's own, as a replaced element is content: a space
+        // after it is not collapsed into it, and a line break takes none of it off.
+        if span.preserve_whitespace {
+            prev_ends_with_space = false;
+            line_end = None;
+            continue;
+        }
         if prev_ends_with_space && span.text.starts_with(' ') {
             span.text.remove(0);
         }
@@ -1288,6 +1412,9 @@ fn collapse_inline_whitespace(spans: &mut [ParsedSpan]) {
             span.text.clear();
             trailing_break_dropped = true;
             continue;
+        }
+        if span.preserve_whitespace {
+            break;
         }
         if span.text.ends_with(' ') {
             span.text.pop();
@@ -1671,6 +1798,8 @@ fn read_html_tree(fragment: &scraper::Html, depth_limit: usize) -> Vec<ParsedEle
         superscript: bool,
         subscript: bool,
         link_href: Option<String>,
+        /// Under an element whose `white-space` keeps whitespace as it is.
+        preserve_whitespace: bool,
     }
 
     /// The list an element stands in: its style, and the number its first item wears when
@@ -1751,6 +1880,7 @@ fn read_html_tree(fragment: &scraper::Html, depth_limit: usize) -> Vec<ParsedEle
             link_href: state.link_href.clone(),
             image: None,
             footnote_ref: None,
+            preserve_whitespace: state.preserve_whitespace,
         }
     }
 
@@ -1786,6 +1916,7 @@ fn read_html_tree(fragment: &scraper::Html, depth_limit: usize) -> Vec<ParsedEle
                             link_href: state.link_href.clone(),
                             image: None,
                             footnote_ref: None,
+                            preserve_whitespace: state.preserve_whitespace,
                         });
                     }
                 }
@@ -1795,6 +1926,9 @@ fn read_html_tree(fragment: &scraper::Html, depth_limit: usize) -> Vec<ParsedEle
                         continue;
                     }
                     let mut new_state = state.clone();
+                    if let Some(keep) = el.attr("style").and_then(style_keeps_whitespace) {
+                        new_state.preserve_whitespace = keep;
+                    }
                     match tag {
                         // Checked by attribute rather than by tag name: the
                         // producer picks the element (a `<sup>` renders sensibly
@@ -2005,6 +2139,9 @@ fn read_html_tree(fragment: &scraper::Html, depth_limit: usize) -> Vec<ParsedEle
                     return;
                 }
                 let mut new_state = state.clone();
+                if let Some(keep) = el.attr("style").and_then(style_keeps_whitespace) {
+                    new_state.preserve_whitespace = keep;
+                }
                 let mut new_list = current_list.clone();
                 let mut bq_depth = blockquote_depth;
                 let mut new_list_depth = list_depth;
@@ -2330,46 +2467,24 @@ fn read_html_tree(fragment: &scraper::Html, depth_limit: usize) -> Vec<ParsedEle
                 }
             }
             Node::Text(text) => {
-                let t = text.text.to_string();
-                let trimmed = t.trim();
-                if !trimmed.is_empty() {
-                    // Bare text not in a block — create a paragraph
-                    elements.push(ParsedElement::Block(ParsedBlock {
-                        spans: vec![ParsedSpan {
-                            text: trimmed.to_string(),
-                            bold: state.bold,
-                            italic: state.italic,
-                            underline: state.underline,
-                            strikeout: state.strikeout,
-                            code: state.code,
-                            superscript: state.superscript,
-                            subscript: state.subscript,
-                            link_href: state.link_href.clone(),
-                            image: None,
-                            footnote_ref: None,
-                        }],
-                        heading_level: None,
-                        list_style: None,
-                        list_indent: 0,
-                        list_prefix: String::new(),
-                        list_suffix: String::new(),
-                        list_start: None,
-                        marker: None,
-                        is_code_block: false,
-                        code_language: None,
+                // Bare text not in a block (a list's text outside any item, `<ol>a</ol>`)
+                // is a paragraph, its whitespace collapsed as a paragraph's is. Only
+                // trimmed, a tab in it reached the model, and a newline, which separates
+                // two blocks there, and the HTML written from it read back otherwise.
+                let mut spans = vec![text_span(text.text.to_string(), state)];
+                collapse_inline_whitespace(&mut spans);
+                if spans_carry_content(&spans) {
+                    let block = ParsedBlock {
+                        spans,
                         blockquote_depth,
                         blockquote_opens: 0,
-                        line_height: None,
-                        non_breakable_lines: None,
-                        page_break_before: None,
-                        front_matter: None,
-                        direction: None,
-                        background_color: None,
-                        alignment: None,
-                        top_margin: None,
-                        text_indent: None,
-                        semantic_role: None,
-                    }));
+                        ..ParsedBlock::default()
+                    };
+                    elements.extend(
+                        split_block_at_line_breaks(block)
+                            .into_iter()
+                            .map(ParsedElement::Block),
+                    );
                 }
             }
             _ => {
@@ -2429,6 +2544,7 @@ fn read_html_tree(fragment: &scraper::Html, depth_limit: usize) -> Vec<ParsedEle
                             link_href: state.link_href.clone(),
                             image: None,
                             footnote_ref: None,
+                            preserve_whitespace: state.preserve_whitespace,
                         });
                     }
                 }
@@ -2438,6 +2554,9 @@ fn read_html_tree(fragment: &scraper::Html, depth_limit: usize) -> Vec<ParsedEle
                         continue;
                     }
                     let mut new_state = state.clone();
+                    if let Some(keep) = el.attr("style").and_then(style_keeps_whitespace) {
+                        new_state.preserve_whitespace = keep;
+                    }
 
                     match tag {
                         // Checked by attribute rather than by tag name: the
@@ -3143,6 +3262,7 @@ pub fn parse_djot(djot: &str, options: &DjotImportOptions) -> Vec<ParsedElement>
                     link_href: link_href.clone(),
                     image: None,
                     footnote_ref: None,
+                    preserve_whitespace: false,
                 };
                 if in_table_cell {
                     current_cell_spans.push(sp);
@@ -3168,6 +3288,7 @@ pub fn parse_djot(djot: &str, options: &DjotImportOptions) -> Vec<ParsedElement>
                 link_href: link_href.clone(),
                 image: Some($img),
                 footnote_ref: None,
+                preserve_whitespace: false,
             };
             if in_table_cell {
                 current_cell_spans.push(sp);
@@ -3669,6 +3790,7 @@ pub fn parse_djot(djot: &str, options: &DjotImportOptions) -> Vec<ParsedElement>
                     link_href: link_href.clone(),
                     image: None,
                     footnote_ref: Some(label.to_string()),
+                    preserve_whitespace: false,
                 };
                 if in_table_cell {
                     current_cell_spans.push(sp);
@@ -3736,6 +3858,33 @@ pub fn parse_djot(djot: &str, options: &DjotImportOptions) -> Vec<ParsedElement>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_style_keeps_whitespace_reads_important() {
+        assert_eq!(style_keeps_whitespace("white-space: pre-wrap"), Some(true));
+        assert_eq!(
+            style_keeps_whitespace("white-space: pre-wrap !important"),
+            Some(true)
+        );
+        assert_eq!(
+            style_keeps_whitespace("white-space:PRE!IMPORTANT; color: red"),
+            Some(true)
+        );
+        assert_eq!(
+            style_keeps_whitespace("white-space: pre ! important; white-space: normal"),
+            Some(true),
+            "a later declaration that is not important does not win"
+        );
+        assert_eq!(
+            style_keeps_whitespace("white-space: pre; white-space: normal !important"),
+            Some(false)
+        );
+        assert_eq!(
+            style_keeps_whitespace("white-space: pre; white-space: normal"),
+            Some(false)
+        );
+        assert_eq!(style_keeps_whitespace("white-space: inherit"), None);
+    }
 
     /// Helper: flatten parse_markdown output to blocks for tests that don't care about tables.
     fn parse_markdown_blocks(md: &str) -> Vec<ParsedBlock> {

@@ -29,6 +29,9 @@ use common::entities::{Alignment, Block, ListStyle, TableCell, TextDirection};
 use common::format_runs::InlineContent;
 use common::format_runs_query::inline_segments_for_block;
 use common::parser_tools::LINE_SEPARATOR;
+use common::parser_tools::content_parser::{
+    html_line_ends_before, html_text_ends_open, push_html_text,
+};
 use common::parser_tools::image_options::{ExportImages, base64_encode};
 use common::types::EntityId;
 
@@ -282,11 +285,21 @@ pub fn render_inline_html(
 
     let mut html = String::new();
 
-    for elem in &elements {
+    // Whether the text before an element, on its line, ends in whitespace a reader would
+    // collapse a space after it into (see `push_html_text`).
+    let mut after_space = true;
+    for (index, elem) in elements.iter().enumerate() {
         let text = match &elem.content {
             // A line break inside the block is HTML's own, `<br/>`, which XHTML (EPUB)
-            // reads as well.
-            InlineContent::Text(t) => escape_html(t).replace(LINE_SEPARATOR, "<br/>"),
+            // reads as well. Whitespace a reader would collapse is kept in a `pre-wrap` span.
+            InlineContent::Text(t) => {
+                let ends_line =
+                    html_line_ends_before(elements[index + 1..].iter().map(|e| &e.content));
+                let mut html = String::new();
+                push_html_text(&mut html, t, after_space, ends_line, escape_html, "<br/>");
+                after_space = html_text_ends_open(t, after_space);
+                html
+            }
             // A footnote reference.
             //
             // Both the `epub:type` and the DPUB-ARIA role: `epub:type` alone
@@ -304,6 +317,7 @@ pub fn render_inline_html(
             // definition anywhere) is not this — it keeps the full noteref
             // treatment exactly as before.
             InlineContent::FootnoteRef { label } => {
+                after_space = false;
                 let marker = escape_html(&notes.marker(label));
                 if notes.is_nested_reference(label) {
                     html.push_str(&format!("<sup>{marker}</sup>"));
@@ -322,31 +336,49 @@ pub fn render_inline_html(
                 width,
                 height,
                 ..
-            } => match images.resolve(name) {
-                Some(src) => {
-                    // `alt` is required markup, not decoration: an <img> without
-                    // it is inaccessible, and EPUB validators flag it. Emit it
-                    // even when empty — an explicit empty alt is the correct way
-                    // to say "decorative", whereas a missing attribute says
-                    // nothing at all.
-                    let mut tag = format!(
-                        "<img src=\"{}\" alt=\"{}\"",
-                        escape_html(&src),
-                        escape_html(alt)
-                    );
-                    if *width > 0 {
-                        tag.push_str(&format!(" width=\"{width}\""));
+            } => {
+                match images.resolve(name) {
+                    Some(src) => {
+                        after_space = false;
+                        // `alt` is required markup, not decoration: an <img> without
+                        // it is inaccessible, and EPUB validators flag it. Emit it
+                        // even when empty: an explicit empty alt is the correct way
+                        // to say "decorative", whereas a missing attribute says
+                        // nothing at all.
+                        let mut tag = format!(
+                            "<img src=\"{}\" alt=\"{}\"",
+                            escape_html(&src),
+                            escape_html(alt)
+                        );
+                        if *width > 0 {
+                            tag.push_str(&format!(" width=\"{width}\""));
+                        }
+                        if *height > 0 {
+                            tag.push_str(&format!(" height=\"{height}\""));
+                        }
+                        tag.push_str(" />");
+                        tag
                     }
-                    if *height > 0 {
-                        tag.push_str(&format!(" height=\"{height}\""));
+                    // Dropped image: the description is all that is left to show,
+                    // and showing it beats leaving a silent hole in the prose. It is
+                    // text of the line, its whitespace kept as a text run's is.
+                    None => {
+                        let ends_line =
+                            html_line_ends_before(elements[index + 1..].iter().map(|e| &e.content));
+                        let mut html = String::new();
+                        push_html_text(
+                            &mut html,
+                            alt,
+                            after_space,
+                            ends_line,
+                            escape_html,
+                            "<br/>",
+                        );
+                        after_space = html_text_ends_open(alt, after_space);
+                        html
                     }
-                    tag.push_str(" />");
-                    tag
                 }
-                // Dropped image: the description is all that is left to show,
-                // and showing it beats leaving a silent hole in the prose.
-                None => escape_html(alt),
-            },
+            }
             InlineContent::Empty => String::new(),
         };
 

@@ -13,3 +13,4 @@ cc 726a13e6138459f64a78e0cb9e1310f1471810b84a4df2c9b41e53b967c6d572 # shrinks to
 cc 053fa73a2c7230e00cb6316c52df5b7b0a62134cfe2ed9582a5822836cbe1558 # shrinks to seed = "\n\n"
 cc 413d17480987e479479c04da90da0f02898e771ee8447a4fdf7b96c7c22901c6 # shrinks to seed = "&#xDg"
 cc 6d1b6b9afed569f2b5750ce59f687bb9b5fc7fb55a55af14acd6f1734b3fd3dc # shrinks to seed = "", ops = [InsertBlock, InsertBlock, SelectBackward(2), InsertText(""), Undo, DeleteChar, MoveNext(1), InsertBlock]
+cc 70e4ac87522bbe917b5e2cb7c9ad14f66391a67621d5558e1f7c22118543e999 # shrinks to seed = "<oL\t>a\t!"

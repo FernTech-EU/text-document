@@ -2,7 +2,8 @@
 
 use crate::{CharVerticalAlignment, InlineContent, LINE_SEPARATOR, ListStyle};
 use frontend::common::parser_tools::content_parser::{
-    ParsedBlock, ParsedElement, ParsedSpan, split_block_at_line_breaks,
+    ParsedBlock, ParsedElement, ParsedSpan, html_line_ends_before, html_text_ends_open,
+    push_html_text, split_block_at_line_breaks,
 };
 use frontend::common::parser_tools::fragment_schema::{
     FragmentBlock, FragmentData, FragmentElement, FragmentListStarts, FragmentQuoting,
@@ -463,12 +464,23 @@ fn block_style_attr(block: &FragmentBlock) -> String {
 }
 
 fn push_inline_html(out: &mut String, elements: &[FragmentElement]) {
-    for elem in elements {
+    // Whether the text before an element, on its line, ends in whitespace a reader would
+    // collapse a space after it into (see `push_html_text`).
+    let mut after_space = true;
+    for (index, elem) in elements.iter().enumerate() {
         let text = match &elem.content {
-            InlineContent::Text(t) => escape_html(t).replace(LINE_SEPARATOR, "<br>"),
+            InlineContent::Text(t) => {
+                let ends_line =
+                    html_line_ends_before(elements[index + 1..].iter().map(|e| &e.content));
+                let mut html = String::new();
+                push_html_text(&mut html, t, after_space, ends_line, escape_html, "<br>");
+                after_space = html_text_ends_open(t, after_space);
+                html
+            }
             // A reference carried onto the clipboard keeps its marker; the note
             // body is not part of the fragment.
             InlineContent::FootnoteRef { label } => {
+                after_space = false;
                 let id = escape_html(label);
                 out.push_str(&format!(
                     "<a epub:type=\"noteref\" role=\"doc-noteref\" href=\"#fn-{id}\"><sup>{id}</sup></a>"
@@ -482,6 +494,7 @@ fn push_inline_html(out: &mut String, elements: &[FragmentElement]) {
                 height,
                 ..
             } => {
+                after_space = false;
                 // This is the HTML written to the OS clipboard, so it is what
                 // another application receives on paste. It carried no `alt` at
                 // all, which made every copied image inaccessible in the target

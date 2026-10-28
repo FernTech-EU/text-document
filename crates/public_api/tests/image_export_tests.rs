@@ -405,3 +405,28 @@ fn an_epub_without_a_cover_gains_no_cover_files() {
         "a book with no cover should carry no cover entries: {names:?}"
     );
 }
+
+/// The description of an image left out is text of its line, and a reader collapses its
+/// whitespace as it does any text's, so it is kept as a text run's is: two spaces in it,
+/// and the space after it before the next run, read back as written.
+#[test]
+fn the_description_of_an_omitted_image_keeps_its_whitespace() {
+    let doc = TextDocument::new();
+    doc.set_html(r#"<p>See <img src="a.png" alt="two  words "><b> after</b></p>"#)
+        .unwrap()
+        .wait()
+        .unwrap();
+    let html = doc
+        .to_html_with_options(HtmlExportOptions {
+            image_mode: HtmlImageMode::Omit,
+            images: ExportImages::new(),
+        })
+        .expect("html");
+    let back = TextDocument::new();
+    back.set_html(&html).unwrap().wait().unwrap();
+    assert_eq!(
+        back.to_plain_text().unwrap(),
+        "See two  words  after",
+        "read back from {html}"
+    );
+}
