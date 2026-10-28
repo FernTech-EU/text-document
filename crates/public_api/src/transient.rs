@@ -1,5 +1,107 @@
-//! Transient edits: changes to the document that no undo history records (see
-//! [`TextCursor::insert_text_transient`]).
+//! Transient edits: changes to the document that no undo history records.
+//!
+//! An input method's composition (the candidates of a Chinese or Japanese input method, the
+//! Korean syllable being built, the live text of dictation) has to be shown in the text,
+//! where the writer is looking, and has to be replaced at every update. Made as ordinary
+//! edits, every update was recorded, and once the composition was committed an undo
+//! replayed each state it went through. A transient edit changes the document and is
+//! announced as a change of its content is ([`DocumentEvent::ContentsChanged`], and the
+//! block and flow events when they apply), so views lay it out and draw it, but it is not
+//! recorded: the undo and redo histories stay as they were, and so does the coalescing of
+//! typing. Nothing arrives yet, so there is no [`DocumentEvent::TextInserted`].
+//!
+//! The edits are [`TextCursor::insert_text_transient`],
+//! [`TextCursor::insert_formatted_text_transient`] and
+//! [`TextCursor::remove_selected_text_transient`].
+//!
+//! # The layer
+//!
+//! The outstanding transient edits are one **layer** over the document as it is recorded.
+//! The layer belongs to the document, whichever cursor made its edits. It begins with the
+//! first transient edit and ends when it is reverted, which puts the recorded content back
+//! as it was before that first edit: the same text, formats and block identities, which is
+//! what every recorded undo entry refers to. Nothing is recorded and the histories are
+//! untouched.
+//!
+//! The layer ends in one of three ways:
+//!
+//! * [`TextDocument::revert_transient_edits`]: the composition is cancelled.
+//! * [`TextCursor::commit_transient_text`]: the composition is committed. The layer is
+//!   reverted, and the text it changed is replaced with the committed text, recorded as
+//!   **one undo step of its own**, closed on both sides: it does not coalesce with the
+//!   typing before it, and the typing after it starts a step of its own, so an undo takes
+//!   back exactly the committed text and gives back what the composition took the place
+//!   of. Inside an open edit block ([`TextCursor::begin_edit_block`]) the commit joins the
+//!   block, as every recorded edit there does.
+//! * Any recorded write to the document, by any cursor or clone of the document. Every edit,
+//!   undo, redo and load reverts the layer before anything else, its own checks included,
+//!   then acts on the recorded content, so the layer is gone even when the write then fails
+//!   or changes nothing. The streaming appends alone check their lines first, and leave the
+//!   layer when they refuse them.
+//!
+//! So a host never keeps its own record of where its composition is: before each update it
+//! asks [`TextDocument::transient_range`], which is `None` once anything has reverted it.
+//!
+//! The history's operations that change no content do not end the layer:
+//! [`TextDocument::clear_undo_redo`], [`TextDocument::break_undo_merge`] and an edit block
+//! leave it outstanding. Nor does [`TextDocument::set_footnote_markers`]: the markers are
+//! the host's, not content, and a revert keeps them.
+//!
+//! # Positions
+//!
+//! A revert puts every cursor back in the recorded text. One that only the transient edits
+//! moved goes back exactly where it stood, the table cells or the whole text it selected
+//! included. Any other (one that something else moved
+//! meanwhile, one made since) is moved back across each transient edit in turn, from the
+//! last, an edit that touches the text the one before it made counting with it as one (a
+//! syllable taken out and its candidate shown in its place are one replacement): a position
+//! before the edit stays, and one after the text it inserted moves by the difference. One inside that text, or at its end, goes to the end of the recorded text
+//! the edit replaced, and one at its start to that text's start, except where the edit only
+//! removed text: there a selection's start, or a caret, goes after the text put back, and
+//! its end before it. So a selection holds the recorded text it held, and one that held
+//! only text a transient edit inserted over nothing comes back empty.
+//!
+//! The recorded writes read a cursor after their revert, so they act where it stands in the
+//! recorded text. The explicit ranges of [`TextCursor::replace`] and
+//! [`TextDocument::replace_ranges`] are read in the document as it was, with the layer, and
+//! moved back the same way, under the lock the write itself takes.
+//!
+//! # Reading
+//!
+//! While the layer is outstanding, the document reads as it shows: the text, the flow, a
+//! search, an export. A host that saves on a timer saves the composition with the rest, and
+//! should revert or commit first when that matters (see
+//! [`TextDocument::has_transient_edits`]).
+//!
+//! A view that is not where the transient edits are made (a read-only preview beside the
+//! editor an input method composes in) shows the recorded document instead:
+//! [`TextDocument::snapshot_recorded_flow_masked`], its `_no_paint` twin and
+//! [`TextDocument::snapshot_recorded_block_at_position_masked`] snapshot it as a revert
+//! would leave it. Its positions are the recorded document's: such a view draws a cursor at
+//! [`TextCursor::recorded_position`] and [`TextCursor::recorded_anchor`], where a revert
+//! puts it, places any other position of the document with
+//! [`TextDocument::recorded_position`], and maps a position read off its own layout into
+//! the document with [`TextDocument::position_from_recorded`]. A view that shows only the
+//! transient edits it made itself tells its layer from another with
+//! [`TextDocument::transient_layer`].
+//!
+//! # Refusals
+//!
+//! What the layer cannot do is refused with [`DocumentError::TransientEdits`], whose
+//! [`TransientRefusal`](crate::TransientRefusal) says which case it is. Underneath, the
+//! document's store enforces what the layer needs of it, whoever calls it:
+//!
+//! * while a layer is outstanding, it refuses to begin any write that is not a transient
+//!   edit's own (a write transaction, a streaming append), so that no recorded edit lands
+//!   over the layer and is then taken away by the revert. Every write this crate offers
+//!   reverts the layer first, so that refusal reaches a caller only when a transient edit
+//!   is made from another thread between the revert and the write
+//!   ([`TransientRefusal::LayerOutstanding`](crate::TransientRefusal::LayerOutstanding));
+//! * it refuses to begin a transient write while any other write is open, a transient one
+//!   included, since the first one's snapshot is the recorded content
+//!   ([`TransientRefusal::WriteInProgress`](crate::TransientRefusal::WriteInProgress));
+//! * it refuses a revert while a transient write is in progress, which the document's lock
+//!   rules out here.
 
 use std::ops::Range;
 use std::sync::{Arc, Weak};
