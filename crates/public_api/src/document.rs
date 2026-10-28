@@ -1306,61 +1306,7 @@ impl TextDocument {
         position: usize,
         mask: &crate::highlight::HighlightMask,
     ) -> Option<crate::flow::BlockSnapshot> {
-        let inner = self.inner.lock();
-        // Effective kind resolved once here (the join over the mask's sessions), then threaded
-        // down with the mask itself.
-        let hl = crate::highlight::SnapshotHighlights {
-            kind: inner.highlights.effective_kind(mask),
-            mask,
-            suppress_paint: false,
-        };
-        let main_frame_id = get_main_frame_id(&inner);
-        let store = inner.ctx.db_context.get_store();
-
-        // Rope-authoritative fast path. When every block is mirrored to the
-        // rope (now true with tables — see `rope_positions_match_flow`), the
-        // rope IS the position space the snapshot reports in, so we must also
-        // *locate* the block via the rope. Walking a hand-rolled `running_pos`
-        // here instead would search in the old cells-inline-no-sentinel space
-        // and then report the rope position — an off-by-the-sentinel mismatch
-        // for any block after a table.
-        if common::database::rope_helpers::rope_positions_match_flow(store)
-            && let Some((block_id, _, _)) =
-                common::database::rope_helpers::find_block_at_char_position(store, position as i64)
-        {
-            return crate::text_block::build_block_snapshot(&inner, block_id, hl);
-        }
-
-        // Collect all block IDs in document order, traversing into nested frames
-        let ordered_block_ids = collect_frame_block_ids(&inner, main_frame_id)?;
-
-        // Walk blocks computing positions on the fly
-        let pos = position as i64;
-        let mut running_pos: i64 = 0;
-        for &block_id in &ordered_block_ids {
-            let block_dto = block_commands::get_block(&inner.ctx, &block_id)
-                .ok()
-                .flatten()?;
-            let entity: common::entities::Block = block_dto.clone().into();
-            let block_end =
-                running_pos + common::database::rope_helpers::block_char_length(&entity, store);
-            if pos >= running_pos && pos <= block_end {
-                return crate::text_block::build_block_snapshot_with_position(
-                    &inner,
-                    block_id,
-                    Some(running_pos as usize),
-                    hl,
-                    &crate::text_block::SnapshotLookups::default(),
-                );
-            }
-            running_pos = block_end + 1;
-        }
-
-        // Fallback to last block
-        if let Some(&last_id) = ordered_block_ids.last() {
-            return crate::text_block::build_block_snapshot(&inner, last_id, hl);
-        }
-        None
+        block_snapshot_at(&self.inner.lock(), position, mask)
     }
 
     /// Get a read-only handle to the block containing the given
@@ -1500,15 +1446,7 @@ impl TextDocument {
         &self,
         mask: &crate::highlight::HighlightMask,
     ) -> crate::flow::FlowSnapshot {
-        let inner = self.inner.lock();
-        let main_frame_id = get_main_frame_id(&inner);
-        let hl = crate::highlight::SnapshotHighlights {
-            kind: inner.highlights.effective_kind(mask),
-            mask,
-            suppress_paint: false,
-        };
-        let elements = crate::text_frame::build_flow_snapshot(&inner, main_frame_id, hl);
-        crate::flow::FlowSnapshot { elements }
+        flow_snapshot_of(&self.inner.lock(), mask, false)
     }
 
     /// Snapshot the main flow like [`snapshot_flow_masked`](Self::snapshot_flow_masked),
@@ -1527,15 +1465,7 @@ impl TextDocument {
         &self,
         mask: &crate::highlight::HighlightMask,
     ) -> crate::flow::FlowSnapshot {
-        let inner = self.inner.lock();
-        let main_frame_id = get_main_frame_id(&inner);
-        let hl = crate::highlight::SnapshotHighlights {
-            kind: inner.highlights.effective_kind(mask),
-            mask,
-            suppress_paint: true,
-        };
-        let elements = crate::text_frame::build_flow_snapshot(&inner, main_frame_id, hl);
-        crate::flow::FlowSnapshot { elements }
+        flow_snapshot_of(&self.inner.lock(), mask, true)
     }
 
     // ── Search ───────────────────────────────────────────────
@@ -2697,6 +2627,87 @@ fn collect_frame_block_ids(
     } else {
         Some(frame_dto.blocks.to_vec())
     }
+}
+
+/// [`TextDocument::snapshot_flow_masked`] of `inner` (with `suppress_paint`,
+/// [`TextDocument::snapshot_flow_masked_no_paint`]), which is the document as it is or,
+/// inside [`TextDocumentInner::read_recorded`], as recorded.
+pub(crate) fn flow_snapshot_of(
+    inner: &TextDocumentInner,
+    mask: &crate::highlight::HighlightMask,
+    suppress_paint: bool,
+) -> crate::flow::FlowSnapshot {
+    let main_frame_id = get_main_frame_id(inner);
+    let hl = crate::highlight::SnapshotHighlights {
+        kind: inner.highlights.effective_kind(mask),
+        mask,
+        suppress_paint,
+    };
+    let elements = crate::text_frame::build_flow_snapshot(inner, main_frame_id, hl);
+    crate::flow::FlowSnapshot { elements }
+}
+
+/// [`TextDocument::snapshot_block_at_position_masked`] of `inner`, which is the document as
+/// it is or, inside [`TextDocumentInner::read_recorded`], as recorded.
+pub(crate) fn block_snapshot_at(
+    inner: &TextDocumentInner,
+    position: usize,
+    mask: &crate::highlight::HighlightMask,
+) -> Option<crate::flow::BlockSnapshot> {
+    // Effective kind resolved once here (the join over the mask's sessions), then threaded
+    // down with the mask itself.
+    let hl = crate::highlight::SnapshotHighlights {
+        kind: inner.highlights.effective_kind(mask),
+        mask,
+        suppress_paint: false,
+    };
+    let main_frame_id = get_main_frame_id(inner);
+    let store = inner.ctx.db_context.get_store();
+
+    // Rope-authoritative fast path. When every block is mirrored to the
+    // rope (now true with tables: see `rope_positions_match_flow`), the
+    // rope IS the position space the snapshot reports in, so we must also
+    // *locate* the block via the rope. Walking a hand-rolled `running_pos`
+    // here instead would search in the old cells-inline-no-sentinel space
+    // and then report the rope position: an off-by-the-sentinel mismatch
+    // for any block after a table.
+    if common::database::rope_helpers::rope_positions_match_flow(store)
+        && let Some((block_id, _, _)) =
+            common::database::rope_helpers::find_block_at_char_position(store, position as i64)
+    {
+        return crate::text_block::build_block_snapshot(inner, block_id, hl);
+    }
+
+    // Collect all block IDs in document order, traversing into nested frames
+    let ordered_block_ids = collect_frame_block_ids(inner, main_frame_id)?;
+
+    // Walk blocks computing positions on the fly
+    let pos = position as i64;
+    let mut running_pos: i64 = 0;
+    for &block_id in &ordered_block_ids {
+        let block_dto = block_commands::get_block(&inner.ctx, &block_id)
+            .ok()
+            .flatten()?;
+        let entity: common::entities::Block = block_dto.clone().into();
+        let block_end =
+            running_pos + common::database::rope_helpers::block_char_length(&entity, store);
+        if pos >= running_pos && pos <= block_end {
+            return crate::text_block::build_block_snapshot_with_position(
+                inner,
+                block_id,
+                Some(running_pos as usize),
+                hl,
+                &crate::text_block::SnapshotLookups::default(),
+            );
+        }
+        running_pos = block_end + 1;
+    }
+
+    // Fallback to last block
+    if let Some(&last_id) = ordered_block_ids.last() {
+        return crate::text_block::build_block_snapshot(inner, last_id, hl);
+    }
+    None
 }
 
 pub(crate) fn get_main_frame_id(inner: &TextDocumentInner) -> frontend::common::types::EntityId {

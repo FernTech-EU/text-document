@@ -177,6 +177,11 @@ pub(crate) struct TextDocumentInner {
     /// none, and kept in step with the store's own record of them
     /// (`RopeStore::has_transient_edits`).
     pub transient: Option<crate::transient::TransientLayer>,
+    /// Whether the document is being read as recorded, inside
+    /// `TextDocumentInner::read_recorded`: its context then reads a store without the
+    /// transient edits, while what is kept beside the store in the positions of the
+    /// document as it shows (a host's highlight ranges) has to be moved back across them.
+    pub reading_recorded: bool,
 }
 
 /// The one empty paragraph the main text is: the block, the list it is an item of and the
@@ -665,6 +670,7 @@ impl TextDocumentInner {
             history_resets: HashMap::new(),
             emptied_text: None,
             transient: None,
+            reading_recorded: false,
         })
     }
 }

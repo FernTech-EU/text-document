@@ -22,8 +22,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use proptest::prelude::*;
 use text_document::{
-    DocumentError, DocumentEvent, FindOptions, HighlightContext, InsertionOrigin, MoveMode,
-    ReplaceOptions, ReplaceRange, SyntaxHighlighter, TextDocument, TextFormat, TransientRefusal,
+    DocumentError, DocumentEvent, FindOptions, FlowSnapshot, HighlightContext, HighlightMask,
+    InsertionOrigin, MoveMode, ReplaceOptions, ReplaceRange, SyntaxHighlighter, TextDocument,
+    TextFormat, TransientRefusal,
 };
 
 fn doc(text: &str) -> TextDocument {
@@ -238,6 +239,17 @@ fn a_hanja_candidate_is_read_as_the_syllable_it_shows_in_place_of() {
         ime.remove_selected_text_transient().unwrap();
         compose(&doc, &ime, updates);
         assert_eq!(doc.transient_range(), Some(2..3));
+        assert_eq!(
+            doc.recorded_position(2),
+            2,
+            "before the candidate is before the syllable"
+        );
+        assert_eq!(
+            doc.recorded_position(3),
+            3,
+            "after it is after the syllable"
+        );
+        assert_eq!(doc.position_from_recorded(3), 3);
 
         // A replacement read over the candidate replaces the syllable.
         doc.cursor().replace(2, 3, "X", Default::default()).unwrap();
@@ -1450,6 +1462,26 @@ fn the_stores_refusal_is_a_transient_edits_error() {
 }
 
 #[test]
+fn a_layer_is_the_same_until_it_ends() {
+    let doc = doc("hello world");
+    assert_eq!(doc.transient_layer(), None);
+    let ime = doc.cursor_at(5);
+    compose(&doc, &ime, &["n"]);
+    let first = doc.transient_layer().expect("a layer is outstanding");
+    compose(&doc, &ime, &["ni", "nih"]);
+    assert_eq!(doc.transient_layer(), Some(first), "updates join it");
+
+    // A recorded write ends it; transient edits after it are another layer.
+    doc.cursor_at(0).insert_text("A").unwrap();
+    assert_eq!(doc.transient_layer(), None);
+    doc.cursor_at(3).insert_text_transient("x").unwrap();
+    let second = doc.transient_layer().expect("a layer is outstanding");
+    assert_ne!(second, first);
+    doc.revert_transient_edits();
+    assert_eq!(doc.transient_layer(), None);
+}
+
+#[test]
 fn a_transient_write_refused_through_anyhow_is_a_write_in_progress() {
     use common::database::rope_store::TransientWriteRefused;
 
@@ -1501,6 +1533,262 @@ fn a_transient_edit_that_changes_nothing_leaves_nothing_outstanding() {
     assert_eq!(cursor.remove_selected_text_transient().unwrap(), "");
     assert!(!doc.has_transient_edits());
     assert_eq!(doc.transient_range(), None);
+}
+
+// ── The recorded document ───────────────────────────────────────
+
+/// Every flow snapshot a view lays out from, with every session and with none: the document
+/// as it shows.
+fn snapshots(doc: &TextDocument) -> [FlowSnapshot; 3] {
+    [
+        doc.snapshot_flow_masked(&HighlightMask::all()),
+        doc.snapshot_flow_masked(&HighlightMask::none()),
+        doc.snapshot_flow_masked_no_paint(&HighlightMask::all()),
+    ]
+}
+
+/// The same snapshots, of the document as recorded.
+fn recorded_snapshots(doc: &TextDocument) -> [FlowSnapshot; 3] {
+    [
+        doc.snapshot_recorded_flow_masked(&HighlightMask::all()),
+        doc.snapshot_recorded_flow_masked(&HighlightMask::none()),
+        doc.snapshot_recorded_flow_masked_no_paint(&HighlightMask::all()),
+    ]
+}
+
+/// A document of three paragraphs, the second formatted, and a table.
+fn structured_doc() -> TextDocument {
+    let doc = doc("first line\nsecond line\nthird line");
+    let second = doc.blocks()[1].position();
+    let cursor = doc.cursor();
+    select(&cursor, second, second + 6);
+    cursor
+        .set_char_format(&TextFormat {
+            font_bold: Some(true),
+            ..Default::default()
+        })
+        .unwrap();
+    let end = end_of(&doc);
+    let table = doc.cursor_at(end).insert_table(1, 2).unwrap();
+    let cell = table.cell(0, 1).unwrap().blocks()[0].position();
+    doc.cursor_at(cell).insert_text("cell").unwrap();
+    doc.clear_undo_redo();
+    doc
+}
+
+#[test]
+fn with_nothing_outstanding_the_recorded_document_is_the_document() {
+    let doc = structured_doc();
+    assert_eq!(recorded_snapshots(&doc), snapshots(&doc));
+    for position in 0..=end_of(&doc) {
+        assert_eq!(
+            doc.snapshot_recorded_block_at_position_masked(position, &HighlightMask::all()),
+            doc.snapshot_block_at_position_masked(position, &HighlightMask::all()),
+            "the block at {position}"
+        );
+        assert_eq!(doc.position_from_recorded(position), position);
+        assert_eq!(doc.recorded_position(position), position);
+    }
+    let cursor = doc.cursor();
+    select(&cursor, 3, 14);
+    assert_eq!(cursor.recorded_position(), 14);
+    assert_eq!(cursor.recorded_anchor(), 3);
+}
+
+#[test]
+fn the_recorded_document_is_the_one_before_the_transient_edits() {
+    let doc = structured_doc();
+    let before = snapshots(&doc);
+    let blocks_before: Vec<_> = (0..=end_of(&doc))
+        .map(|position| doc.snapshot_block_at_position_masked(position, &HighlightMask::all()))
+        .collect();
+
+    // A composition in the formatted paragraph, a removal in the last one, and a
+    // composition in a table cell.
+    let ime = doc.cursor_at(doc.blocks()[1].position() + 3);
+    compose(&doc, &ime, &["n", "ni", "nihao"]);
+    let third = doc.blocks()[2].position();
+    select(&ime, third, third + 5);
+    ime.remove_selected_text_transient().unwrap();
+    let cell = doc.blocks().last().unwrap().position();
+    doc.cursor_at(cell).insert_text_transient("韓").unwrap();
+
+    assert_ne!(
+        snapshots(&doc),
+        before,
+        "the document shows its transient edits"
+    );
+    assert_eq!(recorded_snapshots(&doc), before);
+    let end = blocks_before.len() - 1;
+    for (position, block) in blocks_before.iter().enumerate() {
+        assert_eq!(
+            &doc.snapshot_recorded_block_at_position_masked(position, &HighlightMask::all()),
+            block,
+            "the block at {position} of {end}"
+        );
+    }
+
+    doc.revert_transient_edits();
+    assert_eq!(snapshots(&doc), before);
+    assert_eq!(recorded_snapshots(&doc), before);
+}
+
+#[test]
+fn reading_the_recorded_document_leaves_the_document_as_it_is() {
+    let doc = doc("hello world");
+    let ime = doc.cursor_at(5);
+    compose(&doc, &ime, &["XYZ"]);
+    let shown = snapshots(&doc);
+    let range = doc.transient_range();
+
+    let _ = recorded_snapshots(&doc);
+    let _ = doc.snapshot_recorded_block_at_position_masked(5, &HighlightMask::all());
+    assert_eq!(snapshots(&doc), shown);
+    assert_eq!(text(&doc), "helloXYZ world");
+    assert_eq!(doc.transient_range(), range);
+
+    // The document's own store and history are the ones that go on: the commit records,
+    // and an undo takes it back.
+    ime.commit_transient_text(",").unwrap();
+    assert_eq!(text(&doc), "hello, world");
+    doc.undo().unwrap();
+    assert_eq!(text(&doc), "hello world");
+    assert!(!doc.can_undo());
+}
+
+#[test]
+fn a_view_of_the_recorded_document_agrees_once_the_composition_ends() {
+    for commit in [true, false] {
+        let doc = doc("hello world");
+        let ime = doc.cursor_at(5);
+        compose(&doc, &ime, &["n", "ni"]);
+        assert_ne!(
+            doc.snapshot_recorded_flow_masked(&HighlightMask::none()),
+            doc.snapshot_flow_masked(&HighlightMask::none())
+        );
+        if commit {
+            ime.commit_transient_text("你").unwrap();
+            assert_eq!(text(&doc), "hello你 world");
+        } else {
+            doc.revert_transient_edits();
+            assert_eq!(text(&doc), "hello world");
+        }
+        assert_eq!(recorded_snapshots(&doc), snapshots(&doc));
+    }
+}
+
+#[test]
+fn a_hosts_highlight_ranges_land_on_the_recorded_text_they_mark() {
+    use text_document::{HighlightFormat, RangeHighlight};
+
+    let doc = doc("hello world");
+    let ime = doc.cursor_at(2);
+    compose(&doc, &ime, &["XYZ"]);
+    // A find session the host ran over the text as it shows: "world", and the composition.
+    let find = doc.add_range_session();
+    let mark = |start: usize, length: usize| RangeHighlight {
+        start,
+        length,
+        format: HighlightFormat {
+            background_color: Some(text_document::Color::rgb(255, 255, 0)),
+            ..Default::default()
+        },
+    };
+    doc.set_session_ranges(find, vec![mark(2, 3), mark(9, 5)]);
+    let painted = |block: Option<text_document::BlockSnapshot>| -> Vec<(usize, usize)> {
+        block
+            .expect("the block is there")
+            .paint_highlights
+            .iter()
+            .map(|span| (span.start, span.length))
+            .collect()
+    };
+    let shown = painted(doc.snapshot_block_at_position_masked(0, &HighlightMask::all()));
+    assert_eq!(shown, [(2, 3), (9, 5)]);
+    let recorded =
+        painted(doc.snapshot_recorded_block_at_position_masked(0, &HighlightMask::all()));
+    assert_eq!(
+        recorded,
+        [(6, 5)],
+        "\"world\", and nothing for the composition"
+    );
+}
+
+#[test]
+fn a_syntax_highlighters_spans_land_on_the_recorded_text_they_mark() {
+    /// Marks every "world" in bold, a metric highlight, merged into the fragments.
+    struct Worlds;
+    impl SyntaxHighlighter for Worlds {
+        fn highlight_block(&self, text: &str, ctx: &mut HighlightContext) {
+            for (at, _) in text.match_indices("world") {
+                let start = text[..at].chars().count();
+                ctx.set_format(
+                    start,
+                    5,
+                    text_document::HighlightFormat {
+                        font_bold: Some(true),
+                        ..Default::default()
+                    },
+                );
+            }
+        }
+    }
+    let bold_text = |block: Option<text_document::BlockSnapshot>| -> Vec<String> {
+        block
+            .expect("the block is there")
+            .fragments
+            .iter()
+            .filter_map(|fragment| match fragment {
+                text_document::FragmentContent::Text { text, format, .. }
+                    if format.font_bold == Some(true) =>
+                {
+                    Some(text.clone())
+                }
+                _ => None,
+            })
+            .collect()
+    };
+    let doc = doc("hello world");
+    doc.set_syntax_highlighter(Some(Arc::new(Worlds)));
+    let before = doc.snapshot_block_at_position_masked(0, &HighlightMask::all());
+    compose(&doc, &doc.cursor_at(2), &["XYZ"]);
+    let shown = doc.snapshot_block_at_position_masked(0, &HighlightMask::all());
+    assert_eq!(bold_text(shown), ["world"]);
+    let recorded = doc.snapshot_recorded_block_at_position_masked(0, &HighlightMask::all());
+    assert_eq!(bold_text(recorded.clone()), ["world"]);
+    assert_eq!(recorded, before);
+}
+
+#[test]
+fn a_cursor_shows_in_the_recorded_document_where_a_revert_puts_it() {
+    let doc = doc("hello world");
+    let preview = doc.cursor();
+    select(&preview, 6, 11);
+    let ime = doc.cursor_at(2);
+    compose(&doc, &ime, &["XYZ"]);
+    assert_eq!((preview.anchor(), preview.position()), (9, 14));
+    assert_eq!(
+        (preview.recorded_anchor(), preview.recorded_position()),
+        (6, 11)
+    );
+    assert_eq!(ime.position(), 5);
+    assert_eq!(ime.recorded_position(), 2);
+
+    // Any other position of the document shows where a revert would put a caret.
+    assert_eq!(doc.recorded_position(1), 1);
+    assert_eq!(doc.recorded_position(4), 2);
+    assert_eq!(doc.recorded_position(9), 6);
+
+    // A position read off the recorded document goes where the transient edits moved it.
+    assert_eq!(doc.position_from_recorded(1), 1);
+    assert_eq!(doc.position_from_recorded(8), 11);
+    let clicked = doc.cursor_at(doc.position_from_recorded(8));
+    assert_eq!(clicked.recorded_position(), 8);
+
+    doc.revert_transient_edits();
+    assert_eq!((preview.anchor(), preview.position()), (6, 11));
+    assert_eq!(ime.position(), 2);
+    assert_eq!(clicked.position(), 8);
 }
 
 // ── Properties ──────────────────────────────────────────────────
@@ -1564,6 +1852,8 @@ proptest! {
                 (rider, stood)
             })
             .collect();
+        let before = snapshots(&doc);
+        let recorded_end = end_of(&doc);
 
         for edit in &edits {
             match edit {
@@ -1579,7 +1869,48 @@ proptest! {
             prop_assert!(doc.can_undo() == (depth.0 > 0));
         }
 
+        // The recorded document, and where each cursor shows in it, are what the revert
+        // gives back; so is a position read off it, outside the text the edits changed.
+        prop_assert_eq!(recorded_snapshots(&doc), before.clone());
+        let shown: Vec<(usize, usize)> = riders
+            .iter()
+            .map(|(rider, _)| rider)
+            .chain([&cursor])
+            .map(|c| (c.recorded_position(), c.recorded_anchor()))
+            .collect();
+        let probes: Vec<_> = match doc.transient_range() {
+            Some(range) => {
+                let grown = end_of(&doc) as isize - recorded_end as isize;
+                let changed_end = (range.end as isize - grown) as usize;
+                (0..=recorded_end)
+                    .filter(|p| *p < range.start || *p > changed_end)
+                    .map(|p| (p, doc.cursor_at(doc.position_from_recorded(p))))
+                    .collect()
+            }
+            None => Vec::new(),
+        };
+        for (p, probe) in &probes {
+            prop_assert_eq!(probe.recorded_position(), *p);
+        }
+        let carets: Vec<_> = (0..=end_of(&doc))
+            .map(|p| (doc.recorded_position(p), doc.cursor_at(p)))
+            .collect();
+
         doc.revert_transient_edits();
+        prop_assert_eq!(snapshots(&doc), before);
+        let back: Vec<(usize, usize)> = riders
+            .iter()
+            .map(|(rider, _)| rider)
+            .chain([&cursor])
+            .map(|c| (c.position(), c.anchor()))
+            .collect();
+        prop_assert_eq!(back, shown);
+        for (p, probe) in &probes {
+            prop_assert_eq!(probe.position(), *p);
+        }
+        for (shown, caret) in &carets {
+            prop_assert_eq!(caret.position(), *shown);
+        }
         prop_assert!(!doc.has_transient_edits());
         prop_assert_eq!(block_texts(&doc), texts);
         let back: Vec<usize> = doc.blocks().iter().map(|block| block.id()).collect();

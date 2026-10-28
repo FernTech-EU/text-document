@@ -1259,7 +1259,28 @@ pub(crate) fn merged_spans_for_block(
         match &s.body {
             SessionBody::Syntax(syn) => {
                 if let Some(bd) = syn.blocks.get(&block_id) {
-                    out.extend(bd.spans.iter().cloned());
+                    match inner.recorded_reading() {
+                        None => out.extend(bd.spans.iter().cloned()),
+                        // Made for the paragraph as it shows: each span moved back to the
+                        // recorded text it marks, as a revert moves a range.
+                        Some(layer) => {
+                            let (abs_start, _) =
+                                *geom.get_or_insert_with(|| block_geometry(inner, block_id));
+                            let shown_start = layer.map_position_forward(abs_start);
+                            for span in &bd.spans {
+                                let start = shown_start.saturating_add(span.start);
+                                let end = start.saturating_add(span.length);
+                                let (start, end) = layer.map_range_back(start, end);
+                                if start < end && start >= abs_start {
+                                    out.push(HighlightSpan {
+                                        start: start - abs_start,
+                                        length: end - start,
+                                        format: span.format.clone(),
+                                    });
+                                }
+                            }
+                        }
+                    }
                 }
             }
             SessionBody::Range(r) => {
@@ -1276,8 +1297,15 @@ pub(crate) fn merged_spans_for_block(
                     // Saturating: a range session's offsets come from the host (an externally
                     // driven spell-checker included), so a wild `start + length` must clamp, not
                     // overflow-panic in debug / wrap in release.
-                    let lo = rng.start.max(abs_start);
-                    let hi = rng.start.saturating_add(rng.length).min(block_end);
+                    let (start, end) = (rng.start, rng.start.saturating_add(rng.length));
+                    // The host set its ranges in the document as it shows; a snapshot of the
+                    // document as recorded slices them where a revert would move them.
+                    let (start, end) = match inner.recorded_reading() {
+                        Some(layer) => layer.map_range_back(start, end),
+                        None => (start, end),
+                    };
+                    let lo = start.max(abs_start);
+                    let hi = end.min(block_end);
                     if lo < hi {
                         out.push(HighlightSpan {
                             start: lo - abs_start,

@@ -180,9 +180,25 @@ fn map_back_through(splices: &[Splice], position: usize, end: RangeEnd) -> usize
         .fold(position, |p, splice| unsplice(p, *splice, end))
 }
 
+/// Which layer of transient edits a document holds (see
+/// [`TextDocument::transient_layer`]): the same for as long as they are outstanding, and
+/// another once they have ended and new ones begin, in this document or any other.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct TransientLayerId(u64);
+
+impl TransientLayerId {
+    /// A layer no other has been or will be, in this process.
+    fn next() -> Self {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        TransientLayerId(NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
+    }
+}
+
 /// The outstanding transient edits (see the module documentation).
 #[derive(Debug)]
 pub(crate) struct TransientLayer {
+    /// Which layer this is, for a view that has to tell its own from another's.
+    id: TransientLayerId,
     /// Every change of positions the layer made, in order, as each edit made it: what a
     /// panicking edit announces, and how an edit is seen to have changed anything.
     steps: Vec<Splice>,
@@ -217,6 +233,7 @@ impl TransientLayer {
             })
             .collect();
         TransientLayer {
+            id: TransientLayerId::next(),
             steps: Vec::new(),
             splices: Vec::new(),
             span: None,
@@ -283,6 +300,26 @@ impl TransientLayer {
         self.riders
             .iter()
             .find(|rider| Weak::ptr_eq(&rider.cursor, cursor) && rider.expected == now)
+    }
+
+    /// The range `[start, end)`, read in the document as it shows, in the recorded document,
+    /// as [`Reverted::map_range`] moves it back once the layer is reverted.
+    pub(crate) fn map_range_back(&self, start: usize, end: usize) -> (usize, usize) {
+        map_range_through(&self.splices, start, end)
+    }
+
+    /// [`map_forward`](Self::map_forward), for a reader of the recorded document that has to
+    /// find where one of its positions shows.
+    pub(crate) fn map_position_forward(&self, recorded: usize) -> usize {
+        self.map_forward(recorded)
+    }
+
+    /// `recorded`, a position in the document as recorded, in the document as it is: moved
+    /// across every change the layer made, as each moved every cursor.
+    fn map_forward(&self, recorded: usize) -> usize {
+        self.splices.iter().fold(recorded, |position, splice| {
+            adjust_offset(position, splice.at, splice.removed, splice.added)
+        })
     }
 }
 
@@ -470,6 +507,59 @@ impl TextDocumentInner {
             self.check_block_count_changed();
             self.check_flow_changed();
         }
+    }
+
+    /// Run `read` over the document as recorded: as it is when no transient edits are
+    /// outstanding, and otherwise over a store of its own holding the content a revert would
+    /// put back (`RopeStore::recorded_snapshot`), which nothing else sees.
+    ///
+    /// Only the context `read` is handed changes, for as long as it runs: the document's own
+    /// store, which an export running on another thread may be reading, keeps the transient
+    /// edits. `read` must only read through the context, as the snapshot builders do: the
+    /// caches beside it (the plain text, the highlights) were made from the document as it
+    /// is. The one of them a snapshot reads by position, a host's highlight ranges, is moved
+    /// back across the transient edits where it is sliced to a block (see
+    /// [`recorded_reading`](Self::recorded_reading)).
+    pub(crate) fn read_recorded<R>(&mut self, read: impl FnOnce(&TextDocumentInner) -> R) -> R {
+        let recorded = self
+            .transient
+            .as_ref()
+            .and_then(|_| self.ctx.db_context.get_store().recorded_snapshot());
+        let Some(recorded) = recorded else {
+            return read(self);
+        };
+        let mut ctx = self.ctx.clone();
+        ctx.db_context =
+            common::database::db_context::DbContext::new().expect("an empty store is always made");
+        ctx.db_context.get_store().restore(&recorded);
+        let live = std::mem::replace(&mut self.ctx, ctx);
+        self.reading_recorded = true;
+        // Puts the document's own context back however `read` ends, a panic included: left
+        // in place, the recorded one would take the document's next writes.
+        struct Restore<'a> {
+            inner: &'a mut TextDocumentInner,
+            live: Option<frontend::AppContext>,
+        }
+        impl Drop for Restore<'_> {
+            fn drop(&mut self) {
+                if let Some(live) = self.live.take() {
+                    self.inner.ctx = live;
+                }
+                self.inner.reading_recorded = false;
+            }
+        }
+        let restore = Restore {
+            inner: self,
+            live: Some(live),
+        };
+        read(restore.inner)
+    }
+
+    /// The outstanding transient edits, while the document is read as recorded (inside
+    /// [`read_recorded`](Self::read_recorded)): what a position of the document as it shows,
+    /// kept beside the store, is moved back across. `None` otherwise.
+    pub(crate) fn recorded_reading(&self) -> Option<&TransientLayer> {
+        self.transient.as_ref().filter(|_| self.reading_recorded)
     }
 
     /// Whether a load in place this document started is still writing its content.
@@ -756,6 +846,33 @@ impl TextCursor {
             }
         }
     }
+
+    /// Where the cursor's position is in the document as recorded: where
+    /// [`TextDocument::revert_transient_edits`] would put it. Its
+    /// [`position`](Self::position) when no transient edits are outstanding.
+    ///
+    /// For a view that shows the recorded document
+    /// ([`TextDocument::snapshot_recorded_flow_masked`]) to draw this cursor on the text it
+    /// shows. Read with [`recorded_anchor`](Self::recorded_anchor), a selection holds the
+    /// same recorded text the revert leaves it holding.
+    pub fn recorded_position(&self) -> usize {
+        self.recorded_stand().position
+    }
+
+    /// Where the cursor's anchor is in the document as recorded, as
+    /// [`recorded_position`](Self::recorded_position) says of its position.
+    pub fn recorded_anchor(&self) -> usize {
+        self.recorded_stand().anchor
+    }
+
+    fn recorded_stand(&self) -> Stand {
+        let inner = self.doc.lock();
+        let now = Stand::of(&self.data.lock());
+        match inner.transient.as_ref() {
+            Some(layer) => layer.stand_after_revert(&Arc::downgrade(&self.data), now),
+            None => now,
+        }
+    }
 }
 
 impl TextDocument {
@@ -769,6 +886,19 @@ impl TextDocument {
     /// hold, which a revert takes away.
     pub fn has_transient_edits(&self) -> bool {
         self.inner.lock().transient.is_some()
+    }
+
+    /// Which layer of transient edits is outstanding, `None` when none is: the same from the
+    /// first transient edit to the end of the layer, and another for the next one.
+    ///
+    /// For a view that shows only the transient edits it made (an input method's
+    /// composition belongs to the view the writer types in): it notes the layer its edit
+    /// began or joined, and the layer is its own while this still names it. A recorded
+    /// write that reverts the composition, and transient edits someone else makes after it,
+    /// make another layer, which [`has_transient_edits`](Self::has_transient_edits) alone
+    /// cannot tell from the view's own.
+    pub fn transient_layer(&self) -> Option<TransientLayerId> {
+        self.inner.lock().transient.as_ref().map(|layer| layer.id)
     }
 
     /// Where the outstanding transient edits are, in the document as it is: the smallest
@@ -806,6 +936,97 @@ impl TextDocument {
         };
         crate::inner::dispatch_queued_events(queued);
         true
+    }
+
+    /// Snapshot the main flow as [`snapshot_flow_masked`](Self::snapshot_flow_masked) does,
+    /// of the document **as recorded**: without the outstanding transient edits, as a revert
+    /// would leave it. The same snapshot as `snapshot_flow_masked` when none are outstanding,
+    /// at the same cost.
+    ///
+    /// For a view of the document that is not where the transient edits are made: a
+    /// read-only preview beside the editor an input method composes in shows the text the
+    /// writer has entered, not the composition. Its positions are those of the recorded
+    /// document: show a cursor in it at [`TextCursor::recorded_position`] and
+    /// [`TextCursor::recorded_anchor`], and map a position read off it into the document
+    /// with [`position_from_recorded`](Self::position_from_recorded).
+    ///
+    /// The highlights are the document's own, made for the text as it shows: the ranges a
+    /// host set ([`set_session_ranges`](Self::set_session_ranges)) and a syntax highlighter's
+    /// spans. Each is moved back as a revert moves a range, so it lands on the recorded text
+    /// it marks, and one that marked only transient text marks nothing. Within a paragraph
+    /// the transient edits changed, the highlighter's spans are still the ones it found in
+    /// the text with them (a keyword the composition splits stays split) until they end.
+    pub fn snapshot_recorded_flow_masked(
+        &self,
+        mask: &crate::highlight::HighlightMask,
+    ) -> crate::flow::FlowSnapshot {
+        self.inner
+            .lock()
+            .read_recorded(|inner| crate::document::flow_snapshot_of(inner, mask, false))
+    }
+
+    /// [`snapshot_recorded_flow_masked`](Self::snapshot_recorded_flow_masked) without the
+    /// paint-only overlay, as [`snapshot_flow_masked_no_paint`](Self::snapshot_flow_masked_no_paint)
+    /// is to [`snapshot_flow_masked`](Self::snapshot_flow_masked): the accessibility tree of a
+    /// view that shows the recorded document.
+    pub fn snapshot_recorded_flow_masked_no_paint(
+        &self,
+        mask: &crate::highlight::HighlightMask,
+    ) -> crate::flow::FlowSnapshot {
+        self.inner
+            .lock()
+            .read_recorded(|inner| crate::document::flow_snapshot_of(inner, mask, true))
+    }
+
+    /// The block at `position` in the document as recorded, snapshot as
+    /// [`snapshot_block_at_position_masked`](Self::snapshot_block_at_position_masked) does:
+    /// the incremental relayout of a view that shows the recorded document (see
+    /// [`snapshot_recorded_flow_masked`](Self::snapshot_recorded_flow_masked)). `position`
+    /// is one of the recorded document's.
+    pub fn snapshot_recorded_block_at_position_masked(
+        &self,
+        position: usize,
+        mask: &crate::highlight::HighlightMask,
+    ) -> Option<crate::flow::BlockSnapshot> {
+        self.inner
+            .lock()
+            .read_recorded(|inner| crate::document::block_snapshot_at(inner, position, mask))
+    }
+
+    /// Where `position`, a position in the document as it is, is in the document as
+    /// recorded: where a revert would put a caret standing there (see the
+    /// [module documentation](crate::transient#positions)). Itself when no transient edits
+    /// are outstanding.
+    ///
+    /// For one position a view that shows the recorded document (see
+    /// [`snapshot_recorded_flow_masked`](Self::snapshot_recorded_flow_masked)) has to place
+    /// on the text it shows. A cursor's own ends are read with
+    /// [`TextCursor::recorded_position`] and [`TextCursor::recorded_anchor`] instead: its
+    /// selection is moved back as a whole, and a cursor that only the transient edits moved
+    /// goes back where it stood, which at a place where text was only removed is before the
+    /// text put back, where this puts a caret after it.
+    pub fn recorded_position(&self, position: usize) -> usize {
+        match self.inner.lock().transient.as_ref() {
+            Some(layer) => map_back_through(&layer.splices, position, RangeEnd::Start),
+            None => position,
+        }
+    }
+
+    /// Where `recorded`, a position in the document as recorded, is in the document as it
+    /// is: moved across the outstanding transient edits as they moved every cursor. Itself
+    /// when none are outstanding.
+    ///
+    /// What a view that shows the recorded document (see
+    /// [`snapshot_recorded_flow_masked`](Self::snapshot_recorded_flow_masked)) puts a cursor
+    /// at, for a position it reads off its own layout: a click, an assistive technology's
+    /// selection. Outside the text the transient edits changed, the cursor's
+    /// [`recorded_position`](TextCursor::recorded_position) is then `recorded` again; at
+    /// that text's edge or inside it, the cursor lands at its edge.
+    pub fn position_from_recorded(&self, recorded: usize) -> usize {
+        match self.inner.lock().transient.as_ref() {
+            Some(layer) => layer.map_forward(recorded),
+            None => recorded,
+        }
     }
 }
 
@@ -901,6 +1122,7 @@ mod tests {
             (2, 3),
             "the candidate is the syllable"
         );
+        assert_eq!(layer.map_forward(3), 3);
     }
 
     #[test]

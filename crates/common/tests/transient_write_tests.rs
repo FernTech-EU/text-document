@@ -133,6 +133,44 @@ fn a_revert_keeps_the_host_footnote_markers() {
     );
 }
 
+#[test]
+fn the_recorded_snapshot_reads_as_the_store_will_once_reverted() {
+    let db = DbContext::new().unwrap();
+    write_text(&db, "abc");
+    let store = db.get_store();
+    assert!(store.recorded_snapshot().is_none());
+
+    store.begin_transient_write().unwrap().keep();
+    write_text(&db, "abcnihao");
+    // Markers set while transient edits are outstanding are the host's: a revert keeps
+    // them, and so does the recorded content.
+    store
+        .footnote_markers
+        .write()
+        .insert("note".into(), "7".into());
+    let recorded = store
+        .recorded_snapshot()
+        .expect("transient edits are outstanding");
+    assert_eq!(text(&db), "abcnihao", "the store itself is left as it is");
+
+    let reader = DbContext::new().unwrap();
+    reader.get_store().restore(&recorded);
+    assert_eq!(text(&reader), "abc");
+    assert_eq!(
+        reader
+            .get_store()
+            .footnote_markers
+            .read()
+            .get("note")
+            .map(String::as_str),
+        Some("7")
+    );
+
+    store.revert_transient_edits().unwrap();
+    assert_eq!(text(&db), text(&reader));
+    assert!(store.recorded_snapshot().is_none());
+}
+
 // ── What the store refuses ──────────────────────────────────────
 
 #[test]

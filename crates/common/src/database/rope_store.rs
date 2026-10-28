@@ -332,6 +332,19 @@ impl RopeStore {
         self.transient.lock().base.is_some()
     }
 
+    /// The content as it is recorded, while transient edits are outstanding: what
+    /// [`revert_transient_edits`](Self::revert_transient_edits) would put back, with the
+    /// footnote markers as they are now, which a revert keeps. `None` while there are none.
+    ///
+    /// O(1), as every snapshot is. For a reader that has to show the recorded content while
+    /// the store holds transient edits over it: restored into a store of its own, it reads
+    /// as this store will once they are reverted.
+    pub fn recorded_snapshot(&self) -> Option<RopeStoreSnapshot> {
+        let mut recorded = self.transient.lock().base.clone()?;
+        recorded.footnote_markers = self.footnote_markers.read().clone();
+        Some(recorded)
+    }
+
     /// Put back the content the outstanding transient edits were made over, and end them.
     /// Returns whether there were any.
     ///

@@ -44,6 +44,7 @@ mod text_frame;
 mod text_list;
 mod text_table;
 pub mod transient;
+pub use transient::TransientLayerId;
 
 // ── Re-exports from entity DTOs (enums that consumers need) ──────
 pub use backend::DocumentBackend;
