@@ -564,9 +564,11 @@ impl UndoRedoCommand for InsertTextUseCase {
             return false;
         };
 
+        // The merged DTO keeps this command's selection: a redo replays the combined text
+        // over the selection the first keystroke replaced, as one edit. (`can_merge`
+        // refuses an `other` that replaces a selection of its own.)
         if let (Some(self_dto), Some(other_dto)) = (&mut self.last_dto, &other_cmd.last_dto) {
             self_dto.text.push_str(&other_dto.text);
-            self_dto.anchor = self_dto.position;
         }
         if let Some(other_result) = &other_cmd.last_result {
             self.last_result = Some(other_result.clone());
