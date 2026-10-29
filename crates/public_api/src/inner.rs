@@ -427,9 +427,14 @@ impl TextDocumentInner {
         }
     }
 
-    /// The cursor the edit that made entry `seq` was made with, if it is still alive.
-    pub(crate) fn edit_caret_cursor(&self, seq: Option<u64>) -> Option<Arc<Mutex<CursorData>>> {
-        self.edit_carets.get(&seq?)?.cursor.upgrade()
+    /// The cursor the edit that made entry `seq` was made with, if it is still alive, and
+    /// where the edit left it.
+    pub(crate) fn edit_caret_cursor(
+        &self,
+        seq: Option<u64>,
+    ) -> Option<(Arc<Mutex<CursorData>>, usize)> {
+        let caret = self.edit_carets.get(&seq?)?;
+        Some((caret.cursor.upgrade()?, caret.position))
     }
 
     /// After a redo of entry `seq`: the cursor its edit was made with back where the edit

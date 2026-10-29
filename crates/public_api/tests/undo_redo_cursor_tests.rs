@@ -353,3 +353,31 @@ fn an_undone_format_change_keeps_the_selection() {
     doc.undo().unwrap();
     assert_eq!(caret(&cursor), (4, 7));
 }
+
+#[test]
+fn an_undone_insertion_of_repeated_text_leaves_the_caret_where_it_was_put_in() {
+    let doc = self::doc("ab");
+    let cursor = doc.cursor_at(0);
+    cursor.insert_text("a").unwrap();
+    assert_eq!(text(&doc), "aab");
+    doc.undo().unwrap();
+    assert_eq!(text(&doc), "ab");
+    assert_eq!(caret(&cursor), (0, 0));
+
+    let doc = self::doc("hello");
+    let cursor = doc.cursor_at(0);
+    // A second cursor in the original word, after the copy is put in before it.
+    let in_the_word = doc.cursor_at(2);
+    cursor.insert_text("hello").unwrap();
+    assert_eq!(in_the_word.position(), 7);
+    doc.undo().unwrap();
+    assert_eq!(text(&doc), "hello");
+    assert_eq!(caret(&cursor), (0, 0), "the caret is where the copy was");
+    assert_eq!(
+        in_the_word.position(),
+        2,
+        "the other cursor stays in its word"
+    );
+    cursor.insert_text("X").unwrap();
+    assert_eq!(text(&doc), "Xhello");
+}

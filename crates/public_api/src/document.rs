@@ -1780,8 +1780,7 @@ impl TextDocument {
             let mut inner = self.inner.lock();
             let before = capture_block_state(&inner);
             let entry = undo_redo_commands::head_seq(&inner.ctx, Some(inner.stack_id));
-            let edited_with = inner.edit_caret_cursor(entry);
-            let near = edited_with.as_ref().map(|cursor| cursor.lock().position);
+            let (edited_with, left_at) = inner.edit_caret_cursor(entry).unzip();
             let stepped = undo_redo_commands::can_undo(&inner.ctx, Some(inner.stack_id));
             let result = undo_redo_commands::undo(&inner.ctx, Some(inner.stack_id));
             inner.invalidate_text_cache();
@@ -1810,7 +1809,7 @@ impl TextDocument {
             }
             result?;
             inner.rehighlight_all();
-            let changed_text_end = emit_content_change_events_near(&mut inner, &before, near);
+            let changed_text_end = emit_content_change_events_near(&mut inner, &before, left_at);
             if let (Some(cursor), Some(end)) = (edited_with, changed_text_end) {
                 let end =
                     crate::cursor::max_cursor_position_of(&inner).map_or(end, |max| end.min(max));
@@ -2569,35 +2568,36 @@ fn compute_text_edit(before: &str, after: &str) -> (usize, usize, usize) {
     (prefix_len, removed, added)
 }
 
-/// The edit `minimal` ([`compute_text_edit`] of `before` and `after`) moved as far back as
-/// `near` when it reads the same there: inside a run of repeated text, the same change can
-/// start at several places, and [`compute_text_edit`] takes the last. Otherwise `minimal`.
-fn compute_text_edit_near(
+/// The edit `minimal` ([`compute_text_edit`] of `before` and `after`) as an undo of an edit
+/// that left its cursor at `left_at` reads it: inside a run of repeated text the same
+/// change can start at several places, and [`compute_text_edit`] takes the last. Undoing
+/// the insertion of `a` before `ab`, `aab` becomes `ab` by removing either `a`; the one the
+/// edit put in ends where it left its cursor, at 1, and is the first. So the edit is moved
+/// back while it reads the same, to where what it removes ends at `left_at` (the cursor
+/// stood after what the edit put in, which the undo removes, and on the gap of what it took
+/// away, which the undo puts back). `minimal` when there is no such place.
+fn compute_text_edit_left_at(
     before: &str,
     after: &str,
     minimal: (usize, usize, usize),
-    near: usize,
+    left_at: usize,
 ) -> (usize, usize, usize) {
-    if near >= minimal.0 {
+    let (mut offset, removed, added) = minimal;
+    if offset + removed < left_at {
         return minimal;
     }
     let before_chars: Vec<char> = before.chars().collect();
     let after_chars: Vec<char> = after.chars().collect();
-    let before_remaining = before_chars.len() - near;
-    let after_remaining = after_chars.len() - near;
-    let suffix_len = before_chars
-        .iter()
-        .rev()
-        .zip(after_chars.iter().rev())
-        .take(before_remaining.min(after_remaining))
-        .take_while(|(a, b)| a == b)
-        .count();
-    let removed = before_remaining - suffix_len;
-    let added = after_remaining - suffix_len;
-    if (removed, added) == (minimal.1, minimal.2) {
-        (near, removed, added)
-    } else {
-        minimal
+    loop {
+        if offset + removed == left_at {
+            return (offset, removed, added);
+        }
+        // Moved back by one, the edit reads the same when the character it then leaves
+        // to the text after it is the same before and after the change.
+        if offset == 0 || before_chars[offset - 1 + removed] != after_chars[offset - 1 + added] {
+            return minimal;
+        }
+        offset -= 1;
     }
 }
 
@@ -2626,11 +2626,12 @@ pub(crate) fn emit_content_change_events(inner: &mut TextDocumentInner, before: 
 /// an undo leaves the cursor that made the edit (see [`TextDocument::undo`]). `None` when
 /// no text changed. Where the change sits inside a run of repeated text is ambiguous (a
 /// deletion of the first `a` of `aab` reads the same as one of the second), and is read
-/// nearest `near`, the cursor's position before the change.
+/// as the undo of an edit that left its cursor at `left_at` (see
+/// [`compute_text_edit_left_at`]): the event, the cursors and the end all take that place.
 fn emit_content_change_events_near(
     inner: &mut TextDocumentInner,
     before: &BlockStates,
-    near: Option<usize>,
+    left_at: Option<usize>,
 ) -> Option<usize> {
     let after = capture_block_state(inner);
     let (before_text, after_text) = (&before.text, &after.text);
@@ -2695,8 +2696,11 @@ fn emit_content_change_events_near(
     if content_changed {
         // Use a precise text-level diff for cursor adjustment so cursors land
         // at the actual edit point rather than the end of the affected block.
-        let (edit_offset, precise_removed, precise_added) =
-            compute_text_edit(before_text, after_text);
+        let minimal = compute_text_edit(before_text, after_text);
+        let (edit_offset, precise_removed, precise_added) = match left_at {
+            Some(left_at) => compute_text_edit_left_at(before_text, after_text, minimal, left_at),
+            None => minimal,
+        };
 
         // The event reports the blocks that changed when they hold the precise change, and
         // the precise change when they do not: the blocks leave out a table's anchor,
@@ -2722,18 +2726,7 @@ fn emit_content_change_events_near(
         };
         if precise_removed > 0 || precise_added > 0 {
             inner.adjust_cursors(edit_offset, precise_removed, precise_added);
-            changed_text_end = Some(match near {
-                Some(near) => {
-                    let (offset, _, added) = compute_text_edit_near(
-                        before_text,
-                        after_text,
-                        (edit_offset, precise_removed, precise_added),
-                        near,
-                    );
-                    offset + added
-                }
-                None => edit_offset + precise_added,
-            });
+            changed_text_end = Some(edit_offset + precise_added);
         }
 
         inner.queue_event(DocumentEvent::ContentsChanged {
