@@ -444,7 +444,10 @@ impl ExportMarkdownUseCase {
                             .unwrap_or_else(|| list_entity.start.unwrap_or(1)),
                     }
                     .clamp(0, MAX_MARKDOWN_LIST_NUMBER);
-                    (format!("{counter}. "), counter)
+                    // The delimiter the list wears: CommonMark has `.` and `)`, and a
+                    // list of another kind (or one stored with none) writes `.`.
+                    let delimiter = if list_entity.suffix == ")" { ')' } else { '.' };
+                    (format!("{counter}{delimiter} "), counter)
                 }
                 _ => ("- ".to_string(), 0),
             };

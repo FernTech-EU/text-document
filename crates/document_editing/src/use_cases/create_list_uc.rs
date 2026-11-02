@@ -11,6 +11,7 @@ use common::direct_access::document::document_repository::DocumentRelationshipFi
 use common::direct_access::root::root_repository::RootRelationshipField;
 use common::direct_access::table::TableRelationshipField;
 use common::entities::{Block, Document, Frame, List, Root, TableCell};
+use common::parser_tools::list_grouper::default_list_suffix;
 use common::snapshot::EntityTreeSnapshot;
 use common::types::{EntityId, ROOT_ENTITY_ID};
 use common::undo_redo::UndoRedoCommand;
@@ -207,7 +208,7 @@ fn execute_create_list(
             style: convert_list_style(&dto.style),
             indent: 0,
             prefix: String::new(),
-            suffix: String::new(),
+            suffix: default_list_suffix(&convert_list_style(&dto.style)).to_string(),
             start: None,
         };
         let created_list = uow.create_list(&list, doc_id, -1)?;

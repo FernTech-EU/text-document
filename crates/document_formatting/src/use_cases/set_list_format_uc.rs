@@ -3,6 +3,7 @@ use anyhow::{Result, anyhow};
 use common::database::CommandUnitOfWork;
 use common::direct_access::root::root_repository::RootRelationshipField;
 use common::entities::{Document, List, Root};
+use common::parser_tools::list_grouper::default_list_suffix;
 use common::snapshot::EntityTreeSnapshot;
 use common::types::{EntityId, ROOT_ENTITY_ID};
 use common::undo_redo::UndoRedoCommand;
@@ -34,6 +35,10 @@ fn style_to_entity(s: &crate::dtos::ListStyle) -> common::entities::ListStyle {
     }
 }
 
+fn is_ordered(style: &common::entities::ListStyle) -> bool {
+    !default_list_suffix(style).is_empty()
+}
+
 fn execute_set_list_format(
     uow: &mut Box<dyn SetListFormatUnitOfWorkTrait>,
     dto: &SetListFormatDto,
@@ -62,11 +67,22 @@ fn execute_set_list_format(
 
     // Set list format fields -- None means preserve existing value.
     let mut updated = list.clone();
+    // A style that turns a bullet list into a numbered one, or the reverse, takes the
+    // affixes of its new kind unless the caller names them: a numbered list's `.` or
+    // `(`..`)` left on a bullet would paint "•." and a bullet list given a number would
+    // paint it bare. A change between two numbered styles (or two bullets) keeps them.
+    let mut crossed_kind = false;
     if let Some(ref s) = dto.style {
-        updated.style = style_to_entity(s);
+        let style = style_to_entity(s);
+        crossed_kind = is_ordered(&updated.style) != is_ordered(&style);
+        updated.style = style;
     }
     if let Some(v) = dto.indent {
         updated.indent = v;
+    }
+    if crossed_kind {
+        updated.prefix = String::new();
+        updated.suffix = default_list_suffix(&updated.style).to_string();
     }
     if let Some(ref v) = dto.prefix {
         updated.prefix = v.clone();

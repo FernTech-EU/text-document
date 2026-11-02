@@ -12,11 +12,25 @@ pub struct ListGrouper {
     /// `prefix`/`suffix` are the ordered-list delimiter affixes (e.g. `"."`,
     /// `")"`, `"("`) so that two adjacent ordered lists with the same numbering
     /// but a different delimiter (djot `1.` vs `1)`) are kept as separate lists.
-    /// They are always empty for Markdown/HTML, which don't model delimiters.
+    /// Markdown keeps the `.` or `)` its source wore; HTML and the editor's own
+    /// lists wear [`default_list_suffix`].
     /// `start` is the number the list's first item wears when it is not 1: every
     /// item of a parsed list carries its list's start, so two lists the parser
     /// read apart that start at different numbers stay apart.
     active: Vec<Option<ActiveList>>,
+}
+
+/// The delimiter a list of `style` is given when nothing says which one it wears:
+/// `"."` for every ordered style (`1.`, `a.`, `I.`), nothing for a bullet.
+pub fn default_list_suffix(style: &ListStyle) -> &'static str {
+    match style {
+        ListStyle::Decimal
+        | ListStyle::LowerAlpha
+        | ListStyle::UpperAlpha
+        | ListStyle::LowerRoman
+        | ListStyle::UpperRoman => ".",
+        ListStyle::Disc | ListStyle::Circle | ListStyle::Square => "",
+    }
 }
 
 type ActiveList = (EntityId, ListStyle, String, String, Option<i64>);

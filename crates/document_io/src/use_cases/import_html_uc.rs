@@ -377,8 +377,8 @@ impl LongOperation for ImportHtmlUseCase {
                         let list_id = if let Some(existing_id) = list_grouper.try_reuse_list(
                             list_style,
                             parsed_block.list_indent,
-                            "",
-                            "",
+                            &parsed_block.list_prefix,
+                            &parsed_block.list_suffix,
                             parsed_block.list_start,
                         ) {
                             existing_id
@@ -386,6 +386,8 @@ impl LongOperation for ImportHtmlUseCase {
                             let list = List {
                                 style: list_style.clone(),
                                 indent: parsed_block.list_indent as i64,
+                                prefix: parsed_block.list_prefix.clone(),
+                                suffix: parsed_block.list_suffix.clone(),
                                 start: parsed_block.list_start,
                                 ..List::default()
                             };
@@ -395,8 +397,8 @@ impl LongOperation for ImportHtmlUseCase {
                                 created_list.id,
                                 list_style.clone(),
                                 parsed_block.list_indent,
-                                String::new(),
-                                String::new(),
+                                parsed_block.list_prefix.clone(),
+                                parsed_block.list_suffix.clone(),
                                 parsed_block.list_start,
                             );
                             created_list.id

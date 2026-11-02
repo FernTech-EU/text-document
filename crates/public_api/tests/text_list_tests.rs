@@ -763,13 +763,13 @@ fn a_roman_marker_past_3999_is_written_in_digits() {
 #[test]
 fn an_html_list_start_is_read_as_a_browser_reads_it() {
     for (start, marker) in [
-        (" 5x", "5"),
-        ("+7", "7"),
-        ("12.5", "12"),
-        ("1e3", "1"),
-        ("-3", "1"),
-        ("x5", "1"),
-        ("", "1"),
+        (" 5x", "5."),
+        ("+7", "7."),
+        ("12.5", "12."),
+        ("1e3", "1."),
+        ("-3", "1."),
+        ("x5", "1."),
+        ("", "1."),
     ] {
         let doc = TextDocument::new();
         doc.set_html(&format!("<ol start=\"{start}\"><li>a</li></ol>"))

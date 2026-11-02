@@ -210,8 +210,8 @@ fn assign_list(
     let list_id = match list_grouper.try_reuse_list(
         list_style,
         parsed.list_indent,
-        "",
-        "",
+        &parsed.list_prefix,
+        &parsed.list_suffix,
         parsed.list_start,
     ) {
         Some(existing_id) => existing_id,
@@ -219,6 +219,8 @@ fn assign_list(
             let list = List {
                 style: list_style.clone(),
                 indent: parsed.list_indent as i64,
+                prefix: parsed.list_prefix.clone(),
+                suffix: parsed.list_suffix.clone(),
                 start: parsed.list_start,
                 ..List::default()
             };
@@ -228,8 +230,8 @@ fn assign_list(
                 created_list.id,
                 list_style.clone(),
                 parsed.list_indent,
-                String::new(),
-                String::new(),
+                parsed.list_prefix.clone(),
+                parsed.list_suffix.clone(),
                 parsed.list_start,
             );
             created_list.id

@@ -1,5 +1,6 @@
 use crate::entities::{Alignment, ListStyle, MarkerType, SemanticRole, TextDirection};
 use crate::parser_tools::djot_options::DjotImportOptions;
+use crate::parser_tools::list_grouper::default_list_suffix;
 
 /// An inline image recovered by a parser, before it becomes an `ImageAnchor`.
 ///
@@ -264,7 +265,9 @@ pub struct ParsedBlock {
     /// otherwise). Stored on the `List` entity for round-trip fidelity.
     pub list_prefix: String,
     /// Ordered-list delimiter suffix (`"."` for `1.`, `")"` for `1)`/`(1)`;
-    /// empty for unordered lists).
+    /// empty for unordered lists). Markdown reads it from the source, Djot from
+    /// its list style, and HTML gives an ordered list
+    /// [`default_list_suffix`](crate::parser_tools::list_grouper::default_list_suffix).
     pub list_suffix: String,
     /// The number the first item of the list this item belongs to wears, when it is not 1
     /// (Djot and Markdown `3.`, HTML `<ol start="3">`). Every item of a list carries it.
@@ -396,6 +399,29 @@ fn dangling_footnote_labels(
     referenced.difference(&defined).cloned().collect()
 }
 
+/// The delimiter the ordered list that opens at byte `start` of `source` wears: `")"` for
+/// `1)`, `"."` for `1.`.
+///
+/// pulldown-cmark reports a list as `Tag::List(Some(first))` and says nothing of the
+/// delimiter, but the range of that event starts at the first item's marker (or at the
+/// indentation before it, or after the `> ` of a quotation it stands in), never inside the
+/// item's content. So the line is read from `start`: blanks and `>` are skipped, then the
+/// digits, and the character after them is the delimiter. Anything else reads as `"."`,
+/// the delimiter CommonMark gives an ordered list by default.
+fn markdown_ordered_suffix(source: &str, start: usize) -> &'static str {
+    let Some(rest) = source.get(start..) else {
+        return ".";
+    };
+    let line = rest.split('\n').next().unwrap_or("");
+    let after_blanks = line.trim_start_matches([' ', '\t', '>']);
+    let after_digits = after_blanks.trim_start_matches(|c: char| c.is_ascii_digit());
+    if after_digits.starts_with(')') {
+        ")"
+    } else {
+        "."
+    }
+}
+
 /// Read `markdown` into blocks and tables.
 ///
 /// The parser reads nested containers without recursing, whatever their depth. The
@@ -442,13 +468,14 @@ pub fn parse_markdown(markdown: &str) -> Vec<ParsedElement> {
             });
         &augmented_owner
     };
-    let parser = Parser::new_ext(source, options);
+    let parser = Parser::new_ext(source, options).into_offset_iter();
 
     let mut elements: Vec<ParsedElement> = Vec::new();
     let mut current_spans: Vec<ParsedSpan> = Vec::new();
     let mut current_heading: Option<i64> = None;
     let mut current_list_style: Option<ListStyle> = None;
     let mut current_list_start: Option<i64> = None;
+    let mut current_list_suffix = String::new();
     let mut is_code_block = false;
     let mut code_language: Option<String> = None;
     let mut blockquote_depth: u32 = 0;
@@ -476,6 +503,8 @@ pub fn parse_markdown(markdown: &str) -> Vec<ParsedElement> {
     // of those lists beside it.
     let mut list_stack: Vec<Option<ListStyle>> = Vec::new();
     let mut list_start_stack: Vec<Option<i64>> = Vec::new();
+    // The delimiter each of those lists wears (`"."` or `")"`; empty for a bullet list).
+    let mut list_suffix_stack: Vec<String> = Vec::new();
     let mut current_list_indent: u32 = 0;
 
     // Table tracking state
@@ -486,7 +515,7 @@ pub fn parse_markdown(markdown: &str) -> Vec<ParsedElement> {
     let mut current_cell_spans: Vec<ParsedSpan> = Vec::new();
     let mut table_header_rows: usize = 0;
 
-    for event in parser {
+    for (event, range) in parser {
         match event {
             Event::Start(Tag::Paragraph) => {
                 in_block = true;
@@ -501,7 +530,7 @@ pub fn parse_markdown(markdown: &str) -> Vec<ParsedElement> {
                         list_style: current_list_style.clone(),
                         list_indent: current_list_indent,
                         list_prefix: String::new(),
-                        list_suffix: String::new(),
+                        list_suffix: current_list_suffix.clone(),
                         list_start: current_list_start,
                         marker: None,
                         is_code_block: false,
@@ -523,6 +552,7 @@ pub fn parse_markdown(markdown: &str) -> Vec<ParsedElement> {
                 in_block = false;
                 current_list_style = None;
                 current_list_start = None;
+                current_list_suffix.clear();
             }
             Event::Start(Tag::Heading { level, .. }) => {
                 in_block = true;
@@ -564,10 +594,16 @@ pub fn parse_markdown(markdown: &str) -> Vec<ParsedElement> {
                 };
                 list_stack.push(style);
                 list_start_stack.push(ordered.and_then(list_start_of));
+                list_suffix_stack.push(if ordered.is_some() {
+                    markdown_ordered_suffix(source, range.start).to_string()
+                } else {
+                    String::new()
+                });
             }
             Event::End(TagEnd::List(_)) => {
                 list_stack.pop();
                 list_start_stack.pop();
+                list_suffix_stack.pop();
             }
             Event::Start(Tag::Item) => {
                 // Flush any accumulated spans from the parent item before
@@ -579,7 +615,7 @@ pub fn parse_markdown(markdown: &str) -> Vec<ParsedElement> {
                         list_style: current_list_style.clone(),
                         list_indent: current_list_indent,
                         list_prefix: String::new(),
-                        list_suffix: String::new(),
+                        list_suffix: current_list_suffix.clone(),
                         list_start: current_list_start,
                         marker: None,
                         is_code_block: false,
@@ -601,6 +637,7 @@ pub fn parse_markdown(markdown: &str) -> Vec<ParsedElement> {
                 in_block = true;
                 current_list_style = list_stack.last().cloned().flatten();
                 current_list_start = list_start_stack.last().copied().flatten();
+                current_list_suffix = list_suffix_stack.last().cloned().unwrap_or_default();
                 current_list_indent = if list_stack.is_empty() {
                     0
                 } else {
@@ -617,7 +654,7 @@ pub fn parse_markdown(markdown: &str) -> Vec<ParsedElement> {
                         list_style: current_list_style.clone(),
                         list_indent: current_list_indent,
                         list_prefix: String::new(),
-                        list_suffix: String::new(),
+                        list_suffix: current_list_suffix.clone(),
                         list_start: current_list_start,
                         marker: None,
                         is_code_block: false,
@@ -639,6 +676,7 @@ pub fn parse_markdown(markdown: &str) -> Vec<ParsedElement> {
                 in_block = false;
                 current_list_style = None;
                 current_list_start = None;
+                current_list_suffix.clear();
             }
             Event::Start(Tag::CodeBlock(kind)) => {
                 in_block = true;
@@ -927,7 +965,7 @@ pub fn parse_markdown(markdown: &str) -> Vec<ParsedElement> {
                         list_style: current_list_style.clone(),
                         list_indent: current_list_indent,
                         list_prefix: String::new(),
-                        list_suffix: String::new(),
+                        list_suffix: current_list_suffix.clone(),
                         list_start: current_list_start,
                         marker: None,
                         is_code_block: false,
@@ -956,7 +994,7 @@ pub fn parse_markdown(markdown: &str) -> Vec<ParsedElement> {
                         list_style: current_list_style.clone(),
                         list_indent: current_list_indent,
                         list_prefix: String::new(),
-                        list_suffix: String::new(),
+                        list_suffix: current_list_suffix.clone(),
                         list_start: current_list_start,
                         marker: None,
                         is_code_block: false,
@@ -1029,7 +1067,7 @@ pub fn parse_markdown(markdown: &str) -> Vec<ParsedElement> {
             list_style: current_list_style,
             list_indent: current_list_indent,
             list_prefix: String::new(),
-            list_suffix: String::new(),
+            list_suffix: current_list_suffix.clone(),
             list_start: current_list_start,
             marker: None,
             is_code_block,
@@ -2400,10 +2438,13 @@ fn read_html_tree(fragment: &scraper::Html, depth_limit: usize) -> Vec<ParsedEle
                         let block = ParsedBlock {
                             spans,
                             heading_level,
+                            list_suffix: list_style_for_block
+                                .as_ref()
+                                .map(|style| default_list_suffix(style).to_string())
+                                .unwrap_or_default(),
                             list_style: list_style_for_block,
                             list_indent: list_indent_for_block,
                             list_prefix: String::new(),
-                            list_suffix: String::new(),
                             list_start: list_start_for_block,
                             marker: None,
                             is_code_block,
@@ -5013,6 +5054,149 @@ mod html_depth_tests {
                 .map(|span| span.text.as_str())
                 .collect();
             assert_eq!(text, "One Two", "for {cell}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod list_delimiter_tests {
+    use super::*;
+
+    fn md(source: &str) -> Vec<ParsedBlock> {
+        ParsedElement::flatten_to_blocks(parse_markdown(source))
+    }
+
+    fn html(source: &str) -> Vec<ParsedBlock> {
+        ParsedElement::flatten_to_blocks(parse_html_elements(source))
+    }
+
+    /// The suffix of every list item of `source`, in order.
+    fn suffixes(source: &str) -> Vec<String> {
+        md(source)
+            .into_iter()
+            .filter(|b| b.list_style.is_some())
+            .map(|b| b.list_suffix)
+            .collect()
+    }
+
+    #[test]
+    fn a_period_and_a_paren_are_told_apart() {
+        assert_eq!(suffixes("1. a\n2. b"), [".", "."]);
+        assert_eq!(suffixes("1) a\n2) b"), [")", ")"]);
+        let numbered = md("3) a");
+        assert_eq!(numbered[0].list_suffix, ")");
+        assert_eq!(numbered[0].list_start, Some(3));
+        let numbered = md("3. a");
+        assert_eq!(numbered[0].list_suffix, ".");
+        assert_eq!(numbered[0].list_start, Some(3));
+    }
+
+    #[test]
+    fn a_bullet_list_has_no_suffix() {
+        assert_eq!(suffixes("- a\n- b"), ["", ""]);
+        assert_eq!(suffixes("- 1) x"), [")"]);
+        let nested = md("- x\n  1) y");
+        assert_eq!(nested[0].list_suffix, "");
+        assert_eq!(nested[1].list_suffix, ")");
+    }
+
+    /// The suffix is read from the range pulldown-cmark reports for the list. Each case
+    /// writes `)` so that a range starting anywhere else than at the marker reads `.` and
+    /// fails here, and the cases cover every place a list can open.
+    #[test]
+    fn the_range_of_a_list_starts_at_its_marker_wherever_it_stands() {
+        for source in [
+            "1) a",
+            "  1) a\n  2) b",
+            "> 1) a",
+            "> > 1) a",
+            "> - 1) y\n>   2) z",
+            "text\n1) a",
+            "1) a\n\n2) b",
+            "1. a\n   1) b",
+            "- x\n  1) y",
+            "- a\n\n    1) b",
+            "- 1) y",
+            "1. 2) y",
+            "x[^n]\n\n[^n]: 1) a",
+            "[^x] text\n\n1) a",
+            "1) a\n2) b\n   - c\n3) d",
+        ] {
+            // The blocks of the flow and those of the notes.
+            let mut every_block = Vec::new();
+            for element in parse_markdown(source) {
+                match element {
+                    ParsedElement::Block(b) => every_block.push(b),
+                    ParsedElement::FootnoteDefinition { blocks, .. } => every_block.extend(blocks),
+                    ParsedElement::Table(_) => {}
+                }
+            }
+            let found = every_block
+                .into_iter()
+                .filter(|b| b.list_style == Some(ListStyle::Decimal))
+                .map(|b| b.list_suffix)
+                .collect::<Vec<_>>();
+            assert!(!found.is_empty(), "no numbered item in {source:?}");
+            assert!(
+                found.iter().any(|s| s == ")"),
+                "{source:?} read {found:?}, the innermost ordered list wears ')'"
+            );
+        }
+    }
+
+    #[test]
+    fn nested_lists_each_wear_their_own_delimiter() {
+        let blocks = md("1. a\n   1) b\n2. c");
+        let suffixes: Vec<_> = blocks.iter().map(|b| b.list_suffix.as_str()).collect();
+        assert_eq!(suffixes, [".", ")", "."]);
+    }
+
+    #[test]
+    fn a_change_of_delimiter_starts_a_new_list() {
+        // `1. a` then `1) b`: both start at 1, so only the suffix tells them apart.
+        let blocks = md("1. a\n1) b");
+        let suffixes: Vec<_> = blocks.iter().map(|b| b.list_suffix.as_str()).collect();
+        assert_eq!(suffixes, [".", ")"]);
+    }
+
+    #[test]
+    fn the_suffix_does_not_leak_into_a_following_block() {
+        let blocks = md("1) a\n\nplain");
+        assert_eq!(blocks[0].list_suffix, ")");
+        assert_eq!(blocks[1].list_style, None);
+        assert_eq!(blocks[1].list_suffix, "");
+    }
+
+    #[test]
+    fn a_loose_list_keeps_the_suffix_on_every_item() {
+        assert_eq!(suffixes("1) a\n\n2) b\n\n3) c"), [")", ")", ")"]);
+    }
+
+    #[test]
+    fn the_html_reader_gives_an_ordered_list_a_period() {
+        let blocks = html("<ol><li>a</li></ol>");
+        assert_eq!(blocks[0].list_style, Some(ListStyle::Decimal));
+        assert_eq!(blocks[0].list_suffix, ".");
+        let blocks = html("<ol start=\"3\"><li>a</li></ol>");
+        assert_eq!(blocks[0].list_suffix, ".");
+        assert_eq!(blocks[0].list_start, Some(3));
+        let blocks = html("<ul><li>a</li></ul>");
+        assert_eq!(blocks[0].list_suffix, "");
+    }
+
+    #[test]
+    fn the_default_suffix_follows_the_style() {
+        for style in [
+            ListStyle::Decimal,
+            ListStyle::LowerAlpha,
+            ListStyle::UpperAlpha,
+            ListStyle::LowerRoman,
+            ListStyle::UpperRoman,
+        ] {
+            assert_eq!(default_list_suffix(&style), ".");
+        }
+        for style in [ListStyle::Disc, ListStyle::Circle, ListStyle::Square] {
+            assert_eq!(default_list_suffix(&style), "");
         }
     }
 }

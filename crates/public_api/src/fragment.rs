@@ -324,8 +324,14 @@ impl DocumentFragment {
                 }
                 if is_ordered {
                     list_counter += 1;
+                    // `)` stays `)`; every other delimiter is written as `.`, the only
+                    // other one CommonMark has.
+                    let delimiter = if list.suffix == ")" { ')' } else { '.' };
                     parts.push((
-                        format!("{}{}. {}", indent_prefix, list_counter, inline_text),
+                        format!(
+                            "{}{}{} {}",
+                            indent_prefix, list_counter, delimiter, inline_text
+                        ),
                         true,
                     ));
                 } else {

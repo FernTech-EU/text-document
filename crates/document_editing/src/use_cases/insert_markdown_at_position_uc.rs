@@ -339,8 +339,8 @@ fn execute_content_insert(
                 if let Some(existing_id) = list_grouper.try_reuse_list(
                     list_style,
                     parsed.list_indent,
-                    "",
-                    "",
+                    &parsed.list_prefix,
+                    &parsed.list_suffix,
                     parsed.list_start,
                 ) {
                     Some(existing_id)
@@ -351,8 +351,8 @@ fn execute_content_insert(
                         updated_at: now,
                         style: list_style.clone(),
                         indent: parsed.list_indent as i64,
-                        prefix: String::new(),
-                        suffix: String::new(),
+                        prefix: parsed.list_prefix.clone(),
+                        suffix: parsed.list_suffix.clone(),
                         start: parsed.list_start,
                     };
                     let created_list = uow.create_list(&list, doc_id, -1)?;
@@ -360,8 +360,8 @@ fn execute_content_insert(
                         created_list.id,
                         list_style.clone(),
                         parsed.list_indent,
-                        String::new(),
-                        String::new(),
+                        parsed.list_prefix.clone(),
+                        parsed.list_suffix.clone(),
                         parsed.list_start,
                     );
                     Some(created_list.id)
@@ -586,8 +586,8 @@ fn execute_content_insert(
                 updated_at: now,
                 style: list_style.clone(),
                 indent: parsed.list_indent as i64,
-                prefix: String::new(),
-                suffix: String::new(),
+                prefix: parsed.list_prefix.clone(),
+                suffix: parsed.list_suffix.clone(),
                 start: parsed.list_start,
             };
             let created_list = uow.create_list(&list, doc_id, -1)?;
