@@ -473,6 +473,19 @@ fn content_xml_for(body: String) -> String {
         .expect("the export must not unwind")
 }
 
+/// A comment body in CRLF Djot is written as its LF twin: no carriage return reaches the
+/// package, and the two paragraphs it holds are two.
+#[test]
+fn a_crlf_comment_body_is_exported_as_its_lf_twin() {
+    let body = "First line\r\ncontinues here.\r\n\r\nSecond paragraph.".to_string();
+    let crlf = content_xml_for(body.clone());
+    assert!(
+        !crlf.contains('\r') && !crlf.contains("&#13;") && !crlf.contains("&#xD;"),
+        "{crlf}"
+    );
+    assert_eq!(crlf, content_xml_for(body.replace("\r\n", "\n")));
+}
+
 /// A comment body the Djot parser cannot survive is written as its own text rather than
 /// handed to the parser. Nested past what it follows, the body overflows the stack, which
 /// aborts the process and every unsaved document with it: 700 list levels on one line

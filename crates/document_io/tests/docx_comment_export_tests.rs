@@ -494,6 +494,20 @@ fn comments_xml_for(body: String) -> String {
 /// handed to the parser. Nested past what it follows, the body overflows the stack, which
 /// aborts the process and every unsaved document with it: 700 list levels on one line
 /// abort the parser on a spawned thread's stack.
+/// A comment body in CRLF Djot is written as its LF twin: no carriage return reaches the
+/// package. A pin of parity with the ODT writer rather than a mechanism test: the DOCX
+/// writer leaves no `\r` in the text whether or not the body is normalised.
+#[test]
+fn a_crlf_comment_body_is_exported_as_its_lf_twin() {
+    let body = "First line\r\ncontinues here.\r\n\r\nSecond paragraph.".to_string();
+    let crlf = comments_xml_for(body.clone());
+    assert!(
+        !crlf.contains('\r') && !crlf.contains("&#13;") && !crlf.contains("&#xD;"),
+        "{crlf}"
+    );
+    assert_eq!(crlf, comments_xml_for(body.replace("\r\n", "\n")));
+}
+
 #[test]
 fn a_comment_body_too_deep_to_parse_is_exported_as_its_text() {
     let body = format!("{}deep", "- ".repeat(700));

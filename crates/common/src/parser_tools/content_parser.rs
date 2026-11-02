@@ -3613,8 +3613,16 @@ fn djot_source_lines(djot: &str) -> Vec<ParsedElement> {
 ///
 /// Known model limitations (normalised, not preserved on round-trip):
 /// table column alignment, and list tight/loose.
+///
+/// A CRLF line ending is read as the LF it stands for, so a source with Windows line endings
+/// reads as the same text with Unix ones. A lone carriage return is kept as text: it is how
+/// [`plain_text_to_djot`](crate::parser_tools::plain_text_to_djot) writes one, and what it
+/// guarantees to give back.
 pub fn parse_djot(djot: &str, options: &DjotImportOptions) -> Vec<ParsedElement> {
     use jotdown::{Container as C, Event as E, ListKind};
+
+    let djot = crate::parser_tools::djot_depth::crlf_to_lf(djot);
+    let djot: &str = &djot;
 
     // `jotdown` recurses with no limit of its own, once per nested container and
     // once per line of a paragraph that leaves an inline opener waiting, and a
@@ -6081,5 +6089,147 @@ li.checked::marker { content: "\2612"; }
         ) {
             let _ = parse_whitespace_rules(&css);
         }
+    }
+}
+
+#[cfg(test)]
+mod djot_crlf_tests {
+    use super::*;
+
+    fn parse(djot: &str) -> Vec<ParsedElement> {
+        parse_djot(djot, &DjotImportOptions::default())
+    }
+
+    /// The text of every span of every block, table cell and note, in order.
+    fn all_text(elements: &[ParsedElement]) -> Vec<String> {
+        let mut out = Vec::new();
+        for element in elements {
+            match element {
+                ParsedElement::Block(b) => out.extend(b.spans.iter().map(|s| s.text.clone())),
+                ParsedElement::Table(t) => {
+                    for row in &t.rows {
+                        for cell in row {
+                            out.extend(cell.spans.iter().map(|s| s.text.clone()));
+                        }
+                    }
+                }
+                ParsedElement::FootnoteDefinition { blocks, .. } => {
+                    for b in blocks {
+                        out.extend(b.spans.iter().map(|s| s.text.clone()));
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// A CRLF source reads as its LF twin, for every construct that holds a line ending.
+    #[test]
+    fn a_crlf_document_reads_as_its_lf_twin() {
+        for lf in [
+            "a\nb\n\nc",
+            "```rust\nlet x = 1;\nlet y = 2;\n```\n",
+            "`a\nb` and *c\nd*",
+            "a\\\nb",
+            "- one\n  - nested\n- two\n",
+            "1. one\n2. two\n",
+            "| a | b |\n|---|---|\n| c | d |\n",
+            "> quoted\n> lines\n",
+            "# Heading\n\nbody\n",
+            "text[^n]\n\n[^n]: the note\n",
+        ] {
+            let crlf = lf.replace('\n', "\r\n");
+            let from_crlf = parse(&crlf);
+            let from_lf = parse(lf);
+            assert_eq!(format!("{from_crlf:?}"), format!("{from_lf:?}"), "{lf:?}");
+            assert!(
+                all_text(&from_crlf).iter().all(|t| !t.contains('\r')),
+                "a carriage return in {lf:?}: {:?}",
+                all_text(&from_crlf)
+            );
+        }
+    }
+
+    /// The first paragraph of "a\r\nb\r\n\r\nc" is "a", a soft break, "b", not two lines.
+    #[test]
+    fn a_soft_break_stays_a_soft_break() {
+        let blocks = ParsedElement::flatten_to_blocks(parse("a\r\nb\r\n\r\nc"));
+        assert_eq!(blocks.len(), 2);
+        let first: String = blocks[0].spans.iter().map(|s| s.text.as_str()).collect();
+        assert_eq!(first, "a b");
+    }
+
+    /// Pin, not mechanism: a document too deep to parse is shown as its lines, and
+    /// `str::lines` takes a CRLF off already.
+    #[test]
+    fn a_too_deep_crlf_document_shows_lines_without_carriage_returns() {
+        let deep = format!("{}deep\r\nsecond line\r\n", "- ".repeat(700));
+        assert!(
+            all_text(&parse(&deep)).iter().all(|t| !t.contains('\r')),
+            "{:?}",
+            all_text(&parse(&deep))
+        );
+    }
+
+    /// The guarantee the carriage-return rule is cut around: any string comes back as it
+    /// was through `plain_text_to_djot` and `djot_to_plain_text`, a lone `\r` and a `\r\n`
+    /// included. Goes red if a lone `\r` is read as a line ending.
+    #[test]
+    fn the_plain_text_round_trip_keeps_every_carriage_return() {
+        use crate::parser_tools::plain_text_to_djot;
+        for text in [
+            "a\rb",
+            "\rcarriage return\r",
+            "a\r\nb",
+            "a\r\n\r\nb",
+            "x\r",
+            "a\r\rb",
+        ] {
+            let djot = plain_text_to_djot(text);
+            let back = djot_to_plain_text(&djot, &DjotImportOptions::default());
+            assert_eq!(back, text, "{text:?} written as {djot:?}");
+        }
+    }
+
+    /// A lone carriage return in Djot source stays text.
+    #[test]
+    fn a_lone_carriage_return_is_text() {
+        let text = all_text(&parse("a\rb")).concat();
+        assert_eq!(text, "a\rb");
+    }
+
+    /// Pins of the other readers, which normalise a CRLF themselves: not mechanism tests of
+    /// this change.
+    #[test]
+    fn markdown_and_html_already_read_a_crlf_as_a_line_ending() {
+        let md = ParsedElement::flatten_to_blocks(parse_markdown("a\r\nb\r\n\r\nc"));
+        let md_text: Vec<String> = md
+            .iter()
+            .flat_map(|b| b.spans.iter().map(|s| s.text.clone()))
+            .collect();
+        assert!(md_text.iter().all(|t| !t.contains('\r')), "{md_text:?}");
+        let md = ParsedElement::flatten_to_blocks(parse_markdown("a\rb\n\nc"));
+        assert!(
+            md.iter()
+                .all(|b| b.spans.iter().all(|s| !s.text.contains('\r'))),
+            "a lone CR in Markdown"
+        );
+        let html = ParsedElement::flatten_to_blocks(parse_html_elements("<pre>a\r\nb</pre>"));
+        let html_text: Vec<String> = html
+            .iter()
+            .flat_map(|b| b.spans.iter().map(|s| s.text.clone()))
+            .collect();
+        assert!(html_text.iter().all(|t| !t.contains('\r')), "{html_text:?}");
+    }
+
+    #[test]
+    fn crlf_to_lf_borrows_when_there_is_nothing_to_change() {
+        use crate::parser_tools::djot_depth::crlf_to_lf;
+        assert!(matches!(
+            crlf_to_lf("a\nb\rc"),
+            std::borrow::Cow::Borrowed(_)
+        ));
+        assert_eq!(crlf_to_lf("a\r\nb\r\n\r\n"), "a\nb\n\n");
+        assert_eq!(crlf_to_lf("\r\r\n\r"), "\r\n\r");
     }
 }

@@ -259,6 +259,30 @@ pub fn longest_leaf_lines(text: &str) -> usize {
     reach(text, usize::MAX, usize::MAX, usize::MAX).longest_leaf
 }
 
+/// `text` with each CRLF line ending read as the LF it stands for, borrowed when it holds no
+/// carriage return.
+///
+/// `jotdown` keeps a `\r` as ordinary text: a source with CRLF line endings (a Windows
+/// checkout with `autocrlf`, an `include_str!`ed help page) read as a `\r` ended every line
+/// of every paragraph, and the editor laid that out as a line break, so one paragraph
+/// showed a line for each line of its source. Only the two-character sequence is read as a
+/// line ending: a lone `\r` is text, which `plain_text_to_djot` and `djot_to_plain_text`
+/// guarantee to give back as it was (the writer puts `{}` between a `\r` and a `\n`, never
+/// a bare CRLF).
+///
+/// Not done by [`parsable`] itself, which borrows text within its limits as it is: the
+/// callers that hand text to it read it through this first, so that the lines they show
+/// when it turns the text away are LF-ended as well. Public for the exporters in
+/// `text-document-io`; not part of the supported API.
+#[doc(hidden)]
+pub fn crlf_to_lf(text: &str) -> Cow<'_, str> {
+    if text.contains("\r\n") {
+        Cow::Owned(text.replace("\r\n", "\n"))
+    } else {
+        Cow::Borrowed(text)
+    }
+}
+
 /// `text` made ready for `jotdown` 0.10, or `None` when its structure cannot be computed
 /// without ending the process.
 ///

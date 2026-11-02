@@ -596,6 +596,8 @@ fn render_comment_body_odt(djot: &str, styles: &mut OdtStyleSheet) -> String {
     // down as its lines and the rest parsed on a large enough stack, as `parse_djot`
     // would parse it. A body that door turns away is set down as the text it
     // is, one paragraph broken at each of its lines.
+    let djot = common::parser_tools::djot_depth::crlf_to_lf(djot);
+    let djot: &str = &djot;
     let parsable = common::parser_tools::djot_depth::parsable(djot);
     let Some(events) = parsable.as_ref().and_then(|parsable| parsable.events()) else {
         return format!("<text:p>{}</text:p>", odt_render::encode_run_text(djot));
