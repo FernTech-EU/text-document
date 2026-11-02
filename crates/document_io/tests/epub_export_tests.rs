@@ -129,6 +129,22 @@ fn epub_export_is_a_valid_zip_with_required_entries() {
     assert_eq!(mimetype, "application/epub+zip");
 }
 
+/// The rule EPUB readers rely on, as for ODF: `mimetype` is the first entry and stored, so
+/// the media type can be read without inflating anything.
+#[test]
+fn epub_mimetype_is_the_first_entry_and_stored() {
+    let bytes = epub_from_djot(HEADINGS_DJOT, EpubExportOptions::default());
+    let mut archive = zip::ZipArchive::new(Cursor::new(&bytes)).expect("valid zip");
+    let first = archive.by_index(0).expect("a first entry");
+    assert_eq!(first.name().expect("entry name"), "mimetype");
+    assert_eq!(first.compression(), zip::CompressionMethod::Stored);
+    drop(first);
+    // On the bytes: a stored entry whose data follows its header at once.
+    assert_eq!(&bytes[0..4], b"PK\x03\x04");
+    assert_eq!(u16::from_le_bytes([bytes[8], bytes[9]]), 0, "stored");
+    assert_eq!(&bytes[30..38], b"mimetype");
+}
+
 #[test]
 fn epub_splits_into_one_chapter_per_top_level_heading() {
     let bytes = epub_from_djot(HEADINGS_DJOT, EpubExportOptions::default());

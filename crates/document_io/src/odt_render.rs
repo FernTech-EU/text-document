@@ -763,10 +763,11 @@ fn manifest_xml(image_entries: &[(String, String)]) -> String {
 ///
 /// Every entry carries the same fixed modification time, 1980-01-01 00:00, the earliest a zip
 /// can record, so the same document packages to the same bytes. Without it the zip crate stamps
-/// the wall clock when its `time` feature is on, and that feature is unified across the whole
-/// dependency graph: an application whose other crates enable it would change the entries'
-/// dates (and the bytes of every export) with no change here. A file manager lists the entries
-/// as dated 1980.
+/// the wall clock when its `time` feature is on. Nothing in this crate's own build turns that
+/// feature on, but cargo unifies features across a build: an application with another crate that
+/// uses zip 9 with `time` (epub-builder's `zip-library` asks for it, on its own zip 6 copy until
+/// it moves to zip 9) would change the entries' dates, and the bytes of every export, with no
+/// change here. A file manager lists the entries as dated 1980.
 pub(crate) fn package_odt(
     content_xml: &str,
     styles_xml: &str,
@@ -824,7 +825,9 @@ mod tests {
     /// features other crates of the build turn on in the zip crate.
     ///
     /// The comparison of two packages passes with the clock as well when both are made in
-    /// the same two seconds; the header's date and time are the check that fails with it.
+    /// the same two seconds; the header's date and time are the check that fails with it,
+    /// because this crate's tests build zip with its `time` feature on (see the
+    /// dev-dependency in `Cargo.toml`).
     #[test]
     fn a_package_is_dated_1980_and_is_reproducible() {
         let images = vec![(

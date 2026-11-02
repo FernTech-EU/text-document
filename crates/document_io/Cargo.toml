@@ -95,6 +95,11 @@ test_harness = { workspace = true }
 proptest = "1"
 # `zip` itself is now a real (non-dev) dependency above — the ODT writer needs it at runtime —
 # so tests that unzip a packaged DOCX/EPUB/ODT for inspection already have it in scope.
+#
+# Tests build zip with its `time` feature on, which a dependent crate's build can do too: it
+# makes a zip entry's default date the wall clock, so `odt_render`'s test of the fixed 1980
+# date fails if the writer stops setting the date itself.
+zip = { version = "9", default-features = false, features = ["deflate", "time"] }
 # The djot importer has no table syntax, so `odt_export_tests.rs`'s table coverage builds one
 # structurally instead, through the friendly, high-level `text-document` (`public_api`) crate —
 # `TextCursor::insert_table` + `TextTable::cell(row, col)` + a cursor positioned via
