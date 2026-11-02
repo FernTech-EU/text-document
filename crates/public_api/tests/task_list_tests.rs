@@ -104,14 +104,48 @@ fn a_djot_task_list_reaches_markdown() {
 
 #[test]
 fn an_html_round_trip_is_a_fixpoint() {
-    let doc = from_markdown("- [x] done\n- [ ] todo\n- plain\n");
-    let html = doc.to_html().unwrap();
-    assert!(html.contains(r#"<input type="checkbox" disabled="disabled" checked="checked"/>"#));
+    for md in [
+        "- [x] done\n- [ ] todo\n- plain\n",
+        "1. [x] a\n2. [ ] b\n",
+        "> - [x] quoted\n> - [ ] too\n",
+        "- [x] a\n  - [ ] nested\n  - [x] nested too\n- [ ] b\n",
+    ] {
+        let doc = from_markdown(md);
+        let html = doc.to_html().unwrap();
+        assert!(
+            html.contains(r#"<label><input type="checkbox" disabled="disabled""#),
+            "{html}"
+        );
+        let again = TextDocument::new();
+        again.set_html(&html).unwrap().wait().unwrap();
+        assert_eq!(markers(&again), markers(&doc), "{md:?} through {html:?}");
+        assert_eq!(again.to_html().unwrap(), html, "{md:?}");
+        assert_eq!(
+            again.block_by_number(0).unwrap().text(),
+            doc.block_by_number(0).unwrap().text()
+        );
+    }
+}
+
+/// Djot has task items in bullet lists only: a numbered item with a box keeps its number
+/// and loses the box in a Djot save, so the list does not turn into bullets.
+#[test]
+fn a_numbered_task_item_is_saved_to_djot_numbered_without_its_box() {
+    let doc = from_markdown("1. [x] a\n2. b\n");
+    assert_eq!(markers(&doc), [CHECKED, None]);
+    let djot = doc.to_djot().unwrap();
+    assert_eq!(
+        djot,
+        from_markdown("1. a\n2. b\n").to_djot().unwrap(),
+        "written as the same list without a box"
+    );
+    assert!(djot.starts_with("1. a"));
     let again = TextDocument::new();
-    again.set_html(&html).unwrap().wait().unwrap();
-    assert_eq!(markers(&again), [CHECKED, UNCHECKED, None]);
-    assert_eq!(again.block_by_number(0).unwrap().text(), "done");
-    assert_eq!(again.to_html().unwrap(), html);
+    again.set_djot_sync(&djot).unwrap();
+    assert!(again.block_by_number(0).unwrap().list().is_some());
+    assert_eq!(markers(&again), [None, None]);
+    // A bullet task item is still written as one.
+    assert_eq!(from_markdown("- [x] a\n").to_djot().unwrap(), "- [x] a");
 }
 
 #[test]
@@ -121,7 +155,7 @@ fn a_fragment_writes_the_boxes_in_markdown_and_html() {
     let html = fragment.to_html();
     assert!(
         html.contains(
-            r#"<li><input type="checkbox" disabled="disabled" checked="checked"/> a</li>"#
+            r#"<li><label><input type="checkbox" disabled="disabled" checked="checked"/> a</label></li>"#
         )
     );
     let back = DocumentFragment::from_html(&html);

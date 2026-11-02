@@ -198,6 +198,11 @@ pub fn render_blocks_html(
                     b.fmt_marker.as_ref(),
                 ));
                 html.push_str(&render_inline_html(store, b, images, notes));
+                html.push_str(
+                    common::parser_tools::content_parser::task_checkbox_end_html(
+                        b.fmt_marker.as_ref(),
+                    ),
+                );
                 i += 1;
             }
             while !open.is_empty() {

@@ -1640,16 +1640,27 @@ pub fn task_box_markdown(marker: Option<&MarkerType>) -> &'static str {
     }
 }
 
-/// The checkbox an HTML list item opens with when it is a task, nothing otherwise. Written
-/// as well-formed XML (`disabled="disabled"`, a closed tag) because the same markup is
-/// packaged into EPUB chapters, which are XHTML. Shared by the two HTML writers;
-/// `html_item_checkbox` reads it back.
+/// The checkbox an HTML list item opens with when it is a task, nothing otherwise, inside
+/// the `<label>` that names it: the item's text, which [`task_checkbox_end_html`] closes the
+/// label after, is the checkbox's accessible name (a bare checkbox reads as "checkbox,
+/// checked" and the text as another item). Written as well-formed XML (`disabled="disabled"`,
+/// a closed tag) because the same markup is packaged into EPUB XHTML chapters, which a
+/// minimised attribute and an unclosed input would break in a strict reader. Shared by the
+/// two HTML writers; `html_item_checkbox` reads it back, through the label.
 pub fn task_checkbox_html(marker: Option<&MarkerType>) -> &'static str {
     match marker {
         Some(MarkerType::Checked) => {
-            "<input type=\"checkbox\" disabled=\"disabled\" checked=\"checked\"/> "
+            "<label><input type=\"checkbox\" disabled=\"disabled\" checked=\"checked\"/> "
         }
-        Some(MarkerType::Unchecked) => "<input type=\"checkbox\" disabled=\"disabled\"/> ",
+        Some(MarkerType::Unchecked) => "<label><input type=\"checkbox\" disabled=\"disabled\"/> ",
+        _ => "",
+    }
+}
+
+/// What closes [`task_checkbox_html`]'s label, after the item's inline text.
+pub fn task_checkbox_end_html(marker: Option<&MarkerType>) -> &'static str {
+    match marker {
+        Some(MarkerType::Checked | MarkerType::Unchecked) => "</label>",
         _ => "",
     }
 }
@@ -1658,7 +1669,8 @@ pub fn task_checkbox_html(marker: Option<&MarkerType>) -> &'static str {
 /// from blanks, is an `<input type="checkbox">`, bare or inside inline wrappers such as
 /// `<label>` and `<span>`. `checked` makes it [`MarkerType::Checked`]; `disabled` and
 /// every other attribute change nothing. A checkbox further on is a form control in the
-/// text, not the item's box.
+/// text, not the item's box. A box inside a `<p>` of the item, which is how a loose GitHub task
+/// list is rendered (`<li><p><input type="checkbox"> text</p></li>`), is not read.
 fn html_item_checkbox(item: ego_tree::NodeRef<Node>) -> Option<MarkerType> {
     /// `Some(answer)` once something decided it, `None` while only blanks were seen.
     fn scan(node: ego_tree::NodeRef<Node>, depth: usize) -> Option<Option<MarkerType>> {

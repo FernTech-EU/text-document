@@ -3,7 +3,8 @@
 use crate::{CharVerticalAlignment, InlineContent, LINE_SEPARATOR, ListStyle};
 use frontend::common::parser_tools::content_parser::{
     ParsedBlock, ParsedElement, ParsedSpan, html_line_ends_before, html_text_ends_open,
-    push_html_text, split_block_at_line_breaks, task_box_markdown, task_checkbox_html,
+    push_html_text, split_block_at_line_breaks, task_box_markdown, task_checkbox_end_html,
+    task_checkbox_html,
 };
 use frontend::common::parser_tools::fragment_schema::{
     FragmentBlock, FragmentData, FragmentElement, FragmentListStarts, FragmentQuoting,
@@ -220,6 +221,7 @@ impl DocumentFragment {
                             body.push_str("<li>");
                             body.push_str(task_checkbox_html(b.marker.as_ref()));
                             push_inline_html(&mut body, &b.elements);
+                            body.push_str(task_checkbox_end_html(b.marker.as_ref()));
                             body.push_str("</li>");
                             i += 1;
                         }

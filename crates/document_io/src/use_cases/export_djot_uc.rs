@@ -1517,10 +1517,20 @@ fn djot_list_marker(
     previous: Option<&OpenLevel>,
     number: Option<i64>,
 ) -> (String, Option<OrderedMarker>, i64) {
-    if matches!(
-        fmt_marker,
-        Some(MarkerType::Checked | MarkerType::Unchecked)
-    ) {
+    // Djot has task items in bullet lists only. A numbered item with a box (a Markdown
+    // `1. [x] a`, an HTML `<ol>` item with a checkbox) keeps its number and loses the box: the
+    // structure of the list wins over the state of one item, which would otherwise turn the
+    // whole numbered list into bullets on the first save.
+    let is_numbered = !matches!(
+        list.style,
+        ListStyle::Disc | ListStyle::Circle | ListStyle::Square
+    );
+    if !is_numbered
+        && matches!(
+            fmt_marker,
+            Some(MarkerType::Checked | MarkerType::Unchecked)
+        )
+    {
         // Task list item: `<bullet> [ ]` / `<bullet> [x]`.
         let bullet = djot_bullet_char(&list.style);
         let check = if fmt_marker == Some(&MarkerType::Checked) {
