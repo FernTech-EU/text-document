@@ -1268,16 +1268,19 @@ fn style_keeps_whitespace(style: &str) -> Option<bool> {
 /// is what `QTextDocument::toHtml` writes). Not a CSS engine: a class, an id, an attribute, a
 /// pseudo-class, a combinator, and everything inside an at-rule, is skipped.
 ///
-/// Held as the text of an inline `style` attribute for each tag, so the one precedence
-/// function, [`style_keeps_whitespace`], decides between the sheet and an element's own
-/// `style` as it does between two declarations of one attribute.
+/// Resolved once, when the sheet is read, into the one declaration that wins for each tag
+/// the sheet names and the one that wins for `*`: a lookup for an element then builds nothing.
+/// The declaration is put in front of the element's inline `style` attribute, so the one
+/// precedence function, [`style_keeps_whitespace`], decides between the sheet and an element's
+/// own `style` as it does between two declarations of one attribute.
 #[derive(Debug, Default)]
 struct SheetWhitespace {
-    /// What every element gets (`*` rules), in source order.
-    universal: String,
-    /// What a tag gets: the `*` rules, then the rules naming it, each in source order,
-    /// so that a rule naming the tag beats `*` as its specificity says.
-    per_tag: std::collections::HashMap<String, String>,
+    /// What every element gets (`*` rules): the winning keyword and whether it is `!important`.
+    universal: Option<(&'static str, bool)>,
+    /// What a tag the sheet names gets: the winner among the `*` rules and then the rules
+    /// naming it, each in source order, so that a rule naming the tag beats `*` as its
+    /// specificity says.
+    per_tag: std::collections::HashMap<String, (&'static str, bool)>,
 }
 
 /// One rule of a sheet: the tags it names (`*` for every element) and its `white-space`
@@ -1287,48 +1290,58 @@ struct WhitespaceRule {
     declarations: Vec<(&'static str, bool)>,
 }
 
+/// The declaration that wins when `next` follows `current` in the cascade: the later one,
+/// unless `current` is `!important` and `next` is not.
+fn cascade(
+    current: Option<(&'static str, bool)>,
+    next: (&'static str, bool),
+) -> Option<(&'static str, bool)> {
+    match current {
+        Some((_, true)) if !next.1 => current,
+        _ => Some(next),
+    }
+}
+
 impl SheetWhitespace {
+    /// The sheet of `css`, in one pass over its rules: time and memory in proportion to the
+    /// rules and their selectors, whatever the sheet holds.
     fn from_css(css: &str) -> Self {
         let rules = parse_whitespace_rules(css);
-        let write = |out: &mut String, rule: &WhitespaceRule| {
-            for (keyword, important) in &rule.declarations {
-                out.push_str("white-space: ");
-                out.push_str(keyword);
-                out.push_str(if *important { " !important;" } else { ";" });
-            }
-        };
         let mut sheet = SheetWhitespace::default();
         for rule in rules
             .iter()
             .filter(|r| r.selectors.iter().any(|s| s == "*"))
         {
-            write(&mut sheet.universal, rule);
-        }
-        let mut tags: Vec<&String> = rules
-            .iter()
-            .flat_map(|r| r.selectors.iter())
-            .filter(|s| *s != "*")
-            .collect();
-        tags.sort();
-        tags.dedup();
-        for tag in tags {
-            // In source order, `*` rules first: a rule naming the tag is the more specific.
-            let mut text = sheet.universal.clone();
-            for rule in rules.iter().filter(|r| r.selectors.contains(tag)) {
-                write(&mut text, rule);
+            for declaration in &rule.declarations {
+                sheet.universal = cascade(sheet.universal, *declaration);
             }
-            sheet.per_tag.insert(tag.clone(), text);
         }
+        for rule in &rules {
+            for tag in rule.selectors.iter().filter(|s| *s != "*") {
+                let winner = sheet
+                    .per_tag
+                    .entry(tag.clone())
+                    .or_insert_with(|| sheet.universal.unwrap_or(("", false)));
+                let mut current = (!winner.0.is_empty()).then_some(*winner);
+                for declaration in &rule.declarations {
+                    current = cascade(current, *declaration);
+                }
+                if let Some(resolved) = current {
+                    *winner = resolved;
+                }
+            }
+        }
+        sheet.per_tag.retain(|_, (keyword, _)| !keyword.is_empty());
         sheet
     }
 
-    /// The declarations that apply to an element named `tag`, `None` when none does.
-    fn declarations_for(&self, tag: &str) -> Option<&str> {
-        self.per_tag
-            .get(tag)
-            .map(String::as_str)
-            .or(Some(self.universal.as_str()))
-            .filter(|text| !text.is_empty())
+    /// The declaration that applies to an element named `tag`, `None` when none does.
+    fn declaration_for(&self, tag: &str) -> Option<(&'static str, bool)> {
+        self.per_tag.get(tag).copied().or(self.universal)
+    }
+
+    fn is_empty(&self) -> bool {
+        self.universal.is_none() && self.per_tag.is_empty()
     }
 
     /// Whether the sheet keeps the whitespace of the document's body, which every element
@@ -1336,7 +1349,14 @@ impl SheetWhitespace {
     /// elements of a fragment (the HTML parser drops them), so what they say is the state
     /// the walk starts from; `body` beats `html`, as the inheritance goes.
     fn initial_keeps_whitespace(&self) -> Option<bool> {
-        let of = |tag: &str| self.declarations_for(tag).and_then(style_keeps_whitespace);
+        let of = |tag: &str| {
+            self.declaration_for(tag).and_then(|(keyword, important)| {
+                style_keeps_whitespace(&format!(
+                    "white-space: {keyword}{};",
+                    if important { " !important" } else { "" }
+                ))
+            })
+        };
         of("body").or_else(|| of("html"))
     }
 }
@@ -1485,9 +1505,13 @@ fn element_keeps_whitespace(
     sheet: Option<&SheetWhitespace>,
 ) -> Option<bool> {
     let inline = el.attr("style");
-    match sheet.and_then(|s| s.declarations_for(el.name())) {
+    match sheet.and_then(|s| s.declaration_for(el.name())) {
         None => inline.and_then(style_keeps_whitespace),
-        Some(declared) => style_keeps_whitespace(&format!("{declared}{}", inline.unwrap_or(""))),
+        Some((keyword, important)) => style_keeps_whitespace(&format!(
+            "white-space: {keyword}{};{}",
+            if important { " !important" } else { "" },
+            inline.unwrap_or("")
+        )),
     }
 }
 
@@ -1523,7 +1547,7 @@ fn html_sheet(fragment: &scraper::Html) -> Option<SheetWhitespace> {
         return None;
     }
     let sheet = SheetWhitespace::from_css(&css);
-    (!sheet.universal.is_empty() || !sheet.per_tag.is_empty()).then_some(sheet)
+    (!sheet.is_empty()).then_some(sheet)
 }
 
 /// Whether a text node is the whitespace between blocks, which a `white-space` that keeps
@@ -6087,6 +6111,52 @@ li.checked::marker { content: "\2612"; }
         ] {
             let _ = texts(&with_sheet(css, "<p>a</p>"));
         }
+    }
+
+    /// A sheet is resolved once into one winning declaration per tag: the cost grows with
+    /// the rules, not with their square. 4000 `*` rules and 4000 tag rules (167 KB) used to
+    /// build 272 MB of strings, and a rule of 20,000 selectors took a quarter of a second.
+    #[test]
+    fn a_large_sheet_resolves_in_linear_time_and_memory() {
+        use std::time::Instant;
+        let mut css = String::new();
+        for i in 0..4000 {
+            css.push_str("* { white-space: pre }\n");
+            css.push_str(&format!("t{i} {{ white-space: pre }}\n"));
+        }
+        let started = Instant::now();
+        let sheet = SheetWhitespace::from_css(&css);
+        assert_eq!(sheet.per_tag.len(), 4000);
+        assert_eq!(sheet.declaration_for("t17"), Some(("pre", false)));
+        assert_eq!(sheet.declaration_for("p"), Some(("pre", false)));
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(500),
+            "4000 + 4000 rules took {:?}",
+            started.elapsed()
+        );
+
+        let selectors: Vec<String> = (0..20_000).map(|i| format!("t{i}")).collect();
+        let css = format!("{} {{ white-space: pre }}", selectors.join(","));
+        let started = Instant::now();
+        let sheet = SheetWhitespace::from_css(&css);
+        assert_eq!(sheet.per_tag.len(), 20_000);
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(500),
+            "one rule of 20,000 selectors took {:?}",
+            started.elapsed()
+        );
+
+        // A document of many elements under such a sheet is read in proportion to its size.
+        let body = "<p>a\tb</p>".repeat(5000);
+        let html = format!("<style>{css}</style>{body}");
+        let started = Instant::now();
+        let read = texts(&html);
+        assert_eq!(read.len(), 5000);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "5000 elements took {:?}",
+            started.elapsed()
+        );
     }
 
     proptest! {
