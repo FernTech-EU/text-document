@@ -103,7 +103,8 @@ fn right_then_left_is_the_start() {
 }
 
 /// A caret on the anchor (placed there with `set_position`, or left by a Shift move back into
-/// the table from after it) stands in the first cell already: Right takes it on from there, and Left to the paragraph before.
+/// the table from after it) stands in the first cell already: Right takes it on from there,
+/// and Left to the paragraph before.
 #[test]
 fn a_caret_on_the_anchor_moves_on_from_the_first_cell() {
     let doc = loaded(TABLE_AFTER_PARAGRAPH);
@@ -250,6 +251,29 @@ fn a_table_after_a_list_item_is_crossed_in_one_step_each_way() {
     assert_eq!(plain(&doc, item_end, MoveOperation::Right, 1), (cell, true));
     assert_eq!(plain(&doc, cell, MoveOperation::Left, 1), (item_end, true));
     assert!(doc.block_by_number(0).unwrap().list().is_some());
+}
+
+/// Two tables with nothing between them: Right from the end of the first one's last cell goes
+/// to the second one's first cell in one step, and Left goes back, across both anchors.
+#[test]
+fn adjacent_tables_are_crossed_in_one_step_each_way() {
+    let doc = loaded("| a1 |\n\n| z9 |\n");
+    let first_cell = position_in(&doc, "a1");
+    let second_cell = position_in(&doc, "z9");
+    let first_end = first_cell + 2;
+    assert_eq!(
+        plain(&doc, first_end, MoveOperation::Right, 1),
+        (second_cell, true)
+    );
+    assert_eq!(
+        plain(&doc, second_cell, MoveOperation::Left, 1),
+        (first_end, true)
+    );
+    // And the second step is a character of the second table's first cell.
+    assert_eq!(
+        plain(&doc, first_end, MoveOperation::Right, 2),
+        (second_cell + 1, true)
+    );
 }
 
 /// A table in a quotation is crossed as one at the top level is.
