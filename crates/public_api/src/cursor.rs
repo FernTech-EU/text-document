@@ -853,9 +853,20 @@ impl TextCursor {
     /// A selection holding a table whole, its moving end at the table's edge (see
     /// [`set_position`](Self::set_position)), gives the table back when that end steps back
     /// into it toward where the selection started: the end goes to the table's other side.
+    ///
+    /// A move that keeps no anchor (`MoveMode::MoveAnchor`) does not stop on the positions a
+    /// table's anchor takes in the text, where the caret would stand in the first cell
+    /// without having moved: Right (or `NextCharacter`, or `NextBlock` and Down) from the
+    /// end of the paragraph before a table goes to the start of its first cell in one step,
+    /// and Left (or `PreviousCharacter`) from there goes back to the end of that paragraph.
+    /// A caret standing on an anchor is already in the first cell: Right takes it on from
+    /// there, Left to the paragraph before. A move keeping the anchor
+    /// (`MoveMode::KeepAnchor`) does stop on the anchor, so that a selection can take a table
+    /// whole, and the deletions (`delete_char`, `delete_previous_char`) are not moves.
     pub fn move_position(&self, operation: MoveOperation, mode: MoveMode, n: usize) -> bool {
         let old_pos = self.position();
-        let mut target = self.kept_in_main_text(old_pos, self.resolve_move(operation, n));
+        let resolved = self.resolve_move(operation, n, mode == MoveMode::MoveAnchor);
+        let mut target = self.kept_in_main_text(old_pos, resolved);
         if mode == MoveMode::KeepAnchor {
             target = self.past_a_table_given_back(old_pos, target);
         }
@@ -869,7 +880,7 @@ impl TextCursor {
     /// the table trap put it, and the step goes toward the fixed end. The trap moves any
     /// position in such a table to that far edge, so every step back landed there again,
     /// and the selection could only grow: the Left or the Up arrow could not give back a
-    /// table the Right or the Down arrow had taken.
+    /// table Shift+Right or Shift+Down had taken.
     fn past_a_table_given_back(&self, from: usize, target: usize) -> usize {
         let fixed = {
             let d = self.data.lock();
@@ -2754,8 +2765,9 @@ impl TextCursor {
     /// there and holds none of it; one that runs past the table holds it whole, from its
     /// start; one that runs into a table before it takes that table in whole, as the table
     /// trap does for any selection entering a table from outside it. Read as in the first cell
-    /// whatever the moving end did, a selection started on the anchor, where the Right or the
-    /// Down arrow from the paragraph before a table leaves the caret, jumped forward over the
+    /// whatever the moving end did, a selection started on the anchor, where a caret is
+    /// placed with [`set_position`](Self::set_position) (a plain Right or Down from the
+    /// paragraph before a table goes on into the first cell), jumped forward over the
     /// table when dragged back into that paragraph, and dragged into the table before it was
     /// taken for one between two tables: the cut emptied that table's cells, left its grid,
     /// and the paste put their words back into its first cell. A moving end on a table's
@@ -2791,6 +2803,22 @@ impl TextCursor {
             inner.ctx.db_context.get_store(),
             to_i64(position),
             false,
+        ))
+    }
+
+    /// `position`, or, when it falls on a table's anchor, the start of the table's first
+    /// cell (past the anchor of a table that opens it, and so on): where a caret on the
+    /// anchor stands, and the other direction of [`back_off_table_anchor`].
+    fn forward_off_table_anchor(&self, position: usize) -> usize {
+        let inner = self.doc.lock();
+        let store = inner.ctx.db_context.get_store();
+        if store.tables.read().is_empty() {
+            return position;
+        }
+        to_usize(common::database::rope_helpers::snap_off_table_anchor(
+            store,
+            to_i64(position),
+            true,
         ))
     }
 
@@ -3544,8 +3572,10 @@ impl TextCursor {
         queued
     }
 
-    /// Resolve a MoveOperation to a concrete position.
-    fn resolve_move(&self, op: MoveOperation, n: usize) -> usize {
+    /// Resolve a MoveOperation to a concrete position. With `skip_table_anchors`, a step
+    /// over the structural positions of a table's anchor counts once: see
+    /// [`move_position`](Self::move_position).
+    fn resolve_move(&self, op: MoveOperation, n: usize, skip_table_anchors: bool) -> usize {
         let pos = self.position();
         match op {
             MoveOperation::NoMove => pos,
@@ -3555,9 +3585,20 @@ impl TextCursor {
                 max_cursor_position_of(&inner).unwrap_or(pos)
             }
             MoveOperation::NextCharacter | MoveOperation::Right => {
-                let mut cur = pos;
+                // A caret on a table's anchor stands in its first cell already (see
+                // `block_at_caret_dto`): it goes there without the move counting a step.
+                let mut cur = if skip_table_anchors {
+                    self.forward_off_table_anchor(pos)
+                } else {
+                    pos
+                };
                 for _ in 0..n {
-                    let next = self.next_grapheme_boundary(cur);
+                    let mut next = self.next_grapheme_boundary(cur);
+                    if skip_table_anchors {
+                        // The anchor and the boundary after it hold no text: the step
+                        // lands in the first cell.
+                        next = self.forward_off_table_anchor(next);
+                    }
                     if next == cur {
                         break;
                     }
@@ -3569,10 +3610,22 @@ impl TextCursor {
                 let mut cur = pos;
                 for _ in 0..n {
                     let prev = self.prev_grapheme_boundary(cur);
-                    if prev == cur {
+                    let mut target = prev;
+                    if skip_table_anchors && prev != cur {
+                        // A step onto a table's anchor (or the boundary after it) goes on
+                        // to the end of what comes before the table. When the table opens
+                        // the document there is nothing before it, the snap lands on the
+                        // anchor itself, and the caret stays.
+                        let snapped = self.back_off_table_anchor(prev);
+                        if self.forward_off_table_anchor(snapped) != snapped {
+                            break;
+                        }
+                        target = snapped;
+                    }
+                    if target == cur {
                         break;
                     }
-                    cur = prev;
+                    cur = target;
                 }
                 cur
             }
@@ -3599,12 +3652,19 @@ impl TextCursor {
                 let dto = frontend::document_inspection::GetBlockAtPositionDto {
                     position: to_i64(pos),
                 };
-                document_inspection_commands::get_block_at_position(&inner.ctx, &dto)
+                let next = document_inspection_commands::get_block_at_position(&inner.ctx, &dto)
                     .map(|info| {
                         // Move past current block + 1 (block separator)
                         to_usize(info.block_start) + to_usize(info.block_length) + 1
                     })
-                    .unwrap_or(pos)
+                    .unwrap_or(pos);
+                drop(inner);
+                // Before a table that is its anchor: the move goes into its first cell.
+                if skip_table_anchors {
+                    self.forward_off_table_anchor(next)
+                } else {
+                    next
+                }
             }
             MoveOperation::PreviousBlock => {
                 let inner = self.doc.lock();
@@ -3763,9 +3823,9 @@ impl TextCursor {
                 // Up/Down are visual operations that depend on line wrapping.
                 // Without layout info, treat as PreviousBlock/NextBlock.
                 if matches!(op, MoveOperation::Up) {
-                    self.resolve_move(MoveOperation::PreviousBlock, 1)
+                    self.resolve_move(MoveOperation::PreviousBlock, 1, skip_table_anchors)
                 } else {
-                    self.resolve_move(MoveOperation::NextBlock, 1)
+                    self.resolve_move(MoveOperation::NextBlock, 1, skip_table_anchors)
                 }
             }
         }

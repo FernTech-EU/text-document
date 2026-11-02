@@ -1812,8 +1812,8 @@ fn sorted_characters(text: &str) -> Vec<char> {
 
 const TWO_TABLES: &str = "Before.\n\n| a1 | b1 |\n| c1 | d1 |\n\nMiddle.\n\n| a3 |\n\nAfter.\n";
 
-/// A selection started on a table's anchor, where the Right arrow or the Down arrow from the
-/// paragraph before a table leaves the caret. The anchor reads as the table's first cell only
+/// A selection started on a table's anchor, where a caret is placed with `set_position`
+/// (a plain Right or Down from the paragraph before a table goes on into the first cell). The anchor reads as the table's first cell only
 /// while the other end of the selection is in that table: dragged back before the table, the
 /// selection ends there and holds none of it, and dragged into the table before it, it holds
 /// that table whole from its start. Read as in the first cell whatever the other end did, a
@@ -1870,7 +1870,7 @@ fn assert_cut_takes_what_it_copies(
 
 /// A copy of a selection holds what a cut of it removes. A range holding a table's anchor
 /// was copied with the table whole, while the removal takes the table whole only when the
-/// range reaches the end of the table's last cell: the Right arrow onto a table's anchor then
+/// range reaches the end of the table's last cell: a caret on a table's anchor then
 /// Shift+Right into its first cell copied the table and cut the characters selected, and a
 /// paste of that cut anywhere but back into the cell put the table in a second time.
 #[test]
@@ -1885,15 +1885,11 @@ fn a_selection_ending_on_a_tables_anchor_cuts_what_it_copies() {
     let before_first_table = position_in(&reference, "e.");
     let first_anchor = position_in(&reference, "Before.") + "Before.".len() + 1;
 
-    // The keys: Right from the end of the paragraph before the table, then Shift+Right.
+    // The keys: a caret on the anchor (a plain Right goes on into the first cell, so it is
+    // placed there), then Shift+Right.
     let doc = loaded(TEXT);
-    let cursor = doc.cursor_at(anchor - 1);
-    cursor.move_position(MoveOperation::Right, MoveMode::MoveAnchor, 1);
-    assert_eq!(
-        cursor.position(),
-        anchor,
-        "Right puts the caret on the anchor"
-    );
+    let cursor = doc.cursor_at(anchor);
+    assert_eq!(cursor.position(), anchor, "the caret is on the anchor");
     cursor.move_position(MoveOperation::Right, MoveMode::KeepAnchor, 3);
     assert_cut_takes_what_it_copies(
         &doc,
