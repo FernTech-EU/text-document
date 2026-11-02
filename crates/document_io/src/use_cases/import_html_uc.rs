@@ -322,6 +322,7 @@ impl LongOperation for ImportHtmlUseCase {
                     let block = Block {
                         document_position,
                         fmt_heading_level: parsed_block.heading_level,
+                        fmt_marker: parsed_block.marker.clone(),
                         fmt_line_height: parsed_block.line_height,
                         fmt_non_breakable_lines: parsed_block.non_breakable_lines,
                         fmt_direction: parsed_block.direction.clone(),

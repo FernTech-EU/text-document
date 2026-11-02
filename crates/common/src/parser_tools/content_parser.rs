@@ -476,6 +476,8 @@ pub fn parse_markdown(markdown: &str) -> Vec<ParsedElement> {
     let mut current_list_style: Option<ListStyle> = None;
     let mut current_list_start: Option<i64> = None;
     let mut current_list_suffix = String::new();
+    // The task-list checkbox of the item being read, which only its first block wears.
+    let mut current_marker: Option<MarkerType> = None;
     let mut is_code_block = false;
     let mut code_language: Option<String> = None;
     let mut blockquote_depth: u32 = 0;
@@ -532,7 +534,7 @@ pub fn parse_markdown(markdown: &str) -> Vec<ParsedElement> {
                         list_prefix: String::new(),
                         list_suffix: current_list_suffix.clone(),
                         list_start: current_list_start,
-                        marker: None,
+                        marker: current_marker.clone(),
                         is_code_block: false,
                         code_language: None,
                         blockquote_depth,
@@ -553,6 +555,7 @@ pub fn parse_markdown(markdown: &str) -> Vec<ParsedElement> {
                 current_list_style = None;
                 current_list_start = None;
                 current_list_suffix.clear();
+                current_marker = None;
             }
             Event::Start(Tag::Heading { level, .. }) => {
                 in_block = true;
@@ -600,6 +603,13 @@ pub fn parse_markdown(markdown: &str) -> Vec<ParsedElement> {
                     String::new()
                 });
             }
+            Event::TaskListMarker(checked) => {
+                current_marker = Some(if checked {
+                    MarkerType::Checked
+                } else {
+                    MarkerType::Unchecked
+                });
+            }
             Event::End(TagEnd::List(_)) => {
                 list_stack.pop();
                 list_start_stack.pop();
@@ -617,7 +627,7 @@ pub fn parse_markdown(markdown: &str) -> Vec<ParsedElement> {
                         list_prefix: String::new(),
                         list_suffix: current_list_suffix.clone(),
                         list_start: current_list_start,
-                        marker: None,
+                        marker: current_marker.clone(),
                         is_code_block: false,
                         code_language: None,
                         blockquote_depth,
@@ -638,6 +648,8 @@ pub fn parse_markdown(markdown: &str) -> Vec<ParsedElement> {
                 current_list_style = list_stack.last().cloned().flatten();
                 current_list_start = list_start_stack.last().copied().flatten();
                 current_list_suffix = list_suffix_stack.last().cloned().unwrap_or_default();
+                // Set after the flush above, which wrote the parent item with its own box.
+                current_marker = None;
                 current_list_indent = if list_stack.is_empty() {
                     0
                 } else {
@@ -656,7 +668,7 @@ pub fn parse_markdown(markdown: &str) -> Vec<ParsedElement> {
                         list_prefix: String::new(),
                         list_suffix: current_list_suffix.clone(),
                         list_start: current_list_start,
-                        marker: None,
+                        marker: current_marker.clone(),
                         is_code_block: false,
                         code_language: None,
                         blockquote_depth,
@@ -677,6 +689,7 @@ pub fn parse_markdown(markdown: &str) -> Vec<ParsedElement> {
                 current_list_style = None;
                 current_list_start = None;
                 current_list_suffix.clear();
+                current_marker = None;
             }
             Event::Start(Tag::CodeBlock(kind)) => {
                 in_block = true;
@@ -967,7 +980,7 @@ pub fn parse_markdown(markdown: &str) -> Vec<ParsedElement> {
                         list_prefix: String::new(),
                         list_suffix: current_list_suffix.clone(),
                         list_start: current_list_start,
-                        marker: None,
+                        marker: current_marker.clone(),
                         is_code_block: false,
                         code_language: None,
                         blockquote_depth,
@@ -996,7 +1009,7 @@ pub fn parse_markdown(markdown: &str) -> Vec<ParsedElement> {
                         list_prefix: String::new(),
                         list_suffix: current_list_suffix.clone(),
                         list_start: current_list_start,
-                        marker: None,
+                        marker: current_marker.clone(),
                         is_code_block: false,
                         code_language: None,
                         blockquote_depth,
@@ -1069,7 +1082,7 @@ pub fn parse_markdown(markdown: &str) -> Vec<ParsedElement> {
             list_prefix: String::new(),
             list_suffix: current_list_suffix.clone(),
             list_start: current_list_start,
-            marker: None,
+            marker: current_marker.clone(),
             is_code_block,
             code_language: code_language.take(),
             blockquote_depth,
@@ -1334,6 +1347,75 @@ fn is_html_space(ch: char) -> bool {
     matches!(ch, ' ' | '\t' | '\n' | '\r' | '\u{0C}')
 }
 
+/// The box a Markdown task item writes after its list marker: `[x] ` or `[ ] `, nothing for
+/// an item that is no task. Shared by the two Markdown writers.
+pub fn task_box_markdown(marker: Option<&MarkerType>) -> &'static str {
+    match marker {
+        Some(MarkerType::Checked) => "[x] ",
+        Some(MarkerType::Unchecked) => "[ ] ",
+        _ => "",
+    }
+}
+
+/// The checkbox an HTML list item opens with when it is a task, nothing otherwise. Written
+/// as well-formed XML (`disabled="disabled"`, a closed tag) because the same markup is
+/// packaged into EPUB chapters, which are XHTML. Shared by the two HTML writers;
+/// `html_item_checkbox` reads it back.
+pub fn task_checkbox_html(marker: Option<&MarkerType>) -> &'static str {
+    match marker {
+        Some(MarkerType::Checked) => {
+            "<input type=\"checkbox\" disabled=\"disabled\" checked=\"checked\"/> "
+        }
+        Some(MarkerType::Unchecked) => "<input type=\"checkbox\" disabled=\"disabled\"/> ",
+        _ => "",
+    }
+}
+
+/// The task-list checkbox an HTML list item opens with: the first thing it holds, apart
+/// from blanks, is an `<input type="checkbox">`, bare or inside inline wrappers such as
+/// `<label>` and `<span>`. `checked` makes it [`MarkerType::Checked`]; `disabled` and
+/// every other attribute change nothing. A checkbox further on is a form control in the
+/// text, not the item's box.
+fn html_item_checkbox(item: ego_tree::NodeRef<Node>) -> Option<MarkerType> {
+    /// `Some(answer)` once something decided it, `None` while only blanks were seen.
+    fn scan(node: ego_tree::NodeRef<Node>, depth: usize) -> Option<Option<MarkerType>> {
+        for child in node.children() {
+            match child.value() {
+                Node::Text(text) => {
+                    if !text.chars().all(is_html_space) {
+                        return Some(None);
+                    }
+                }
+                Node::Element(el) => {
+                    let name = el.name();
+                    if name == "input" {
+                        let is_checkbox = el
+                            .attr("type")
+                            .is_some_and(|t| t.trim().eq_ignore_ascii_case("checkbox"));
+                        return Some(is_checkbox.then(|| {
+                            if el.attr("checked").is_some() {
+                                MarkerType::Checked
+                            } else {
+                                MarkerType::Unchecked
+                            }
+                        }));
+                    }
+                    if matches!(name, "label" | "span") && depth < 8 {
+                        if let Some(decided) = scan(child, depth + 1) {
+                            return Some(decided);
+                        }
+                    } else {
+                        return Some(None);
+                    }
+                }
+                _ => {}
+            }
+        }
+        None
+    }
+    scan(item, 0).flatten()
+}
+
 /// Whether a span run holds anything a reader would see.
 fn spans_carry_content(spans: &[ParsedSpan]) -> bool {
     spans
@@ -1514,6 +1596,8 @@ pub fn split_block_at_line_breaks(mut block: ParsedBlock) -> Vec<ParsedBlock> {
     let later_line = ParsedBlock {
         page_break_before: None,
         blockquote_opens: 0,
+        // The box is the item's, which its first line holds.
+        marker: None,
         ..block.clone()
     };
     let mut first_line = Some(block);
@@ -2435,6 +2519,7 @@ fn read_html_tree(fragment: &scraper::Html, depth_limit: usize) -> Vec<ParsedEle
                             && !spans
                                 .iter()
                                 .any(|span| span.image.is_some() || span.footnote_ref.is_some());
+                        let list_style_for_block_is_some = list_style_for_block.is_some();
                         let block = ParsedBlock {
                             spans,
                             heading_level,
@@ -2446,7 +2531,13 @@ fn read_html_tree(fragment: &scraper::Html, depth_limit: usize) -> Vec<ParsedEle
                             list_indent: list_indent_for_block,
                             list_prefix: String::new(),
                             list_start: list_start_for_block,
-                            marker: None,
+                            // Only a list item has a box: an `<li>` outside any list is read
+                            // as a paragraph (see `is_inline_only`) and has none to keep.
+                            marker: if list_style_for_block_is_some {
+                                html_item_checkbox(node)
+                            } else {
+                                None
+                            },
                             is_code_block,
                             code_language: code_language.filter(|_| is_code_block),
                             blockquote_depth: bq_depth,
@@ -5198,5 +5289,170 @@ mod list_delimiter_tests {
         for style in [ListStyle::Disc, ListStyle::Circle, ListStyle::Square] {
             assert_eq!(default_list_suffix(&style), "");
         }
+    }
+}
+
+#[cfg(test)]
+mod task_list_tests {
+    use super::*;
+
+    fn md(source: &str) -> Vec<ParsedBlock> {
+        ParsedElement::flatten_to_blocks(parse_markdown(source))
+    }
+
+    fn html(source: &str) -> Vec<ParsedBlock> {
+        ParsedElement::flatten_to_blocks(parse_html_elements(source))
+    }
+
+    fn text(block: &ParsedBlock) -> String {
+        block.spans.iter().map(|s| s.text.as_str()).collect()
+    }
+
+    fn markers(blocks: &[ParsedBlock]) -> Vec<Option<MarkerType>> {
+        blocks.iter().map(|b| b.marker.clone()).collect()
+    }
+
+    #[test]
+    fn markdown_task_items_keep_their_state_and_lose_the_box_text() {
+        let blocks = md("- [x] done\n- [ ] todo\n- plain");
+        assert_eq!(
+            markers(&blocks),
+            [Some(MarkerType::Checked), Some(MarkerType::Unchecked), None]
+        );
+        assert_eq!(text(&blocks[0]), "done");
+        assert_eq!(text(&blocks[1]), "todo");
+        assert_eq!(text(&blocks[2]), "plain");
+    }
+
+    #[test]
+    fn ordered_and_starred_items_and_a_capital_x() {
+        assert_eq!(markers(&md("1. [x] a")), [Some(MarkerType::Checked)]);
+        assert_eq!(markers(&md("* [X] cap")), [Some(MarkerType::Checked)]);
+        assert_eq!(markers(&md("3) [ ] a")), [Some(MarkerType::Unchecked)]);
+    }
+
+    #[test]
+    fn a_nested_tight_item_has_its_own_box_and_the_parent_keeps_its_own() {
+        let blocks = md("- [x] a\n  - [ ] b\n- c");
+        assert_eq!(
+            markers(&blocks),
+            [Some(MarkerType::Checked), Some(MarkerType::Unchecked), None]
+        );
+        assert_eq!(text(&blocks[0]), "a");
+        assert_eq!(text(&blocks[1]), "b");
+    }
+
+    #[test]
+    fn only_the_first_block_of_an_item_wears_the_box() {
+        let blocks = md("- [ ] a\n\n  second para\n- [x] b");
+        assert_eq!(text(&blocks[0]), "a");
+        assert_eq!(blocks[0].marker, Some(MarkerType::Unchecked));
+        assert_eq!(text(&blocks[1]), "second para");
+        assert_eq!(blocks[1].marker, None);
+        assert_eq!(text(&blocks[2]), "b");
+        assert_eq!(blocks[2].marker, Some(MarkerType::Checked));
+    }
+
+    #[test]
+    fn a_task_item_in_a_quotation_is_read() {
+        let blocks = md("> - [x] a");
+        assert_eq!(blocks[0].marker, Some(MarkerType::Checked));
+        assert_eq!(blocks[0].blockquote_depth, 1);
+    }
+
+    #[test]
+    fn an_empty_task_item_does_not_leak_into_the_next_one() {
+        // `- [x]` alone is text; `- [x] ` is a box with nothing after it, which makes no
+        // block (an empty item never did) and must not hand its box to the next item.
+        let blocks = md("- [x]");
+        assert_eq!(markers(&blocks), [None]);
+        assert_eq!(text(&blocks[0]), "[x]");
+        let blocks = md("- [x] \n- next");
+        assert_eq!(text(blocks.last().unwrap()), "next");
+        assert_eq!(blocks.last().unwrap().marker, None);
+    }
+
+    #[test]
+    fn a_footnote_with_a_task_list_reads_the_boxes() {
+        let elements = parse_markdown("x[^n]\n\n[^n]: - [x] a\n");
+        let note = elements
+            .into_iter()
+            .find_map(|e| match e {
+                ParsedElement::FootnoteDefinition { blocks, .. } => Some(blocks),
+                _ => None,
+            })
+            .expect("a note");
+        assert!(note.iter().any(|b| b.marker == Some(MarkerType::Checked)));
+    }
+
+    #[test]
+    fn a_line_break_split_keeps_the_box_on_the_first_line_only() {
+        let block = ParsedBlock {
+            spans: vec![ParsedSpan {
+                text: "one\ntwo".into(),
+                preserve_whitespace: true,
+                ..Default::default()
+            }],
+            list_style: Some(ListStyle::Disc),
+            marker: Some(MarkerType::Checked),
+            ..Default::default()
+        };
+        let lines = split_block_at_line_breaks(block);
+        assert_eq!(
+            markers(&lines),
+            [Some(MarkerType::Checked), None],
+            "the item's box is its first line's"
+        );
+    }
+
+    #[test]
+    fn html_checkbox_items_are_read() {
+        let blocks = html(
+            r#"<ul><li><input type="checkbox" checked> a</li><li><input type="checkbox" disabled> b</li><li>c</li></ul>"#,
+        );
+        assert_eq!(
+            markers(&blocks),
+            [Some(MarkerType::Checked), Some(MarkerType::Unchecked), None]
+        );
+        assert_eq!(text(&blocks[0]), "a");
+        assert_eq!(text(&blocks[1]), "b");
+    }
+
+    #[test]
+    fn html_checkbox_through_a_label_and_in_any_case() {
+        let blocks = html(r#"<ul><li><label><input type="checkbox"> a</label></li></ul>"#);
+        assert_eq!(blocks[0].marker, Some(MarkerType::Unchecked));
+        assert_eq!(text(&blocks[0]), "a");
+        let blocks = html(r#"<ul><li><input type="CHECKBOX" checked="checked"/> a</li></ul>"#);
+        assert_eq!(blocks[0].marker, Some(MarkerType::Checked));
+    }
+
+    #[test]
+    fn html_checkbox_that_is_not_first_or_not_a_checkbox_sets_nothing() {
+        let blocks = html(r#"<ul><li>a <input type="checkbox" checked></li></ul>"#);
+        assert_eq!(blocks[0].marker, None);
+        assert_eq!(text(&blocks[0]), "a");
+        let blocks = html(r#"<ul><li><input type="text"> a</li></ul>"#);
+        assert_eq!(blocks[0].marker, None);
+    }
+
+    #[test]
+    fn html_checkbox_outside_a_list_sets_nothing() {
+        let blocks = html(r#"<li><input type="checkbox" checked> a</li>"#);
+        assert!(blocks.iter().all(|b| b.marker.is_none()));
+    }
+
+    #[test]
+    fn the_checkbox_writers_are_read_back() {
+        for marker in [MarkerType::Checked, MarkerType::Unchecked] {
+            let written = task_checkbox_html(Some(&marker));
+            let blocks = html(&format!("<ul><li>{written}a</li></ul>"));
+            assert_eq!(blocks[0].marker, Some(marker));
+            assert_eq!(text(&blocks[0]), "a");
+        }
+        assert_eq!(task_checkbox_html(None), "");
+        assert_eq!(task_box_markdown(Some(&MarkerType::Checked)), "[x] ");
+        assert_eq!(task_box_markdown(Some(&MarkerType::Unchecked)), "[ ] ");
+        assert_eq!(task_box_markdown(None), "");
     }
 }

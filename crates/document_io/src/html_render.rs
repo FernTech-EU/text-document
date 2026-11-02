@@ -194,6 +194,9 @@ pub fn render_blocks_html(
                     open.push((tag, list_entity.id));
                 }
                 html.push_str("<li>");
+                html.push_str(common::parser_tools::content_parser::task_checkbox_html(
+                    b.fmt_marker.as_ref(),
+                ));
                 html.push_str(&render_inline_html(store, b, images, notes));
                 i += 1;
             }

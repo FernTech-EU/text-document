@@ -321,6 +321,7 @@ fn execute_content_insert(
             };
             updated_current.list = head_list_id;
             updated_current.fmt_heading_level = first_parsed.heading_level;
+            updated_current.fmt_marker = first_parsed.marker.clone();
             updated_current.fmt_line_height = first_parsed.line_height;
             updated_current.fmt_non_breakable_lines = first_parsed.non_breakable_lines;
             updated_current.fmt_page_break_before = first_parsed.page_break_before;
@@ -460,7 +461,7 @@ fn execute_content_insert(
                 fmt_heading_level: parsed.heading_level,
                 fmt_indent: None,
                 fmt_text_indent: None,
-                fmt_marker: None,
+                fmt_marker: parsed.marker.clone(),
                 fmt_tab_positions: vec![],
                 fmt_line_height: parsed.line_height,
                 fmt_non_breakable_lines: parsed.non_breakable_lines,
@@ -745,6 +746,7 @@ fn execute_content_insert(
             let mut updated_current = current_block.clone();
             updated_current.list = list_id;
             updated_current.fmt_heading_level = parsed.heading_level;
+            updated_current.fmt_marker = parsed.marker.clone();
             updated_current.fmt_line_height = parsed.line_height;
             updated_current.fmt_non_breakable_lines = parsed.non_breakable_lines;
             updated_current.fmt_page_break_before = parsed.page_break_before;
@@ -925,7 +927,7 @@ fn execute_content_insert(
                 fmt_heading_level: parsed.heading_level,
                 fmt_indent: None,
                 fmt_text_indent: None,
-                fmt_marker: None,
+                fmt_marker: parsed.marker.clone(),
                 fmt_tab_positions: vec![],
                 fmt_line_height: parsed.line_height,
                 fmt_non_breakable_lines: parsed.non_breakable_lines,

@@ -3,7 +3,7 @@
 use crate::{CharVerticalAlignment, InlineContent, LINE_SEPARATOR, ListStyle};
 use frontend::common::parser_tools::content_parser::{
     ParsedBlock, ParsedElement, ParsedSpan, html_line_ends_before, html_text_ends_open,
-    push_html_text, split_block_at_line_breaks,
+    push_html_text, split_block_at_line_breaks, task_box_markdown, task_checkbox_html,
 };
 use frontend::common::parser_tools::fragment_schema::{
     FragmentBlock, FragmentData, FragmentElement, FragmentListStarts, FragmentQuoting,
@@ -218,6 +218,7 @@ impl DocumentFragment {
                     match &b.list {
                         Some(l) if is_ordered_list_style(&l.style) == is_ordered => {
                             body.push_str("<li>");
+                            body.push_str(task_checkbox_html(b.marker.as_ref()));
                             push_inline_html(&mut body, &b.elements);
                             body.push_str("</li>");
                             i += 1;
@@ -315,6 +316,7 @@ impl DocumentFragment {
                 list_counter = 0;
             } else if let Some(ref list) = block.list {
                 let is_ordered = is_ordered_list_style(&list.style);
+                let task_box = task_box_markdown(block.marker.as_ref());
                 if !prev_was_list {
                     // From where the list starts, when it is not 1.
                     list_counter = list_starts
@@ -329,13 +331,16 @@ impl DocumentFragment {
                     let delimiter = if list.suffix == ")" { ')' } else { '.' };
                     parts.push((
                         format!(
-                            "{}{}{} {}",
-                            indent_prefix, list_counter, delimiter, inline_text
+                            "{}{}{} {}{}",
+                            indent_prefix, list_counter, delimiter, task_box, inline_text
                         ),
                         true,
                     ));
                 } else {
-                    parts.push((format!("{}- {}", indent_prefix, inline_text), true));
+                    parts.push((
+                        format!("{}- {}{}", indent_prefix, task_box, inline_text),
+                        true,
+                    ));
                 }
                 prev_was_list = true;
             } else {

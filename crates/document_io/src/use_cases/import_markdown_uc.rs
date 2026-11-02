@@ -364,6 +364,7 @@ fn import_parsed_elements(
                 let block = Block {
                     document_position,
                     fmt_heading_level: parsed_block.heading_level,
+                    fmt_marker: parsed_block.marker.clone(),
                     fmt_is_code_block: if parsed_block.is_code_block {
                         Some(true)
                     } else {

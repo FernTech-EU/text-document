@@ -6,6 +6,7 @@ use common::database::QueryUnitOfWork;
 use common::database::rope_helpers::block_content_via_store;
 use common::entities::{Block, Document, Frame, List, ListStyle, Root, Table, TableCell};
 use common::format_runs::{InlineContent, InlineSegment};
+use common::parser_tools::content_parser::task_box_markdown;
 use common::parser_tools::{LINE_SEPARATOR, MarkdownExportOptions};
 use common::types::{EntityId, ROOT_ENTITY_ID};
 use std::collections::HashSet;
@@ -458,11 +459,16 @@ impl ExportMarkdownUseCase {
             });
             // The item's later lines start where its text does.
             let continuation = format!("{quote_prefix}{}", " ".repeat(column + marker.0.len()));
+            // The box of a task item goes in the written line only, never into the marker:
+            // `content_column` is where the item's text starts for a nested item and a
+            // continuation line, and four more columns would make them an indented code block.
+            let task_box = task_box_markdown(block.fmt_marker.as_ref());
             format!(
-                "{}{}{}{}",
+                "{}{}{}{}{}",
                 quote_prefix,
                 " ".repeat(column),
                 marker.0,
+                task_box,
                 join_hard_broken(&lines, &continuation)
             )
         } else {
