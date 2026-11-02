@@ -1467,6 +1467,31 @@ fn whitespace_rule(selectors: &str, body: &str) -> Option<WhitespaceRule> {
         return None;
     }
     let mut declarations = Vec::new();
+    // The declarations of the rule itself: a nested rule (`p { span { white-space: pre } }`)
+    // is another rule's, and a block in the body is taken out before it is split.
+    let own;
+    let body = if body.contains('{') {
+        let mut text = String::with_capacity(body.len());
+        let mut depth = 0usize;
+        for ch in body.chars() {
+            match ch {
+                '{' => depth += 1,
+                '}' if depth > 0 => {
+                    depth -= 1;
+                    if depth == 0 {
+                        // What ended the nested rule ends a declaration too.
+                        text.push(';');
+                    }
+                }
+                _ if depth == 0 => text.push(ch),
+                _ => {}
+            }
+        }
+        own = text;
+        own.as_str()
+    } else {
+        body
+    };
     for part in body.split(';') {
         let Some((property, value)) = part.split_once(':') else {
             continue;
@@ -1550,24 +1575,96 @@ fn html_sheet(fragment: &scraper::Html) -> Option<SheetWhitespace> {
     (!sheet.is_empty()).then_some(sheet)
 }
 
+/// Whether `name` is an element that sets its content apart as a block, in the sense of
+/// "blanks next to it are layout".
+fn is_block_level_name(name: &str) -> bool {
+    matches!(
+        name,
+        "address"
+            | "article"
+            | "aside"
+            | "blockquote"
+            | "caption"
+            | "center"
+            | "dd"
+            | "details"
+            | "dialog"
+            | "dir"
+            | "div"
+            | "dl"
+            | "dt"
+            | "fieldset"
+            | "figcaption"
+            | "figure"
+            | "footer"
+            | "form"
+            | "h1"
+            | "h2"
+            | "h3"
+            | "h4"
+            | "h5"
+            | "h6"
+            | "header"
+            | "hgroup"
+            | "hr"
+            | "li"
+            | "main"
+            | "menu"
+            | "nav"
+            | "ol"
+            | "p"
+            | "pre"
+            | "search"
+            | "section"
+            | "summary"
+            | "table"
+            | "tbody"
+            | "td"
+            | "tfoot"
+            | "th"
+            | "thead"
+            | "tr"
+            | "ul"
+    )
+}
+
 /// Whether a text node is the whitespace between blocks, which a `white-space` that keeps
-/// whitespace must not turn into content: only blanks, in an element that also holds a
-/// block-level one. A paragraph made of blanks alone is content and stays.
+/// whitespace must not turn into content: only blanks, with a block-level element on one
+/// side and a block-level element or the edge of the parent on the other. Blanks between
+/// two inline siblings (`<b>a</b> <i>b</i>`) are the space between two words, and blanks
+/// alone in an element (`<p> </p>`) are the content a writer put there; both stay. Decided
+/// from the two neighbours, so the cost does not depend on how many siblings there are.
 fn is_formatting_whitespace(text: &str, node: ego_tree::NodeRef<Node>) -> bool {
-    text.chars().all(is_html_space)
-        && node.parent().is_some_and(|parent| {
-            parent.children().any(|sibling| {
-                matches!(
-                    sibling.value(),
-                    Node::Element(el) if matches!(
-                        el.name(),
-                        "p" | "div" | "h1" | "h2" | "h3" | "h4" | "h5" | "h6" | "li" | "pre"
-                            | "blockquote" | "ul" | "ol" | "table" | "thead" | "tbody"
-                            | "tfoot" | "tr" | "td" | "th" | "hr"
-                    )
-                )
-            })
-        })
+    if !text.chars().all(is_html_space) {
+        return false;
+    }
+    // The neighbour on a side, skipping comments: `None` at the edge of the parent.
+    let neighbour = |next: bool| {
+        let mut at = node;
+        loop {
+            let sibling = if next {
+                at.next_sibling()
+            } else {
+                at.prev_sibling()
+            };
+            match sibling {
+                Some(s) if matches!(s.value(), Node::Comment(_)) => at = s,
+                other => return other,
+            }
+        }
+    };
+    let side = |sibling: Option<ego_tree::NodeRef<Node>>| match sibling {
+        // The edge: layout when the other side is a block.
+        None => Some(false),
+        Some(s) => match s.value() {
+            Node::Element(el) => Some(is_block_level_name(el.name())),
+            _ => None,
+        },
+    };
+    match (side(neighbour(false)), side(neighbour(true))) {
+        (Some(before), Some(after)) => before || after,
+        _ => false,
+    }
 }
 
 /// Write `text`, a run of a paragraph's text, into `out` as HTML: each of its lines (it
@@ -2197,7 +2294,12 @@ fn html_tree_depth(tree: &ego_tree::Tree<Node>) -> usize {
 /// `p, li { white-space: pre-wrap; }` does (what Qt writes). A rule with a class, id,
 /// attribute, pseudo-class or combinator in its selector, a rule inside an at-rule such as
 /// `@media`, a `<style>` of another `type` or for `print`, and every other property, is
-/// ignored. Blanks alone between two blocks stay layout.
+/// ignored. Blanks alone between two blocks stay layout; between two inline siblings they are
+/// the space between two words. Known limits: a rule with a class or id is not applied, and
+/// neither is what it overrides (`p.plain { white-space: normal }` over `p { white-space: pre }`
+/// leaves the paragraphs of the class kept); `pre-line` and `nowrap` collapse all whitespace,
+/// as they do in an inline `style`; and a `pre` from a sheet, unlike one in an inline `style`,
+/// does not mark the block non-breakable.
 pub fn parse_html_elements(html: &str) -> Vec<ParsedElement> {
     use scraper::Html;
 
@@ -2334,6 +2436,14 @@ fn read_html_tree(fragment: &scraper::Html, depth_limit: usize) -> Vec<ParsedEle
         }
     }
 
+    /// The space a cell puts between two blocks of its own: layout, collapsed whatever the
+    /// state's whitespace, where a kept one would stay a space at the cell's edge.
+    fn separator_span(state: &FmtState) -> ParsedSpan {
+        let mut span = text_span(" ".to_string(), state);
+        span.preserve_whitespace = false;
+        span
+    }
+
     /// Collect inline spans from a `<td>` or `<th>` cell element.
     fn collect_cell_spans(
         node: ego_tree::NodeRef<Node>,
@@ -2417,12 +2527,12 @@ fn read_html_tree(fragment: &scraper::Html, depth_limit: usize) -> Vec<ParsedEle
                         // the HTML writer puts out as `One<br/>Two`, came back as
                         // the one word `OneTwo`.
                         "br" => {
-                            spans.push(text_span(" ".to_string(), state));
+                            spans.push(separator_span(state));
                             continue;
                         }
                         "p" | "div" | "li" | "ul" | "ol" | "blockquote" | "pre" | "h1" | "h2"
                         | "h3" | "h4" | "h5" | "h6" => {
-                            spans.push(text_span(" ".to_string(), state));
+                            spans.push(separator_span(state));
                         }
                         _ => {}
                     }
@@ -2493,8 +2603,14 @@ fn read_html_tree(fragment: &scraper::Html, depth_limit: usize) -> Vec<ParsedEle
                                 {
                                     let mut spans = Vec::new();
                                     // A cell starts from the whitespace the table stands in
-                                    // (the sheet's, with the table's own), then its own.
-                                    let mut cell_state = state.clone();
+                                    // (the sheet's, with the table's own), then its own. It
+                                    // takes none of the formatting around the table: a table
+                                    // in a `<b>` or an `<a>` is not made of bold cells or links.
+                                    let mut cell_state = FmtState {
+                                        preserve_whitespace: state.preserve_whitespace,
+                                        sheet: state.sheet.clone(),
+                                        ..FmtState::default()
+                                    };
                                     if let Some(keep) =
                                         element_keeps_whitespace(td_el, state.sheet.as_deref())
                                     {
@@ -3162,7 +3278,8 @@ fn read_html_tree(fragment: &scraper::Html, depth_limit: usize) -> Vec<ParsedEle
     // Only when something survived: the root's direct text children are the
     // newlines between top-level blocks in every document an exporter writes.
     if spans_carry_content(&root_spans) {
-        elements.push(ParsedElement::Block(ParsedBlock {
+        // Text that kept its line breaks is one block for each line, as for any other block.
+        let root_block = ParsedBlock {
             spans: root_spans,
             heading_level: None,
             list_style: None,
@@ -3185,7 +3302,12 @@ fn read_html_tree(fragment: &scraper::Html, depth_limit: usize) -> Vec<ParsedEle
             top_margin: None,
             text_indent: None,
             semantic_role: None,
-        }));
+        };
+        elements.extend(
+            split_block_at_line_breaks(root_block)
+                .into_iter()
+                .map(ParsedElement::Block),
+        );
     }
 
     // If no elements were parsed, create a single empty paragraph
@@ -6111,6 +6233,164 @@ li.checked::marker { content: "\2612"; }
         ] {
             let _ = texts(&with_sheet(css, "<p>a</p>"));
         }
+    }
+
+    /// A document with no <style> reads as it did before sheets were read: the blank between
+    /// two inline siblings is the space between two words, whatever the element's own
+    /// `white-space` says.
+    #[test]
+    fn blanks_between_inline_siblings_are_content() {
+        for html in [
+            r#"<div style="white-space: pre-wrap"><b>a</b> <i>b</i><p>c</p></div>"#,
+            r#"<ul style="white-space: pre-wrap"><li><b>a</b> <i>b</i><ul><li>c</li></ul></li></ul>"#,
+            "<style>li { white-space: pre-wrap }</style><ul><li><b>a</b> <i>b</i><ul><li>c</li></ul></li></ul>",
+            "<style>* { white-space: pre-wrap }</style><div><b>a</b> <i>b</i><p>c</p></div>",
+        ] {
+            let read = texts(html);
+            assert!(read.iter().any(|t| t == "a b"), "{html}: {read:?}");
+            assert!(!read.iter().any(|t| t == "ab"), "{html}: {read:?}");
+        }
+        // And inside a cell.
+        let cell = ParsedElement::flatten_to_blocks(parse_html_elements(
+            r#"<table><tr><td style="white-space: pre-wrap"><b>a</b> <b>b</b><p>c</p></td></tr></table>"#,
+        ));
+        let cell: String = cell
+            .iter()
+            .flat_map(|b| b.spans.iter().map(|s| s.text.as_str()))
+            .collect();
+        assert!(cell.contains("a b"), "{cell:?}");
+    }
+
+    /// Blanks between blocks are layout whatever the block elements are called, HTML5
+    /// sectioning and grouping included.
+    #[test]
+    fn blanks_between_html5_containers_are_layout() {
+        let sections = "<section>\n<p>a</p>\n</section>\n<section>\n<p>b</p>\n</section>\n";
+        for selector in ["body", "html", "*"] {
+            let html = with_sheet(&format!("{selector} {{ white-space: pre-wrap }}"), sections);
+            assert_eq!(texts(&html), ["a", "b"], "{selector}");
+        }
+        for tag in [
+            "article", "main", "header", "footer", "nav", "aside", "figure", "dl",
+        ] {
+            let html = with_sheet(
+                "* { white-space: pre-wrap }",
+                &format!("<{tag}>\n<p>a</p>\n</{tag}>\n<{tag}>\n<p>b</p>\n</{tag}>\n"),
+            );
+            assert_eq!(texts(&html), ["a", "b"], "{tag}");
+        }
+    }
+
+    /// The decision is made from the two neighbours of a blank, so a parent with a hundred
+    /// thousand children is read in proportion to them.
+    #[test]
+    fn a_parent_of_many_children_is_read_in_linear_time() {
+        let children = "<b>x</b> ".repeat(100_000);
+        let html =
+            format!("<style>* {{ white-space: pre-wrap }}</style><div>{children}<p>end</p></div>");
+        let started = std::time::Instant::now();
+        let read = texts(&html);
+        assert!(read.len() >= 2);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(10),
+            "100,000 children took {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// A table in a bold or a link makes no bold or linked cells: a cell starts from the
+    /// whitespace around the table and nothing else.
+    #[test]
+    fn a_cell_takes_the_whitespace_around_the_table_and_no_formatting() {
+        let parsed = parse_html_elements(
+            r#"<b><a href="http://x"><table><tr><td>x</td></tr></table></a></b>"#,
+        );
+        let cell = parsed
+            .iter()
+            .find_map(|e| match e {
+                ParsedElement::Table(t) => Some(t.rows[0][0].spans.clone()),
+                _ => None,
+            })
+            .expect("a table");
+        assert!(
+            cell.iter().all(|s| !s.bold && s.link_href.is_none()),
+            "{cell:?}"
+        );
+    }
+
+    /// A kept whitespace does not keep the space a cell puts between its blocks.
+    #[test]
+    fn a_cell_of_blocks_under_kept_whitespace_has_no_leading_space() {
+        let parsed = parse_html_elements(&with_sheet(
+            "* { white-space: pre-wrap }",
+            "<table><tr><td><p>x</p></td></tr></table>",
+        ));
+        let cell: String = parsed
+            .iter()
+            .find_map(|e| match e {
+                ParsedElement::Table(t) => {
+                    Some(t.rows[0][0].spans.iter().map(|s| s.text.as_str()).collect())
+                }
+                _ => None,
+            })
+            .expect("a table");
+        assert_eq!(cell, "x");
+        let parsed = parse_html_elements(&with_sheet(
+            "td { white-space: pre-wrap }",
+            "<table><tr><td>a\tb   c</td></tr></table>",
+        ));
+        let cell: String = parsed
+            .iter()
+            .find_map(|e| match e {
+                ParsedElement::Table(t) => {
+                    Some(t.rows[0][0].spans.iter().map(|s| s.text.as_str()).collect())
+                }
+                _ => None,
+            })
+            .expect("a table");
+        assert_eq!(cell, "a\tb   c");
+    }
+
+    /// Bare text that kept its line breaks is one block for each line, as it is anywhere else.
+    #[test]
+    fn bare_text_with_a_line_break_under_a_kept_whitespace_is_two_blocks() {
+        let html = "<style>body { white-space: pre-wrap }</style>a\nb";
+        assert_eq!(texts(html), ["a", "b"]);
+    }
+
+    /// The declarations of a nested rule are that rule's, not the rule that holds it.
+    #[test]
+    fn a_nested_rule_does_not_leak_into_the_rule_around_it() {
+        let case = |css: &str| texts(&with_sheet(css, "<p>a\tb</p>"));
+        assert_eq!(
+            case("p { span { white-space: normal; white-space: pre; } }"),
+            ["a b"]
+        );
+        assert_eq!(
+            case("p { span { white-space: pre } white-space: pre-wrap }"),
+            ["a\tb"]
+        );
+        assert_eq!(
+            case("p { white-space: pre-wrap; & span { white-space: normal } }"),
+            ["a\tb"]
+        );
+    }
+
+    /// `pre-line` and `nowrap` from a sheet collapse the whitespace, as they do inline, and a
+    /// sheet's `pre` marks no block non-breakable, as an inline one does.
+    #[test]
+    fn pre_line_nowrap_and_pre_from_a_sheet() {
+        for keyword in ["pre-line", "nowrap"] {
+            let html = with_sheet(
+                &format!("p {{ white-space: {keyword} }}"),
+                "<p>a\tb   c</p>",
+            );
+            assert_eq!(texts(&html), ["a b c"], "{keyword}");
+        }
+        let html = with_sheet("p { white-space: pre }", "<p>a\tb</p>");
+        let parsed = blocks(&html);
+        assert_eq!(parsed[0].non_breakable_lines, None);
+        assert_eq!(texts(&html), ["a\tb"]);
     }
 
     /// A sheet is resolved once into one winning declaration per tag: the cost grows with
