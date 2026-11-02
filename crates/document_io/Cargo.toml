@@ -39,6 +39,12 @@ regex = "1"
 # Skribisto's build outright — it did, which is how this note came to be written. Whatever this
 # is pinned to must also satisfy every other `docx-rs` requirement in the tree.
 #
+# Pending: docx-rs `main` moved to zip 9 (commit ad7fede6, not released). When 0.4.23 is
+# released, bump this to `=0.4.23` and Skribisto's `document_ingest` to `^0.4.23` in the same
+# window (a unilateral bump is unsatisfiable in the unified graph, the failure described above),
+# re-read the extracted source as the paragraph below requires, and the zip 8 copy leaves the
+# lock. epub-builder 0.8.3 still asks for zip 6, so a zip 6 copy stays until it follows.
+#
 # 0.4.22 is safe for the raw-XML patch above: `elements/comment.rs`, `elements/comment_extended.rs`
 # and `elements/paragraph.rs` are byte-identical to 0.4.21, `xml_docx.rs` differs only in doc
 # comments (`comments`/`comments_extended` are still `pub Vec<u8>`), and the auto-collector's
@@ -64,7 +70,12 @@ epub-builder = { version = "0.8.3", optional = true }
 # `META-INF/manifest.xml`, `content.xml`, `styles.xml`, deflated. Was a dev-dependency only
 # (used by tests to unzip a packaged DOCX/EPUB for inspection); promoted to a real dependency
 # because the ODT writer itself now needs it at runtime, not only in tests.
-zip = { version = "6", optional = true }
+#
+# Not matched to epub-builder's or docx-rs's `zip` any more: the three each name their own, so
+# an upstream fix to one can land without the other two. Default features are off because the
+# writer needs only the stored and deflated methods; the defaults would add zstd (and its
+# `zstd-safe` and `zstd-sys`), which nothing here writes. zip 9 needs Rust 1.88.
+zip = { version = "9", optional = true, default-features = false, features = ["deflate"] }
 
 # PDF export (via embedded Typst), behind the `pdf` feature — see [features] below.
 # Pinned exactly (`=x.y.z`): typst is pre-1.0 with breaking changes across 0.x bumps, and PDF

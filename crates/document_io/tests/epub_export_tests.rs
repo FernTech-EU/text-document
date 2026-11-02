@@ -82,7 +82,10 @@ fn epub_from_djot(djot: &str, options: EpubExportOptions) -> Vec<u8> {
 
 fn zip_entry_names(bytes: &[u8]) -> Vec<String> {
     let archive = zip::ZipArchive::new(Cursor::new(bytes)).expect("packaged EPUB is a valid zip");
-    archive.file_names().map(|s| s.to_string()).collect()
+    archive
+        .file_names()
+        .map(|name| name.expect("entry name").to_string())
+        .collect()
 }
 
 fn read_zip_entry(bytes: &[u8], name: &str) -> String {
@@ -612,7 +615,11 @@ fn rich_document_packs_to_a_valid_epub_file_on_disk() {
     assert!(!bytes.is_empty());
     let archive =
         zip::ZipArchive::new(Cursor::new(&bytes[..])).expect("packed epub must be a valid zip");
-    assert!(archive.file_names().any(|n| n == "mimetype"));
+    assert!(
+        archive
+            .file_names()
+            .any(|n| n.expect("entry name") == "mimetype")
+    );
 
     let _ = std::fs::remove_file(&path);
 }

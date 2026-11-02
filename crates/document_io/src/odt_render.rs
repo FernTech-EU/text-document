@@ -760,6 +760,13 @@ fn manifest_xml(image_entries: &[(String, String)]) -> String {
 /// rule `export_epub_uc`'s module doc points at for EPUB (`epub-builder` enforces it there; here
 /// there is no library doing it for us, so it is enforced by hand: `mimetype` is written before
 /// anything else, with `CompressionMethod::Stored`).
+///
+/// Every entry carries the same fixed modification time, 1980-01-01 00:00, the earliest a zip
+/// can record, so the same document packages to the same bytes. Without it the zip crate stamps
+/// the wall clock when its `time` feature is on, and that feature is unified across the whole
+/// dependency graph: an application whose other crates enable it would change the entries'
+/// dates (and the bytes of every export) with no change here. A file manager lists the entries
+/// as dated 1980.
 pub(crate) fn package_odt(
     content_xml: &str,
     styles_xml: &str,
@@ -771,12 +778,16 @@ pub(crate) fn package_odt(
     let mut buf = std::io::Cursor::new(Vec::new());
     let mut zip = zip::ZipWriter::new(&mut buf);
 
-    let stored = SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
+    let fixed_time = zip::DateTime::default();
+    let stored = SimpleFileOptions::default()
+        .compression_method(zip::CompressionMethod::Stored)
+        .last_modified_time(fixed_time);
     zip.start_file("mimetype", stored)?;
     zip.write_all(b"application/vnd.oasis.opendocument.text")?;
 
-    let deflated =
-        SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+    let deflated = SimpleFileOptions::default()
+        .compression_method(zip::CompressionMethod::Deflated)
+        .last_modified_time(fixed_time);
 
     zip.add_directory("META-INF/", deflated)?;
     let image_entries: Vec<(String, String)> = images
@@ -802,4 +813,50 @@ pub(crate) fn package_odt(
 
     zip.finish()?;
     Ok(buf.into_inner())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The entries of a package carry the zip format's earliest date, 1980-01-01 00:00, not
+    /// the clock, so the same document is the same bytes and the date does not depend on the
+    /// features other crates of the build turn on in the zip crate.
+    ///
+    /// The comparison of two packages passes with the clock as well when both are made in
+    /// the same two seconds; the header's date and time are the check that fails with it.
+    #[test]
+    fn a_package_is_dated_1980_and_is_reproducible() {
+        let images = vec![(
+            "Pictures/a.png".to_string(),
+            vec![1u8, 2, 3],
+            "image/png".to_string(),
+        )];
+        let first = package_odt("<c/>", "<s/>", &images).unwrap();
+        let second = package_odt("<c/>", "<s/>", &images).unwrap();
+        assert_eq!(first, second);
+
+        // Every local file header (signature, then at offset 10 the DOS time and at 12 the
+        // DOS date, 1980-01-01 being 0x0021).
+        let mut headers = 0;
+        for at in
+            (0..first.len().saturating_sub(14)).filter(|at| first[*at..].starts_with(b"PK\x03\x04"))
+        {
+            headers += 1;
+            assert_eq!(
+                u16::from_le_bytes([first[at + 10], first[at + 11]]),
+                0,
+                "time at {at}"
+            );
+            assert_eq!(
+                u16::from_le_bytes([first[at + 12], first[at + 13]]),
+                (1 << 5) | 1,
+                "date at {at}"
+            );
+        }
+        assert!(
+            headers >= 5,
+            "mimetype, manifest, content, styles and a picture: {headers}"
+        );
+    }
 }

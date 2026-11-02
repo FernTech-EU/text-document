@@ -146,7 +146,7 @@ fn an_epub_chapter_holds_a_well_formed_checkbox() {
     let mut chapters = String::new();
     for i in 0..zip.len() {
         let mut f = zip.by_index(i).unwrap();
-        if f.name().ends_with(".xhtml") {
+        if f.name().expect("entry name").ends_with(".xhtml") {
             let mut text = String::new();
             f.read_to_string(&mut text).unwrap();
             chapters.push_str(&text);

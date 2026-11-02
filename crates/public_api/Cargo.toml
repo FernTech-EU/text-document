@@ -35,7 +35,7 @@ insta = { version = "1.40", features = ["yaml", "redactions"] }
 # Image-export tests unzip the DOCX/EPUB they produce and assert on the media
 # parts inside — the markup that references them was never the part that was
 # wrong, so checking it would not have caught a dangling reference.
-zip = { version = "6", default-features = false, features = ["deflate"] }
+zip = { version = "9", default-features = false, features = ["deflate"] }
 png = "0.17"
 tempfile = "3"
 

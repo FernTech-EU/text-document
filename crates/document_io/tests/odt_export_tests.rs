@@ -172,7 +172,10 @@ fn odt_from_plain_text(text: &str, options: OdtExportOptions) -> Vec<u8> {
 
 fn zip_entry_names(bytes: &[u8]) -> Vec<String> {
     let archive = zip::ZipArchive::new(Cursor::new(bytes)).expect("packaged ODT is a valid zip");
-    archive.file_names().map(|s| s.to_string()).collect()
+    archive
+        .file_names()
+        .map(|name| name.expect("entry name").to_string())
+        .collect()
 }
 
 fn read_zip_entry(bytes: &[u8], name: &str) -> Vec<u8> {
@@ -240,6 +243,25 @@ fn mimetype_is_stored_uncompressed_as_the_first_entry() {
 
     let contents = read_zip_text(&bytes, "mimetype");
     assert_eq!(contents, "application/vnd.oasis.opendocument.text");
+}
+
+/// The rule readers rely on, read off the bytes rather than through a zip reader: the file
+/// opens with the local header of an entry named `mimetype`, stored, with no extra field, and
+/// its data follows at once, so that a program can find the media type at a fixed offset.
+#[test]
+fn mimetype_is_found_at_the_fixed_offset_of_the_first_local_header() {
+    let bytes = odt_from_djot("Just prose.", OdtExportOptions::default());
+    let media_type = b"application/vnd.oasis.opendocument.text";
+    assert_eq!(&bytes[0..4], b"PK\x03\x04", "local file header signature");
+    assert_eq!(u16::from_le_bytes([bytes[8], bytes[9]]), 0, "stored");
+    assert_eq!(u16::from_le_bytes([bytes[26], bytes[27]]), 8, "name length");
+    assert_eq!(
+        u16::from_le_bytes([bytes[28], bytes[29]]),
+        0,
+        "no extra field"
+    );
+    assert_eq!(&bytes[30..38], b"mimetype");
+    assert_eq!(&bytes[38..38 + media_type.len()], media_type);
 }
 
 #[test]

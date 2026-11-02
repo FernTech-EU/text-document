@@ -54,7 +54,7 @@ fn zip_entry(archive: &[u8], suffix: &str) -> Option<(String, Vec<u8>)> {
     let mut zip = zip::ZipArchive::new(std::io::Cursor::new(archive.to_vec())).ok()?;
     for i in 0..zip.len() {
         let mut f = zip.by_index(i).ok()?;
-        let name = f.name().to_string();
+        let name = f.name().expect("entry name").to_string();
         if name.ends_with(suffix) {
             let mut bytes = Vec::new();
             f.read_to_end(&mut bytes).ok()?;
@@ -68,7 +68,13 @@ fn zip_entry(archive: &[u8], suffix: &str) -> Option<(String, Vec<u8>)> {
 fn zip_names(archive: &[u8]) -> Vec<String> {
     let mut zip = zip::ZipArchive::new(std::io::Cursor::new(archive.to_vec())).expect("zip");
     (0..zip.len())
-        .map(|i| zip.by_index(i).expect("entry").name().to_string())
+        .map(|i| {
+            zip.by_index(i)
+                .expect("entry")
+                .name()
+                .expect("entry name")
+                .to_string()
+        })
         .collect()
 }
 
