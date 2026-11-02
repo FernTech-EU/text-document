@@ -3086,7 +3086,9 @@ impl TextCursor {
         Ok(())
     }
 
-    /// Set formatting on a list by its ID.
+    /// Set formatting on a list by its ID. A `format` whose style turns a numbered list into a
+    /// bullet list, or the reverse, resets the prefix and suffix it leaves `None` (see
+    /// [`ListFormat`]).
     pub fn set_list_format(&self, list_id: usize, format: &crate::ListFormat) -> Result<()> {
         let _settled = self.settle_transient_edits();
         let queued = {

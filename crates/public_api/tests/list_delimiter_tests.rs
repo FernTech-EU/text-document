@@ -238,3 +238,135 @@ fn a_mixed_delimiter_document_round_trips() {
     assert!(out.contains("1. a") && out.contains("2. b"), "{out:?}");
     assert!(out.contains("1) c") && out.contains("2) d"), "{out:?}");
 }
+
+/// The items of an HTML list pasted into a numbered list join it and wear its delimiter,
+/// whatever it is: HTML has none to say.
+#[test]
+fn html_pasted_into_a_numbered_list_joins_it_and_takes_its_delimiter() {
+    let html = "<ol><li>x</li><li>y</li></ol>";
+    for (source, markers) in [
+        ("1) a\n2) b", ["1)", "2)", "3)", "4)"]),
+        ("1. a\n2. b", ["1.", "2.", "3.", "4."]),
+    ] {
+        let doc = from_markdown(source);
+        doc.cursor_at(1).insert_html(html).unwrap();
+        let ids: Vec<_> = (0..doc.block_count())
+            .map(|n| doc.block_by_number(n).unwrap().list().map(|l| l.id()))
+            .collect();
+        assert!(
+            ids.iter().all(|id| *id == ids[0] && id.is_some()),
+            "{source:?}: {ids:?}"
+        );
+        let found: Vec<_> = (0..doc.block_count()).map(|n| marker(&doc, n)).collect();
+        assert_eq!(found, markers, "{source:?}");
+    }
+
+    // A Djot `(1)` list, and an older list stored with no delimiter.
+    let doc = TextDocument::new();
+    doc.set_djot_sync("(1) a\n(2) b").unwrap();
+    doc.cursor_at(1).insert_html(html).unwrap();
+    let found: Vec<_> = (0..doc.block_count()).map(|n| marker(&doc, n)).collect();
+    assert_eq!(found, ["(1)", "(2)", "(3)", "(4)"]);
+
+    let doc = list_doc(ListStyle::Decimal);
+    let cursor = doc.cursor_at(0);
+    cursor
+        .set_current_list_format(&ListFormat {
+            suffix: Some(String::new()),
+            ..ListFormat::default()
+        })
+        .unwrap();
+    doc.cursor_at(5).insert_html(html).unwrap();
+    let ids: Vec<_> = (0..doc.block_count())
+        .map(|n| doc.block_by_number(n).unwrap().list().map(|l| l.id()))
+        .collect();
+    assert!(
+        ids.iter().all(|id| *id == ids[0] && id.is_some()),
+        "{ids:?}"
+    );
+    let found: Vec<_> = (0..doc.block_count()).map(|n| marker(&doc, n)).collect();
+    assert_eq!(found, ["1", "2", "3", "4"]);
+}
+
+/// A list that is not the caret's, or of another style, is as it was: the pasted list keeps
+/// the default delimiter.
+#[test]
+fn html_pasted_next_to_a_list_of_another_style_keeps_the_default_delimiter() {
+    let doc = TextDocument::new();
+    doc.set_djot_sync("- a\n- b").unwrap();
+    doc.cursor_at(1)
+        .insert_html("<ol><li>x</li><li>y</li></ol>")
+        .unwrap();
+    let markers: Vec<_> = (0..doc.block_count()).map(|n| marker(&doc, n)).collect();
+    assert!(markers.contains(&"1.".to_string()), "{markers:?}");
+}
+
+/// Two items pasted from HTML take the head-overwrite path into an empty block and the
+/// middle-block path after text; both keep the default delimiter.
+#[test]
+fn a_multi_item_html_paste_paints_a_period() {
+    let html = "<ol><li>a</li><li>b</li></ol>";
+    let doc = TextDocument::new();
+    doc.set_plain_text("").unwrap();
+    doc.cursor().insert_html(html).unwrap();
+    assert_eq!(
+        (marker(&doc, 0), marker(&doc, 1)),
+        ("1.".into(), "2.".into())
+    );
+
+    let doc = TextDocument::new();
+    doc.set_plain_text("x").unwrap();
+    doc.cursor_at(1).insert_html(html).unwrap();
+    let first_item = (0..doc.block_count())
+        .find(|n| doc.block_by_number(*n).unwrap().list().is_some())
+        .expect("a list item");
+    assert_eq!(marker(&doc, first_item), "1.");
+    assert_eq!(marker(&doc, first_item + 1), "2.");
+}
+
+/// A multi-item Djot paste keeps the delimiter, in an empty block and after text.
+#[test]
+fn a_multi_item_djot_paste_keeps_the_delimiter() {
+    for djot in ["1) a\n2) b\n", "(1) a\n(2) b\n"] {
+        let expected = if djot.starts_with('(') {
+            ["(1)", "(2)"]
+        } else {
+            ["1)", "2)"]
+        };
+        let doc = TextDocument::new();
+        doc.set_plain_text("").unwrap();
+        doc.cursor().insert_djot(djot).unwrap();
+        assert_eq!(
+            (marker(&doc, 0), marker(&doc, 1)),
+            (expected[0].into(), expected[1].into())
+        );
+
+        let doc = TextDocument::new();
+        doc.set_plain_text("x").unwrap();
+        doc.cursor_at(1).insert_djot(&format!("\n{djot}")).unwrap();
+        let first_item = (0..doc.block_count())
+            .find(|n| doc.block_by_number(*n).unwrap().list().is_some())
+            .expect("a list item");
+        assert_eq!(marker(&doc, first_item), expected[0]);
+    }
+}
+
+/// The change of a list from numbered to bullet is one undo step and its redo makes the same
+/// change.
+#[test]
+fn the_crossing_style_change_undoes_and_redoes() {
+    let doc = list_doc(ListStyle::Decimal);
+    assert_eq!(marker(&doc, 0), "1.");
+    let cursor = doc.cursor_at(0);
+    cursor
+        .set_current_list_format(&ListFormat {
+            style: Some(ListStyle::Disc),
+            ..ListFormat::default()
+        })
+        .unwrap();
+    assert_eq!(marker(&doc, 0), "\u{2022}");
+    doc.undo().unwrap();
+    assert_eq!(marker(&doc, 0), "1.");
+    doc.redo().unwrap();
+    assert_eq!(marker(&doc, 0), "\u{2022}");
+}

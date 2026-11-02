@@ -19,7 +19,7 @@ use common::format_runs::{
 use common::parser_tools::content_parser::{
     self, ParsedBlock, ParsedInline, format_runs_from_spans,
 };
-use common::parser_tools::list_grouper::ListGrouper;
+use common::parser_tools::list_grouper::{ListGrouper, default_list_suffix};
 use common::snapshot::EntityTreeSnapshot;
 use common::types::{EntityId, ROOT_ENTITY_ID};
 use common::undo_redo::UndoRedoCommand;
@@ -137,6 +137,40 @@ fn execute_content_insert(
 
     let (current_block, block_idx, offset) =
         find_block_at_position(&blocks, position, &uow.store())?;
+
+    // HTML says nothing of a list's delimiter: the reader gives every `<ol>` the default one.
+    // Items pasted into a numbered list of the same style and indent join it and take its
+    // delimiter, whatever it is (`1)`, `(1)`, none in an older document), as the items of a
+    // list the user typed in would.
+    let continued;
+    let parsed_blocks: &[ParsedBlock] = match current_block
+        .list
+        .and_then(|id| uow.get_list(&id).ok().flatten())
+        .filter(|list| !default_list_suffix(&list.style).is_empty())
+    {
+        Some(list)
+            if parsed_blocks.iter().any(|b| {
+                b.list_style.as_ref() == Some(&list.style)
+                    && i64::from(b.list_indent) == list.indent
+            }) =>
+        {
+            continued = parsed_blocks
+                .iter()
+                .cloned()
+                .map(|mut b| {
+                    if b.list_style.as_ref() == Some(&list.style)
+                        && i64::from(b.list_indent) == list.indent
+                    {
+                        b.list_prefix = list.prefix.clone();
+                        b.list_suffix = list.suffix.clone();
+                    }
+                    b
+                })
+                .collect::<Vec<_>>();
+            &continued
+        }
+        _ => parsed_blocks,
+    };
 
     let store = uow.store();
     let (current_runs, current_images) = {

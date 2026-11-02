@@ -36,7 +36,11 @@ fn style_to_entity(s: &crate::dtos::ListStyle) -> common::entities::ListStyle {
 }
 
 fn is_ordered(style: &common::entities::ListStyle) -> bool {
-    !default_list_suffix(style).is_empty()
+    use common::entities::ListStyle as S;
+    matches!(
+        style,
+        S::Decimal | S::LowerAlpha | S::UpperAlpha | S::LowerRoman | S::UpperRoman
+    )
 }
 
 fn execute_set_list_format(

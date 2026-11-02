@@ -34,6 +34,7 @@ pub use direct_access::document::dtos::CreateDocumentDto;
 pub use direct_access::frame::dtos::{CreateFrameDto, FrameDto};
 pub use direct_access::frame::frame_controller;
 pub use direct_access::list::dtos::CreateListDto as CreateListEntityDto;
+pub use direct_access::list::dtos::UpdateListDto;
 pub use direct_access::list::list_controller;
 pub use direct_access::root::dtos::CreateRootDto;
 pub use direct_access::root::root_controller;

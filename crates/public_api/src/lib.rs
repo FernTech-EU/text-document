@@ -244,7 +244,12 @@ pub struct BlockFormat {
 }
 
 /// List formatting. All fields are optional: `None` means
-/// "not set — don't change this property."
+/// "not set, don't change this property", with one exception: a `style` that turns a bullet
+/// list into a numbered one, or the reverse, replaces the `prefix` and `suffix` the caller
+/// leaves `None` with those of the new kind (no prefix, and `.` or no suffix), because the
+/// affixes of a numbered list ("1." or "(1)") do not belong on a bullet. A style that stays
+/// in its kind (two numbered styles, two bullets) keeps them, and a `prefix` or `suffix`
+/// that is given always wins.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ListFormat {
     pub style: Option<ListStyle>,
