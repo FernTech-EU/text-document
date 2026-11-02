@@ -1655,12 +1655,14 @@ fn is_block_in_the_reader(name: &str) -> bool {
 enum BlankText {
     /// Content: kept as it is.
     Content,
-    /// The layout between blocks: nothing.
+    /// The layout between blocks, or at the edge of the element holding them: nothing.
     Layout,
     /// The layout between two block-level elements the reader does not split a run at
-    /// (`<section>A</section> <section>B</section>`): a collapsible space, which is the gap
-    /// between the two texts it joins and disappears at the edge of the run.
-    Gap,
+    /// (`<dt>a</dt>\n<dd>b</dd>`, two sections): the boundary a browser shows between two
+    /// block boxes, which is one line break where whitespace is kept (and one space in a
+    /// table cell, which is a single paragraph). The texts of the two stay apart, one line
+    /// each, and not joined into a word.
+    Boundary,
 }
 
 /// Classify a text node of a parent whose whitespace is kept: only blanks, with a block-level
@@ -1688,24 +1690,26 @@ fn blank_text_kind(text: &str, node: ego_tree::NodeRef<Node>) -> BlankText {
             }
         }
     };
-    // How a neighbour sets blanks apart: `None` for text, `Some((is_block_level,
-    // splits_a_run))` for an element, and the edge counts as neither.
+    // How a neighbour sets blanks apart: `None` for text, and for an element or the edge of
+    // the parent: whether it is block-level, whether the reader splits a run at it, and
+    // whether it is the edge.
     let side = |sibling: Option<ego_tree::NodeRef<Node>>| match sibling {
-        None => Some((false, false)),
+        None => Some((false, false, true)),
         Some(s) => match s.value() {
             Node::Element(el) => Some((
                 is_block_level_name(el.name()),
                 is_block_in_the_reader(el.name()),
+                false,
             )),
             _ => None,
         },
     };
     match (side(neighbour(false)), side(neighbour(true))) {
         (Some(before), Some(after)) if before.0 || after.0 => {
-            if before.1 || after.1 {
+            if before.1 || after.1 || before.2 || after.2 {
                 BlankText::Layout
             } else {
-                BlankText::Gap
+                BlankText::Boundary
             }
         }
         _ => BlankText::Content,
@@ -2514,8 +2518,15 @@ fn read_html_tree(fragment: &scraper::Html, depth_limit: usize) -> Vec<ParsedEle
                     } else {
                         BlankText::Content
                     };
-                    if blank == BlankText::Gap {
-                        spans.push(separator_span(state));
+                    if blank == BlankText::Boundary {
+                        // One space between two texts, none where the cell has no text yet
+                        // or the text before ends in a blank already.
+                        if spans
+                            .last()
+                            .is_some_and(|last| !last.text.ends_with(is_html_space))
+                        {
+                            spans.push(separator_span(state));
+                        }
                     } else if !t.is_empty() && blank == BlankText::Content {
                         spans.push(ParsedSpan {
                             text: t,
@@ -3187,8 +3198,15 @@ fn read_html_tree(fragment: &scraper::Html, depth_limit: usize) -> Vec<ParsedEle
                     } else {
                         BlankText::Content
                     };
-                    if blank == BlankText::Gap {
-                        spans.push(separator_span(state));
+                    if blank == BlankText::Boundary {
+                        // One line break where whitespace is kept: the block is split there,
+                        // as it is at any other newline. None when nothing comes before it
+                        // in the run (the elements before it hold blocks of their own), or
+                        // when the line has ended already; one that ends the run is no line
+                        // of its own, as a browser shows it.
+                        if spans.last().is_some_and(|last| !last.text.ends_with('\n')) {
+                            spans.push(text_span("\n".to_string(), state));
+                        }
                     } else if !t.is_empty() && blank == BlankText::Content {
                         spans.push(ParsedSpan {
                             text: t,
@@ -6453,28 +6471,141 @@ li.checked::marker { content: "\2612"; }
     }
 
     /// Block-level elements the reader does not split a run at (a definition list, the HTML5
-    /// sections) join their texts into one run: the blank between two of them is the gap
-    /// between two words, and never read as nothing.
+    /// sections) join their texts into one run, and a browser shows each on a line of its
+    /// own: where whitespace is kept, the blank between two of them is one line break, so
+    /// each is a line, and none is merged into a word with the next or given a stray space.
     #[test]
-    fn words_in_block_level_elements_the_reader_does_not_split_do_not_merge() {
-        for html in [
-            "<div style=\"white-space: pre-wrap\"><dl>\n<dt>a</dt>\n<dd>b</dd>\n</dl></div>",
-            "<style>* { white-space: pre-wrap }</style><section>A</section> <section>B</section>",
-            "<style>body { white-space: pre-wrap }</style><header>Title</header>\n<main>Body</main>",
-            "<style>* { white-space: pre-wrap }</style><div><article>A</article>\n<aside>B</aside></div>",
-        ] {
-            let read = texts(html).join("|");
-            assert!(
-                !read.contains("ab") && !read.contains("AB"),
-                "{html}: {read:?}"
-            );
-            assert!(
-                ["a b", "A B", "Title Body"]
-                    .iter()
-                    .any(|gap| read.contains(gap)),
-                "{html}: {read:?}"
-            );
-        }
+    fn block_level_elements_the_reader_does_not_split_are_a_line_each() {
+        let dl = "<dl>\n<dt>a</dt>\n<dd>b</dd>\n</dl>";
+        assert_eq!(
+            texts(&format!("<div style=\"white-space: pre-wrap\">{dl}</div>")),
+            ["a", "b"]
+        );
+        assert_eq!(
+            texts(&with_sheet(
+                "* { white-space: pre-wrap }",
+                &format!("<div>{dl}</div>")
+            )),
+            ["a", "b"]
+        );
+        assert_eq!(
+            texts(&with_sheet(
+                "* { white-space: pre-wrap }",
+                "<section>A</section> <section>B</section>"
+            )),
+            ["A", "B"]
+        );
+        assert_eq!(
+            texts(&with_sheet(
+                "body { white-space: pre-wrap }",
+                "<header>Title</header>\n<main>Body</main>"
+            )),
+            ["Title", "Body"]
+        );
+        assert_eq!(
+            texts(&with_sheet(
+                "* { white-space: pre-wrap }",
+                "<div><article>A</article>\n<aside>B</aside></div>"
+            )),
+            ["A", "B"]
+        );
+        // A block-level element beside an inline one.
+        assert_eq!(
+            texts(&with_sheet(
+                "* { white-space: pre-wrap }",
+                "<div><section>A</section> <b>x</b></div>"
+            )),
+            ["A", "x"]
+        );
+    }
+
+    /// Where whitespace collapses the same blank is one space, and there is never two.
+    #[test]
+    fn block_level_elements_the_reader_does_not_split_are_a_word_gap_where_whitespace_collapses() {
+        let dl = "<dl>\n<dt>a</dt>\n<dd>b</dd>\n</dl>";
+        assert_eq!(
+            texts(&with_sheet(
+                "body { white-space: pre-wrap }",
+                &format!("<div style=\"white-space: normal\">{dl}</div>")
+            )),
+            ["a b"]
+        );
+        assert_eq!(texts(&format!("<div>{dl}</div>")), ["a b"]);
+        // Text that ends in a blank before the blank does not double it.
+        assert_eq!(
+            texts("<div><dl><dt>a </dt>\n<dd> b</dd></dl></div>"),
+            ["a b"]
+        );
+        assert_eq!(
+            texts(&with_sheet(
+                "body { white-space: pre-wrap }",
+                "<div style=\"white-space: normal\"><dl><dt>a </dt>\n<dd> b</dd></dl></div>"
+            )),
+            ["a b"]
+        );
+        // And in a cell, the one space.
+        let parsed = parse_html_elements(&with_sheet(
+            "* { white-space: pre-wrap }",
+            "<table><tr><td><section>A</section> <section>B</section></td></tr></table>",
+        ));
+        let cell: String = parsed
+            .iter()
+            .find_map(|e| match e {
+                ParsedElement::Table(t) => {
+                    Some(t.rows[0][0].spans.iter().map(|s| s.text.as_str()).collect())
+                }
+                _ => None,
+            })
+            .expect("a table");
+        assert_eq!(cell, "A B");
+        // The text before the blank ends in a blank already: no second space.
+        let parsed = parse_html_elements(&with_sheet(
+            "* { white-space: pre-wrap }",
+            "<table><tr><td><section>A </section> <section>B</section></td></tr></table>",
+        ));
+        let cell: String = parsed
+            .iter()
+            .find_map(|e| match e {
+                ParsedElement::Table(t) => {
+                    Some(t.rows[0][0].spans.iter().map(|s| s.text.as_str()).collect())
+                }
+                _ => None,
+            })
+            .expect("a table");
+        assert_eq!(cell, "A B");
+    }
+
+    /// A boundary adds a line only where there is a line to end: not at the start of a run,
+    /// not twice in a row, and not for elements that hold blocks of their own.
+    #[test]
+    fn boundaries_add_no_empty_lines() {
+        let html = with_sheet(
+            "* { white-space: pre-wrap }",
+            "<section>x</section>\n<section><p>p</p></section>\n<section>y</section>",
+        );
+        let mut read = texts(&html);
+        read.sort();
+        assert_eq!(read, ["p", "x", "y"], "{html}");
+        let html = with_sheet(
+            "* { white-space: pre-wrap }",
+            "<section><p>p</p></section>\n<section><p>q</p></section>",
+        );
+        let mut read = texts(&html);
+        read.sort();
+        assert_eq!(read, ["p", "q"], "{html}");
+    }
+
+    /// Where whitespace is kept, a line keeps the blank that ends its own text: one
+    /// line break is added between two elements and no space either side of it.
+    #[test]
+    fn a_kept_line_keeps_its_own_blanks_and_gains_none() {
+        assert_eq!(
+            texts(&with_sheet(
+                "* { white-space: pre-wrap }",
+                "<dl><dt>a </dt>\n<dd> b</dd></dl>"
+            )),
+            ["a ", " b"]
+        );
     }
 
     /// A sheet is resolved once into one winning declaration per tag, a small value and not
