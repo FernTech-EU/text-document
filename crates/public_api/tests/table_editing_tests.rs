@@ -1813,14 +1813,14 @@ fn sorted_characters(text: &str) -> Vec<char> {
 const TWO_TABLES: &str = "Before.\n\n| a1 | b1 |\n| c1 | d1 |\n\nMiddle.\n\n| a3 |\n\nAfter.\n";
 
 /// A selection started on a table's anchor, where a caret is placed with `set_position`
-/// (a plain Right or Down from the paragraph before a table goes on into the first cell). The anchor reads as the table's first cell only
-/// while the other end of the selection is in that table: dragged back before the table, the
-/// selection ends there and holds none of it, and dragged into the table before it, it holds
-/// that table whole from its start. Read as in the first cell whatever the other end did, a
-/// selection dragged back into the paragraph before the table jumped forward over the table,
-/// and one dragged into the table before it was taken for a selection between two tables:
-/// the cut emptied the cells of that table, left its grid, and the paste put their words back
-/// into its first cell.
+/// (a plain Right or Down from the paragraph before a table goes on into the first cell).
+/// The anchor reads as the table's first cell only while the other end of the selection is
+/// in that table: dragged back before the table, the selection ends there and holds none of
+/// it, and dragged into the table before it, it holds that table whole from its start. Read
+/// as in the first cell whatever the other end did, a selection dragged back into the
+/// paragraph before the table jumped forward over the table, and one dragged into the table
+/// before it was taken for a selection between two tables: the cut emptied the cells of that
+/// table, left its grid, and the paste put their words back into its first cell.
 #[test]
 fn a_selection_started_on_a_tables_anchor_cuts_and_pastes_back_as_it_was() {
     let reference = loaded(TWO_TABLES);

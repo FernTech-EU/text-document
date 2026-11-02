@@ -854,15 +854,19 @@ impl TextCursor {
     /// [`set_position`](Self::set_position)), gives the table back when that end steps back
     /// into it toward where the selection started: the end goes to the table's other side.
     ///
-    /// A move that keeps no anchor (`MoveMode::MoveAnchor`) does not stop on the positions a
-    /// table's anchor takes in the text, where the caret would stand in the first cell
-    /// without having moved: Right (or `NextCharacter`, or `NextBlock` and Down) from the
-    /// end of the paragraph before a table goes to the start of its first cell in one step,
-    /// and Left (or `PreviousCharacter`) from there goes back to the end of that paragraph.
-    /// A caret standing on an anchor is already in the first cell: Right takes it on from
-    /// there, Left to the paragraph before. A move keeping the anchor
-    /// (`MoveMode::KeepAnchor`) does stop on the anchor, so that a selection can take a table
-    /// whole, and the deletions (`delete_char`, `delete_previous_char`) are not moves.
+    /// The character moves and `NextBlock` (so Down) that keep no anchor
+    /// (`MoveMode::MoveAnchor`) do not stop on the positions a table's anchor takes in the
+    /// text, where the caret would stand in the first cell without having moved: Right (or
+    /// `NextCharacter`, or `NextBlock` and Down) from the end of the paragraph before a table
+    /// goes to the start of its first cell in one step, and Left (or `PreviousCharacter`)
+    /// from there goes back to the end of that paragraph. A caret standing on an anchor is
+    /// already in the first cell: Right takes it on from there (unless `n` is 0), Left to
+    /// the paragraph before. When the table opens the document there is nothing before it,
+    /// and Left from its first cell stays. A move keeping the anchor (`MoveMode::KeepAnchor`)
+    /// does stop on the anchor, so that a selection can take a table whole, and the
+    /// deletions (`delete_char`, `delete_previous_char`) are not moves. The other operations
+    /// are as they were, and two of them still land on the anchor of a table that opens the
+    /// document, position 0: `Start`, and `PreviousWord` or `WordLeft` from the first cell.
     pub fn move_position(&self, operation: MoveOperation, mode: MoveMode, n: usize) -> bool {
         let old_pos = self.position();
         let resolved = self.resolve_move(operation, n, mode == MoveMode::MoveAnchor);
@@ -2766,8 +2770,9 @@ impl TextCursor {
     /// start; one that runs into a table before it takes that table in whole, as the table
     /// trap does for any selection entering a table from outside it. Read as in the first cell
     /// whatever the moving end did, a selection started on the anchor, where a caret is
-    /// placed with [`set_position`](Self::set_position) (a plain Right or Down from the
-    /// paragraph before a table goes on into the first cell), jumped forward over the
+    /// placed with [`set_position`](Self::set_position), or where a Shift move back into a
+    /// table from after it leaves the moving end (a plain Right or Down from the paragraph
+    /// before a table goes on into the first cell), jumped forward over the
     /// table when dragged back into that paragraph, and dragged into the table before it was
     /// taken for one between two tables: the cut emptied that table's cells, left its grid,
     /// and the paste put their words back into its first cell. A moving end on a table's
@@ -2799,6 +2804,9 @@ impl TextCursor {
     /// up or the previous word went nowhere.
     fn back_off_table_anchor(&self, position: usize) -> usize {
         let inner = self.doc.lock();
+        if inner.ctx.db_context.get_store().tables.read().is_empty() {
+            return position;
+        }
         to_usize(common::database::rope_helpers::snap_off_table_anchor(
             inner.ctx.db_context.get_store(),
             to_i64(position),
@@ -3587,7 +3595,7 @@ impl TextCursor {
             MoveOperation::NextCharacter | MoveOperation::Right => {
                 // A caret on a table's anchor stands in its first cell already (see
                 // `block_at_caret_dto`): it goes there without the move counting a step.
-                let mut cur = if skip_table_anchors {
+                let mut cur = if skip_table_anchors && n > 0 {
                     self.forward_off_table_anchor(pos)
                 } else {
                     pos
