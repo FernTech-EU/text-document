@@ -143,3 +143,28 @@ fn a_space_after_an_image_or_a_footnote_reference_survives() {
         assert!(!back.starts_with("See "), "{back:?}");
     }
 }
+
+/// What `QTextDocument::toHtml` writes: whitespace kept by a rule in the `<style>` block,
+/// not by an attribute of the paragraph.
+const QT_HTML: &str = r#"<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.0//EN" "http://www.w3.org/TR/REC-html40/strict.dtd"><html><head><meta name="qrichtext" content="1" /><style type="text/css">
+p, li { white-space: pre-wrap; }
+</style></head><body style=" font-family:'Sans'; font-size:9pt; font-weight:400; font-style:normal;">
+<p style=" margin-top:0px;">a	b   c</p>
+<ul><li>d	e</li></ul></body></html>"#;
+
+#[test]
+fn a_style_block_that_keeps_whitespace_is_honoured_on_import_and_paste() {
+    let doc = imported(QT_HTML);
+    assert_eq!(doc.block_by_number(0).unwrap().text(), "a\tb   c");
+    assert_eq!(doc.block_by_number(1).unwrap().text(), "d\te");
+    assert_eq!(doc.block_count(), 2, "the layout between blocks makes none");
+
+    let doc = plain("");
+    doc.cursor().insert_html(QT_HTML).unwrap();
+    assert_eq!(doc.block_by_number(0).unwrap().text(), "a\tb   c");
+    assert_eq!(doc.block_by_number(1).unwrap().text(), "d\te");
+
+    // Without the rule the same markup collapses, as before.
+    let doc = imported("<p>a\tb   c</p>");
+    assert_eq!(doc.block_by_number(0).unwrap().text(), "a b c");
+}

@@ -1263,6 +1263,289 @@ fn style_keeps_whitespace(style: &str) -> Option<bool> {
     kept
 }
 
+/// The `white-space` declarations of a document's `<style>` blocks that this reader honours:
+/// the rules whose every selector is `*` or a bare tag name (`p, li { white-space: pre-wrap; }`
+/// is what `QTextDocument::toHtml` writes). Not a CSS engine: a class, an id, an attribute, a
+/// pseudo-class, a combinator, and everything inside an at-rule, is skipped.
+///
+/// Held as the text of an inline `style` attribute for each tag, so the one precedence
+/// function, [`style_keeps_whitespace`], decides between the sheet and an element's own
+/// `style` as it does between two declarations of one attribute.
+#[derive(Debug, Default)]
+struct SheetWhitespace {
+    /// What every element gets (`*` rules), in source order.
+    universal: String,
+    /// What a tag gets: the `*` rules, then the rules naming it, each in source order,
+    /// so that a rule naming the tag beats `*` as its specificity says.
+    per_tag: std::collections::HashMap<String, String>,
+}
+
+/// One rule of a sheet: the tags it names (`*` for every element) and its `white-space`
+/// declarations as `(keyword, important)`.
+struct WhitespaceRule {
+    selectors: Vec<String>,
+    declarations: Vec<(&'static str, bool)>,
+}
+
+impl SheetWhitespace {
+    fn from_css(css: &str) -> Self {
+        let rules = parse_whitespace_rules(css);
+        let write = |out: &mut String, rule: &WhitespaceRule| {
+            for (keyword, important) in &rule.declarations {
+                out.push_str("white-space: ");
+                out.push_str(keyword);
+                out.push_str(if *important { " !important;" } else { ";" });
+            }
+        };
+        let mut sheet = SheetWhitespace::default();
+        for rule in rules
+            .iter()
+            .filter(|r| r.selectors.iter().any(|s| s == "*"))
+        {
+            write(&mut sheet.universal, rule);
+        }
+        let mut tags: Vec<&String> = rules
+            .iter()
+            .flat_map(|r| r.selectors.iter())
+            .filter(|s| *s != "*")
+            .collect();
+        tags.sort();
+        tags.dedup();
+        for tag in tags {
+            // In source order, `*` rules first: a rule naming the tag is the more specific.
+            let mut text = sheet.universal.clone();
+            for rule in rules.iter().filter(|r| r.selectors.contains(tag)) {
+                write(&mut text, rule);
+            }
+            sheet.per_tag.insert(tag.clone(), text);
+        }
+        sheet
+    }
+
+    /// The declarations that apply to an element named `tag`, `None` when none does.
+    fn declarations_for(&self, tag: &str) -> Option<&str> {
+        self.per_tag
+            .get(tag)
+            .map(String::as_str)
+            .or(Some(self.universal.as_str()))
+            .filter(|text| !text.is_empty())
+    }
+
+    /// Whether the sheet keeps the whitespace of the document's body, which every element
+    /// without a rule of its own inherits. A sheet cannot style the `<html>` and `<body>`
+    /// elements of a fragment (the HTML parser drops them), so what they say is the state
+    /// the walk starts from; `body` beats `html`, as the inheritance goes.
+    fn initial_keeps_whitespace(&self) -> Option<bool> {
+        let of = |tag: &str| self.declarations_for(tag).and_then(style_keeps_whitespace);
+        of("body").or_else(|| of("html"))
+    }
+}
+
+/// The `white-space` rules of `css` that [`SheetWhitespace`] honours.
+///
+/// One pass that reads the text as bytes and cuts it only at ASCII delimiters, so that
+/// nothing in it, an unterminated comment, string or block, a stray `}` or text that is not
+/// ASCII, can panic or loop.
+fn parse_whitespace_rules(css: &str) -> Vec<WhitespaceRule> {
+    // Comments, and the `<!--` and `-->` a stylesheet inside HTML is wrapped in (Word and
+    // Outlook do), which browsers ignore as tokens.
+    let mut text = String::with_capacity(css.len());
+    let mut rest = css;
+    while let Some(start) = rest.find("/*") {
+        text.push_str(&rest[..start]);
+        text.push(' ');
+        match rest[start + 2..].find("*/") {
+            Some(end) => rest = &rest[start + 2 + end + 2..],
+            None => {
+                rest = "";
+                break;
+            }
+        }
+    }
+    text.push_str(rest);
+    let text = text.replace("<!--", " ").replace("-->", " ");
+    let bytes = text.as_bytes();
+
+    // The first of `stops` at or after `from` outside a string, or the end.
+    let scan = |from: usize, stops: &[u8]| -> usize {
+        let mut i = from;
+        while i < bytes.len() {
+            match bytes[i] {
+                b'\\' => i += 1,
+                quote @ (b'"' | b'\'') => {
+                    i += 1;
+                    while i < bytes.len() && bytes[i] != quote {
+                        if bytes[i] == b'\\' {
+                            i += 1;
+                        }
+                        i += 1;
+                    }
+                }
+                b if stops.contains(&b) => return i,
+                _ => {}
+            }
+            i += 1;
+        }
+        bytes.len()
+    };
+    // The `}` closing the block whose `{` is at `open`, counting nested braces, or the end.
+    let block_end = |open: usize| -> usize {
+        let mut depth = 0usize;
+        let mut i = open;
+        while i < bytes.len() {
+            i = scan(i, b"{}");
+            match bytes.get(i) {
+                Some(b'{') => depth += 1,
+                Some(b'}') => {
+                    depth = depth.saturating_sub(1);
+                    if depth == 0 {
+                        return i;
+                    }
+                }
+                _ => return bytes.len(),
+            }
+            i += 1;
+        }
+        bytes.len()
+    };
+
+    let mut rules = Vec::new();
+    let mut pos = 0usize;
+    while pos < bytes.len() {
+        let prelude_end = scan(pos, b"{;}");
+        let prelude = text[pos..prelude_end].trim();
+        match bytes.get(prelude_end) {
+            // A statement (`@import url(x);`) or a stray `}`: nothing to keep.
+            Some(b';') | Some(b'}') => pos = prelude_end + 1,
+            Some(b'{') => {
+                let close = block_end(prelude_end);
+                if !prelude.starts_with('@') {
+                    let body = &text[prelude_end + 1..close];
+                    if let Some(rule) = whitespace_rule(prelude, body) {
+                        rules.push(rule);
+                    }
+                }
+                pos = close + 1;
+            }
+            _ => break,
+        }
+    }
+    rules
+}
+
+/// The rule `selectors { body }` makes, when every selector is `*` or a bare tag name and
+/// the body holds a valid `white-space` declaration.
+fn whitespace_rule(selectors: &str, body: &str) -> Option<WhitespaceRule> {
+    let selectors: Vec<String> = selectors
+        .split(',')
+        .map(|s| s.trim().to_ascii_lowercase())
+        .collect();
+    let bare = |s: &String| {
+        s == "*" || (!s.is_empty() && s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-'))
+    };
+    if !selectors.iter().all(bare) {
+        return None;
+    }
+    let mut declarations = Vec::new();
+    for part in body.split(';') {
+        let Some((property, value)) = part.split_once(':') else {
+            continue;
+        };
+        if !property.trim().eq_ignore_ascii_case("white-space") {
+            continue;
+        }
+        let value = value.trim().to_ascii_lowercase();
+        let (value, important) = value
+            .strip_suffix("important")
+            .and_then(|rest| rest.trim_end().strip_suffix('!'))
+            .map_or((value.as_str(), false), |rest| (rest.trim_end(), true));
+        // Only the keywords CSS defines; any other value is dropped, as a browser does.
+        let keyword = match value {
+            "normal" => "normal",
+            "nowrap" => "nowrap",
+            "pre" => "pre",
+            "pre-wrap" => "pre-wrap",
+            "pre-line" => "pre-line",
+            "break-spaces" => "break-spaces",
+            _ => continue,
+        };
+        declarations.push((keyword, important));
+    }
+    (!declarations.is_empty()).then_some(WhitespaceRule {
+        selectors,
+        declarations,
+    })
+}
+
+/// What the whitespace of an element's text is, from the sheet and the element's own
+/// `style`: the sheet's declarations first, so that the inline ones win unless the sheet's
+/// is `!important`. `None` when neither says.
+fn element_keeps_whitespace(
+    el: &scraper::node::Element,
+    sheet: Option<&SheetWhitespace>,
+) -> Option<bool> {
+    let inline = el.attr("style");
+    match sheet.and_then(|s| s.declarations_for(el.name())) {
+        None => inline.and_then(style_keeps_whitespace),
+        Some(declared) => style_keeps_whitespace(&format!("{declared}{}", inline.unwrap_or(""))),
+    }
+}
+
+/// The CSS of the `<style>` blocks of `fragment` that apply to a screen: no `type` or
+/// `text/css`, no `media` or `all` or `screen`.
+fn html_sheet(fragment: &scraper::Html) -> Option<SheetWhitespace> {
+    let mut css = String::new();
+    for node in fragment.tree.nodes() {
+        let Node::Element(el) = node.value() else {
+            continue;
+        };
+        if el.name() != "style" {
+            continue;
+        }
+        let type_ok = el
+            .attr("type")
+            .is_none_or(|t| t.trim().is_empty() || t.trim().eq_ignore_ascii_case("text/css"));
+        let media_ok = el.attr("media").is_none_or(|m| {
+            let m = m.trim();
+            m.is_empty() || m.eq_ignore_ascii_case("all") || m.eq_ignore_ascii_case("screen")
+        });
+        if !(type_ok && media_ok) {
+            continue;
+        }
+        for child in node.children() {
+            if let Node::Text(text) = child.value() {
+                css.push_str(text);
+                css.push('\n');
+            }
+        }
+    }
+    if css.is_empty() {
+        return None;
+    }
+    let sheet = SheetWhitespace::from_css(&css);
+    (!sheet.universal.is_empty() || !sheet.per_tag.is_empty()).then_some(sheet)
+}
+
+/// Whether a text node is the whitespace between blocks, which a `white-space` that keeps
+/// whitespace must not turn into content: only blanks, in an element that also holds a
+/// block-level one. A paragraph made of blanks alone is content and stays.
+fn is_formatting_whitespace(text: &str, node: ego_tree::NodeRef<Node>) -> bool {
+    text.chars().all(is_html_space)
+        && node.parent().is_some_and(|parent| {
+            parent.children().any(|sibling| {
+                matches!(
+                    sibling.value(),
+                    Node::Element(el) if matches!(
+                        el.name(),
+                        "p" | "div" | "h1" | "h2" | "h3" | "h4" | "h5" | "h6" | "li" | "pre"
+                            | "blockquote" | "ul" | "ol" | "table" | "thead" | "tbody"
+                            | "tfoot" | "tr" | "td" | "th" | "hr"
+                    )
+                )
+            })
+        })
+}
+
 /// Write `text`, a run of a paragraph's text, into `out` as HTML: each of its lines (it
 /// separates them with [`LINE_SEPARATOR`]) escaped by `escape`, the lines joined by
 /// `line_break`, and a line whose whitespace an HTML reader would collapse put in a
@@ -1872,6 +2155,13 @@ fn html_tree_depth(tree: &ego_tree::Tree<Node>) -> usize {
 /// deeper than that read as its text. The quotations it holds are kept within
 /// [`MAX_QUOTE_LEVELS`](crate::parser_tools::quote_depth::MAX_QUOTE_LEVELS) (see
 /// `quote_depth`).
+///
+/// Whitespace is kept where an element's `white-space` says so: in its inline `style`, and
+/// in a `<style>` block whose rule names only `*` or bare tags, as
+/// `p, li { white-space: pre-wrap; }` does (what Qt writes). A rule with a class, id,
+/// attribute, pseudo-class or combinator in its selector, a rule inside an at-rule such as
+/// `@media`, a `<style>` of another `type` or for `print`, and every other property, is
+/// ignored. Blanks alone between two blocks stay layout.
 pub fn parse_html_elements(html: &str) -> Vec<ParsedElement> {
     use scraper::Html;
 
@@ -1922,6 +2212,8 @@ fn read_html_tree(fragment: &scraper::Html, depth_limit: usize) -> Vec<ParsedEle
         link_href: Option<String>,
         /// Under an element whose `white-space` keeps whitespace as it is.
         preserve_whitespace: bool,
+        /// The `white-space` rules of the document's `<style>` blocks, shared by every state.
+        sheet: Option<std::rc::Rc<SheetWhitespace>>,
     }
 
     /// The list an element stands in: its style, and the number its first item wears when
@@ -2025,7 +2317,10 @@ fn read_html_tree(fragment: &scraper::Html, depth_limit: usize) -> Vec<ParsedEle
             match child.value() {
                 Node::Text(text) => {
                     let t = text.text.to_string();
-                    if !t.is_empty() {
+                    // The blanks between two blocks are layout, even where whitespace is kept.
+                    let between_blocks =
+                        state.preserve_whitespace && is_formatting_whitespace(&t, child);
+                    if !t.is_empty() && !between_blocks {
                         spans.push(ParsedSpan {
                             text: t,
                             bold: state.bold,
@@ -2048,7 +2343,7 @@ fn read_html_tree(fragment: &scraper::Html, depth_limit: usize) -> Vec<ParsedEle
                         continue;
                     }
                     let mut new_state = state.clone();
-                    if let Some(keep) = el.attr("style").and_then(style_keeps_whitespace) {
+                    if let Some(keep) = element_keeps_whitespace(el, state.sheet.as_deref()) {
                         new_state.preserve_whitespace = keep;
                     }
                     match tag {
@@ -2111,6 +2406,7 @@ fn read_html_tree(fragment: &scraper::Html, depth_limit: usize) -> Vec<ParsedEle
     /// and `limit` how deep it goes.
     fn parse_table_element(
         table_node: ego_tree::NodeRef<Node>,
+        state: &FmtState,
         depth: usize,
         limit: usize,
     ) -> (ParsedTable, usize) {
@@ -2121,6 +2417,7 @@ fn read_html_tree(fragment: &scraper::Html, depth_limit: usize) -> Vec<ParsedEle
         /// `walk` is how deep the walk stands at `node` and how deep it goes.
         fn collect_rows(
             node: ego_tree::NodeRef<Node>,
+            state: &FmtState,
             rows: &mut Vec<Vec<ParsedTableCell>>,
             header_rows: &mut usize,
             own_cells: &mut usize,
@@ -2133,6 +2430,7 @@ fn read_html_tree(fragment: &scraper::Html, depth_limit: usize) -> Vec<ParsedEle
                     match el.name() {
                         "thead" => collect_rows(
                             child,
+                            state,
                             rows,
                             header_rows,
                             own_cells,
@@ -2141,6 +2439,7 @@ fn read_html_tree(fragment: &scraper::Html, depth_limit: usize) -> Vec<ParsedEle
                         ),
                         "tbody" | "tfoot" => collect_rows(
                             child,
+                            state,
                             rows,
                             header_rows,
                             own_cells,
@@ -2157,8 +2456,21 @@ fn read_html_tree(fragment: &scraper::Html, depth_limit: usize) -> Vec<ParsedEle
                                     && matches!(td_el.name(), "td" | "th")
                                 {
                                     let mut spans = Vec::new();
-                                    let state = FmtState::default();
-                                    collect_cell_spans(td, &state, &mut spans, depth + 2, limit);
+                                    // A cell starts from the whitespace the table stands in
+                                    // (the sheet's, with the table's own), then its own.
+                                    let mut cell_state = state.clone();
+                                    if let Some(keep) =
+                                        element_keeps_whitespace(td_el, state.sheet.as_deref())
+                                    {
+                                        cell_state.preserve_whitespace = keep;
+                                    }
+                                    collect_cell_spans(
+                                        td,
+                                        &cell_state,
+                                        &mut spans,
+                                        depth + 2,
+                                        limit,
+                                    );
                                     collapse_inline_whitespace(&mut spans);
                                     if spans.is_empty() {
                                         spans.push(ParsedSpan::default());
@@ -2204,6 +2516,7 @@ fn read_html_tree(fragment: &scraper::Html, depth_limit: usize) -> Vec<ParsedEle
 
         collect_rows(
             table_node,
+            state,
             &mut rows,
             &mut header_rows,
             &mut own_cells,
@@ -2261,7 +2574,7 @@ fn read_html_tree(fragment: &scraper::Html, depth_limit: usize) -> Vec<ParsedEle
                     return;
                 }
                 let mut new_state = state.clone();
-                if let Some(keep) = el.attr("style").and_then(style_keeps_whitespace) {
+                if let Some(keep) = element_keeps_whitespace(el, state.sheet.as_deref()) {
                     new_state.preserve_whitespace = keep;
                 }
                 let mut new_list = current_list.clone();
@@ -2361,7 +2674,8 @@ fn read_html_tree(fragment: &scraper::Html, depth_limit: usize) -> Vec<ParsedEle
 
                 if tag == "table" {
                     // Parse table structure into a ParsedTable
-                    let (mut parsed_table, own_cells) = parse_table_element(node, depth, limit);
+                    let (mut parsed_table, own_cells) =
+                        parse_table_element(node, &new_state, depth, limit);
                     if !parsed_table.rows.is_empty() {
                         parsed_table.blockquote_depth = bq_depth;
                         push_table(elements, parsed_table, own_cells);
@@ -2603,9 +2917,11 @@ fn read_html_tree(fragment: &scraper::Html, depth_limit: usize) -> Vec<ParsedEle
                 // is a paragraph, its whitespace collapsed as a paragraph's is. Only
                 // trimmed, a tab in it reached the model, and a newline, which separates
                 // two blocks there, and the HTML written from it read back otherwise.
+                //
+                // Blanks alone are the layout between blocks, whitespace kept or not.
                 let mut spans = vec![text_span(text.text.to_string(), state)];
                 collapse_inline_whitespace(&mut spans);
-                if spans_carry_content(&spans) {
+                if spans_carry_content(&spans) && !text.chars().all(is_html_space) {
                     let block = ParsedBlock {
                         spans,
                         blockquote_depth,
@@ -2663,7 +2979,10 @@ fn read_html_tree(fragment: &scraper::Html, depth_limit: usize) -> Vec<ParsedEle
             match child.value() {
                 Node::Text(text) => {
                     let t = text.text.to_string();
-                    if !t.is_empty() {
+                    // The blanks between two blocks are layout, even where whitespace is kept.
+                    let between_blocks =
+                        state.preserve_whitespace && is_formatting_whitespace(&t, child);
+                    if !t.is_empty() && !between_blocks {
                         spans.push(ParsedSpan {
                             text: t,
                             bold: state.bold,
@@ -2686,7 +3005,7 @@ fn read_html_tree(fragment: &scraper::Html, depth_limit: usize) -> Vec<ParsedEle
                         continue;
                     }
                     let mut new_state = state.clone();
-                    if let Some(keep) = el.attr("style").and_then(style_keeps_whitespace) {
+                    if let Some(keep) = element_keeps_whitespace(el, state.sheet.as_deref()) {
                         new_state.preserve_whitespace = keep;
                     }
 
@@ -2776,7 +3095,18 @@ fn read_html_tree(fragment: &scraper::Html, depth_limit: usize) -> Vec<ParsedEle
         }
     }
 
-    let initial_state = FmtState::default();
+    // What the sheet says of `<body>` and `<html>` is where the walk starts: the HTML parser
+    // drops both elements from a fragment, so no element is left to carry it. Bare text
+    // outside any element inherits only that.
+    let sheet = html_sheet(fragment).map(std::rc::Rc::new);
+    let initial_state = FmtState {
+        preserve_whitespace: sheet
+            .as_deref()
+            .and_then(SheetWhitespace::initial_keeps_whitespace)
+            .unwrap_or(false),
+        sheet,
+        ..FmtState::default()
+    };
     // Treat the root element as a block-level container so that
     // top-level inline elements (e.g. `<b>Bold</b> <em>Italic</em>`)
     // are grouped into a single block instead of becoming separate blocks.
@@ -5454,5 +5784,302 @@ mod task_list_tests {
         assert_eq!(task_box_markdown(Some(&MarkerType::Checked)), "[x] ");
         assert_eq!(task_box_markdown(Some(&MarkerType::Unchecked)), "[ ] ");
         assert_eq!(task_box_markdown(None), "");
+    }
+}
+
+#[cfg(test)]
+mod html_sheet_whitespace_tests {
+    use super::*;
+    use proptest::prelude::*;
+
+    fn blocks(source: &str) -> Vec<ParsedBlock> {
+        ParsedElement::flatten_to_blocks(parse_html_elements(source))
+    }
+
+    fn texts(source: &str) -> Vec<String> {
+        blocks(source)
+            .iter()
+            .map(|b| b.spans.iter().map(|s| s.text.as_str()).collect())
+            .collect()
+    }
+
+    /// `QTextDocument::toHtml` as Qt 6 writes it, its sheet included.
+    const QT_HEAD: &str = r#"<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.0//EN" "http://www.w3.org/TR/REC-html40/strict.dtd"><html><head><meta name="qrichtext" content="1" /><meta charset="utf-8" /><style type="text/css">
+p, li { white-space: pre-wrap; }
+hr { height: 1px; border-width: 0; }
+li.unchecked::marker { content: "\2610"; }
+li.checked::marker { content: "\2612"; }
+</style></head>"#;
+
+    fn with_sheet(css: &str, body: &str) -> String {
+        format!("<html><head><style>{css}</style></head><body>{body}</body></html>")
+    }
+
+    #[test]
+    fn the_qt_sheet_keeps_tabs_and_runs_of_spaces() {
+        let html = format!(
+            "{QT_HEAD}<body style=\" font-family:'Sans'; font-size:9pt;\">\n<p style=\" margin-top:0px;\">a\tb   c</p></body></html>"
+        );
+        assert_eq!(texts(&html), ["a\tb   c"]);
+        let html = format!("{QT_HEAD}<body>\n<ul>\n<li>a\tb   c</li></ul></body></html>");
+        assert_eq!(texts(&html), ["a\tb   c"]);
+        let html = format!(
+            "{QT_HEAD}<body><table><tr><td><p>a\tb   c</p></td></tr></table></body></html>"
+        );
+        let elements = parse_html_elements(&html);
+        let cell = elements
+            .iter()
+            .find_map(|e| match e {
+                ParsedElement::Table(t) => Some(
+                    t.rows[0][0]
+                        .spans
+                        .iter()
+                        .map(|s| s.text.as_str())
+                        .collect::<String>(),
+                ),
+                _ => None,
+            })
+            .expect("a table");
+        assert!(cell.contains("a\tb   c"), "{cell:?}");
+    }
+
+    #[test]
+    fn without_a_sheet_the_whitespace_collapses_as_before() {
+        assert_eq!(texts("<p>a\tb   c</p>"), ["a b c"]);
+    }
+
+    /// The sheet must not change the block: a `white-space` in a block's own `style` makes
+    /// it non-breakable, and a sheet's must not.
+    #[test]
+    fn a_sheet_rule_does_not_make_blocks_non_breakable() {
+        let html = format!("{QT_HEAD}<body><p>a\tb</p></body></html>");
+        let parsed = blocks(&html);
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].non_breakable_lines, None);
+        assert!(parsed[0].is_inline_only());
+    }
+
+    #[test]
+    fn only_simple_selectors_count() {
+        for css in [
+            "p.x { white-space: pre }",
+            "#a p { white-space: pre }",
+            "p:first-child { white-space: pre }",
+            "p > b { white-space: pre }",
+            "p[class] { white-space: pre }",
+            "p, p.x { white-space: pre }",
+            "@media print { p { white-space: pre } }",
+            "@font-face { font-family: x; white-space: pre }",
+            "/* p { white-space: pre } */",
+            "/* } */ p { color: red }",
+            "p { color: red }",
+            "p { white-space: inherit }",
+        ] {
+            assert_eq!(texts(&with_sheet(css, "<p>a\tb</p>")), ["a b"], "{css}");
+        }
+    }
+
+    #[test]
+    fn a_style_of_another_kind_is_not_read() {
+        for head in [
+            r#"<style type="text/less">p { white-space: pre }</style>"#,
+            r#"<style media="print">p { white-space: pre }</style>"#,
+        ] {
+            assert_eq!(
+                texts(&format!(
+                    "<html><head>{head}</head><body><p>a\tb</p></body></html>"
+                )),
+                ["a b"],
+                "{head}"
+            );
+        }
+        for head in [
+            r#"<style type="TEXT/CSS" media="screen">p { white-space: pre }</style>"#,
+            r#"<style media="all">p { white-space: pre }</style>"#,
+        ] {
+            assert_eq!(
+                texts(&format!(
+                    "<html><head>{head}</head><body><p>a\tb</p></body></html>"
+                )),
+                ["a\tb"],
+                "{head}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_later_rule_and_the_more_specific_one_win() {
+        let case = |css: &str| texts(&with_sheet(css, "<p>a\tb</p>"));
+        assert_eq!(
+            case("p { white-space: pre } p { white-space: normal }"),
+            ["a b"]
+        );
+        assert_eq!(
+            case("p { white-space: normal } p { white-space: pre }"),
+            ["a\tb"]
+        );
+        // A rule naming the tag beats `*`, whichever comes first.
+        assert_eq!(
+            case("* { white-space: pre-wrap } p { white-space: normal }"),
+            ["a b"]
+        );
+        assert_eq!(
+            case("p { white-space: normal } * { white-space: pre-wrap }"),
+            ["a b"]
+        );
+        assert_eq!(case("p { white-space: pre; white-space: normal }"), ["a b"]);
+        assert_eq!(case("p { white-space: pre; white-space: bogus }"), ["a\tb"]);
+        assert_eq!(case("P { white-space: pre }"), ["a\tb"]);
+        assert_eq!(case("p, b { white-space: pre }"), ["a\tb"]);
+        // One member too complex for us drops the whole rule, as an unknown one would.
+        assert_eq!(case("p, p.x { white-space: pre }"), ["a b"]);
+    }
+
+    #[test]
+    fn inline_style_and_importance_decide_between_sheet_and_element() {
+        let case = |css: &str, style: &str| {
+            texts(&with_sheet(css, &format!("<p style=\"{style}\">a\tb</p>")))
+        };
+        assert_eq!(
+            case("p { white-space: pre-wrap }", "white-space: normal"),
+            ["a b"]
+        );
+        assert_eq!(
+            case(
+                "p { white-space: pre-wrap !important }",
+                "white-space: normal"
+            ),
+            ["a\tb"]
+        );
+        assert_eq!(
+            case(
+                "p { white-space: pre-wrap !important }",
+                "white-space: normal !important"
+            ),
+            ["a b"]
+        );
+    }
+
+    #[test]
+    fn body_html_and_star_start_the_walk_without_making_blocks_of_the_layout() {
+        for selector in ["body", "html", "*", "body, html"] {
+            let html = with_sheet(
+                &format!("{selector} {{ white-space: pre-wrap }}"),
+                "<p>a\tb</p>\n<p>c</p>\n<ul>\n<li>d</li>\n<li>e<ul>\n<li>f</li>\n</ul></li>\n</ul>\n<table>\n<tr>\n<td>g\th</td>\n</tr>\n</table>\n",
+            );
+            let parsed = ParsedElement::flatten_to_blocks(parse_html_elements(&html));
+            let found: Vec<String> = parsed
+                .iter()
+                .map(|b| b.spans.iter().map(|s| s.text.as_str()).collect())
+                .collect();
+            assert_eq!(
+                found,
+                ["a\tb", "c", "d", "e", "f", "g\th"],
+                "{selector}: {found:?}"
+            );
+        }
+    }
+
+    /// Text outside any element inherits what the sheet says of `<body>`: the rule naming
+    /// it beats `*`, and `*` reaches the body before `html` does.
+    #[test]
+    fn bare_text_starts_from_the_body_as_the_cascade_gives_it() {
+        let case = |css: &str| texts(&with_sheet(css, "a\tb"));
+        assert_eq!(
+            case("body { white-space: normal } * { white-space: pre }"),
+            ["a b"]
+        );
+        assert_eq!(
+            case("* { white-space: pre } body { white-space: normal }"),
+            ["a b"]
+        );
+        assert_eq!(
+            case("html { white-space: normal } * { white-space: pre }"),
+            ["a\tb"]
+        );
+        assert_eq!(case("html { white-space: pre }"), ["a\tb"]);
+        assert_eq!(
+            case("body { white-space: pre } html { white-space: normal }"),
+            ["a\tb"]
+        );
+    }
+
+    #[test]
+    fn the_style_may_come_after_the_content_or_be_split() {
+        let html = "<p>a\tb</p><style>p { white-space: pre-wrap }</style>";
+        assert_eq!(texts(html), ["a\tb"]);
+        let html =
+            "<style>p { color: red }</style><style>p { white-space: pre-wrap }</style><p>a\tb</p>";
+        assert_eq!(texts(html), ["a\tb"]);
+    }
+
+    #[test]
+    fn a_deep_document_with_a_sheet_is_read_on_its_own_thread() {
+        let depth = HTML_DEPTH_ON_THE_CALLERS_STACK + 20;
+        let html = format!(
+            "<style>p {{ white-space: pre-wrap }}</style>{}<p>a\tb</p>{}",
+            "<div>".repeat(depth),
+            "</div>".repeat(depth)
+        );
+        assert_eq!(texts(&html), ["a\tb"]);
+    }
+
+    /// The sheets Word and Qt put on the clipboard, wrapped as they are.
+    #[test]
+    fn a_word_sheet_in_comment_markers_is_skipped_without_losing_the_next_rule() {
+        let css = "\n<!--\n /* Font Definitions */\n @font-face\n\t{font-family:\"Cambria Math\";\n\tpanose-1:2 4 5 3 5 4 6 3 2 4;}\n /* Style Definitions */\n p.MsoNormal, li.MsoNormal, div.MsoNormal\n\t{margin:0cm; font-size:11.0pt;}\n@page WordSection1\n\t{size:612.0pt 792.0pt; margin:72.0pt 72.0pt 72.0pt 72.0pt;}\ndiv.WordSection1\n\t{page:WordSection1;}\n /* List Definitions */\n @list l0:level1\n\t{mso-level-number-format:bullet;}\np { white-space: pre-wrap }\n-->\n";
+        assert_eq!(texts(&with_sheet(css, "<p>a\tb</p>")), ["a\tb"]);
+        // The first rule right after the opening marker is not lost either.
+        assert_eq!(
+            texts(&with_sheet(
+                "<!-- p { white-space: pre-wrap } -->",
+                "<p>a\tb</p>"
+            )),
+            ["a\tb"]
+        );
+    }
+
+    #[test]
+    fn a_blank_paragraph_stays_content_and_blanks_between_blocks_do_not() {
+        let html = with_sheet(
+            "p { white-space: pre-wrap }",
+            "<p>a</p>\n  <p>   </p>\n<p>b</p>",
+        );
+        assert_eq!(texts(&html), ["a", "   ", "b"]);
+    }
+
+    #[test]
+    fn a_hostile_sheet_neither_panics_nor_loops() {
+        for css in [
+            "/* unterminated",
+            "p { white-space: pre",
+            "p { \"unterminated",
+            "} } }",
+            "{ { {",
+            "p {",
+            "@media {",
+            "\u{e9}\u{4e2d}\u{1f600} p { white-space: pre }",
+            "p\\",
+            "\\",
+            "'",
+            "<!-- -->",
+            "p { white-space: \u{e9}pre }",
+        ] {
+            let _ = texts(&with_sheet(css, "<p>a</p>"));
+        }
+    }
+
+    proptest! {
+        #[test]
+        fn the_rule_scanner_survives_any_text(css in "\\PC{0,200}") {
+            let _ = parse_whitespace_rules(&css);
+        }
+
+        #[test]
+        fn the_rule_scanner_survives_css_shaped_noise(
+            css in "[a-z*.#:>,@{}();!/\"' \\\\\n\u{e9}-]{0,120}"
+        ) {
+            let _ = parse_whitespace_rules(&css);
+        }
     }
 }
