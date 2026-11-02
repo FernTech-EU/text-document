@@ -2816,7 +2816,7 @@ impl TextCursor {
 
     /// `position`, or, when it falls on a table's anchor, the start of the table's first
     /// cell (past the anchor of a table that opens it, and so on): where a caret on the
-    /// anchor stands, and the other direction of [`back_off_table_anchor`].
+    /// anchor stands, and the other direction of [`back_off_table_anchor`](Self::back_off_table_anchor).
     fn forward_off_table_anchor(&self, position: usize) -> usize {
         let inner = self.doc.lock();
         let store = inner.ctx.db_context.get_store();
@@ -3088,7 +3088,7 @@ impl TextCursor {
 
     /// Set formatting on a list by its ID. A `format` whose style turns a numbered list into a
     /// bullet list, or the reverse, resets the prefix and suffix it leaves `None` (see
-    /// [`ListFormat`]).
+    /// [`ListFormat`](crate::ListFormat)).
     pub fn set_list_format(&self, list_id: usize, format: &crate::ListFormat) -> Result<()> {
         let _settled = self.settle_transient_edits();
         let queued = {

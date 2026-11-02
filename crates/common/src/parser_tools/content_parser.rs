@@ -267,7 +267,7 @@ pub struct ParsedBlock {
     /// Ordered-list delimiter suffix (`"."` for `1.`, `")"` for `1)`/`(1)`;
     /// empty for unordered lists). Markdown reads it from the source, Djot from
     /// its list style, and HTML gives an ordered list
-    /// [`default_list_suffix`](crate::parser_tools::list_grouper::default_list_suffix).
+    /// [`default_list_suffix`].
     pub list_suffix: String,
     /// The number the first item of the list this item belongs to wears, when it is not 1
     /// (Djot and Markdown `3.`, HTML `<ol start="3">`). Every item of a list carries it.
