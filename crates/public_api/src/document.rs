@@ -14,9 +14,11 @@ use crate::{
 };
 use frontend::commands::{
     block_commands, document_commands, document_inspection_commands, document_io_commands,
-    document_search_commands, frame_commands, resource_commands, table_cell_commands,
-    table_commands, undo_redo_commands,
+    document_search_commands, frame_commands, list_commands, resource_commands,
+    table_cell_commands, table_commands, undo_redo_commands,
 };
+
+use frontend::common::format_runs::{FootnoteRefAnchor, FormatRun, ImageAnchor};
 
 use crate::HtmlExportOptions;
 use crate::convert::{self, to_i64, to_usize};
@@ -1779,6 +1781,7 @@ impl TextDocument {
         let queued = {
             let mut inner = self.inner.lock();
             let before = capture_block_state(&inner);
+            let before_outside = capture_outside_blocks(&inner);
             let entry = undo_redo_commands::head_seq(&inner.ctx, Some(inner.stack_id));
             let (edited_with, left_at) = inner.edit_caret_cursor(entry).unzip();
             let stepped = undo_redo_commands::can_undo(&inner.ctx, Some(inner.stack_id));
@@ -1810,6 +1813,7 @@ impl TextDocument {
             result?;
             inner.rehighlight_all();
             let changed_text_end = emit_content_change_events_near(&mut inner, &before, left_at);
+            emit_changes_outside_blocks(&mut inner, &before_outside, changed_text_end.is_some());
             if let (Some(cursor), Some(end)) = (edited_with, changed_text_end) {
                 let end =
                     crate::cursor::max_cursor_position_of(&inner).map_or(end, |max| end.min(max));
@@ -1842,6 +1846,7 @@ impl TextDocument {
         let queued = {
             let mut inner = self.inner.lock();
             let before = capture_block_state(&inner);
+            let before_outside = capture_outside_blocks(&inner);
             let stepped = undo_redo_commands::can_redo(&inner.ctx, Some(inner.stack_id));
             let result = undo_redo_commands::redo(&inner.ctx, Some(inner.stack_id));
             inner.invalidate_text_cache();
@@ -1855,7 +1860,8 @@ impl TextDocument {
             }
             result?;
             inner.rehighlight_all();
-            emit_content_change_events(&mut inner, &before);
+            let changed_text_end = emit_content_change_events_near(&mut inner, &before, None);
+            emit_changes_outside_blocks(&mut inner, &before_outside, changed_text_end.is_some());
             if stepped {
                 let entry = undo_redo_commands::head_seq(&inner.ctx, Some(inner.stack_id));
                 inner.restore_edit_caret(entry, crate::cursor::max_cursor_position_of(&inner));
@@ -2440,6 +2446,11 @@ pub(crate) struct UndoBlockState {
     text_length: i64,
     plain_text: String,
     format: BlockFormat,
+    list: Option<u64>,
+    /// What the block's text wears: an undo of a format change leaves the text as it was,
+    /// so comparing the text alone could not see it. Offsets are within the block, so an
+    /// edit in another block does not change them.
+    inline: (Vec<FormatRun>, Vec<ImageAnchor>, Vec<FootnoteRefAnchor>),
 }
 
 /// The blocks of the document, sorted by position, and its addressable text, as they were
@@ -2459,6 +2470,11 @@ pub(crate) fn capture_block_state(inner: &TextDocumentInner) -> BlockStates {
         frontend::commands::block_commands::get_all_block(&inner.ctx).unwrap_or_default();
     let store = inner.ctx.db_context.get_store();
     crate::inner::refresh_block_positions(&mut all_blocks, store);
+    let (runs, images, notes) = (
+        store.format_runs.read(),
+        store.block_images.read(),
+        store.block_footnote_refs.read(),
+    );
     let mut states: Vec<UndoBlockState> = all_blocks
         .into_iter()
         .map(|b| {
@@ -2473,9 +2489,16 @@ pub(crate) fn capture_block_state(inner: &TextDocumentInner) -> BlockStates {
                 text_length,
                 plain_text,
                 format,
+                list: b.list,
+                inline: (
+                    runs.get(&b.id).cloned().unwrap_or_default(),
+                    images.get(&b.id).cloned().unwrap_or_default(),
+                    notes.get(&b.id).cloned().unwrap_or_default(),
+                ),
             }
         })
         .collect();
+    drop((runs, images, notes));
     states.sort_by_key(|s| s.position);
     let text = addressable_text_of(store, &states);
     BlockStates {
@@ -2650,14 +2673,20 @@ fn emit_content_change_events_near(
     let mut old_end: usize = 0;
     let mut blocks_affected: usize = 0;
 
-    let mut format_only_changes: Vec<(usize, usize)> = Vec::new(); // (position, length)
+    // Per kind of format, the blocks whose text stayed as it was: (position, length).
+    let mut block_format_changes: Vec<(usize, usize)> = Vec::new();
+    let mut list_changes: Vec<(usize, usize)> = Vec::new();
+    let mut inline_changes: Vec<(usize, usize)> = Vec::new();
 
     // Check blocks present in both before and after.
     for after_state in after {
         if let Some(before_state) = before_map.get(&after_state.id) {
             let text_changed = before_state.plain_text != after_state.plain_text
                 || before_state.text_length != after_state.text_length;
-            let format_changed = before_state.format != after_state.format;
+            let extent = (
+                after_state.position.max(0) as usize,
+                after_state.text_length.max(0) as usize,
+            );
 
             if text_changed {
                 content_changed = true;
@@ -2668,10 +2697,16 @@ fn emit_content_change_events_near(
                     before_state.position.max(0) as usize
                         + before_state.text_length.max(0) as usize,
                 );
-            } else if format_changed {
-                let pos = after_state.position.max(0) as usize;
-                let len = after_state.text_length.max(0) as usize;
-                format_only_changes.push((pos, len));
+            } else {
+                if before_state.format != after_state.format {
+                    block_format_changes.push(extent);
+                }
+                if before_state.list != after_state.list {
+                    list_changes.push(extent);
+                }
+                if before_state.inline != after_state.inline {
+                    inline_changes.push(extent);
+                }
             }
         } else {
             // Block exists in after but not in before — new block from undo/redo.
@@ -2767,14 +2802,191 @@ fn emit_content_change_events_near(
     }
 
     // Emit FormatChanged for blocks where only formatting changed (not content).
-    for (position, length) in format_only_changes {
+    for (changes, kind) in [
+        (block_format_changes, FormatChangeKind::Block),
+        (list_changes, FormatChangeKind::List),
+        (inline_changes, FormatChangeKind::Character),
+    ] {
+        for (position, length) in join_adjacent_blocks(changes) {
+            inner.queue_event(DocumentEvent::FormatChanged {
+                position,
+                length,
+                kind,
+            });
+        }
+    }
+    changed_text_end
+}
+
+/// `extents` of blocks, in document order, with the extents of consecutive blocks made one
+/// (the newline between two blocks is one position): an undo of bold over a whole document
+/// reports one change, as the edit did, and not one per paragraph.
+fn join_adjacent_blocks(extents: Vec<(usize, usize)>) -> Vec<(usize, usize)> {
+    let mut joined: Vec<(usize, usize)> = Vec::new();
+    for (position, length) in extents {
+        match joined.last_mut() {
+            Some((start, len)) if *start + *len + 1 == position => *len += 1 + length,
+            _ => joined.push((position, length)),
+        }
+    }
+    joined
+}
+
+/// What an undo or a redo can change that is not in a block: the lists, the tables, their
+/// cells and the frames (a blockquote is a frame), as they were at one moment.
+struct OutsideBlocks {
+    lists: Vec<frontend::list::dtos::ListDto>,
+    tables: Vec<frontend::table::dtos::TableDto>,
+    cells: Vec<frontend::table_cell::dtos::TableCellDto>,
+    frames: Vec<frontend::frame::dtos::FrameDto>,
+}
+
+fn capture_outside_blocks(inner: &TextDocumentInner) -> OutsideBlocks {
+    let mut lists = list_commands::get_all_list(&inner.ctx).unwrap_or_default();
+    let mut tables = table_commands::get_all_table(&inner.ctx).unwrap_or_default();
+    let mut cells = table_cell_commands::get_all_table_cell(&inner.ctx).unwrap_or_default();
+    let mut frames = frame_commands::get_all_frame(&inner.ctx).unwrap_or_default();
+    lists.sort_by_key(|list| list.id);
+    tables.sort_by_key(|table| table.id);
+    cells.sort_by_key(|cell| cell.id);
+    frames.sort_by_key(|frame| frame.id);
+    OutsideBlocks {
+        lists,
+        tables,
+        cells,
+        frames,
+    }
+}
+
+/// Whether an entity in both `before` and `after`, each sorted by `id`, has another
+/// `format`. An entity that came or went is a change of shape, not of format.
+fn format_differs<T, F: PartialEq>(
+    before: &[T],
+    after: &[T],
+    id: impl Fn(&T) -> u64,
+    format: impl Fn(&T) -> F,
+) -> bool {
+    after.iter().any(|entity| {
+        before
+            .binary_search_by_key(&id(entity), &id)
+            .is_ok_and(|index| format(&before[index]) != format(entity))
+    })
+}
+
+/// Queue `FormatChanged` for what changed outside the blocks since `before`, with the kinds
+/// the edits themselves report and over the whole document, as they do (a length of `0`).
+///
+/// The edit that changed one of these said so itself; an undo or a redo goes by the stores,
+/// and this is how it finds out. Without it a view kept showing the list, the quote or the
+/// table format that had just been taken back.
+///
+/// A frame or a table changing shape is reported only when no text changed: every undo of a
+/// new paragraph changes its frame's blocks, and that is a change of content, which
+/// [`emit_content_change_events_near`] has reported.
+fn emit_changes_outside_blocks(
+    inner: &mut TextDocumentInner,
+    before: &OutsideBlocks,
+    text_changed: bool,
+) {
+    let after = capture_outside_blocks(inner);
+    let list_format_changed = format_differs(
+        &before.lists,
+        &after.lists,
+        |list| list.id,
+        |list| {
+            (
+                list.style.clone(),
+                list.indent,
+                list.prefix.clone(),
+                list.suffix.clone(),
+                list.start,
+            )
+        },
+    );
+    let block_format_changed = format_differs(
+        &before.tables,
+        &after.tables,
+        |table| table.id,
+        |table| {
+            (
+                table.column_widths.clone(),
+                table.fmt_border,
+                table.fmt_cell_spacing,
+                table.fmt_cell_padding,
+                table.fmt_width,
+                table.fmt_alignment.clone(),
+            )
+        },
+    ) || format_differs(
+        &before.cells,
+        &after.cells,
+        |cell| cell.id,
+        |cell| {
+            (
+                cell.fmt_padding,
+                cell.fmt_border,
+                cell.fmt_vertical_alignment.clone(),
+                cell.fmt_background_color.clone(),
+            )
+        },
+    ) || format_differs(
+        &before.frames,
+        &after.frames,
+        |frame| frame.id,
+        |frame| {
+            (
+                (frame.fmt_height, frame.fmt_width, frame.fmt_padding),
+                (frame.fmt_top_margin, frame.fmt_bottom_margin),
+                (frame.fmt_left_margin, frame.fmt_right_margin),
+                frame.fmt_border,
+                frame.fmt_position.clone(),
+                frame.fmt_is_blockquote,
+                frame.fmt_semantic_role.clone(),
+            )
+        },
+    );
+    let shape_changed = !text_changed && !same_shape(before, &after);
+    if list_format_changed {
         inner.queue_event(DocumentEvent::FormatChanged {
-            position,
-            length,
+            position: 0,
+            length: 0,
+            kind: FormatChangeKind::List,
+        });
+    }
+    if block_format_changed || shape_changed {
+        inner.queue_event(DocumentEvent::FormatChanged {
+            position: 0,
+            length: 0,
             kind: FormatChangeKind::Block,
         });
     }
-    changed_text_end
+}
+
+/// Whether the same frames, tables and cells hold the same things in both.
+fn same_shape(before: &OutsideBlocks, after: &OutsideBlocks) -> bool {
+    fn all_same<T, S: PartialEq>(before: &[T], after: &[T], shape: impl Fn(&T) -> S) -> bool {
+        before.iter().map(&shape).eq(after.iter().map(&shape))
+    }
+    all_same(&before.frames, &after.frames, |frame| {
+        (
+            frame.id,
+            frame.parent_frame,
+            frame.blocks.clone(),
+            frame.child_order.clone(),
+            frame.table,
+        )
+    }) && all_same(&before.tables, &after.tables, |table| {
+        (table.id, table.cells.clone(), table.rows, table.columns)
+    }) && all_same(&before.cells, &after.cells, |cell| {
+        (
+            cell.id,
+            cell.row,
+            cell.column,
+            cell.row_span,
+            cell.column_span,
+            cell.cell_frame,
+        )
+    })
 }
 
 // ── Flow helpers ──────────────────────────────────────────────

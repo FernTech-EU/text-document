@@ -1,4 +1,7 @@
-use text_document::{Alignment, DocumentEvent, TextDocument};
+use text_document::{
+    Alignment, BlockFormat, CellFormat, DocumentEvent, FormatChangeKind, ListFormat, ListStyle,
+    MoveMode, TableFormat, TextDocument, TextFormat,
+};
 
 fn new_doc_with_text(text: &str) -> TextDocument {
     let doc = TextDocument::new();
@@ -533,4 +536,212 @@ fn long_operation_events_on_html_import() {
         "expected LongOperationFinished(success=true), got: {:?}",
         events
     );
+}
+
+// ── Undoing and redoing a format change ─────────────────────
+
+type FormatChanges = Vec<(usize, usize, FormatChangeKind)>;
+
+fn format_changes(events: &[DocumentEvent]) -> FormatChanges {
+    events
+        .iter()
+        .filter_map(|event| match event {
+            DocumentEvent::FormatChanged {
+                position,
+                length,
+                kind,
+            } => Some((*position, *length, *kind)),
+            _ => None,
+        })
+        .collect()
+}
+
+fn bold() -> TextFormat {
+    TextFormat {
+        font_bold: Some(true),
+        ..Default::default()
+    }
+}
+
+/// Undo and then redo the edit `doc` has just made, and return the format changes each
+/// reported.
+fn format_changes_of_undo_and_redo(doc: &TextDocument) -> (FormatChanges, FormatChanges) {
+    doc.poll_events();
+    doc.undo().unwrap();
+    let undone = format_changes(&doc.poll_events());
+    doc.redo().unwrap();
+    let redone = format_changes(&doc.poll_events());
+    (undone, redone)
+}
+
+#[test]
+fn undoing_a_character_format_reports_it() {
+    let doc = new_doc_with_text("Phileas Fogg\nsecond");
+    let cursor = doc.cursor_at(0);
+    cursor.set_position(7, MoveMode::KeepAnchor);
+    cursor.merge_char_format(&bold()).unwrap();
+    let (undone, redone) = format_changes_of_undo_and_redo(&doc);
+    let the_block = vec![(0, 12, FormatChangeKind::Character)];
+    assert_eq!(undone, the_block);
+    assert_eq!(redone, the_block);
+}
+
+#[test]
+fn undoing_a_format_over_several_blocks_reports_one_change() {
+    let doc = new_doc_with_text("one\ntwo\nthree");
+    let cursor = doc.cursor_at(0);
+    cursor.set_position(13, MoveMode::KeepAnchor);
+    cursor.merge_char_format(&bold()).unwrap();
+    let (undone, _) = format_changes_of_undo_and_redo(&doc);
+    assert_eq!(undone, vec![(0, 13, FormatChangeKind::Character)]);
+}
+
+#[test]
+fn undoing_a_format_on_two_apart_blocks_reports_each() {
+    let doc = new_doc_with_text("one\ntwo\nthree");
+    let cursor = doc.cursor_at(0);
+    cursor.begin_edit_block();
+    for (start, end) in [(0, 3), (8, 13)] {
+        cursor.set_position(start, MoveMode::MoveAnchor);
+        cursor.set_position(end, MoveMode::KeepAnchor);
+        cursor.merge_char_format(&bold()).unwrap();
+    }
+    cursor.end_edit_block();
+    let (undone, _) = format_changes_of_undo_and_redo(&doc);
+    assert_eq!(
+        undone,
+        vec![
+            (0, 3, FormatChangeKind::Character),
+            (8, 5, FormatChangeKind::Character)
+        ]
+    );
+}
+
+#[test]
+fn undoing_a_block_format_reports_it() {
+    let doc = new_doc_with_text("Phileas Fogg\nsecond");
+    doc.cursor_at(0)
+        .set_block_format(&BlockFormat {
+            alignment: Some(Alignment::Center),
+            ..Default::default()
+        })
+        .unwrap();
+    let (undone, redone) = format_changes_of_undo_and_redo(&doc);
+    let the_block = vec![(0, 12, FormatChangeKind::Block)];
+    assert_eq!(undone, the_block);
+    assert_eq!(redone, the_block);
+}
+
+#[test]
+fn undoing_a_list_reports_it() {
+    let doc = new_doc_with_text("Phileas Fogg\nsecond");
+    doc.cursor_at(0).create_list(ListStyle::Decimal).unwrap();
+    let (undone, redone) = format_changes_of_undo_and_redo(&doc);
+    assert!(
+        undone.iter().any(|c| c.2 == FormatChangeKind::List),
+        "{undone:?}"
+    );
+    assert!(
+        redone.iter().any(|c| c.2 == FormatChangeKind::List),
+        "{redone:?}"
+    );
+}
+
+#[test]
+fn undoing_a_list_format_reports_it() {
+    let doc = new_doc_with_text("Phileas Fogg\nsecond");
+    let cursor = doc.cursor_at(0);
+    cursor.create_list(ListStyle::Decimal).unwrap();
+    cursor
+        .set_current_list_format(&ListFormat {
+            style: Some(ListStyle::Disc),
+            ..Default::default()
+        })
+        .unwrap();
+    let (undone, redone) = format_changes_of_undo_and_redo(&doc);
+    let the_document = vec![(0, 0, FormatChangeKind::List)];
+    assert_eq!(undone, the_document);
+    assert_eq!(redone, the_document);
+}
+
+#[test]
+fn undoing_a_table_or_cell_format_reports_it() {
+    let doc = new_doc_with_text("Phileas Fogg");
+    let cursor = doc.cursor_at(12);
+    let table = cursor.insert_table(2, 2).unwrap();
+    cursor
+        .set_table_format(
+            table.id(),
+            &TableFormat {
+                border: Some(3),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let the_document = vec![(0, 0, FormatChangeKind::Block)];
+    let (undone, redone) = format_changes_of_undo_and_redo(&doc);
+    assert_eq!(undone, the_document);
+    assert_eq!(redone, the_document);
+
+    let cell = table.cell(0, 0).unwrap();
+    cursor
+        .set_table_cell_format(
+            cell.id(),
+            &CellFormat {
+                padding: Some(9),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let (undone, redone) = format_changes_of_undo_and_redo(&doc);
+    assert_eq!(undone, the_document);
+    assert_eq!(redone, the_document);
+}
+
+#[test]
+fn undoing_a_blockquote_reports_it() {
+    let doc = new_doc_with_text("Phileas Fogg\nsecond");
+    doc.cursor_at(0).wrap_selection_in_blockquote().unwrap();
+    let (undone, redone) = format_changes_of_undo_and_redo(&doc);
+    assert_eq!(undone, vec![(0, 0, FormatChangeKind::Block)]);
+    assert_eq!(redone, vec![(0, 0, FormatChangeKind::Block)]);
+}
+
+#[test]
+fn undoing_typing_reports_no_format_change() {
+    let doc = new_doc_with_text("Phileas Fogg\nsecond");
+    let cursor = doc.cursor_at(0);
+    cursor.set_position(7, MoveMode::KeepAnchor);
+    cursor.merge_char_format(&bold()).unwrap();
+    doc.cursor_at(19).insert_text(" line").unwrap();
+    let (undone, redone) = format_changes_of_undo_and_redo(&doc);
+    assert_eq!(undone, vec![]);
+    assert_eq!(redone, vec![]);
+}
+
+#[test]
+fn undoing_a_new_paragraph_reports_no_format_change() {
+    let doc = new_doc_with_text("Phileas Fogg");
+    doc.cursor_at(7).insert_block().unwrap();
+    let (undone, redone) = format_changes_of_undo_and_redo(&doc);
+    assert_eq!(undone, vec![]);
+    assert_eq!(redone, vec![]);
+}
+
+#[test]
+fn undoing_typing_in_a_list_or_a_table_reports_no_format_change() {
+    let doc = new_doc_with_text("Phileas Fogg");
+    let cursor = doc.cursor_at(0);
+    cursor.create_list(ListStyle::Decimal).unwrap();
+    doc.cursor_at(3).insert_text("x").unwrap();
+    let (undone, redone) = format_changes_of_undo_and_redo(&doc);
+    assert_eq!(undone, vec![]);
+    assert_eq!(redone, vec![]);
+
+    let table = doc.cursor_at(0).insert_table(2, 2).unwrap();
+    let cell = table.cell(1, 1).unwrap().blocks()[0].position();
+    doc.cursor_at(cell).insert_text("y").unwrap();
+    let (undone, redone) = format_changes_of_undo_and_redo(&doc);
+    assert_eq!(undone, vec![]);
+    assert_eq!(redone, vec![]);
 }

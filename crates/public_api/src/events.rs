@@ -176,6 +176,11 @@ pub enum DocumentEvent {
     },
 
     /// Formatting changed without text content change.
+    ///
+    /// An undo or a redo reports this too, for what it changed in text it left as it was:
+    /// character formats and block formats over the blocks they are in, list membership,
+    /// and list, table, cell and frame formats (a blockquote is a frame) over the whole
+    /// document (a `length` of `0`), as the edits themselves do.
     FormatChanged {
         position: usize,
         length: usize,
