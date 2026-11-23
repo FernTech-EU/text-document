@@ -14,8 +14,7 @@ extern crate text_document_io as document_io;
 
 use common::long_operation::{LongOperationManager, OperationStatus};
 use document_io::docx_rs::{
-    AlignmentType, DocumentChild, Docx, HyperlinkData, Paragraph, ParagraphChild, RunChild,
-    SpecialIndentType,
+    DocumentChild, Docx, HyperlinkData, Paragraph, ParagraphChild, RunChild, SpecialIndentType,
 };
 use document_io::{ExportDocxDto, ImportDjotDto, document_io_controller};
 use test_harness::{EventHub, setup};
@@ -362,17 +361,17 @@ fn alignment_center_maps_to_jc() {
 #[test]
 fn alignment_all_variants_map() {
     for (attr, expected) in [
-        ("left", AlignmentType::Left),
-        ("right", AlignmentType::Right),
-        ("center", AlignmentType::Center),
-        ("justify", AlignmentType::Justified),
+        ("left", "left"),
+        ("right", "right"),
+        ("center", "center"),
+        // OOXML's justified value is `both`; `justified` is not in `ST_Jc`.
+        ("justify", "both"),
     ] {
         let marker = format!("aligned-{attr}");
         let docx = docx_from_djot(&format!("{{alignment={attr}}}\n{marker}"));
         let p = para_containing(&docx, &marker);
-        let got = alignment(p).expect("alignment set");
-        // docx-rs renders AlignmentType via Display; compare its string form.
-        assert_eq!(got, expected.to_string(), "attr={attr}");
+        // Compare against the literal `w:jc` value, not docx-rs's own name for it.
+        assert_eq!(alignment(p), Some(expected), "attr={attr}");
     }
 }
 
@@ -915,11 +914,7 @@ fn options_apply_page_size_and_font_defaults() {
 
     // The single body paragraph is justified, spaced, and first-line indented.
     let ps = paragraphs(&docx);
-    assert_eq!(
-        alignment(ps[0]),
-        Some("justified"),
-        "justify → jc=justified"
-    );
+    assert_eq!(alignment(ps[0]), Some("both"), "justify → jc=both");
     assert!(ps[0].property.line_spacing.is_some(), "line spacing set");
     let ind = ps[0].property.indent.as_ref().expect("indent set");
     assert!(

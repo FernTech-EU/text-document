@@ -1821,7 +1821,7 @@ impl ExportDocxUseCase {
         // for it — a plain LTR export leaves the docx default so existing behaviour is intact).
         if block.fmt_alignment.is_none() {
             let align = if o.justify {
-                Some(AlignmentType::Justified)
+                Some(AlignmentType::Both)
             } else if rtl {
                 Some(AlignmentType::Right)
             } else {
@@ -2030,13 +2030,16 @@ fn check_cancelled(cancel_flag: Option<&AtomicBool>) -> Result<()> {
 }
 
 /// Map the model's paragraph alignment to docx-rs.
+///
+/// Justify is `Both` (`w:jc="both"`), the only justified value in OOXML's `ST_Jc`. docx-rs's
+/// `AlignmentType::Justified` writes `w:jc="justified"`, which is not in the schema.
 fn map_alignment(alignment: &Alignment) -> docx_rs::AlignmentType {
     use docx_rs::AlignmentType;
     match alignment {
         Alignment::Left => AlignmentType::Left,
         Alignment::Right => AlignmentType::Right,
         Alignment::Center => AlignmentType::Center,
-        Alignment::Justify => AlignmentType::Justified,
+        Alignment::Justify => AlignmentType::Both,
     }
 }
 
