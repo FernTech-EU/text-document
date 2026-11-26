@@ -1,13 +1,31 @@
 # cargo-audit configuration. See https://github.com/rustsec/rustsec/tree/main/cargo-audit
 #
-# `cargo audit` scans Cargo.lock, which lists *every* resolved crate — including
-# dependencies of optional features that no default build ever compiles. The entries
-# below are advisories that resolve to such crates and are not reachable from this
-# workspace. Each needs a re-check whenever the typst pin in
-# `crates/document_io/Cargo.toml` is bumped.
+# Advisories `cargo audit` may skip, each one checked against how this workspace actually
+# uses the crate. Every entry needs a crate we don't own to move before it can be fixed;
+# delete it as soon as that happens. Anything new still fails the Security Audit workflow.
 
 [advisories]
 ignore = [
+    # zip 6.0.0 (epub-builder 0.8.3, the latest) and zip 8.6.0 (docx-rs 0.4.22, the
+    # latest; its zip 9 move is on docx-rs `main`, unreleased). text-document's own ODT
+    # container is on zip 9, which is patched. Neither older copy can move until those two
+    # crates release on zip 9 (see the docx-rs note in `crates/document_io/Cargo.toml`).
+    # Both build with default features off and `deflate` only. Not reachable:
+    # - extraction: epub-builder only writes (`ZipWriter`); docx-rs's reader opens entries
+    #   by name through `ZipArchive` and never calls `extract`; text-document reads no zip
+    #   outside its tests, and those use zip 9;
+    "RUSTSEC-2026-0367",
+    "RUSTSEC-2026-0368",
+    "RUSTSEC-2026-0369",
+    "RUSTSEC-2026-0429",
+    "RUSTSEC-2026-0546",
+    # - AES entries: the `aes-crypto` feature is off in both copies, nothing is decrypted;
+    "RUSTSEC-2026-0545",
+    # - Shrink/Reduce/Implode: the `legacy-zip` feature is off in both copies;
+    "RUSTSEC-2026-0547",
+    # - `ZipStreamReader`: neither epub-builder nor docx-rs uses it.
+    "RUSTSEC-2026-0548",
+
     # RUSTSEC-2026-0194 — quick-xml: quadratic run time checking a start tag for
     #   duplicate attribute names.
     # RUSTSEC-2026-0195 — quick-xml: unbounded namespace-declaration allocation in
